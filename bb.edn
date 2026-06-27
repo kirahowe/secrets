@@ -1,0 +1,18 @@
+;; Tasks for developing the library itself. (Consumers wire `com.kirahowe.secrets.cli`
+;; into their *own* bb.edn — see the README.)
+{:paths ["src" "test"]
+
+ :tasks
+ {test
+  {:doc      "Run the test suite under babashka"
+   :requires ([clojure.test :as t] [com.kirahowe.secrets-test])
+   :task     (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test)]
+               (System/exit (if (pos? (+ fail error)) 1 0)))}
+
+  secrets
+  {:doc      "Demo of the management CLI against a throwaway tmp/ secrets file"
+   :requires ([com.kirahowe.secrets.cli :as cli])
+   :task     (cli/run! {:app "kira-secrets-demo"
+                        :default-environment :dev
+                        :environments {:dev {:secrets-file "tmp/secrets.edn.age"}}}
+                       *command-line-args*)}}}

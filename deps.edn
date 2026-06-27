@@ -1,0 +1,15 @@
+{:paths ["src" "resources"]
+
+ ;; Zero runtime dependencies beyond Clojure itself — the library shells out to
+ ;; the `age` CLI and uses only clojure.core/edn/io/shell, so it loads and runs
+ ;; identically under JVM Clojure and babashka.
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}}
+
+ :aliases
+ {:test  {:extra-paths ["test"]
+          :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+          :main-opts   ["-m" "kaocha.runner"]}
+
+  :build {:deps      {io.github.clojure/tools.build {:mvn/version "0.10.13"}
+                      slipset/deps-deploy           {:mvn/version "0.2.2"}}
+          :ns-default build}}}

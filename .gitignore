@@ -1,0 +1,11 @@
+target/
+.cpcache/
+.clj-kondo/.cache/
+.lsp/
+.nrepl-port
+.portal/
+*.log
+.DS_Store
+
+# Scratch space for the demo `bb secrets` task — never commit decrypted secrets.
+tmp/
