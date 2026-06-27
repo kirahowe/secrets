@@ -1,5 +1,7 @@
-;; Tasks for developing the library itself. (Consumers wire `com.kirahowe.secrets.cli`
-;; into their *own* bb.edn — see the README.)
+;; Tasks for developing, building, and publishing the library itself.
+;; (Consumers wire `com.kirahowe.secrets.cli` into their *own* bb.edn — see the
+;; README.) The build/install/deploy tasks shell out to `clojure -T:build …`,
+;; which needs a JDK on the PATH; everything else runs under babashka alone.
 {:paths ["src" "test"]
 
  :tasks
@@ -8,6 +10,22 @@
    :requires ([clojure.test :as t] [com.kirahowe.secrets-test])
    :task     (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test)]
                (System/exit (if (pos? (+ fail error)) 1 0)))}
+
+  clean
+  {:doc  "Remove the target/ build directory"
+   :task (clojure "-T:build clean")}
+
+  build
+  {:doc  "Build the library jar (target/secrets-<version>.jar)"
+   :task (clojure "-T:build jar")}
+
+  install
+  {:doc  "Build + install the jar to the local Maven repo (~/.m2)"
+   :task (clojure "-T:build install")}
+
+  deploy
+  {:doc  "Build + publish to Clojars (needs CLOJARS_USERNAME / CLOJARS_PASSWORD)"
+   :task (clojure "-T:build deploy")}
 
   secrets
   {:doc      "Demo of the management CLI against a throwaway tmp/ secrets file"
