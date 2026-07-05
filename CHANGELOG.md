@@ -16,3 +16,14 @@ All notable changes to this project are documented here. The format follows
   `merge-readers`).
 - `com.kirahowe.secrets.cli` — config-driven `bb secrets` management task
   (`keygen`, `new`, `edit`, `show-key`, `encrypt`, `decrypt`, `help`).
+- **Multi-recipient encryption.** An environment may set `:recipients-file` (a
+  committed list of age public keys); it then encrypts to all of them (`age -R`)
+  so each teammate decrypts with their own key. New commands `add-recipient`,
+  `recipients`, and `reencrypt`; `encrypt-file!` now accepts a recipients spec
+  (`:identity-file` / `:recipients-file` / `:recipients`); `age/valid-recipient?`.
+- **Committed manifest.** `com.kirahowe.secrets.manifest` and a `verify` command.
+  Every `new` / `edit` / `reencrypt` writes a value-free `*.manifest` beside the
+  ciphertext (key paths + value types, plus a key-derived `:vhash` in single-key
+  mode) so `git diff` shows which keys changed. `bb secrets verify` regenerates
+  it from the ciphertext and exits non-zero on drift; disable per-env with
+  `:manifest false`.

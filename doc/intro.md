@@ -37,4 +37,14 @@ secrets.edn.age  (ciphertext, committed to git)
 - **Production:** the same key is injected as one secret, `AGE_IDENTITY`, which
   the library materializes to a temp keyfile at startup.
 
-See the [README](../README.md) for the full API and an end-to-end integration.
+## Beyond the basics
+
+- **Teams.** Point an environment at a committed `recipients.txt` and it
+  encrypts to everyone's public key (`age -R`), so each person decrypts with
+  their own key — no shared private key.
+- **A committed manifest.** Every save writes a value-free `secrets.edn.manifest`
+  beside the ciphertext, so `git diff` shows which keys changed. `bb secrets
+  verify` checks it still matches (a good CI gate).
+
+See the [README](../README.md) for the full API, these workflows, and the
+trade-offs of managing secrets this way.

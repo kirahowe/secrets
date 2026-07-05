@@ -3,14 +3,21 @@
 Manage application secrets as a single **version-controlled, age-encrypted EDN
 file** instead of a sprawl of environment variables. One private key decrypts it;
 everything else — structure, defaults, and the encrypted ciphertext itself —
-lives in git and is reviewed like any other code.
+lives in git, with a committed value-free manifest that makes each change
+reviewable.
 
 - **Pluggable.** Zero runtime dependencies beyond Clojure. Loads and runs
   identically under JVM Clojure and [babashka](https://babashka.org).
-- **A `bb secrets` task.** `keygen` · `new` · `edit` · `show-key` · `encrypt` ·
-  `decrypt`, wired into any project with one task definition.
+- **A `bb secrets` task.** `keygen` · `new` · `edit` · `verify` · `show-key` ·
+  `add-recipient` · `recipients` · `reencrypt` · `encrypt` · `decrypt`, wired
+  into any project with one task definition.
 - **Two ways to consume secrets:** `#secret` / `#secret/opt` EDN reader literals,
   or a plain `load-secrets` map for Integrant/component setups.
+- **Solo or team.** Encrypt to your own key, or to a committed list of
+  recipients so each teammate decrypts with their own key.
+- **A committed manifest.** Every save writes a value-free `*.manifest` beside
+  the ciphertext, so `git diff` shows *which keys changed* without leaking any
+  secret.
 
 It wraps [`age`](https://age-encryption.org) — a small, audited, modern
 file-encryption tool — so there are no GPG keyrings, no KMS, no vault to run.
@@ -22,8 +29,13 @@ sprawl (every integration adds another), they're untyped strings (a
 comma-separated allowlist becomes parsing code), and they aren't
 version-controlled (no history, no review, just mutable state in a deploy
 platform). Encrypting a plain EDN map fixes all three — the map is real data
-(sets, nested maps, numbers), the encrypted form is committed and diffable, and
-the only out-of-band secret is one `age` key.
+(sets, nested maps, numbers), the encrypted form is committed, and the only
+out-of-band secret is one `age` key.
+
+The ciphertext itself diffs opaquely (age re-encrypts the whole file), so the
+committed [manifest](#manifest-seeing-what-changed) is what makes changes
+*reviewable* — it records the shape of the secrets, so a PR shows which keys
+were added, removed, or changed without revealing any value.
 
 ## Install
 
@@ -76,7 +88,8 @@ bb secrets new prod       # opens $EDITOR with the template; fill in, save, encr
 ```
 
 `new` seeds your editor from `secrets.edn.example` (if present) so the shape is
-self-documenting. Saving writes `secrets.edn.age` — commit that; it's ciphertext.
+self-documenting. Saving writes `secrets.edn.age` (ciphertext) and
+`secrets.edn.manifest` (its value-free shape) — commit both.
 
 **3. Day to day:**
 
@@ -163,6 +176,66 @@ its own `:key-file` to isolate it (e.g. so a dev key can't read prod). The same
 resource name (`secrets.edn.age`) can live on each environment's own classpath,
 so one set of reader literals serves every environment.
 
+## Teams: multiple recipients
+
+The default single-key model means everyone shares one private key. For a team,
+point an environment at a **recipients file** — a committed list of age public
+keys — and it encrypts to all of them (`age -R`). Each person then decrypts with
+their *own* key; nobody shares a private key.
+
+```clojure
+;; bb.edn — add :recipients-file to an environment
+{:prod {:secrets-file    "env/prod/resources/secrets.edn.age"
+        :recipients-file "env/prod/recipients.txt"}}
+```
+
+Public keys are safe to commit, so `recipients.txt` lives in git. The workflow:
+
+```sh
+bb secrets keygen prod                 # each dev makes their own key
+bb secrets add-recipient prod          # …and adds their public key to the list
+#   (a maintainer can also add someone else's: bb secrets add-recipient prod age1…)
+bb secrets reencrypt prod              # re-encrypt so new recipients can decrypt
+bb secrets recipients prod             # list who can currently decrypt
+```
+
+- **Onboard** = add a key + `reencrypt`. **Offboard** = remove the line +
+  `reencrypt` (stops *future* access; see the key-rotation note below).
+- **Deploy/CI** gets its own recipient — include a dedicated deploy key so no
+  human needs to hold it. It's still injected as `AGE_IDENTITY` at runtime.
+- Runtime decryption is unchanged: any listed identity decrypts the file, so
+  `load-secrets` / `#secret` need no configuration for this.
+
+## Manifest: seeing what changed
+
+Because age re-encrypts the whole file, a `git diff` of `secrets.edn.age` is an
+opaque blob — you can't tell *what* changed. So every `new` / `edit` / `reencrypt`
+also writes a plaintext **manifest** next to it (`secrets.edn.manifest`) that
+records only the *shape* of the secrets — never a value:
+
+```clojure
+{:version 1
+ :app "myapp"
+ :keys
+ {[:auth :admins]  {:type :set, :count 3, :vhash "9ad1126f40c10b21"}
+  [:database/url]  {:type :string, :vhash "32450c7262fdd852"}}}
+```
+
+Commit it. A diff of the manifest shows keys added, removed, retyped, or (via
+`:vhash`) a value changed — enough to review a change meaningfully without ever
+exposing a secret. `:vhash` is an HMAC keyed by a secret derived from the private
+key, so someone with only the repo can't brute-force a value from it. (In
+multi-recipient mode there's no single shared key, so the manifest is
+structure-only — no `:vhash`.)
+
+```sh
+bb secrets verify         # regenerate from the ciphertext and check every env
+bb secrets verify prod    # …or just one; exits non-zero on drift, so CI can gate
+```
+
+Add `bb secrets verify` to CI to catch a manifest that drifted from its secrets.
+Disable the manifest for an environment with `:manifest false`.
+
 ## API
 
 `com.kirahowe.secrets`
@@ -171,9 +244,11 @@ so one set of reader literals serves every environment.
 - `(reader-literals opts)` → `{'secret … 'secret/opt …}`; `(merge-readers readers opts)`.
 - `(resolve-identity-file)` / `(expand-home path)`.
 
-`com.kirahowe.secrets.age` — `installed?`, `public-key`, `keygen!`, `encrypt-file!`, `decrypt`, `decrypt-to-file!`.
+`com.kirahowe.secrets.age` — `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity, a `:recipients-file`, or a `:recipients` list), `decrypt`, `decrypt-to-file!`.
 
-`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns.
+`com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `render`, `diff`, `value-type`, `hmac-key`.
+
+`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}`.
 
 ## Development
 
@@ -183,16 +258,65 @@ bb secrets help            # demo the CLI against a throwaway tmp/ file
 clojure -T:build install   # build + install the jar to ~/.m2 (needs a JDK)
 ```
 
+## Trade-offs and limitations
+
+This is the "encrypted secrets in git" model (like SOPS, git-crypt, sealed-
+secrets), made EDN-native and age-backed. It's a deliberately small tool; know
+what you're trading for that simplicity.
+
+- **Ciphertext diffs are opaque.** age re-encrypts the whole file, so a `git
+  diff` of `secrets.edn.age` reveals nothing. The [manifest](#manifest-seeing-what-changed)
+  makes *which* keys changed reviewable, but you never see the changed *value*
+  in a PR. If reviewing plaintext values is a hard requirement, you want per-
+  value encryption (SOPS) instead.
+- **Access is coarse and shared.** One key decrypts an entire environment;
+  there's no per-secret access control within a file. Multi-recipient gives each
+  person their own key, but every recipient can still read the whole file.
+- **Key rotation is all-or-nothing, and history is immutable.** A leaked key can
+  decrypt every past commit it encrypted; true revocation means rotating the
+  secret *values*, not just the key (see [Security notes](#security-notes)).
+- **No authenticity / signing.** age encrypts *to* a recipient but doesn't sign,
+  so anyone holding the public key(s) can craft a file that decrypts cleanly.
+  Integrity rests on git review + branch protection; `verify` and `:vhash`
+  detect manifest/ciphertext *drift*, not a forged commit.
+- **`age` is a runtime dependency.** Decryption shells out, so every environment
+  that decrypts — dev, CI, the production container — needs the `age` binary on
+  PATH, not just the build.
+- **Plaintext briefly touches disk on `edit`/`new`.** It's an owner-only temp
+  file, securely deleted after — but the window is unavoidable, editor swap/undo
+  files are outside this tool's control, and secure-delete is best-effort (and
+  largely symbolic on SSD / copy-on-write filesystems like APFS).
+- **The manifest leaks structure.** Key names and value types/shape are
+  committed in the clear (values are not). Opt out per environment with
+  `:manifest false`.
+- **`:vhash` only in single-key mode.** Detecting a same-type value edit needs a
+  shared secret to key the HMAC; multi-recipient setups have no single shared
+  key, so their manifests are structure-only (add / remove / retype still show;
+  a rotated string does not).
+- **Right size.** Ideal for a solo developer or small team shipping a handful of
+  apps with no secrets infrastructure. If you need dynamic secrets, centralized
+  audit, fine-grained IAM, or automatic rotation, a dedicated secrets manager
+  (Vault, a cloud KMS / secret manager) earns its extra complexity.
+
 ## Security notes
 
-- Never commit decrypted plaintext — only `*.edn.age` (encrypted) and
-  `*.edn.example` (templates). `edit`/`new` keep plaintext in an owner-only temp
-  file and securely delete it.
+- Never commit decrypted plaintext — only `*.edn.age` (encrypted),
+  `*.edn.manifest` (value-free shape), `*.edn.example` (templates), and
+  `recipients.txt` (public keys). `edit`/`new` keep plaintext in an owner-only
+  temp file and securely delete it.
 - Back up the private key (a password manager). It is not in git and cannot be
   recovered; losing it means re-keying every secret.
+- **A leaked key exposes history, not just the present.** Git history is
+  immutable, so a key that leaks can decrypt every past version of every file it
+  encrypted. Rotating the key is not enough — you must rotate the underlying
+  secret *values*. Likewise, removing a recipient stops *future* access but not
+  their ability to decrypt old commits.
 - The decrypted map lives in process memory like any config; an RCE in the host
   app can read it. Encryption protects secrets at rest and in git, not from a
   compromised running process.
+- The manifest is intentionally plaintext: it leaks key *names* and value
+  *types/shape* (not values). If a key's mere existence is sensitive, set
+  `:manifest false` for that environment.
 
 ## License
 

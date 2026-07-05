@@ -42,6 +42,15 @@
       (some #(second (re-find #"(?i)public key:\s*(\S+)" %))
             (str/split-lines (slurp f))))))
 
+(defn valid-recipient?
+  "Cheap sanity check that `s` looks like an age recipient (an `age1…` public
+  key, or an `ssh-ed25519`/`ssh-rsa` line). Not a full validation — `age` itself
+  is the authority; this just catches obvious typos before writing a keys file."
+  [s]
+  (let [s (str/trim (str s))]
+    (boolean (or (re-matches #"age1[0-9a-z]{20,}" s)
+                 (re-matches #"ssh-(ed25519|rsa) .+" s)))))
+
 (defn keygen!
   "Generate a fresh age identity at `path`, creating parent directories and
   tightening the file to owner-only permissions. Returns the public key.
@@ -64,12 +73,29 @@
       (public-key path))))
 
 (defn encrypt-file!
-  "Encrypt plaintext file `in` to ciphertext file `out`, for the recipient
-  implied by `identity-file` (`age -e -i`). Returns `out`. Throws on failure."
-  [identity-file in out]
+  "Encrypt plaintext file `in` to ciphertext file `out`. Returns `out`; throws
+  on failure.
+
+  `recipients` selects who can decrypt. It is either:
+    • an identity-file path (String/File) — encrypt to that identity's own
+      recipient (`age -e -i`), the single-key workflow; or
+    • a map with any of, whose recipients are unioned:
+        :identity-file    encrypt to this identity's own recipient (`-i`)
+        :recipients-file  path to a file of age public keys, one per line (`-R`)
+        :recipients       a seq of age recipient strings (`-r` each)
+
+  Multi-recipient encryption (`:recipients-file` / `:recipients`) lets each
+  person hold their *own* key: any one of the listed recipients can decrypt."
+  [recipients in out]
   (ensure-installed!)
-  (let [{:keys [exit err]} (shell/sh "age" "-e" "-i" (str identity-file)
-                                     "-o" (str out) (str in))]
+  (let [{:keys [identity-file recipients-file] rs :recipients}
+        (if (map? recipients) recipients {:identity-file recipients})
+        args (concat ["age" "-e"]
+                     (when identity-file   ["-i" (str identity-file)])
+                     (when recipients-file ["-R" (str recipients-file)])
+                     (mapcat (fn [r] ["-r" (str r)]) rs)
+                     ["-o" (str out) (str in)])
+        {:keys [exit err]} (apply shell/sh args)]
     (when-not (zero? exit)
       (throw (ex-info "age encryption failed" {:out (str out) :error err})))
     out))
