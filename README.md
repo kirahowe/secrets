@@ -11,8 +11,8 @@ reviewable.
 - **A `bb secrets` task.** `keygen` · `new` · `edit` · `verify` · `show-key` ·
   `add-recipient` · `recipients` · `reencrypt` · `encrypt` · `decrypt`, wired
   into any project with one task definition.
-- **Two ways to consume secrets:** `#secret` / `#secret/opt` EDN reader literals,
-  or a plain `load-secrets` map for Integrant/component setups.
+- **Two ways to consume secrets:** `#secret/req` / `#secret/opt` EDN reader
+  literals, or a plain `load-secrets` map for Integrant/component setups.
 - **Solo or team.** Encrypt to your own key, or to a committed list of
   recipients so each teammate decrypts with their own key.
 - **A committed manifest.** Every save writes a value-free `*.manifest` beside
@@ -78,7 +78,11 @@ com.kirahowe/secrets {:mvn/version "0.1.0"}
 ```
 
 Per-environment defaults fill in automatically: `:key-file` →
-`~/.config/<app>/key.txt`, `:template` → `<secrets-file>.example`.
+`~/.config/<app>/key.txt`, `:template` → `<secrets-file>.example`, `:manifest` →
+`<secrets-file>.manifest`. The config is validated up front: `:secrets-file` is
+required, and must end in `.age` — otherwise the derived template/manifest names
+would collide with (and overwrite) the ciphertext itself — unless you set both
+`:template` and `:manifest` explicitly.
 
 **2. Create secrets:**
 
@@ -96,16 +100,21 @@ self-documenting. Saving writes `secrets.edn.age` (ciphertext) and
 ```sh
 bb secrets edit prod      # decrypt → $EDITOR → re-encrypt (no plaintext left on disk)
 bb secrets show-key       # print public key(s) to share with teammates
-bb secrets decrypt env/prod/resources/secrets.edn.age   # print plaintext to stdout
+bb secrets decrypt prod env/prod/resources/secrets.edn.age  # plaintext to stdout
 ```
+
+Every command takes the environment first (`bb secrets decrypt [env] <file>`);
+omit it to use the default environment. `decrypt` writes to stdout byte-for-byte,
+so it works for any `.age` file, not just EDN.
 
 ## Using secrets at runtime
 
 ### Reader literals (recommended for EDN-configured systems)
 
-`reader-literals` returns `#secret` / `#secret/opt` tag functions to merge into
-the `:readers` you pass to `clojure.edn/read-string` or
-`integrant.core/read-string`:
+`reader-literals` returns `#secret/req` / `#secret/opt` tag functions to merge
+into the `:readers` you pass to `clojure.edn/read-string` or
+`integrant.core/read-string`. (The tags are namespaced because the EDN spec
+reserves bare tags like `#secret` for EDN itself.)
 
 ```clojure
 (require '[com.kirahowe.secrets :as secrets])
@@ -121,42 +130,73 @@ the `:readers` you pass to `clojure.edn/read-string` or
 Then config files reference secrets inline:
 
 ```clojure
-{:db   {:jdbc-url #secret :database/url}        ; required — throws if absent
+{:db   {:jdbc-url #secret/req :database/url}    ; required — throws if absent
  :llm  {:api-key  #secret/opt :llm/api-key}     ; optional — nil if absent
- :auth {:admins   #secret :auth/admins}}        ; values are real EDN: #{"a@b.com"}
+ :auth {:admins   #secret/req :auth/admins}}    ; values are real EDN: #{"a@b.com"}
 ```
 
-The file is resolved and decrypted **once, lazily**, on the first `#secret`
+The file is resolved and decrypted **once, lazily**, on the first secret tag
 encountered — so dev/test configs with no secret tags never touch `age` or the
-key, even if a secrets file happens to be on the classpath. `#secret/opt` returns
-`nil` when the file or key is absent; `#secret` throws.
+key, even if a secrets file happens to be on the classpath. The two tags mirror
+required/optional env reads: `#secret/opt` returns `nil` when the secrets file
+is absent, when no identity (key) is available, or when the key is missing from
+the decrypted map; `#secret/req` throws in all three cases, saying which. A
+genuine decryption failure — the identity exists but `age` fails — always
+throws, for both tags.
+
+### Aero
+
+[aero](https://github.com/juxt/aero) resolves tags through its own
+`aero.core/reader` multimethod rather than a `:readers` map, so delegate the
+two tags to the same functions:
+
+```clojure
+(def secret-readers
+  (secrets/reader-literals {:app "myapp" :resource "secrets.edn.age"}))
+
+(defmethod aero.core/reader 'secret/req [_opts _tag value]
+  ((secret-readers 'secret/req) value))
+(defmethod aero.core/reader 'secret/opt [_opts _tag value]
+  ((secret-readers 'secret/opt) value))
+```
 
 ### As a map (Integrant component / direct use)
 
 ```clojure
 (require '[com.kirahowe.secrets :as secrets])
 
-(def m (secrets/load-secrets (clojure.java.io/resource "secrets.edn.age")))
+(def m (secrets/load-secrets (clojure.java.io/resource "secrets.edn.age")
+                             {:app "myapp"}))
 (secrets/get-secret m :database/url)        ; → "jdbc:…"
 (secrets/get-secret m [:r2 :account-id])    ; nested path
 ```
+
+The second argument selects the identity (private key): a path string/File, or
+an opts map with `:identity-file` (an explicit path) or `:app` (→
+`~/.config/<app>/key.txt`). Without it, only the `AGE_IDENTITY*` environment
+variables are consulted — there is deliberately no default key path, so loading
+with no resolvable identity throws (listing your options) rather than silently
+reading some other app's key. Passing `{:app "myapp"}` gives you the local
+default *and* still lets the env vars win in production.
 
 A six-line Integrant `init-key`:
 
 ```clojure
 (defmethod ig/init-key ::secrets [_ {:keys [resource]}]
-  (secrets/load-secrets (io/resource resource)))
+  (secrets/load-secrets (io/resource resource) {:app "myapp"}))
 ```
 
 ## Production & CI: injecting the key
 
 Locally the key lives at `~/.config/<app>/key.txt`. Anywhere else, provide it
-through one of two environment variables (checked before the default path):
+through one of three environment variables, checked in this order (and before
+the local default path):
 
-| Var                | Value                                                              |
-| ------------------ | ----------------------------------------------------------------- |
-| `AGE_IDENTITY_FILE`| a path to the key file                                            |
-| `AGE_IDENTITY`     | the key *contents* (raw or base64) — materialized to a 0600 temp file |
+| Var                 | Value                                                                 |
+| ------------------- | --------------------------------------------------------------------- |
+| `AGE_IDENTITY_FILE` | a path to the key file                                                |
+| `AGE_IDENTITY`      | the key file *contents*, used verbatim (never decoded) — materialized to an owner-only (0600) temp file |
+| `AGE_IDENTITY_B64`  | base64 of the key file contents (newline-tolerant), for secret stores that mangle multi-line values; invalid base64 throws — no silent fallback |
 
 So a Fly / Docker / CI deployment sets exactly one secret:
 
@@ -165,7 +205,10 @@ flyctl secrets set AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
 ```
 
 The container image needs the `age` binary (e.g. `apt-get install -y age`). The
-encrypted `secrets.edn.age` ships in the image (in the jar or on the classpath);
+encrypted `secrets.edn.age` ships in the image — in the jar or on the classpath.
+`load-secrets` and the reader literals handle `jar:` resource URLs from inside
+an uberjar (the ciphertext is copied to an owner-only temp file so `age` can
+read it), so the file works the same whether it sits on disk or inside the jar.
 `AGE_IDENTITY` decrypts it at startup.
 
 ## Environments
@@ -204,7 +247,7 @@ bb secrets recipients prod             # list who can currently decrypt
 - **Deploy/CI** gets its own recipient — include a dedicated deploy key so no
   human needs to hold it. It's still injected as `AGE_IDENTITY` at runtime.
 - Runtime decryption is unchanged: any listed identity decrypts the file, so
-  `load-secrets` / `#secret` need no configuration for this.
+  `load-secrets` / `#secret/req` need no configuration for this.
 
 ## Manifest: seeing what changed
 
@@ -216,6 +259,7 @@ records only the *shape* of the secrets — never a value:
 ```clojure
 {:version 1
  :app "myapp"
+ :ciphertext-sha "0b7d9f31…"   ; SHA-256 of secrets.edn.age when it was written
  :keys
  {[:auth :admins]  {:type :set, :count 3, :vhash "9ad1126f40c10b21"}
   [:database/url]  {:type :string, :vhash "32450c7262fdd852"}}}
@@ -223,32 +267,56 @@ records only the *shape* of the secrets — never a value:
 
 Commit it. A diff of the manifest shows keys added, removed, retyped, or (via
 `:vhash`) a value changed — enough to review a change meaningfully without ever
-exposing a secret. `:vhash` is an HMAC keyed by a secret derived from the private
-key, so someone with only the repo can't brute-force a value from it. (In
-multi-recipient mode there's no single shared key, so the manifest is
-structure-only — no `:vhash`.)
+exposing a secret. `:vhash` is an HMAC keyed by a secret derived from the
+private key *material* — only the `AGE-SECRET-KEY` lines, so the identity
+file's comment lines and whitespace don't affect it and two copies of the same
+key always agree — and someone with only the repo can't brute-force a value
+from it. (In multi-recipient mode there's no single shared key, so the manifest
+is structure-only — no `:vhash`.)
+
+`:ciphertext-sha` is the SHA-256 of the encrypted `.age` file at the moment the
+manifest was written. It ties the manifest to the exact ciphertext, which lets
+CI check the manifest is fresh without holding any key, and lets a keyed
+`verify` catch an out-of-band re-encryption even when the shape still matches.
 
 ```sh
 bb secrets verify         # regenerate from the ciphertext and check every env
-bb secrets verify prod    # …or just one; exits non-zero on drift, so CI can gate
+bb secrets verify prod    # …or just one
 ```
 
-Add `bb secrets verify` to CI to catch a manifest that drifted from its secrets.
-Disable the manifest for an environment with `:manifest false`.
+### Verifying in CI
+
+`verify` exits 0 when everything matches, 1 on drift, and 2 when an artifact or
+key is missing — so `bb secrets verify` gates a pipeline directly. It runs in
+two modes:
+
+- **Keyless freshness check.** With no identity available, `verify` compares
+  the manifest's recorded `:ciphertext-sha` against the actual file. A CI job
+  holding **no secret material at all** can still catch a manifest that drifted
+  from its ciphertext (exit 0 on a pass, same as a keyed run).
+- **Full verification.** With a key (e.g. `AGE_IDENTITY` on the runner),
+  `verify` decrypts and checks the full shape and `:vhash`es, and also flags an
+  out-of-band re-encryption via the sha even when the shape matches.
+
+`verify` also reads the manifest's `:version` and treats an unsupported one as
+drift. Disable the manifest for an environment with `:manifest false`.
 
 ## API
 
 `com.kirahowe.secrets`
-- `(load-secrets source)` / `(load-secrets source identity-file)` — decrypt + read an EDN map.
+- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
-- `(reader-literals opts)` → `{'secret … 'secret/opt …}`; `(merge-readers readers opts)`.
-- `(resolve-identity-file)` / `(expand-home path)`.
+- `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
+- `(identity-from-env)` — identity path from `AGE_IDENTITY_FILE` / `AGE_IDENTITY` / `AGE_IDENTITY_B64`, or nil.
+- `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise.
+- `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
+- `(expand-home path)`.
 
-`com.kirahowe.secrets.age` — `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity, a `:recipients-file`, or a `:recipients` list), `decrypt`, `decrypt-to-file!`.
+`com.kirahowe.secrets.age` — `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte).
 
-`com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `render`, `diff`, `value-type`, `hmac-key`.
+`com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
 
-`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}`.
+`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits; `(verify! config env)` returns `{:results {env status} :exit code}`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}` — validated on load (`:secrets-file` required, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side `:identity-file` resolves from the `AGE_IDENTITY*` env vars before falling back to its `:key-file`, so CI holding only `AGE_IDENTITY` can encrypt, decrypt, and verify.
 
 ## Development
 
@@ -278,10 +346,14 @@ what you're trading for that simplicity.
 - **No authenticity / signing.** age encrypts *to* a recipient but doesn't sign,
   so anyone holding the public key(s) can craft a file that decrypts cleanly.
   Integrity rests on git review + branch protection; `verify` and `:vhash`
-  detect manifest/ciphertext *drift*, not a forged commit.
+  detect manifest/ciphertext *drift*, not a forged commit. (A keyless `verify`
+  run checks freshness only, via `:ciphertext-sha`; the full value-level check
+  still needs a key.)
 - **`age` is a runtime dependency.** Decryption shells out, so every environment
   that decrypts — dev, CI, the production container — needs the `age` binary on
-  PATH, not just the build.
+  PATH, not just the build. (The one exception: a keyless `bb secrets verify`
+  compares hashes only, so a freshness-gating CI job needs neither a key nor
+  the binary.)
 - **Plaintext briefly touches disk on `edit`/`new`.** It's an owner-only temp
   file, securely deleted after — but the window is unavoidable, editor swap/undo
   files are outside this tool's control, and secure-delete is best-effort (and
@@ -317,6 +389,10 @@ what you're trading for that simplicity.
 - The manifest is intentionally plaintext: it leaks key *names* and value
   *types/shape* (not values). If a key's mere existence is sensitive, set
   `:manifest false` for that environment.
+- Sensitive temp files (injected identities, plaintext during `edit`) are
+  created owner-only (0600) atomically on POSIX filesystems. On non-POSIX
+  filesystems (e.g. Windows) the permissions are applied best-effort after
+  creation — the library targets POSIX systems.
 
 ## License
 

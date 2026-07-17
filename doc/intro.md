@@ -34,8 +34,10 @@ secrets.edn.age  (ciphertext, committed to git)
 ```
 
 - **Local dev:** the key lives at `~/.config/<app>/key.txt`.
-- **Production:** the same key is injected as one secret, `AGE_IDENTITY`, which
-  the library materializes to a temp keyfile at startup.
+- **Production:** the same key is injected as one secret — `AGE_IDENTITY`, the
+  raw key file contents (or `AGE_IDENTITY_B64`, its base64, for secret stores
+  that mangle multi-line values) — which the library materializes to an
+  owner-only temp keyfile at startup.
 
 ## Beyond the basics
 
@@ -44,7 +46,8 @@ secrets.edn.age  (ciphertext, committed to git)
   their own key — no shared private key.
 - **A committed manifest.** Every save writes a value-free `secrets.edn.manifest`
   beside the ciphertext, so `git diff` shows which keys changed. `bb secrets
-  verify` checks it still matches (a good CI gate).
+  verify` checks it still matches (a good CI gate — it can even confirm the
+  manifest is fresh without holding any private key).
 
 See the [README](../README.md) for the full API, these workflows, and the
 trade-offs of managing secrets this way.
