@@ -36,4 +36,31 @@
    :task     (cli/run! {:app "kira-secrets-demo"
                         :default-environment :dev
                         :environments {:dev {:secrets-file "tmp/secrets.edn.age"}}}
-                       *command-line-args*)}}}
+                       *command-line-args*)}
+
+  ;; ---- Documentation book (Clay + Quarto; see clay.edn) --------------------
+  ;; The book tasks shell out to `clojure -M:book`, so they need a JDK and the
+  ;; `quarto` CLI on the PATH (and `age`, since the chapters run real examples).
+
+  book:build
+  {:doc      "Render the documentation book (Clay + Quarto) into book/rendered"
+   :requires ([babashka.fs :as fs])
+   :task     (do (when (fs/exists? "book/rendered")
+                   (fs/delete-tree "book/rendered"))
+                 (clojure "-M:book -m scicloj.clay.v2.main -r"))}
+
+  book:preview
+  {:doc      "Serve the rendered book locally via `quarto preview` (builds first if needed)"
+   :requires ([babashka.fs :as fs])
+   :task     (do (when-not (fs/exists? "book/rendered/_quarto.yml")
+                   (run 'book:build))
+                 (shell "quarto preview book/rendered"))}
+
+  book:watch
+  {:doc      "Watch the chapters and re-render on save (Clay live reload)"
+   :requires ([babashka.fs :as fs])
+   ;; Start from a clean slate: leftover HTML from a previous book:build
+   ;; confuses quarto's incremental render inside watch mode.
+   :task     (do (when (fs/exists? "book/rendered")
+                   (fs/delete-tree "book/rendered"))
+                 (clojure "-M:book -m scicloj.clay.v2.main book/chapters"))}}}

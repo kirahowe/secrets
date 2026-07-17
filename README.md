@@ -326,6 +326,20 @@ bb secrets help            # demo the CLI against a throwaway tmp/ file
 clojure -T:build install   # build + install the jar to ~/.m2 (needs a JDK)
 ```
 
+### The documentation book
+
+Full documentation lives in a [Quarto](https://quarto.org) book under
+`book/chapters` — quick start, design rationale, runtime/CLI/teams/manifest
+guides, production & CI, caveats, and a generated API reference. Chapters are
+literate Clojure namespaces rendered with [Clay](https://scicloj.github.io/clay/),
+so every example is evaluated against the real library at build time.
+
+```sh
+bb book:build     # render the book into book/rendered (needs JDK + quarto + age)
+bb book:preview   # serve the rendered book locally
+bb book:watch     # re-render chapters on save (Clay live reload)
+```
+
 ## Trade-offs and limitations
 
 This is the "encrypted secrets in git" model (like SOPS, git-crypt, sealed-

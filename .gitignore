@@ -9,3 +9,6 @@ target/
 
 # Scratch space for the demo `bb secrets` task — never commit decrypted secrets.
 tmp/
+
+# Rendered documentation book (regenerate with `bb book:build`).
+book/rendered/

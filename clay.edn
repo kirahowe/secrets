@@ -1,0 +1,24 @@
+;; Clay configuration for the documentation book (https://scicloj.github.io/clay/).
+;; Every chapter under book/chapters is a literate Clojure namespace: prose in
+;; `;;` comments, code evaluated against the real library at render time.
+;; Rendered by the book:* tasks in bb.edn; output lands in book/rendered
+;; (gitignored), with the publishable site at book/rendered/_book.
+{:format           [:quarto :html]
+ :base-source-path "book/chapters"
+ :source-path      ["secrets_book/index.clj"
+                    "secrets_book/quick_start.clj"
+                    "secrets_book/design.clj"
+                    "secrets_book/runtime.clj"
+                    "secrets_book/cli.clj"
+                    "secrets_book/teams.clj"
+                    "secrets_book/manifest.clj"
+                    "secrets_book/production.clj"
+                    "secrets_book/caveats.clj"
+                    "secrets_book/reference.clj"]
+ :base-target-path "book/rendered"
+ :book             {:title "com.kirahowe/secrets"}
+ ;; Use the first chapter (the preface) as the book's index page instead of a
+ ;; generated placeholder.
+ :first-as-index   true
+ :quarto           {:format {:html {:theme :cosmo}}}
+ :hide-info-line   true}
