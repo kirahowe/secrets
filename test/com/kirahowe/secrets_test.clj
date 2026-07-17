@@ -69,7 +69,7 @@
         readers (secrets/reader-literals {:file enc :identity-file *key*})
         cfg     (edn/read-string
                  {:readers readers}
-                 "{:url #secret :database/url
+                 "{:url #secret/req :database/url
                    :key #secret/opt :llm/api-key
                    :absent #secret/opt :not-there}")]
     (is (= "jdbc:x" (:url cfg)))
@@ -81,19 +81,29 @@
         readers (secrets/reader-literals {:file enc :identity-file *key*})]
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"missing from the secrets file"
-         (edn/read-string {:readers readers} "#secret :totally-absent")))))
+         (edn/read-string {:readers readers} "#secret/req :totally-absent")))))
 
 (deftest reader-absent-file
-  (testing "no secrets file on disk: #secret/opt → nil, #secret → throws"
+  (testing "no secrets file on disk: #secret/opt → nil, #secret/req → throws"
     (let [readers (secrets/reader-literals {:file (str *dir* "/nope.age")
                                             :identity-file *key*})]
       (is (nil? (edn/read-string {:readers readers} "#secret/opt :anything")))
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"no secrets file found"
-           (edn/read-string {:readers readers} "#secret :anything"))))))
+           (edn/read-string {:readers readers} "#secret/req :anything"))))))
+
+(deftest reader-absent-identity
+  (testing "secrets file present but identity file missing: opt → nil, req → throws"
+    (let [enc     (encrypt-edn! {:k "v"})
+          readers (secrets/reader-literals {:file enc
+                                            :identity-file (str *dir* "/no-such-key.txt")})]
+      (is (nil? (edn/read-string {:readers readers} "#secret/opt :k")))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"identity"
+           (edn/read-string {:readers readers} "#secret/req :k"))))))
 
 (deftest reader-decrypts-once
-  (testing "many #secret tags share a single decryption"
+  (testing "many secret tags share a single decryption"
     (let [enc   (encrypt-edn! {:a 1 :b 2 :c 3})
           calls (atom 0)
           real  age/decrypt]
@@ -101,19 +111,58 @@
         (let [readers (secrets/reader-literals {:file enc :identity-file *key*})
               cfg     (edn/read-string
                        {:readers readers}
-                       "[#secret :a #secret :b #secret/opt :c #secret/opt :missing]")]
+                       "[#secret/req :a #secret/req :b #secret/opt :c #secret/opt :missing]")]
           (is (= [1 2 3 nil] cfg))
           (is (= 1 @calls) "decryption is memoized for the process"))))))
 
 (deftest identity-from-env-contents
-  (testing "AGE_IDENTITY contents are materialized to a usable keyfile"
+  (testing "AGE_IDENTITY-style contents are materialized to a usable keyfile"
     (let [enc      (encrypt-edn! {:k "v"})
-          contents (slurp *key*)
-          ;; resolve-identity-file prefers AGE_IDENTITY_FILE, so clear nothing —
-          ;; instead drive materialize via the public resolution by faking env.
-          path     (#'secrets/materialize-identity! contents)]
+          ;; env vars can't be set in-process, so drive the materialization
+          ;; step directly — identity-from-env feeds it the same contents.
+          path     (#'secrets/materialize-identity! (slurp *key*))]
       (is (.exists (io/file path)))
       (is (= {:k "v"} (secrets/load-secrets enc path))))))
+
+(deftest identity-resolution-nil-without-app
+  (testing "no env vars + no app ⇒ resolution returns nil (no silent default)"
+    ;; Guarded: in an environment that has AGE_IDENTITY* set (e.g. CI), the
+    ;; env legitimately wins, so only assert on a clean environment.
+    (if (some #(System/getenv %) ["AGE_IDENTITY_FILE" "AGE_IDENTITY" "AGE_IDENTITY_B64"])
+      (is true "skipped: an AGE_IDENTITY* env var is set")
+      (do (is (nil? (secrets/identity-from-env)))
+          (is (nil? (secrets/resolve-identity-file)))
+          (is (nil? (secrets/resolve-identity-file {})))))))
+
+(deftest b64-identity-decode
+  (let [decode #'secrets/decode-b64-identity
+        raw    "AGE-SECRET-KEY-1EXAMPLE\n"
+        b64    (.encodeToString (java.util.Base64/getMimeEncoder) (.getBytes raw "UTF-8"))]
+    (is (= raw (decode b64)) "valid base64 round-trips")
+    (is (= raw (decode (str "  " b64 "\n"))) "surrounding whitespace is tolerated")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"base64"
+         (decode "!!! not base64 !!!"))
+        "invalid base64 throws instead of silently falling back")))
+
+(deftest load-secrets-opts-map
+  (let [enc (encrypt-edn! {:k "v"})]
+    (is (= {:k "v"} (secrets/load-secrets enc {:identity-file *key*})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"(?i)no age identity.*AGE_IDENTITY_FILE"
+         (secrets/load-secrets enc {:identity-file (str *dir* "/nope")}))
+        "a nonexistent identity file throws with the remediation options")))
+
+(deftest jar-resource-loading
+  (testing "load-secrets reads an encrypted entry through a jar: URL"
+    (let [enc (encrypt-edn! {:from :jar})
+          jar (str *dir* "/app.jar")]
+      (with-open [zos (java.util.zip.ZipOutputStream. (io/output-stream jar))]
+        (.putNextEntry zos (java.util.zip.ZipEntry. "secrets.edn.age"))
+        (io/copy (io/file enc) zos)
+        (.closeEntry zos))
+      (let [url (java.net.URL. (str "jar:file:" jar "!/secrets.edn.age"))]
+        (is (= {:from :jar} (secrets/load-secrets url *key*)))))))
 
 ;; ---------- Multi-recipient ----------
 
@@ -151,6 +200,27 @@
       (age/encrypt-file! *key* plain enc)
       (is (= {:y 2} (secrets/load-secrets enc *key*))))))
 
+(deftest bare-public-key-guard
+  (testing "a bare age1… public key is rejected — it is not an identity-file path"
+    (let [plain (str *dir* "/p.edn")]
+      (spit plain (pr-str {:z 3}))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #":recipients"
+           (age/encrypt-file! (age/public-key *key*) plain (str *dir* "/x.age")))))))
+
+(deftest binary-roundtrip
+  (testing "decrypt-bytes / decrypt-to-file! preserve binary plaintext exactly"
+    (let [payload (byte-array (map unchecked-byte [0 1 2 255 254 10 13]))
+          plain   (io/file *dir* "bin.dat")
+          enc     (str *dir* "/bin.dat.age")
+          out     (io/file *dir* "bin.out")]
+      (io/copy payload plain)
+      (age/encrypt-file! *key* plain enc)
+      (is (java.util.Arrays/equals payload (age/decrypt-bytes *key* enc)))
+      (age/decrypt-to-file! *key* enc out)
+      (is (java.util.Arrays/equals payload
+                                   (java.nio.file.Files/readAllBytes (.toPath out)))))))
+
 ;; ---------- Manifest ----------
 
 (deftest manifest-structure
@@ -182,11 +252,34 @@
 
 (deftest manifest-render-round-trips
   (let [e (manifest/entries {:a 1 :b {:c "x"} :d #{:e}} nil)
-        s (manifest/render "myapp" e)
-        parsed (edn/read-string s)]
-    (is (= 1 (:version parsed)))
-    (is (= "myapp" (:app parsed)))
-    (is (= e (:keys parsed)) "renders to EDN that reads back to the same entries")))
+        sha "a3f1c2d4e5b6978012345678901234567890123456789012345678901234abcd"]
+    (testing "with a :ciphertext-sha it round-trips through the EDN"
+      (let [parsed (edn/read-string (manifest/render {:app "myapp" :ciphertext-sha sha} e))]
+        (is (= 1 (:version parsed)))
+        (is (= "myapp" (:app parsed)))
+        (is (= sha (:ciphertext-sha parsed)))
+        (is (= e (:keys parsed)) "renders to EDN that reads back to the same entries")))
+    (testing "omitted/nil :ciphertext-sha leaves the key out entirely"
+      (doseq [hdr [{:app "myapp"} {:app "myapp" :ciphertext-sha nil}]]
+        (let [parsed (edn/read-string (manifest/render hdr e))]
+          (is (not (contains? parsed :ciphertext-sha)))
+          (is (= e (:keys parsed))))))))
+
+(deftest manifest-hmac-key-comment-insensitive
+  (let [secret "AGE-SECRET-KEY-1QQPXZ6EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE"
+        a (str "# created: 2026-01-01\n# public key: age1aaa\n" secret "\n")
+        b (str "\n# created: 2026-07-14\n# public key: age1bbb\n  " secret "  \n\n")
+        c (str "# created: 2026-01-01\n" secret "DIFFERENT\n")]
+    (is (java.util.Arrays/equals (manifest/hmac-key a) (manifest/hmac-key b))
+        "same secret line ⇒ same key, regardless of comments and whitespace")
+    (is (not (java.util.Arrays/equals (manifest/hmac-key a) (manifest/hmac-key c)))
+        "a different secret line ⇒ a different key")
+    (testing "no AGE-SECRET-KEY line at all (e.g. an SSH identity) still works"
+      (let [ssh "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"]
+        (is (java.util.Arrays/equals (manifest/hmac-key ssh)
+                                     (manifest/hmac-key (str "\n" ssh "\n")))
+            "fallback path is stable (and whitespace-insensitive)")
+        (is (not (java.util.Arrays/equals (manifest/hmac-key ssh) (manifest/hmac-key a))))))))
 
 (deftest manifest-diff-test
   (testing "structure-only diff (nil key): sees add/remove/retype, not value edits"

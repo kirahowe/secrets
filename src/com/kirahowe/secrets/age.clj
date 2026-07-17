@@ -77,8 +77,10 @@
   on failure.
 
   `recipients` selects who can decrypt. It is either:
-    • an identity-file path (String/File) — encrypt to that identity's own
-      recipient (`age -e -i`), the single-key workflow; or
+    • a bare String/File — always an identity-*file path*: encrypt to that
+      identity's own recipient (`age -e -i`), the single-key workflow. A bare
+      `age1…` public-key string throws — pass those as `{:recipients [\"age1…\"]}`
+      (age would otherwise try to read the key as a file path); or
     • a map with any of, whose recipients are unioned:
         :identity-file    encrypt to this identity's own recipient (`-i`)
         :recipients-file  path to a file of age public keys, one per line (`-R`)
@@ -88,6 +90,11 @@
   person hold their *own* key: any one of the listed recipients can decrypt."
   [recipients in out]
   (ensure-installed!)
+  (when (and (string? recipients) (valid-recipient? recipients))
+    (throw (ex-info (str "encrypt-file! got a bare public key, but a bare "
+                         "recipients value means an identity-file path. Pass "
+                         "public keys as {:recipients [\"age1…\"]}.")
+                    {:recipients recipients})))
   (let [{:keys [identity-file recipients-file] rs :recipients}
         (if (map? recipients) recipients {:identity-file recipients})
         args (concat ["age" "-e"]
@@ -100,13 +107,17 @@
       (throw (ex-info "age encryption failed" {:out (str out) :error err})))
     out))
 
-(defn decrypt
+(defn decrypt-bytes
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
-  string. Throws an ex-info (with the captured stderr) on failure."
-  [identity-file encrypted-file]
+  byte array (binary-safe — age encrypts arbitrary files, not just text).
+  Throws an ex-info (with the captured stderr) on failure."
+  ^bytes [identity-file encrypted-file]
   (ensure-installed!)
+  ;; :out-enc :bytes leaves stdout undecoded; stderr is still returned as a
+  ;; string (both here and on the JVM).
   (let [{:keys [exit out err]} (shell/sh "age" "-d" "-i" (str identity-file)
-                                         (str encrypted-file))]
+                                         (str encrypted-file)
+                                         :out-enc :bytes)]
     (if (zero? exit)
       out
       (throw (ex-info "age decryption failed"
@@ -115,8 +126,16 @@
                        :error          err
                        :hint           "Wrong key, or you are not a recipient of this file."})))))
 
+(defn decrypt
+  "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
+  UTF-8 string. Use `decrypt-bytes` for binary plaintexts. Throws an ex-info
+  (with the captured stderr) on failure."
+  [identity-file encrypted-file]
+  (String. (decrypt-bytes identity-file encrypted-file) "UTF-8"))
+
 (defn decrypt-to-file!
-  "Decrypt `encrypted-file` to plaintext file `out`. Returns `out`."
+  "Decrypt `encrypted-file` to plaintext file `out`, byte-for-byte (binary
+  content is preserved). Returns `out`."
   [identity-file encrypted-file out]
-  (spit (io/file (str out)) (decrypt identity-file encrypted-file))
+  (io/copy (decrypt-bytes identity-file encrypted-file) (io/file (str out)))
   out)
