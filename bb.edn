@@ -7,8 +7,11 @@
  :tasks
  {test
   {:doc      "Run the test suite under babashka"
-   :requires ([clojure.test :as t] [com.kirahowe.secrets-test])
-   :task     (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test)]
+   :requires ([clojure.test :as t]
+              [com.kirahowe.secrets-test]
+              [com.kirahowe.secrets.cli-test])
+   :task     (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
+                                                     'com.kirahowe.secrets.cli-test)]
                (System/exit (if (pos? (+ fail error)) 1 0)))}
 
   clean
