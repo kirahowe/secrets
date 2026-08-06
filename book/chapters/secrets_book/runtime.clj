@@ -62,7 +62,7 @@
 (secrets/get-secret loaded :missing/key "fallback")
 
 ;; `loaded` is an ordinary immutable map. There is no wrapper type to learn.
-;; If you use Integrant, a component that provides it is three lines:
+;; If you use Integrant, the component that provides it is one `defmethod`:
 
 ;; ```clojure
 ;; (defmethod ig/init-key ::secrets [_ {:keys [resource]}]
@@ -84,14 +84,14 @@
 
 ;; | Variable | Meaning |
 ;; |----------|---------|
-;; | `AGE_IDENTITY_FILE` | a path to the key file |
-;; | `AGE_IDENTITY` | the raw key file contents, used verbatim |
-;; | `AGE_IDENTITY_B64` | base64 of the contents; invalid base64 throws |
+;; | `SECRETS_AGE_IDENTITY_FILE` | a path to the key file |
+;; | `SECRETS_AGE_IDENTITY` | the raw key file contents, used verbatim |
+;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the contents; invalid base64 throws |
 
 ;; The env vars always win, even when you pass `{:app "myapp"}`. That is the
 ;; deployment story in one sentence: code passes `{:app "myapp"}` so local
 ;; development finds `~/.config/myapp/key.txt`, and production sets
-;; `AGE_IDENTITY`, which overrides it.
+;; `SECRETS_AGE_IDENTITY`, which overrides it.
 
 ;; There is deliberately no default key path when no app is named. A library
 ;; that guessed `~/.config/something/key.txt` would sometimes guess a path

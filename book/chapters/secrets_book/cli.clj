@@ -36,19 +36,29 @@
 ;; Worth noticing in that output: `:template` and `:manifest` derive from the
 ;; secrets file name, `:key-file` is the durable path `keygen` writes to, and
 ;; `:identity-file` is what decryption actually uses. The two are separate
-;; because the `AGE_IDENTITY*` environment variables override `:identity-file`
+;; because the `SECRETS_AGE_IDENTITY*` environment variables override `:identity-file`
 ;; but never `:key-file`. A CI runner holding one env var decrypts and
 ;; verifies with it; `keygen` on your laptop still writes to the configured
 ;; path.
 
 ;; ## Validation catches the dangerous config
 
+;; `:app` is required, with no default. It names the default key path, and a
+;; defaulted app name would mean two unrelated projects quietly sharing
+;; `~/.config/secrets/key.txt`, which is exactly the guessing the runtime
+;; side refuses to do.
+
+(try
+  (cli/normalize-config {:environments {:dev {:secrets-file "s.edn.age"}}})
+  (catch Exception e (ex-message e)))
+
 ;; A `:secrets-file` that does not end in `.age` would derive a template and
 ;; manifest name equal to the ciphertext path itself, and writing the manifest
 ;; would then overwrite your encrypted secrets. The config loader refuses:
 
 (try
-  (cli/normalize-config {:environments {:dev {:secrets-file "secrets.enc"}}})
+  (cli/normalize-config {:app "myapp"
+                         :environments {:dev {:secrets-file "secrets.enc"}}})
   (catch Exception e (ex-message e)))
 
 ;; Set `:template` and `:manifest` explicitly if you really need another
@@ -134,13 +144,12 @@
 
 ;; ## REPL safety, stated plainly
 
-;; Earlier versions of tools like this one call `System/exit` inside command
-;; functions, which turns a REPL experiment into a dead REPL. Here the
-;; contract is: command functions never exit, never print to stderr except
-;; through their return path, and always give back something you can inspect.
-;; Declined confirmation prompts return `:aborted`. Only `run!`, the function
-;; your `bb.edn` wires to the task, translates all of that into process exit
-;; codes.
+;; CLI tools love to call `System/exit` inside command functions, which turns
+;; a REPL experiment into a dead REPL. Here the contract is: command functions
+;; print their progress, but they never exit, and they always give back
+;; something you can inspect: a path, a result map, `:aborted` from a
+;; declined confirmation prompt. Only `run!`, the function your `bb.edn`
+;; wires to the task, translates failures into process exit codes.
 
 ^{:kindly/hide-code true}
 (doseq [f (reverse (file-seq (io/file dir)))]

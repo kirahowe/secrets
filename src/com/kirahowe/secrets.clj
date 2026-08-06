@@ -9,7 +9,7 @@
   Two ways to consume secrets:
 
   • As an Integrant/component value — call `load-secrets` to get the map and
-    `get-secret` to read keys from it. (See the README for a 6-line init-key.)
+    `get-secret` to read keys from it. (See the README for a two-line init-key.)
 
   • As EDN reader literals — call `reader-literals` (or `merge-readers`) to get
     `#secret/req` / `#secret/opt` tags you can register with your config
@@ -19,11 +19,11 @@
         :api-key  #secret/opt :llm/api-key   ; optional — nil if absent
 
   Identity resolution (where the private key comes from), in order:
-    1. $AGE_IDENTITY_FILE — a path to the key file.
-    2. $AGE_IDENTITY      — the raw key file *contents*, used verbatim and
+    1. $SECRETS_AGE_IDENTITY_FILE — a path to the key file.
+    2. $SECRETS_AGE_IDENTITY      — the raw key file *contents*, used verbatim and
        materialized to a 0600 temp file. Lets a deploy inject the key as one
        secret/env var.
-    3. $AGE_IDENTITY_B64  — base64-encoded key file contents (newline-tolerant),
+    3. $SECRETS_AGE_IDENTITY_B64  — base64-encoded key file contents (newline-tolerant),
        for secret stores that mangle multi-line values. Invalid base64 throws —
        there is no silent fallback.
     4. ~/.config/<app>/key.txt — the local developer default, used only when an
@@ -71,23 +71,23 @@
 ;; ---------- Identity (private key) resolution ----------
 
 (def ^:private identity-temp
-  "Caches the temp file materialized from $AGE_IDENTITY / $AGE_IDENTITY_B64 so
+  "Caches the temp file materialized from $SECRETS_AGE_IDENTITY / $SECRETS_AGE_IDENTITY_B64 so
   the key is written to disk at most once per process, keyed on its contents."
   (atom {}))
 
 (defn- decode-b64-identity
-  "Decode an $AGE_IDENTITY_B64 value (base64 of the key file contents,
+  "Decode an $SECRETS_AGE_IDENTITY_B64 value (base64 of the key file contents,
   newline-tolerant) to the raw identity text. Throws on invalid base64 —
   never falls back to using the value verbatim."
   [contents]
   (try
     (String. (.decode (java.util.Base64/getMimeDecoder) (str/trim contents)) "UTF-8")
     (catch IllegalArgumentException e
-      (throw (ex-info (str "AGE_IDENTITY_B64 is not valid base64. Set it to the"
+      (throw (ex-info (str "SECRETS_AGE_IDENTITY_B64 is not valid base64. Set it to the"
                            " base64-encoded age key file contents, or use"
-                           " AGE_IDENTITY (raw contents) / AGE_IDENTITY_FILE"
+                           " SECRETS_AGE_IDENTITY (raw contents) / SECRETS_AGE_IDENTITY_FILE"
                            " (a path) instead.")
-                      {:env "AGE_IDENTITY_B64"}
+                      {:env "SECRETS_AGE_IDENTITY_B64"}
                       e)))))
 
 (defn- materialize-identity!
@@ -104,18 +104,18 @@
 (defn identity-from-env
   "Resolve the age identity (private key) file path from the environment, or
   nil when no identity variable is set. Checked in order:
-    $AGE_IDENTITY_FILE — a path to the key file, returned as-is.
-    $AGE_IDENTITY      — the raw key file contents, used verbatim.
-    $AGE_IDENTITY_B64  — base64-encoded key file contents (invalid base64 throws).
+    $SECRETS_AGE_IDENTITY_FILE — a path to the key file, returned as-is.
+    $SECRETS_AGE_IDENTITY      — the raw key file contents, used verbatim.
+    $SECRETS_AGE_IDENTITY_B64  — base64-encoded key file contents (invalid base64 throws).
   Contents are materialized to a 0600 temp file, written at most once per
   process. Public (rather than folded into `resolve-identity-file`) so callers
   like the CLI namespace can layer their own defaults under it when it
   returns nil."
   []
-  (or (System/getenv "AGE_IDENTITY_FILE")
-      (when-let [c (System/getenv "AGE_IDENTITY")]
+  (or (System/getenv "SECRETS_AGE_IDENTITY_FILE")
+      (when-let [c (System/getenv "SECRETS_AGE_IDENTITY")]
         (materialize-identity! c))
-      (when-let [c (System/getenv "AGE_IDENTITY_B64")]
+      (when-let [c (System/getenv "SECRETS_AGE_IDENTITY_B64")]
         (materialize-identity! (decode-b64-identity c)))))
 
 (defn resolve-identity-file
@@ -132,8 +132,8 @@
 
 (def ^:private identity-options
   "One-line remediation appended to \"no identity\" errors."
-  (str "Set AGE_IDENTITY_FILE (key path), AGE_IDENTITY (raw key contents), or "
-       "AGE_IDENTITY_B64 (base64 contents); pass {:identity-file …} or "
+  (str "Set SECRETS_AGE_IDENTITY_FILE (key path), SECRETS_AGE_IDENTITY (raw key contents), or "
+       "SECRETS_AGE_IDENTITY_B64 (base64 contents); pass {:identity-file …} or "
        "{:app \"myapp\"} (→ ~/.config/myapp/key.txt); or create the key with "
        "`bb secrets keygen`."))
 
@@ -166,7 +166,7 @@
     :identity-file  explicit identity path (wins over :app and the env vars)
     :app            app name for the default ~/.config/<app>/key.txt
   With neither, the identity comes from `resolve-identity-file` (the
-  AGE_IDENTITY* env vars). Throws when no identity resolves or the resolved
+  SECRETS_AGE_IDENTITY* env vars). Throws when no identity resolves or the resolved
   identity file does not exist.
 
   Reads with `clojure.edn` (no eval), so secret files are plain data and may use

@@ -89,7 +89,7 @@
 
 ;; | Key | Required | Meaning |
 ;; |-----|----------|---------|
-;; | `:app` | no (default `"secrets"`) | names the default key path `~/.config/<app>/key.txt` |
+;; | `:app` | yes | names the default key path `~/.config/<app>/key.txt`; recorded in the manifest |
 ;; | `:default-environment` | no | environment used when a command omits `[env]` |
 ;; | `:environments` | yes | map of environment keyword to environment config |
 
@@ -104,15 +104,15 @@
 ;; | `:recipients-file` | no | committed list of age public keys; enables team mode |
 
 ;; Normalization also computes `:identity-file` per environment: the
-;; `AGE_IDENTITY*` environment variables when set, otherwise `:key-file`.
+;; `SECRETS_AGE_IDENTITY*` environment variables when set, otherwise `:key-file`.
 
 ;; ## Environment variables
 
 ;; | Variable | Contents |
 ;; |----------|----------|
-;; | `AGE_IDENTITY_FILE` | path to the key file |
-;; | `AGE_IDENTITY` | raw key file contents, used verbatim |
-;; | `AGE_IDENTITY_B64` | base64 of the key file contents; invalid base64 throws |
+;; | `SECRETS_AGE_IDENTITY_FILE` | path to the key file |
+;; | `SECRETS_AGE_IDENTITY` | raw key file contents, used verbatim |
+;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the key file contents; invalid base64 throws |
 
 ;; ## Reader tags
 

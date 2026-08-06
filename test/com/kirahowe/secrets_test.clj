@@ -116,7 +116,7 @@
           (is (= 1 @calls) "decryption is memoized for the process"))))))
 
 (deftest identity-from-env-contents
-  (testing "AGE_IDENTITY-style contents are materialized to a usable keyfile"
+  (testing "SECRETS_AGE_IDENTITY-style contents are materialized to a usable keyfile"
     (let [enc      (encrypt-edn! {:k "v"})
           ;; env vars can't be set in-process, so drive the materialization
           ;; step directly — identity-from-env feeds it the same contents.
@@ -126,10 +126,10 @@
 
 (deftest identity-resolution-nil-without-app
   (testing "no env vars + no app ⇒ resolution returns nil (no silent default)"
-    ;; Guarded: in an environment that has AGE_IDENTITY* set (e.g. CI), the
+    ;; Guarded: in an environment that has SECRETS_AGE_IDENTITY* set (e.g. CI), the
     ;; env legitimately wins, so only assert on a clean environment.
-    (if (some #(System/getenv %) ["AGE_IDENTITY_FILE" "AGE_IDENTITY" "AGE_IDENTITY_B64"])
-      (is true "skipped: an AGE_IDENTITY* env var is set")
+    (if (some #(System/getenv %) ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY" "SECRETS_AGE_IDENTITY_B64"])
+      (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
       (do (is (nil? (secrets/identity-from-env)))
           (is (nil? (secrets/resolve-identity-file)))
           (is (nil? (secrets/resolve-identity-file {})))))))
@@ -149,7 +149,7 @@
   (let [enc (encrypt-edn! {:k "v"})]
     (is (= {:k "v"} (secrets/load-secrets enc {:identity-file *key*})))
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"(?i)no age identity.*AGE_IDENTITY_FILE"
+         clojure.lang.ExceptionInfo #"(?i)no age identity.*SECRETS_AGE_IDENTITY_FILE"
          (secrets/load-secrets enc {:identity-file (str *dir* "/nope")}))
         "a nonexistent identity file throws with the remediation options")))
 

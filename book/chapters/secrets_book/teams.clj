@@ -126,7 +126,7 @@
 ;; age-keygen -o deploy-key.txt
 ;; bb secrets add-recipient prod age1...   # the deploy key's public half
 ;; bb secrets reencrypt prod
-;; flyctl secrets set AGE_IDENTITY="$(cat deploy-key.txt)"
+;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat deploy-key.txt)"
 ;; # store deploy-key.txt in the team password manager, then delete it locally
 ;; ```
 

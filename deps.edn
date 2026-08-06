@@ -1,4 +1,4 @@
-{:paths ["src" "resources"]
+{:paths ["src"]
 
  ;; Zero runtime dependencies beyond Clojure itself — the library shells out to
  ;; the `age` CLI and uses only clojure.core/edn/io/shell, so it loads and runs

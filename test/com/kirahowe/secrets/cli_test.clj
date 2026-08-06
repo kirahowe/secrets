@@ -5,7 +5,7 @@
   instead of exiting), plus `run!` for the dispatch/arg-order cases that don't
   exit on success.
 
-  Tests that pin a specific key skip themselves when an AGE_IDENTITY* env var
+  Tests that pin a specific key skip themselves when an SECRETS_AGE_IDENTITY* env var
   is set, because the env legitimately overrides :key-file."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -31,9 +31,9 @@
 (use-fixtures :each with-tmp-key)
 
 (def ^:private age-env-set?
-  "AGE_IDENTITY* overrides :key-file in :identity-file resolution, so tests
+  "SECRETS_AGE_IDENTITY* overrides :key-file in :identity-file resolution, so tests
   that must decrypt with the fixture's key can't run under it."
-  (boolean (some #(System/getenv %) ["AGE_IDENTITY_FILE" "AGE_IDENTITY" "AGE_IDENTITY_B64"])))
+  (boolean (some #(System/getenv %) ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY" "SECRETS_AGE_IDENTITY_B64"])))
 
 (defn- test-config
   "A single-env config rooted in the fixture's temp dir, key pinned to *key*."
@@ -79,13 +79,14 @@
     (is (= :prod (:name env)))
     (is (= "myapp" (:app env)))
     (if age-env-set?
-      (is true "skipped: an AGE_IDENTITY* env var is set")
+      (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
       (is (= (:key-file env) (:identity-file env))
-          ":identity-file falls back to :key-file without AGE_IDENTITY*"))))
+          ":identity-file falls back to :key-file without SECRETS_AGE_IDENTITY*"))))
 
 (deftest normalize-config-explicit-values-respected
   (let [cfg (cli/normalize-config
-             {:environments {:dev {:secrets-file "s.edn.age"
+             {:app "myapp"
+              :environments {:dev {:secrets-file "s.edn.age"
                                    :template     "tpl.edn"
                                    :manifest     false}}})
         env (get-in cfg [:environments :dev])]
@@ -96,15 +97,20 @@
   (testing "no :environments"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #":environments"
                           (cli/normalize-config {:app "x"}))))
+  (testing "missing :app — no default, so unrelated projects can't share a key path"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #":app"
+                          (cli/normalize-config
+                           {:environments {:dev {:secrets-file "s.edn.age"}}}))))
   (testing "missing :secrets-file"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #":secrets-file"
-                          (cli/normalize-config {:environments {:dev {}}}))))
+                          (cli/normalize-config {:app "x" :environments {:dev {}}}))))
   (testing "non-.age name would make derived template/manifest overwrite the ciphertext"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"\.age"
                           (cli/normalize-config
-                           {:environments {:dev {:secrets-file "secrets.enc"}}}))))
+                           {:app "x" :environments {:dev {:secrets-file "secrets.enc"}}}))))
   (testing "non-.age accepted when :template and :manifest are both explicit"
-    (let [env (-> {:environments {:dev {:secrets-file "secrets.enc"
+    (let [env (-> {:app "x"
+                   :environments {:dev {:secrets-file "secrets.enc"
                                         :template     "secrets.example"
                                         :manifest     false}}}
                   cli/normalize-config
@@ -119,7 +125,7 @@
 
 (deftest reencrypt-writes-manifest-and-verify-passes
   (if age-env-set?
-    (is true "skipped: an AGE_IDENTITY* env var is set")
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))]
       (encrypt-edn! {:database/url "jdbc:x" :auth/admins #{"a@b.com"}})
       (with-out-str (cli/reencrypt! config "dev"))
@@ -135,7 +141,7 @@
 
 (deftest verify-detects-drift
   (if age-env-set?
-    (is true "skipped: an AGE_IDENTITY* env var is set")
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))]
       (testing "shape change out-of-band"
         (encrypt-edn! {:a 1})
@@ -155,7 +161,7 @@
 
 (deftest verify-keyless-freshness
   (if age-env-set?
-    (is true "skipped: an AGE_IDENTITY* env var is set")
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config  (cli/normalize-config (test-config))
           keyless (cli/normalize-config
                    (test-config {:key-file (str *dir* "/no-such-key.txt")}))]
@@ -173,7 +179,7 @@
 
 (deftest verify-version-gate
   (if age-env-set?
-    (is true "skipped: an AGE_IDENTITY* env var is set")
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))]
       (encrypt-edn! {:a 1})
       (spit (str *dir* "/secrets.edn.manifest")
@@ -193,7 +199,7 @@
 
 (deftest encrypt-decrypt-arg-order-and-binary-safety
   (if age-env-set?
-    (is true "skipped: an AGE_IDENTITY* env var is set")
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config  (test-config)
           f       (str *dir* "/note.txt")
           g       (str *dir* "/other.txt")

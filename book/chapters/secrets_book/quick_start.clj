@@ -123,7 +123,7 @@
 
 ;; The Postmark key is not in the file, so it read as nil and the rest of the
 ;; config was untouched. In a real app you would pass `:resource
-;; \"secrets.edn.age\"` instead of `:file`, and the library finds it on the
+;; "secrets.edn.age"` instead of `:file`, and the library finds it on the
 ;; classpath, jar or no jar.
 
 ;; ## Day to day
@@ -143,7 +143,7 @@
 ;; Production needs exactly one secret set out-of-band, the key itself:
 
 ;; ```sh
-;; flyctl secrets set AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
+;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
 ;; ```
 
 ;; The encrypted file ships inside your image or jar, and the library decrypts

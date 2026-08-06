@@ -22,8 +22,8 @@ All notable changes to this project are documented here. The format follows
   `merge-readers`) as the EDN spec requires. `#secret/req` throws when the
   secrets file, the identity, or the key is missing; `#secret/opt` returns nil
   in those cases; a genuine decryption failure throws for both tags.
-- **Identity resolution** from `AGE_IDENTITY_FILE` (a path), `AGE_IDENTITY`
-  (raw key contents, used verbatim), or `AGE_IDENTITY_B64` (base64-encoded
+- **Identity resolution** from `SECRETS_AGE_IDENTITY_FILE` (a path), `SECRETS_AGE_IDENTITY`
+  (raw key contents, used verbatim), or `SECRETS_AGE_IDENTITY_B64` (base64-encoded
   contents; invalid base64 throws), checked in that order (`identity-from-env`),
   then `~/.config/<app>/key.txt` when an app name is known
   (`resolve-identity-file`). There is deliberately no default key path: loading
@@ -38,12 +38,14 @@ All notable changes to this project are documented here. The format follows
   REPL-safe API: they return data (paths, result maps, `:aborted` from a
   declined overwrite prompt) and throw `ex-info` on failure; only `run!` prints
   error details (`:hint` / `:install` / `:error` / `:docs`) and exits. Config
-  is validated up front (`:secrets-file` is required and must end in `.age`
-  unless both `:template` and `:manifest` are set explicitly), every command
+  is validated up front (`:app` is required — it names the default key path,
+  and a default would let unrelated projects share a key by accident;
+  `:secrets-file` is required and must end in `.age` unless both `:template`
+  and `:manifest` are set explicitly), every command
   takes the environment first (`bb secrets decrypt [env] <file>`), and each
   environment's decrypt-side `:identity-file` resolves from the
-  `AGE_IDENTITY*` variables before its configured `:key-file` — so CI holding
-  only `AGE_IDENTITY` can encrypt, decrypt, and verify.
+  `SECRETS_AGE_IDENTITY*` variables before its configured `:key-file` — so CI holding
+  only `SECRETS_AGE_IDENTITY` can encrypt, decrypt, and verify.
 - **Multi-recipient encryption.** An environment may set `:recipients-file` (a
   committed list of age public keys); it then encrypts to all of them (`age -R`)
   so each teammate decrypts with their own key, via the `add-recipient`,

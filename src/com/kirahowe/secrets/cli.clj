@@ -25,11 +25,11 @@
                      from it.
     :identity-file — what decrypt-side operations (edit, decrypt, reencrypt,
                      verify) and single-key encryption use. Resolved in order:
-                       1. $AGE_IDENTITY_FILE — a path to the key file
-                       2. $AGE_IDENTITY      — raw key contents (→ 0600 temp file)
-                       3. $AGE_IDENTITY_B64  — base64-encoded key contents
+                       1. $SECRETS_AGE_IDENTITY_FILE — a path to the key file
+                       2. $SECRETS_AGE_IDENTITY      — raw key contents (→ 0600 temp file)
+                       3. $SECRETS_AGE_IDENTITY_B64  — base64-encoded key contents
                        4. the environment's :key-file
-                     So CI holding only an AGE_IDENTITY* variable can encrypt,
+                     So CI holding only an SECRETS_AGE_IDENTITY* variable can encrypt,
                      decrypt, and verify, while `keygen` still writes to the
                      configured key path.
 
@@ -96,7 +96,9 @@
 (defn normalize-config
   "Apply per-environment defaults (:key-file, :identity-file, :template,
   :manifest), validate the configuration, and stamp each env with its :name.
-  Throws (ex-info, as `run!` expects) when there are no environments, when an
+  Throws (ex-info, as `run!` expects) when there are no environments, when
+  :app is missing (it names the default key path ~/.config/<app>/key.txt, so
+  defaulting it would make unrelated projects share a key), when an
   environment lacks a :secrets-file string, or when a derived :template /
   :manifest name would collide with the ciphertext (a :secrets-file that does
   not end in `.age` derives template = manifest = the secrets file itself, and
@@ -104,42 +106,46 @@
   [{:keys [app environments] :as config}]
   (when (empty? environments)
     (fail! "secrets config has no :environments" {:config config}))
-  (let [app (or app "secrets")]
-    (assoc config
-           :app app
-           :environments
-           (into {}
-                 (map (fn [[env {:keys [secrets-file key-file template manifest recipients-file] :as e}]]
-                        (when-not (string? secrets-file)
-                          (fail! (str "Environment " env " has no :secrets-file (a path string is required).")
-                                 {:environment env :env-config e}))
-                        (when (and (not (str/ends-with? secrets-file ".age"))
-                                   (not (and (contains? e :template) (contains? e :manifest))))
-                          (fail! (str "Environment " env " :secrets-file (" secrets-file ") does not end in .age, so the\n"
-                                      "    derived :template/:manifest names would collide with — and overwrite — the\n"
-                                      "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
-                                      "    explicitly.")
-                                 {:environment env :secrets-file secrets-file}))
-                        (let [key-file (secrets/expand-home
-                                        (or key-file (str "~/.config/" app "/key.txt")))]
-                          [env (assoc e
-                                      :name env
-                                      :app app
-                                      :secrets-file secrets-file
-                                      :key-file key-file
-                                      ;; Decrypt-side identity: AGE_IDENTITY* env vars win,
-                                      ;; then the configured/default key path.
-                                      :identity-file (or (secrets/identity-from-env) key-file)
-                                      ;; Explicit values (incl. :manifest false) are always
-                                      ;; kept; absent ⇒ derive from the secrets file.
-                                      :template (if (contains? e :template)
-                                                  template
-                                                  (str/replace secrets-file #"\.age$" ".example"))
-                                      :manifest (if (contains? e :manifest)
-                                                  manifest
-                                                  (str/replace secrets-file #"\.age$" ".manifest"))
-                                      :recipients-file (some-> recipients-file secrets/expand-home))])))
-                 environments))))
+  (when-not (and (string? app) (not (str/blank? app)))
+    (fail! (str "secrets config has no :app (a name string is required). It names the\n"
+                "    default key path ~/.config/<app>/key.txt and is recorded in the manifest,\n"
+                "    so there is deliberately no default — projects must not share a key path\n"
+                "    by accident.")
+           {:config config}))
+  (assoc config
+         :environments
+         (into {}
+               (map (fn [[env {:keys [secrets-file key-file template manifest recipients-file] :as e}]]
+                      (when-not (string? secrets-file)
+                        (fail! (str "Environment " env " has no :secrets-file (a path string is required).")
+                               {:environment env :env-config e}))
+                      (when (and (not (str/ends-with? secrets-file ".age"))
+                                 (not (and (contains? e :template) (contains? e :manifest))))
+                        (fail! (str "Environment " env " :secrets-file (" secrets-file ") does not end in .age, so the\n"
+                                    "    derived :template/:manifest names would collide with — and overwrite — the\n"
+                                    "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
+                                    "    explicitly.")
+                               {:environment env :secrets-file secrets-file}))
+                      (let [key-file (secrets/expand-home
+                                      (or key-file (str "~/.config/" app "/key.txt")))]
+                        [env (assoc e
+                                    :name env
+                                    :app app
+                                    :secrets-file secrets-file
+                                    :key-file key-file
+                                    ;; Decrypt-side identity: SECRETS_AGE_IDENTITY* env vars win,
+                                    ;; then the configured/default key path.
+                                    :identity-file (or (secrets/identity-from-env) key-file)
+                                    ;; Explicit values (incl. :manifest false) are always
+                                    ;; kept; absent ⇒ derive from the secrets file.
+                                    :template (if (contains? e :template)
+                                                template
+                                                (str/replace secrets-file #"\.age$" ".example"))
+                                    :manifest (if (contains? e :manifest)
+                                                manifest
+                                                (str/replace secrets-file #"\.age$" ".manifest"))
+                                    :recipients-file (some-> recipients-file secrets/expand-home))])))
+               environments)))
 
 (defn- resolve-env
   "Resolve an environment argument string to its (defaulted) config map.
@@ -160,9 +166,12 @@
 (defn- editor [] (or (System/getenv "VISUAL") (System/getenv "EDITOR") "vim"))
 
 (defn- run-editor!
-  "Open `$EDITOR` on `path`, inheriting the terminal. Throws if it exits non-zero."
+  "Open `$EDITOR` on `path`, inheriting the terminal. The editor value goes
+  through the shell because it may carry arguments (\"code --wait\",
+  \"emacsclient -t\"); the path is passed as a positional argument, not
+  interpolated. Throws if the editor exits non-zero."
   [path]
-  (let [proc (-> (ProcessBuilder. (into-array String [(editor) (str path)]))
+  (let [proc (-> (ProcessBuilder. (into-array String ["sh" "-c" (str (editor) " \"$1\"") "editor" (str path)]))
                  (.inheritIO)
                  (.start))]
     (when-not (zero? (.waitFor proc))
@@ -221,8 +230,8 @@
   (when-not (.exists (io/file identity-file))
     (fail! (str "No age identity for " (clojure.core/name name) " at " identity-file "\n"
                 "    Create one with:  bb secrets keygen " (clojure.core/name name) "\n"
-                "    Or point at an existing key via AGE_IDENTITY_FILE (a path),\n"
-                "    AGE_IDENTITY (raw key contents), or AGE_IDENTITY_B64 (base64 contents).")
+                "    Or point at an existing key via SECRETS_AGE_IDENTITY_FILE (a path),\n"
+                "    SECRETS_AGE_IDENTITY (raw key contents), or SECRETS_AGE_IDENTITY_B64 (base64 contents).")
            {:identity-file (str identity-file) :environment name})))
 
 ;; ---------- Recipients (multi-recipient mode) ----------
@@ -239,7 +248,7 @@
 (defn- encrypt-recipients
   "The age recipient spec an environment encrypts to: its shared recipients file
   in multi-recipient mode, otherwise the environment's own identity (single-key
-  mode — the resolved :identity-file, so AGE_IDENTITY* works in CI too)."
+  mode — the resolved :identity-file, so SECRETS_AGE_IDENTITY* works in CI too)."
   [{:keys [recipients-file identity-file]}]
   (if recipients-file {:recipients-file recipients-file} {:identity-file identity-file}))
 
@@ -305,8 +314,8 @@
           (println (paint :bold "  Public key:") pub)
           (println)
           (warn "Back this key up (e.g. a password manager). It is NOT in git and")
-          (println "    cannot be recovered. To deploy, set it as the AGE_IDENTITY secret:")
-          (println (paint :dim (str "      flyctl secrets set AGE_IDENTITY=\"$(cat " key-file ")\"")))
+          (println "    cannot be recovered. To deploy, set it as the SECRETS_AGE_IDENTITY secret:")
+          (println (paint :dim (str "      flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat " key-file ")\"")))
           (when recipients-file
             (println)
             (info "This project encrypts to a shared recipients file. Add your public")
@@ -370,7 +379,8 @@
 (defn show-key!
   "Print the public key(s) — share these so teammates can encrypt to you.
   Reads the configured :key-file (not the env-var identity). Returns a map of
-  env name → public key (nil when the key is missing)."
+  env name → public key (nil when the key is missing); environments sharing a
+  :key-file are reported once, under whichever env is seen first."
   [config env-arg]
   (require-age!)
   (let [envs (if env-arg

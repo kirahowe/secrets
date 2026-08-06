@@ -19,7 +19,7 @@
 ;; easily as it reads env vars. No client-side secrets scheme changes this.
 
 ;; It also does not reduce production's trust in the deploy platform. The key
-;; arrives as `AGE_IDENTITY`, so anyone who can read your platform's secrets
+;; arrives as `SECRETS_AGE_IDENTITY`, so anyone who can read your platform's secrets
 ;; still gets everything. What you gain in production is narrower: one secret
 ;; to manage instead of forty, and a reviewable history of the other
 ;; thirty-nine.

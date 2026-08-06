@@ -1,8 +1,8 @@
 ;; Clay configuration for the documentation book (https://scicloj.github.io/clay/).
 ;; Every chapter under book/chapters is a literate Clojure namespace: prose in
 ;; `;;` comments, code evaluated against the real library at render time.
-;; Rendered by the book:* tasks in bb.edn; output lands in book/rendered
-;; (gitignored), with the publishable site at book/rendered/_book.
+;; Rendered by the book:* tasks in bb.edn; the publishable site lands in
+;; book/rendered (gitignored).
 {:format           [:quarto :html]
  :base-source-path "book/chapters"
  :source-path      ["secrets_book/index.clj"

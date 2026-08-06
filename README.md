@@ -1,13 +1,13 @@
 # com.kirahowe/secrets
 
 Manage application secrets as a single **version-controlled, age-encrypted EDN
-file** instead of a sprawl of environment variables. One private key decrypts it;
+file** instead of a pile of environment variables. One private key decrypts it;
 everything else — structure, defaults, and the encrypted ciphertext itself —
 lives in git, with a committed value-free manifest that makes each change
 reviewable.
 
-- **Pluggable.** Zero runtime dependencies beyond Clojure. Loads and runs
-  identically under JVM Clojure and [babashka](https://babashka.org).
+- **No dependencies.** Nothing beyond Clojure itself, and it loads and runs
+  the same under JVM Clojure and [babashka](https://babashka.org).
 - **A `bb secrets` task.** `keygen` · `new` · `edit` · `verify` · `show-key` ·
   `add-recipient` · `recipients` · `reencrypt` · `encrypt` · `decrypt`, wired
   into any project with one task definition.
@@ -54,7 +54,7 @@ isn't in the build context):
 
 ```clojure
 ;; git
-io.github.you/secrets {:git/tag "v0.1.0" :git/sha "…"}
+io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "…"}
 ;; or Maven, after `clojure -T:build install` / a Clojars deploy
 com.kirahowe/secrets {:mvn/version "0.1.0"}
 ```
@@ -79,9 +79,11 @@ com.kirahowe/secrets {:mvn/version "0.1.0"}
 
 Per-environment defaults fill in automatically: `:key-file` →
 `~/.config/<app>/key.txt`, `:template` → `<secrets-file>.example`, `:manifest` →
-`<secrets-file>.manifest`. The config is validated up front: `:secrets-file` is
-required, and must end in `.age` — otherwise the derived template/manifest names
-would collide with (and overwrite) the ciphertext itself — unless you set both
+`<secrets-file>.manifest`. The config is validated up front: `:app` and each
+`:secrets-file` are required (`:app` names the default key path, so there is no
+default — unrelated projects must not share a key by accident), and the secrets
+file must end in `.age` — otherwise the derived template/manifest names would
+collide with (and overwrite) the ciphertext itself — unless you set both
 `:template` and `:manifest` explicitly.
 
 **2. Create secrets:**
@@ -173,13 +175,13 @@ two tags to the same functions:
 
 The second argument selects the identity (private key): a path string/File, or
 an opts map with `:identity-file` (an explicit path) or `:app` (→
-`~/.config/<app>/key.txt`). Without it, only the `AGE_IDENTITY*` environment
+`~/.config/<app>/key.txt`). Without it, only the `SECRETS_AGE_IDENTITY*` environment
 variables are consulted — there is deliberately no default key path, so loading
 with no resolvable identity throws (listing your options) rather than silently
 reading some other app's key. Passing `{:app "myapp"}` gives you the local
 default *and* still lets the env vars win in production.
 
-A six-line Integrant `init-key`:
+An Integrant `init-key` is two lines:
 
 ```clojure
 (defmethod ig/init-key ::secrets [_ {:keys [resource]}]
@@ -194,14 +196,14 @@ the local default path):
 
 | Var                 | Value                                                                 |
 | ------------------- | --------------------------------------------------------------------- |
-| `AGE_IDENTITY_FILE` | a path to the key file                                                |
-| `AGE_IDENTITY`      | the key file *contents*, used verbatim (never decoded) — materialized to an owner-only (0600) temp file |
-| `AGE_IDENTITY_B64`  | base64 of the key file contents (newline-tolerant), for secret stores that mangle multi-line values; invalid base64 throws — no silent fallback |
+| `SECRETS_AGE_IDENTITY_FILE` | a path to the key file                                                |
+| `SECRETS_AGE_IDENTITY`      | the key file *contents*, used verbatim (never decoded) — materialized to an owner-only (0600) temp file |
+| `SECRETS_AGE_IDENTITY_B64`  | base64 of the key file contents (newline-tolerant), for secret stores that mangle multi-line values; invalid base64 throws — no silent fallback |
 
 So a Fly / Docker / CI deployment sets exactly one secret:
 
 ```sh
-flyctl secrets set AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
+flyctl secrets set SECRETS_AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
 ```
 
 The container image needs the `age` binary (e.g. `apt-get install -y age`). The
@@ -209,7 +211,7 @@ encrypted `secrets.edn.age` ships in the image — in the jar or on the classpat
 `load-secrets` and the reader literals handle `jar:` resource URLs from inside
 an uberjar (the ciphertext is copied to an owner-only temp file so `age` can
 read it), so the file works the same whether it sits on disk or inside the jar.
-`AGE_IDENTITY` decrypts it at startup.
+`SECRETS_AGE_IDENTITY` decrypts it at startup.
 
 ## Environments
 
@@ -245,7 +247,7 @@ bb secrets recipients prod             # list who can currently decrypt
 - **Onboard** = add a key + `reencrypt`. **Offboard** = remove the line +
   `reencrypt` (stops *future* access; see the key-rotation note below).
 - **Deploy/CI** gets its own recipient — include a dedicated deploy key so no
-  human needs to hold it. It's still injected as `AGE_IDENTITY` at runtime.
+  human needs to hold it. It's still injected as `SECRETS_AGE_IDENTITY` at runtime.
 - Runtime decryption is unchanged: any listed identity decrypts the file, so
   `load-secrets` / `#secret/req` need no configuration for this.
 
@@ -294,7 +296,7 @@ two modes:
   the manifest's recorded `:ciphertext-sha` against the actual file. A CI job
   holding **no secret material at all** can still catch a manifest that drifted
   from its ciphertext (exit 0 on a pass, same as a keyed run).
-- **Full verification.** With a key (e.g. `AGE_IDENTITY` on the runner),
+- **Full verification.** With a key (e.g. `SECRETS_AGE_IDENTITY` on the runner),
   `verify` decrypts and checks the full shape and `:vhash`es, and also flags an
   out-of-band re-encryption via the sha even when the shape matches.
 
@@ -307,7 +309,7 @@ drift. Disable the manifest for an environment with `:manifest false`.
 - `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
 - `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
-- `(identity-from-env)` — identity path from `AGE_IDENTITY_FILE` / `AGE_IDENTITY` / `AGE_IDENTITY_B64`, or nil.
+- `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil.
 - `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
@@ -316,7 +318,7 @@ drift. Disable the manifest for an environment with `:manifest false`.
 
 `com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
 
-`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits; `(verify! config env)` returns `{:results {env status} :exit code}`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}` — validated on load (`:secrets-file` required, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side `:identity-file` resolves from the `AGE_IDENTITY*` env vars before falling back to its `:key-file`, so CI holding only `AGE_IDENTITY` can encrypt, decrypt, and verify.
+`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits; `(verify! config env)` returns `{:results {env status} :exit code}`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side `:identity-file` resolves from the `SECRETS_AGE_IDENTITY*` env vars before falling back to its `:key-file`, so CI holding only `SECRETS_AGE_IDENTITY` can encrypt, decrypt, and verify.
 
 ## Development
 
@@ -343,8 +345,8 @@ bb book:watch     # re-render chapters on save (Clay live reload)
 ## Trade-offs and limitations
 
 This is the "encrypted secrets in git" model (like SOPS, git-crypt, sealed-
-secrets), made EDN-native and age-backed. It's a deliberately small tool; know
-what you're trading for that simplicity.
+secrets), done with EDN and age. It's a deliberately small tool; know what
+you're trading for that simplicity.
 
 - **Ciphertext diffs are opaque.** age re-encrypts the whole file, so a `git
   diff` of `secrets.edn.age` reveals nothing. The [manifest](#manifest-seeing-what-changed)
@@ -379,8 +381,8 @@ what you're trading for that simplicity.
   shared secret to key the HMAC; multi-recipient setups have no single shared
   key, so their manifests are structure-only (add / remove / retype still show;
   a rotated string does not).
-- **Right size.** Ideal for a solo developer or small team shipping a handful of
-  apps with no secrets infrastructure. If you need dynamic secrets, centralized
+- **Where it fits.** A solo developer or small team shipping a handful of apps
+  with no secrets infrastructure. If you need dynamic secrets, centralized
   audit, fine-grained IAM, or automatic rotation, a dedicated secrets manager
   (Vault, a cloud KMS / secret manager) earns its extra complexity.
 

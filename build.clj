@@ -24,14 +24,17 @@
                 :version   version
                 :basis     @basis
                 :src-dirs  ["src"]
-                :scm       {:url "https://github.com/kirahowe/secrets"}
+                ;; :tag lets cljdoc (and anyone reading the pom) find the exact
+                ;; revision the artifact was built from.
+                :scm       {:url "https://github.com/kirahowe/secrets"
+                            :tag (str "v" version)}
                 :pom-data  [[:description
                              "Manage application secrets as a version-controlled, age-encrypted EDN file."]
                             [:licenses
                              [:license
                               [:name "MIT"]
                               [:url "https://opensource.org/license/mit"]]]]})
-  (b/copy-dir {:src-dirs   ["src" "resources"]
+  (b/copy-dir {:src-dirs   ["src"]
                :target-dir class-dir})
   (b/jar {:class-dir class-dir
           :jar-file  jar-file})

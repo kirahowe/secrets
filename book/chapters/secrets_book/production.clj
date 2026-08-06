@@ -17,11 +17,11 @@
 
 ;; | Variable | Contents | Use it when |
 ;; |----------|----------|-------------|
-;; | `AGE_IDENTITY_FILE` | a path to the key file | the platform mounts secret files |
-;; | `AGE_IDENTITY` | the raw key file contents | the platform stores secret strings |
-;; | `AGE_IDENTITY_B64` | base64 of the contents | the platform mangles newlines |
+;; | `SECRETS_AGE_IDENTITY_FILE` | a path to the key file | the platform mounts secret files |
+;; | `SECRETS_AGE_IDENTITY` | the raw key file contents | the platform stores secret strings |
+;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the contents | the platform mangles newlines |
 
-;; `AGE_IDENTITY` is used verbatim, never decoded. `AGE_IDENTITY_B64` is
+;; `SECRETS_AGE_IDENTITY` is used verbatim, never decoded. `SECRETS_AGE_IDENTITY_B64` is
 ;; always decoded, and invalid base64 is an error rather than a silent
 ;; fallback. The split exists because guessing whether a value is encoded is
 ;; how keys get corrupted quietly; here nothing guesses. Key contents are
@@ -31,13 +31,13 @@
 ;; On Fly, that means one command:
 
 ;; ```sh
-;; flyctl secrets set AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
+;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
 ;; ```
 
 ;; and for a store that eats newlines:
 
 ;; ```sh
-;; some-platform set AGE_IDENTITY_B64="$(base64 < ~/.config/myapp/key.txt)"
+;; some-platform set SECRETS_AGE_IDENTITY_B64="$(base64 < ~/.config/myapp/key.txt)"
 ;; ```
 
 ;; ## The image
@@ -94,7 +94,7 @@
 ;; ```
 
 ;; On a laptop, that resolves to `~/.config/myapp/key.txt`. In the container,
-;; `AGE_IDENTITY` overrides it. Same code, no branches.
+;; `SECRETS_AGE_IDENTITY` overrides it. Same code, no branches.
 
 ;; Secrets decrypt once, at startup. Changing a secret means a commit and a
 ;; deploy, and a restart picks it up. There is no hot reload, and the
@@ -130,7 +130,7 @@
 ;; verify-secrets:
 ;;   runs-on: ubuntu-latest
 ;;   env:
-;;     AGE_IDENTITY: ${{ secrets.AGE_IDENTITY }}
+;;     SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ;;   steps:
 ;;     - uses: actions/checkout@v4
 ;;     - run: sudo apt-get install -y age

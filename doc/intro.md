@@ -34,8 +34,8 @@ secrets.edn.age  (ciphertext, committed to git)
 ```
 
 - **Local dev:** the key lives at `~/.config/<app>/key.txt`.
-- **Production:** the same key is injected as one secret — `AGE_IDENTITY`, the
-  raw key file contents (or `AGE_IDENTITY_B64`, its base64, for secret stores
+- **Production:** the same key is injected as one secret — `SECRETS_AGE_IDENTITY`, the
+  raw key file contents (or `SECRETS_AGE_IDENTITY_B64`, its base64, for secret stores
   that mangle multi-line values) — which the library materializes to an
   owner-only temp keyfile at startup.
 
