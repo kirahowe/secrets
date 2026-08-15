@@ -122,7 +122,29 @@
                                         :manifest     false}}}
                   cli/normalize-config
                   (get-in [:environments :dev]))]
-      (is (= "secrets.enc" (:secrets-file env))))))
+      (is (= "secrets.enc" (:secrets-file env)))))
+  (testing "explicit ciphertext and manifest paths cannot be identical"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"colliding artifact paths"
+                          (cli/normalize-config
+                           {:app "x"
+                            :environments {:dev {:secrets-file "s.age"
+                                                 :manifest "s.age"}}}))))
+  (testing "every pair of artifact paths is compared canonically"
+    (let [fields [:secrets-file :manifest :template :key-file :recipients-file]
+          env    {:secrets-file "ciphertext.age"
+                  :manifest "manifest.edn"
+                  :template "template.edn"
+                  :key-file "key.txt"
+                  :recipients-file "recipients.txt"}]
+      (doseq [left-index (range (count fields))
+              right-index (range (inc left-index) (count fields))]
+        (let [left  (nth fields left-index)
+              right (nth fields right-index)
+              env   (assoc env right (str "./" (get env left)))]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"colliding artifact paths"
+                                (cli/normalize-config
+                                 {:app "x" :environments {:dev env}}))
+              (str left " and " right " alias the same canonical path")))))))
 
 (deftest unknown-environment-throws
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown environment"

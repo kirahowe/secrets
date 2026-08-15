@@ -102,7 +102,10 @@
   environment lacks a :secrets-file string, or when a derived :template /
   :manifest name would collide with the ciphertext (a :secrets-file that does
   not end in `.age` derives template = manifest = the secrets file itself, and
-  writing the manifest would then overwrite the encrypted file)."
+  writing the manifest would then overwrite the encrypted file). Ciphertext,
+  manifest, template, key, and recipients paths are compared by canonical path
+  so aliases such as `./s.age` and `s.age` cannot refer to different artifacts
+  in the configuration."
   [{:keys [app environments] :as config}]
   (when (empty? environments)
     (fail! "secrets config has no :environments" {:config config}))
@@ -126,8 +129,32 @@
                                     "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
                                     "    explicitly.")
                                {:environment env :secrets-file secrets-file}))
-                      (let [key-file (secrets/expand-home
-                                      (or key-file (str "~/.config/" app "/key.txt")))]
+                      (let [key-file        (secrets/expand-home
+                                             (or key-file (str "~/.config/" app "/key.txt")))
+                            template        (if (contains? e :template)
+                                              template
+                                              (str/replace secrets-file #"\.age$" ".example"))
+                            manifest        (if (contains? e :manifest)
+                                              manifest
+                                              (str/replace secrets-file #"\.age$" ".manifest"))
+                            recipients-file (some-> recipients-file secrets/expand-home)
+                            collisions      (->> [[:secrets-file secrets-file]
+                                                  [:manifest manifest]
+                                                  [:template template]
+                                                  [:key-file key-file]
+                                                  [:recipients-file recipients-file]]
+                                                 (filter (fn [[_ path]] (string? path)))
+                                                 (map (fn [[kind path]]
+                                                        [kind (.getCanonicalPath (io/file path))]))
+                                                 (group-by second)
+                                                 vals
+                                                 (filter #(> (count %) 1)))]
+                        (when-let [collision (first collisions)]
+                          (fail! (str "Environment " env " has colliding artifact paths: "
+                                      (str/join ", " (map (comp name first) collision))
+                                      " (canonical path " (second (first collision)) ").")
+                                 {:environment env
+                                  :path-collision collision}))
                         [env (assoc e
                                     :name env
                                     :app app
@@ -138,13 +165,9 @@
                                     :identity-file (or (secrets/identity-from-env) key-file)
                                     ;; Explicit values (incl. :manifest false) are always
                                     ;; kept; absent ⇒ derive from the secrets file.
-                                    :template (if (contains? e :template)
-                                                template
-                                                (str/replace secrets-file #"\.age$" ".example"))
-                                    :manifest (if (contains? e :manifest)
-                                                manifest
-                                                (str/replace secrets-file #"\.age$" ".manifest"))
-                                    :recipients-file (some-> recipients-file secrets/expand-home))])))
+                                    :template template
+                                    :manifest manifest
+                                    :recipients-file recipients-file)])))
                environments)))
 
 (defn- resolve-env

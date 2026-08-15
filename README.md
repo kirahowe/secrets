@@ -84,7 +84,8 @@ Per-environment defaults fill in automatically: `:key-file` →
 default — unrelated projects must not share a key by accident), and the secrets
 file must end in `.age` — otherwise the derived template/manifest names would
 collide with (and overwrite) the ciphertext itself — unless you set both
-`:template` and `:manifest` explicitly.
+`:template` and `:manifest` explicitly. Ciphertext, manifest, template, key,
+and recipients paths must resolve to distinct canonical paths.
 
 **2. Create secrets:**
 
