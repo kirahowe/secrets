@@ -60,3 +60,8 @@ All notable changes to this project are documented here. The format follows
   still verifies freshness against `:ciphertext-sha`, with one it also flags
   out-of-band re-encryption, and an unsupported manifest `:version` counts as
   drift. Disable per-environment with `:manifest false`.
+- **Transactional CLI saves.** `new`, `edit`, and `reencrypt` validate the
+  complete plaintext as EDN before encrypting, stage ciphertext and manifest in
+  sibling temporary files, and atomically replace the live pair with rollback
+  if either commit fails. Invalid editor contents therefore leave existing
+  secrets untouched.

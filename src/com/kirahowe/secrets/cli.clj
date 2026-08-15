@@ -274,24 +274,135 @@
     (manifest/hmac-key (slurp identity-file))))
 
 (defn- parse-edn [s]
-  (try {:ok? true :value (edn/read-string s)}
-       (catch Exception e {:ok? false :error (ex-message e)})))
+  (try
+    (let [eof    (Object.)
+          reader (java.io.PushbackReader. (java.io.StringReader. s))
+          value  (edn/read {:eof eof} reader)
+          extra  (edn/read {:eof eof} reader)]
+      (cond
+        (identical? eof value) {:ok? false :error "expected one EDN value"}
+        (not (identical? eof extra)) {:ok? false :error "expected one EDN value, found another"}
+        :else {:ok? true :value value}))
+    (catch Exception e {:ok? false :error (ex-message e)})))
 
-(defn- write-manifest!
-  "Regenerate the plaintext manifest next to the secrets file from `plaintext`
-  (the just-saved secrets text), recording the SHA-256 of the freshly written
-  ciphertext so `verify` can check freshness even without a key. Must be
-  called *after* encryption. No-op when the env disabled the manifest."
-  [{:keys [manifest app secrets-file] :as env} plaintext]
-  (when (string? manifest)
-    (let [{:keys [ok? value error]} (parse-edn plaintext)]
-      (if-not ok?
-        (warn (str "Secrets are not valid EDN (" error ") — manifest not updated:\n")
-              (str "    " manifest " — fix with `bb secrets edit` and re-save."))
-        (do (spit (io/file (str manifest))
-                  (manifest/render {:app app :ciphertext-sha (sha256 secrets-file)}
-                                   (manifest/entries value (manifest-hmac-key env))))
-            (info "Manifest updated:" manifest))))))
+(defn- validate-plaintext!
+  "Parse all of `plaintext`, returning its EDN value. Fail before encryption
+  when it is empty, malformed, or contains more than one value."
+  [secrets-file plaintext]
+  (let [{:keys [ok? value error]} (parse-edn plaintext)]
+    (if ok?
+      value
+      (fail! (str "Secrets are not valid EDN (" error ").\n"
+                  "    Ciphertext and manifest were left unchanged.")
+             {:secrets-file (str secrets-file) :error error}))))
+
+(defn- sibling-temp-file!
+  "Create a temporary file beside `target`, ensuring an atomic move to the
+  target is possible whenever the filesystem supports atomic moves."
+  [target suffix]
+  (let [target (.getAbsoluteFile (io/file (str target)))
+        parent (.getParentFile target)]
+    (.mkdirs parent)
+    (.toFile
+     (java.nio.file.Files/createTempFile
+      (.toPath parent)
+      (str "." (.getName target) ".") suffix
+      (into-array java.nio.file.attribute.FileAttribute [])))))
+
+(defn- atomic-replace!
+  "Atomically replace `target` with the staged sibling file `source`."
+  [source target]
+  (try
+    (java.nio.file.Files/move
+     (.toPath (io/file source)) (.toPath (io/file target))
+     (into-array java.nio.file.CopyOption
+                 [java.nio.file.StandardCopyOption/ATOMIC_MOVE
+                  java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+    (catch Exception e
+      ;; Babashka does not expose AtomicMoveNotSupportedException as a
+      ;; resolvable class, so identify this one portable NIO exception by name.
+      (if (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e)))
+        (throw (ex-info (str "The filesystem does not support an atomic secrets update for " target)
+                        {:source (str source) :target (str target)}
+                        e))
+        (throw e)))))
+
+(defn- backup-target!
+  "Copy an existing replacement target to a sibling temp file for rollback."
+  [{:keys [target] :as replacement}]
+  (let [target (io/file target)]
+    (if-not (.exists target)
+      (assoc replacement :existed? false)
+      (let [backup (sibling-temp-file! target ".backup")]
+        (try
+          (java.nio.file.Files/copy
+           (.toPath target) (.toPath backup)
+           (into-array java.nio.file.CopyOption
+                       [java.nio.file.StandardCopyOption/REPLACE_EXISTING
+                        java.nio.file.StandardCopyOption/COPY_ATTRIBUTES]))
+          (assoc replacement :existed? true :backup backup)
+          (catch Exception e
+            (.delete backup)
+            (throw e)))))))
+
+(defn- commit-replacements!
+  "Commit staged sibling files with atomic moves. Existing targets are first
+  copied to sibling rollback files so a later move failure restores every
+  target already replaced during this commit."
+  [replacements]
+  (let [prepared  (atom [])
+        committed (atom [])]
+    (try
+      (doseq [replacement replacements]
+        (swap! prepared conj (backup-target! replacement)))
+      (try
+        (doseq [{:keys [staged target] :as replacement} @prepared]
+          (atomic-replace! staged target)
+          (swap! committed conj replacement))
+        (catch Exception commit-error
+          (let [rollback-errors
+                (reduce (fn [errors {:keys [target backup existed?]}]
+                          (try
+                            (if existed?
+                              (atomic-replace! backup target)
+                              (java.nio.file.Files/deleteIfExists (.toPath (io/file target))))
+                            errors
+                            (catch Exception rollback-error
+                              (conj errors (ex-message rollback-error)))))
+                        [] (reverse @committed))]
+            (throw (ex-info (if (seq rollback-errors)
+                              "Could not commit the secrets update, and rollback also failed."
+                              "Could not commit the secrets update; restored the previous files.")
+                            (cond-> {:targets (mapv (comp str :target) replacements)}
+                              (seq rollback-errors) (assoc :rollback-errors rollback-errors))
+                            commit-error)))))
+      (finally
+        (doseq [{:keys [staged backup]} @prepared
+                f [staged backup]
+                :when f]
+          (.delete (io/file f)))))))
+
+(defn- write-secrets!
+  "Validate `plaintext-file`, then stage its ciphertext and optional manifest
+  beside their destinations and commit both through atomic replacements."
+  [{:keys [manifest app secrets-file] :as env} plaintext-file]
+  (let [plaintext       (slurp plaintext-file)
+        value           (validate-plaintext! secrets-file plaintext)
+        ciphertext-temp (sibling-temp-file! secrets-file ".age.tmp")
+        manifest-temp   (when (string? manifest)
+                          (sibling-temp-file! manifest ".manifest.tmp"))]
+    (try
+      (age/encrypt-file! (encrypt-recipients env) plaintext-file ciphertext-temp)
+      (when manifest-temp
+        (spit manifest-temp
+              (manifest/render {:app app :ciphertext-sha (sha256 ciphertext-temp)}
+                               (manifest/entries value (manifest-hmac-key env)))))
+      (commit-replacements!
+       (cond-> [{:staged ciphertext-temp :target (io/file secrets-file)}]
+         manifest-temp (conj {:staged manifest-temp :target (io/file manifest)})))
+      (finally
+        (.delete ciphertext-temp)
+        (when manifest-temp (.delete manifest-temp))))))
 
 ;; ---------- Commands ----------
 
@@ -341,11 +452,10 @@
             (spit tmp (template-content env))
             (info "Opening" (editor) "…")
             (run-editor! tmp)
-            (when-let [parent (.getParentFile (io/file secrets-file))] (.mkdirs parent))
             (info "Encrypting…")
-            (age/encrypt-file! (encrypt-recipients env) tmp secrets-file)
+            (write-secrets! env tmp)
             (ok "Encrypted secrets written:" secrets-file)
-            (write-manifest! env (slurp tmp))
+            (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env)))
             secrets-file
             (finally (secure-delete! tmp))))))))
 
@@ -370,9 +480,9 @@
           (if (= before (sha256 tmp))
             (warn "No changes — leaving" secrets-file "untouched.")
             (do (info "Re-encrypting…")
-                (age/encrypt-file! (encrypt-recipients env) tmp secrets-file)
+                (write-secrets! env tmp)
                 (ok "Secrets updated:" secrets-file)
-                (write-manifest! env (slurp tmp)))))
+                (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env))))))
         secrets-file
         (finally (secure-delete! tmp))))))
 
@@ -443,9 +553,9 @@
         (info "Decrypting" secrets-file "…")
         (age/decrypt-to-file! identity-file secrets-file tmp)
         (info "Re-encrypting to current recipients…")
-        (age/encrypt-file! (encrypt-recipients env) tmp secrets-file)
+        (write-secrets! env tmp)
         (ok "Re-encrypted:" secrets-file)
-        (write-manifest! env (slurp tmp))
+        (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env)))
         secrets-file
         (finally (secure-delete! tmp))))))
 

@@ -11,7 +11,8 @@
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [com.kirahowe.secrets.age :as age]
-            [com.kirahowe.secrets.cli :as cli]))
+            [com.kirahowe.secrets.cli :as cli]
+            [com.kirahowe.secrets.manifest :as manifest]))
 
 (def ^:dynamic *dir* nil)
 (def ^:dynamic *key* nil)
@@ -64,6 +65,12 @@
     (binding [*err* (java.io.StringWriter.)]
       (with-out-str (reset! res (cli/verify! config env-arg))))
     @res))
+
+(defn- file-bytes [path]
+  (vec (java.nio.file.Files/readAllBytes (.toPath (io/file path)))))
+
+(defn- cli-private [sym]
+  (ns-resolve 'com.kirahowe.secrets.cli sym))
 
 ;; ---------- normalize-config ----------
 
@@ -120,6 +127,88 @@
 (deftest unknown-environment-throws
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown environment"
                         (cli/recipients! (cli/normalize-config (test-config)) "nope"))))
+
+;; ---------- validated, transactional saves ----------
+
+(deftest new-rejects-invalid-edn-before-writing
+  (let [config   (cli/normalize-config (test-config))
+        encrypted (str *dir* "/secrets.edn.age")
+        manifest  (str *dir* "/secrets.edn.manifest")]
+    (doseq [invalid ["{:unfinished" "{:one 1} {:two 2}" ""]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"not valid EDN"
+           (with-out-str
+             (with-redefs-fn {(cli-private 'run-editor!) #(spit % invalid)}
+               #(cli/new! config "dev")))))
+      (is (not (.exists (io/file encrypted)))
+          "invalid editor contents never create ciphertext")
+      (is (not (.exists (io/file manifest)))
+          "invalid editor contents never create a manifest"))))
+
+(deftest edit-rejects-invalid-edn-without-replacing-valid-files
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config        (cli/normalize-config (test-config))
+          encrypted     (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")]
+      (encrypt-edn! {:valid true})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [ciphertext-before (file-bytes encrypted)
+            manifest-before   (slurp manifest-path)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"not valid EDN"
+             (with-out-str
+               (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:broken")}
+                 #(cli/edit! config "dev")))))
+        (is (= ciphertext-before (file-bytes encrypted)))
+        (is (= manifest-before (slurp manifest-path)))))))
+
+(deftest edit-stages-all-output-before-replacing-either-file
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config        (cli/normalize-config (test-config))
+          encrypted     (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")]
+      (encrypt-edn! {:version :old})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [ciphertext-before (file-bytes encrypted)
+            manifest-before   (slurp manifest-path)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"manifest rendering failed"
+             (with-out-str
+               (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:version :new}")
+                                 #'manifest/render (fn [& _]
+                                                     (throw (ex-info "manifest rendering failed" {})))}
+                 #(cli/edit! config "dev")))))
+        (is (= ciphertext-before (file-bytes encrypted)))
+        (is (= manifest-before (slurp manifest-path)))))))
+
+(deftest edit-rolls-back-an-interrupted-pair-commit
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config        (cli/normalize-config (test-config))
+          encrypted     (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")]
+      (encrypt-edn! {:version :old})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [ciphertext-before (file-bytes encrypted)
+            manifest-before   (slurp manifest-path)
+            atomic-var        (cli-private 'atomic-replace!)
+            atomic-replace!   @atomic-var
+            moves             (atom 0)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"Could not commit"
+             (with-out-str
+               (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:version :new}")
+                                 atomic-var
+                                 (fn [source target]
+                                   (if (= 2 (swap! moves inc))
+                                     (throw (ex-info "simulated manifest move failure" {}))
+                                     (atomic-replace! source target)))}
+                 #(cli/edit! config "dev")))))
+        (is (= 3 @moves) "ciphertext commit, failed manifest commit, ciphertext rollback")
+        (is (= ciphertext-before (file-bytes encrypted)))
+        (is (= manifest-before (slurp manifest-path)))))))
 
 ;; ---------- reencrypt / verify ----------
 
