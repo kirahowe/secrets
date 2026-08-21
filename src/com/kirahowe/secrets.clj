@@ -151,9 +151,12 @@
         (materialize-identity! (decode-b64-identity c)))))
 
 (defn resolve-identity-file
-  "Resolve the age identity (private key) file path: the environment first
-  (see `identity-from-env`), then `~/.config/<app>/key.txt` when an app name
-  is given. Returns nil when no env var is set and no app is known — there is
+  "Resolve the *conventional* age identity (private key) file path: the
+  environment first (see `identity-from-env`), then `~/.config/<app>/key.txt`
+  when an app name is given. The path returned is where the identity *would*
+  live — it is never checked for existence, so a non-nil result does not mean
+  a usable key is actually there. Use `identity-available?` to ask that
+  question. Returns nil when no env var is set and no app is known — there is
   deliberately no default path, so callers fail loudly instead of reading some
   other app's key. `app-or-opts` is an app-name string or a map with `:app`."
   ([] (resolve-identity-file nil))
@@ -161,6 +164,22 @@
    (let [app (if (map? app-or-opts) (:app app-or-opts) app-or-opts)]
      (or (identity-from-env)
          (when app (expand-home (str "~/.config/" app "/key.txt")))))))
+
+(defn identity-available?
+  "True when an age identity actually resolves AND its file exists on disk.
+  Exists for the \"do I have a key, or should I tell the user to run
+  keygen?\" check — `resolve-identity-file` alone can't answer that, since it
+  returns the conventional path whether or not anything is there.
+  `app-or-opts` takes the same app-name-string-or-opts-map `resolve-identity-file`
+  does, plus an opts-map `:identity-file` (an explicit path, taking priority
+  over :app and the env vars — as `load-secrets` treats it)."
+  ([] (identity-available? nil))
+  ([app-or-opts]
+   (let [identity (if (map? app-or-opts)
+                    (or (:identity-file app-or-opts)
+                        (resolve-identity-file app-or-opts))
+                    (resolve-identity-file app-or-opts))]
+     (boolean (and identity (.exists (io/file (str identity))))))))
 
 (def ^:private identity-options
   "One-line remediation appended to \"no identity\" errors."

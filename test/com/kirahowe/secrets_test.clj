@@ -134,6 +134,36 @@
           (is (nil? (secrets/resolve-identity-file)))
           (is (nil? (secrets/resolve-identity-file {})))))))
 
+(def ^:private age-env-set?
+  "SECRETS_AGE_IDENTITY* overrides both :app and :identity-file resolution, so tests
+  that pin a specific (non-)existent key skip themselves when it is set — matching
+  the guard in test/com/kirahowe/secrets/cli_test.clj."
+  (boolean (some #(System/getenv %) ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY" "SECRETS_AGE_IDENTITY_B64"])))
+
+(deftest identity-available?-test
+  (testing ":identity-file — true when the file exists, false when it doesn't"
+    (is (true?  (secrets/identity-available? {:identity-file *key*})))
+    (is (false? (secrets/identity-available? {:identity-file (str *dir* "/no-such-key.txt")}))))
+  (testing "app-name resolution — true for an existing app key, false for a missing one"
+    (if age-env-set?
+      (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+      (let [home (System/getProperty "user.home")]
+        (try
+          (System/setProperty "user.home" *dir*)
+          (io/make-parents (io/file *dir* ".config" "testapp" "key.txt"))
+          (io/copy (io/file *key*) (io/file *dir* ".config" "testapp" "key.txt"))
+          (is (true?  (secrets/identity-available? "testapp"))
+              "string arg is an app name, as resolve-identity-file treats it")
+          (is (true?  (secrets/identity-available? {:app "testapp"})))
+          (is (false? (secrets/identity-available? "definitely-not-a-real-app-xyz")))
+          (is (false? (secrets/identity-available? {:app "definitely-not-a-real-app-xyz"})))
+          (finally
+            (System/setProperty "user.home" home))))))
+  (testing "0-arity mirrors resolve-identity-file with no app"
+    (if age-env-set?
+      (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+      (is (false? (secrets/identity-available?))))))
+
 (deftest b64-identity-decode
   (let [decode #'secrets/decode-b64-identity
         raw    "AGE-SECRET-KEY-1EXAMPLE\n"
