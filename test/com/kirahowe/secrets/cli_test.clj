@@ -388,3 +388,29 @@
             c (cli/normalize-config (test-config {:recipients-file f}))]
         (with-out-str (cli/add-recipient! c "dev" newkey))
         (is (= (str newkey "\n") (slurp f)))))))
+
+(deftest blank-artifact-paths-are-rejected
+  (let [cfg (fn [env-overrides]
+              {:app "x" :environments {:dev (merge {:secrets-file "s.age"} env-overrides)}})]
+    (testing "every artifact path field rejects a blank string"
+      (doseq [[field overrides]
+              [[:secrets-file    {:secrets-file "" :template "t" :manifest "m"}]
+               [:key-file        {:key-file ""}]
+               [:template        {:template ""}]
+               [:manifest        {:manifest ""}]
+               [:recipients-file {:recipients-file ""}]]]
+        (let [e (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                      #"blank"
+                                      (cli/normalize-config (cfg overrides))))]
+          (is (= field (:field (ex-data e))) "the error names the offending field"))))
+    (testing "whitespace-only is blank too — it canonicalizes to a directory, not a file"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                            (cli/normalize-config (cfg {:template "   "})))))
+    (testing ":manifest false stays supported — the check is about strings, not presence"
+      (is (false? (get-in (cli/normalize-config (cfg {:manifest false}))
+                          [:environments :dev :manifest]))))
+    (testing "ordinary configs are unaffected"
+      (let [e (get-in (cli/normalize-config (cfg {})) [:environments :dev])]
+        (is (= "s.age" (:secrets-file e)))
+        (is (= "s.manifest" (:manifest e)))
+        (is (= "s.example" (:template e)))))))

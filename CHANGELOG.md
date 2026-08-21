@@ -44,7 +44,8 @@ All notable changes to this project are documented here. The format follows
   is validated up front (`:app` is required — it names the default key path,
   and a default would let unrelated projects share a key by accident;
   `:secrets-file` is required and must end in `.age` unless both `:template`
-  and `:manifest` are set explicitly), every command
+  and `:manifest` are set explicitly; no artifact path may be a blank string,
+  which would otherwise resolve to the working directory), every command
   takes the environment first (`bb secrets decrypt [env] <file>`), and each
   environment's decrypt-side `:identity-file` resolves from the
   `SECRETS_AGE_IDENTITY*` variables before its configured `:key-file` — so CI holding

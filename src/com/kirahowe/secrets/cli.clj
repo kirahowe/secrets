@@ -93,19 +93,34 @@
 
 ;; ---------- Config ----------
 
+(defn- require-path!
+  "Reject a blank artifact path, returning `path` otherwise. Only strings are
+  checked, so documented non-string values (`:manifest false` to disable the
+  manifest) keep their meaning. Blank is worth its own error because `\"\"`
+  canonicalizes to the *working directory*: it slips past the collision check
+  as a plausible path and then fails much later as an unattributable write
+  error."
+  [env kind path]
+  (when (and (string? path) (str/blank? path))
+    (fail! (str "Environment " env " has a blank " kind " (a path string must not be empty).\n"
+                "    An empty path resolves to the working directory, not a file.")
+           {:environment env :field kind :path path}))
+  path)
+
 (defn normalize-config
   "Apply per-environment defaults (:key-file, :identity-file, :template,
   :manifest), validate the configuration, and stamp each env with its :name.
   Throws (ex-info, as `run!` expects) when there are no environments, when
   :app is missing (it names the default key path ~/.config/<app>/key.txt, so
   defaulting it would make unrelated projects share a key), when an
-  environment lacks a :secrets-file string, or when a derived :template /
-  :manifest name would collide with the ciphertext (a :secrets-file that does
-  not end in `.age` derives template = manifest = the secrets file itself, and
-  writing the manifest would then overwrite the encrypted file). Ciphertext,
-  manifest, template, key, and recipients paths are compared by canonical path
-  so aliases such as `./s.age` and `s.age` cannot refer to different artifacts
-  in the configuration."
+  environment lacks a :secrets-file string, when any artifact path is a blank
+  string (an empty path canonicalizes to the working directory, not a file),
+  or when a derived :template / :manifest name would collide with the
+  ciphertext (a :secrets-file that does not end in `.age` derives
+  template = manifest = the secrets file itself, and writing the manifest
+  would then overwrite the encrypted file). Ciphertext, manifest, template, key, and recipients paths
+  are compared by canonical path so aliases such as `./s.age` and `s.age`
+  cannot refer to different artifacts in the configuration."
   [{:keys [app environments] :as config}]
   (when (empty? environments)
     (fail! "secrets config has no :environments" {:config config}))
@@ -122,6 +137,7 @@
                       (when-not (string? secrets-file)
                         (fail! (str "Environment " env " has no :secrets-file (a path string is required).")
                                {:environment env :env-config e}))
+                      (require-path! env :secrets-file secrets-file)
                       (when (and (not (str/ends-with? secrets-file ".age"))
                                  (not (and (contains? e :template) (contains? e :manifest))))
                         (fail! (str "Environment " env " :secrets-file (" secrets-file ") does not end in .age, so the\n"
@@ -138,6 +154,10 @@
                                               manifest
                                               (str/replace secrets-file #"\.age$" ".manifest"))
                             recipients-file (some-> recipients-file secrets/expand-home)
+                            _               (do (require-path! env :key-file key-file)
+                                                (require-path! env :template template)
+                                                (require-path! env :manifest manifest)
+                                                (require-path! env :recipients-file recipients-file))
                             collisions      (->> [[:secrets-file secrets-file]
                                                   [:manifest manifest]
                                                   [:template template]
