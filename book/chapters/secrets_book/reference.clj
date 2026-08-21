@@ -35,6 +35,7 @@
              #'secrets/merge-readers
              #'secrets/identity-from-env
              #'secrets/resolve-identity-file
+             #'secrets/identity-available?
              #'secrets/expand-home
              #'secrets/owner-only-temp-file!)
 
@@ -75,6 +76,8 @@
              #'cli/keygen!
              #'cli/new!
              #'cli/edit!
+             #'cli/set-secret!
+             #'cli/remove-secret!
              #'cli/verify!
              #'cli/show-key!
              #'cli/add-recipient!

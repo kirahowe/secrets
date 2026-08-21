@@ -62,6 +62,28 @@
 ;; `env/prod/resources` is on the classpath, `secrets.edn.age` rides along
 ;; into the uberjar with everything else.
 
+;; ## Runtimes without `age`
+
+;; Decryption shells out to the `age` binary, so every runtime that decrypts
+;; needs it on `PATH` — a container, a VM, a CI runner, your laptop. Some
+;; platforms can't offer that at all: Cloudflare Workers, Deno Deploy, and
+;; edge runtimes generally run your code somewhere that can't exec a
+;; subprocess, `age` or otherwise.
+
+;; That's not a gap in this library, it's a boundary of the design — it wraps
+;; a CLI tool, so anywhere a CLI tool can't run, it can't run either. The
+;; answer isn't to work around it; it's to use this library for what it's
+;; good at (development and CI, where the ciphertext and the manifest still
+;; do their job) and let the edge platform hold the one secret value itself
+;; in production.
+
+;; | Where | How the identity gets there |
+;; |-------|------------------------------|
+;; | Laptop | `~/.config/<app>/key.txt` |
+;; | GitHub Actions | `SECRETS_AGE_IDENTITY` repository secret |
+;; | Container / VM | env var, `age` installed in the image |
+;; | Edge runtime (Workers, Deno Deploy) | **it doesn't** — use the platform's own secret store; this library covers dev and CI |
+
 ;; ## Loading from inside a jar, demonstrated
 
 ;; This is the part that must not break on a Friday deploy, so the book
@@ -153,6 +175,38 @@
 ;; your production key. The keyless job catches the common failure for free,
 ;; so start there and add the keyed job only if you need value-level checks
 ;; on every merge.
+
+;; ## A job that reads secrets
+
+;; The two jobs above only ever check freshness or shape — neither one
+;; decrypts a value into something that runs. A job that actually needs the
+;; secrets, an eval run hitting a real API, say, needs `age` installed and the
+;; identity in its environment, the same as the container does:
+
+;; ```yaml
+;; evals:
+;;   runs-on: ubuntu-latest
+;;   steps:
+;;     - uses: actions/checkout@v4
+;;     - name: Install age
+;;       run: sudo apt-get update && sudo apt-get install -y age
+;;     - name: Run the thing
+;;       run: bb evals
+;;       env:
+;;         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
+;; ```
+
+;; The repository secret's value is the *contents* of `~/.config/<app>/key.txt`,
+;; not a path — and the ciphertext it decrypts is the one already committed to
+;; the repo. That's the whole point of the design: the secret Actions holds is
+;; small and rotatable, and the thing it unlocks travels with the code. It
+;; still feels backwards the first time, though — you are not sending secrets
+;; to GitHub, you are giving GitHub the one key that reads the secrets already
+;; sitting in the checkout. Set it with:
+
+;; ```sh
+;; gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
+;; ```
 
 ;; ## Back up the key like you mean it
 

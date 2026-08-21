@@ -130,6 +130,24 @@
       (is (= :new (:v (aero/read-config cfg)))
           "after reset-cache!, the edited file is decrypted fresh"))))
 
+(deftest profile-evaluates-only-the-selected-branch
+  (testing "#profile picks a branch before the #secret tag in it is read, so the key
+            in the unselected branch does not have to exist"
+    ;; The README documents this as the way to give eval runs their own key, and
+    ;; the promise that makes it safe is that adding a profile for a key some
+    ;; consumers do not have cannot break them. That is aero's behaviour, not
+    ;; ours, so pin it: an aero change would otherwise turn the docs into a lie.
+    (let [enc (encrypt-edn! {:openrouter/api-key "sk-default"})
+          cfg (spit-config! (str "{:api-key #profile {:default #secret/req :openrouter/api-key\n"
+                                 "                    :evals   #secret/req :openrouter/evals-api-key}}"))]
+      (secrets-aero/register! {:file enc :identity-file *key*})
+      (is (= {:api-key "sk-default"} (aero/read-config cfg))
+          "the :evals key is absent from the store, and the default profile does not care")
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"missing from the secrets file"
+           (aero/read-config cfg {:profile :evals}))
+          "selecting that profile does evaluate it, and it is genuinely missing"))))
+
 (deftest register-returns-and-replaces-config
   (testing "register! returns the config map and is idempotent (replaces, not accumulates)"
     (let [a {:file "a" :identity-file "ka"}

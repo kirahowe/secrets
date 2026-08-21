@@ -8,9 +8,9 @@ reviewable.
 
 - **No dependencies.** Nothing beyond Clojure itself, and it loads and runs
   the same under JVM Clojure and [babashka](https://babashka.org).
-- **A `bb secrets` task.** `keygen` · `new` · `edit` · `verify` · `show-key` ·
-  `add-recipient` · `recipients` · `reencrypt` · `encrypt` · `decrypt`, wired
-  into any project with one task definition.
+- **A `bb secrets` task.** `keygen` · `new` · `edit` · `set` · `rm` · `verify` ·
+  `show-key` · `add-recipient` · `recipients` · `reencrypt` · `encrypt` ·
+  `decrypt`, wired into any project with one task definition.
 - **Two ways to consume secrets:** `#secret/req` / `#secret/opt` EDN reader
   literals, or a plain `load-secrets` map for Integrant/component setups.
 - **Solo or team.** Encrypt to your own key, or to a committed list of
@@ -110,6 +110,26 @@ Every command takes the environment first (`bb secrets decrypt [env] <file>`);
 omit it to use the default environment. `decrypt` writes to stdout byte-for-byte,
 so it works for any `.age` file, not just EDN.
 
+**4. Non-interactively** (scripts, bootstrap, CI):
+
+```sh
+printf %s "sk-live-…" | bb secrets set prod :openrouter/api-key
+echo '#{"a@b.com" "b@b.com"}' | bb secrets set prod :auth/admins --edn
+bb secrets rm prod :openrouter/old-key
+```
+
+`set` reads the value from **stdin**, never a command-line argument, so it
+never lands in shell history or `ps`. The value is stored as a string unless
+`--edn` parses stdin as EDN — sets, numbers, nested maps. `set` creates the
+environment's secrets file when it doesn't exist yet, so bootstrapping a new
+environment end to end is scriptable; a blank value on stdin is refused (an
+unset CI variable expands to nothing, and storing that silently is worse than
+failing loudly) — pass `--edn` with `""` if you genuinely want an empty
+string. `rm` fails, rather than quietly doing nothing, when the key or the
+file doesn't exist. `<key>` is a keyword (`:some/key`) or a vector path
+(`[:a :b]`) for both commands, and both refresh the manifest like every other
+write.
+
 ## Using secrets at runtime
 
 ### Reader literals (recommended for EDN-configured systems)
@@ -150,18 +170,72 @@ throws, for both tags.
 ### Aero
 
 [aero](https://github.com/juxt/aero) resolves tags through its own
-`aero.core/reader` multimethod rather than a `:readers` map, so delegate the
-two tags to the same functions:
+`aero.core/reader` multimethod rather than a `:readers` map, so the
+integration ships as a namespace instead of a snippet to paste into your own
+code:
 
 ```clojure
-(def secret-readers
-  (secrets/reader-literals {:app "myapp" :resource "secrets.edn.age"}))
-
-(defmethod aero.core/reader 'secret/req [_opts _tag value]
-  ((secret-readers 'secret/req) value))
-(defmethod aero.core/reader 'secret/opt [_opts _tag value]
-  ((secret-readers 'secret/opt) value))
+(require '[com.kirahowe.secrets.aero])
 ```
+
+That's the whole thing — requiring the namespace registers the `#secret/req` /
+`#secret/opt` methods on `aero.core/reader`; there's nothing else to call.
+`aero` is **not** a dependency of this library (`deps.edn`'s `:deps` stays
+clean); the namespace only compiles and loads for consumers who already have
+`aero` on their own classpath.
+
+Two ways to supply the secrets config — the same opts map `reader-literals`
+takes (`:app`/`:resource`, `:file`, `:identity-file`):
+
+- **Process-wide**, for the common case of one app reading its own config in
+  one place:
+
+  ```clojure
+  (com.kirahowe.secrets.aero/register! {:app "myapp" :resource "secrets.edn.age"})
+  ```
+
+- **Per read**, through aero's own opts — `aero.core/read-config` passes its
+  entire opts map to readers, so the config comes straight off a `:secrets`
+  key and can be varied per call (see the profile recipe below):
+
+  ```clojure
+  (aero.core/read-config "config.edn"
+    {:secrets {:app "myapp" :resource "secrets.edn.age"}})
+  ```
+
+A per-read `:secrets` opt always wins over a `register!`ed default. With
+neither supplied, reading a `#secret/…` tag throws rather than resolving to
+nil.
+
+In a long-running REPL, `reset-cache!` drops the cached decrypted store, so
+the next `#secret/…` read picks up a `bb secrets edit` made after the process
+started (without it, the store stays whatever it was at the first read for
+the life of the process):
+
+```clojure
+(com.kirahowe.secrets.aero/reset-cache!)
+```
+
+#### A different key per profile
+
+A real case: eval runs need to authenticate with a different OpenRouter key
+than production, so benchmark spend stays off the key serving real traffic.
+Both keys live in the same store — the whole solution is one config line,
+combining aero's `#profile` with `#secret/req`:
+
+```clojure
+:api-key #profile {:default #secret/req :openrouter/api-key
+                   :evals   #secret/req :openrouter/evals-api-key}
+```
+
+with the caller passing `{:profile :evals}` to `read-config`. This is safe
+because aero evaluates **only the selected branch** — reading with `:default`
+decrypts and looks up `:openrouter/api-key` alone, and `:openrouter/evals-api-key`
+doesn't need to exist in the store at all; reading with `:evals` is the
+mirror image. That's a genuine advantage of building on aero rather than a
+bespoke reader: you can add a profile for a key some consumers don't have —
+a benchmark-only key, say — without breaking every `read-config` call that
+never selects it.
 
 ### As a map (Integrant component / direct use)
 
@@ -220,6 +294,54 @@ encrypted `secrets.edn.age` ships in the image — in the jar or on the classpat
 an uberjar (the ciphertext is copied to an owner-only temp file so `age` can
 read it), so the file works the same whether it sits on disk or inside the jar.
 `SECRETS_AGE_IDENTITY` decrypts it at startup.
+
+### GitHub Actions
+
+GitHub's runner images don't ship `age`, so decryption fails until you install
+it. Next to the Fly command above, a job that actually reads secrets (as
+opposed to the manifest-only [verify job](#verifying-in-ci) below) needs an
+install step and the identity in its environment:
+
+```yaml
+- name: Install age
+  run: sudo apt-get update && sudo apt-get install -y age
+
+- name: Run the thing
+  run: bb evals
+  env:
+    SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
+```
+
+The repository secret's value is the **contents** of `~/.config/<app>/key.txt`,
+not a path — and the ciphertext it decrypts is the one already committed to
+the repo. That's the whole point of the design (the secret Actions holds is
+small and rotatable; the thing it unlocks travels with the code), but it's
+still the part that feels backwards the first time. Set it with:
+
+```sh
+gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
+```
+
+### When the runtime can't exec `age`
+
+Decryption shells out to the `age` binary (see [Trade-offs and
+limitations](#trade-offs-and-limitations)), so every runtime that decrypts
+needs it on `PATH`. Some platforms can't offer that at all — Cloudflare
+Workers, Deno Deploy, and edge runtimes generally run your code somewhere that
+can't exec a subprocess, `age` or otherwise.
+
+That's a boundary of the design, not a gap: this library wraps a CLI tool, so
+anywhere a CLI tool can't run, neither can it. The fix isn't to work around
+that — it's to use this library for development and CI, where the ciphertext
+and manifest still do their job, and let the edge platform's own secret store
+hold the value for production.
+
+| Where | How the identity gets there |
+|---|---|
+| Laptop | `~/.config/<app>/key.txt` |
+| GitHub Actions | `SECRETS_AGE_IDENTITY` repository secret |
+| Container / VM | env var, `age` installed in the image |
+| Edge runtime (Workers, Deno Deploy) | **it doesn't** — use the platform's own secret store; this library covers dev and CI |
 
 ## Environments
 
@@ -314,11 +436,12 @@ drift. Disable the manifest for an environment with `:manifest false`.
 ## API
 
 `com.kirahowe.secrets`
-- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`.
+- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`. Every failure throws `ex-info` with a `:reason` — `:no-identity` (no identity resolves, or the resolved file doesn't exist) or `:no-file` (the source is nil, names a path that doesn't exist, or wraps another IOException) — the same vocabulary `#secret/req` uses, so a consumer can branch on it whichever way it reached the store.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
 - `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
 - `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil when none is set. A variable that is set but empty throws.
-- `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise.
+- `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise. The path is *conventional* — it's never checked for existence, so a non-nil result doesn't mean a usable key is actually there.
+- `(identity-available?)` / `(identity-available? app-or-opts)` — true when an identity actually resolves **and** its file exists on disk. The "do I have a key, or should I tell the user to run `keygen`?" check; `app-or-opts` also accepts an opts map's `:identity-file`.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
 

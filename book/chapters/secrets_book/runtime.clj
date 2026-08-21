@@ -181,20 +181,63 @@
 ;; ## Aero
 
 ;; [aero](https://github.com/juxt/aero) resolves tags through its own
-;; multimethod rather than a `:readers` map, so delegate:
+;; multimethod rather than a `:readers` map, so the integration ships as a
+;; namespace, `com.kirahowe.secrets.aero`, instead of a snippet to paste into
+;; your own code. Requiring it is the whole thing:
 
 ;; ```clojure
-;; (def secret-readers
-;;   (secrets/reader-literals {:app "myapp" :resource "secrets.edn.age"}))
-;;
-;; (defmethod aero.core/reader 'secret/req [_opts _tag value]
-;;   ((secret-readers 'secret/req) value))
-;; (defmethod aero.core/reader 'secret/opt [_opts _tag value]
-;;   ((secret-readers 'secret/opt) value))
+;; (require '[com.kirahowe.secrets.aero])
 ;; ```
 
-;; After that, `#secret/req :database/url` works inside an aero config file
-;; like any other aero tag.
+;; That registers the `#secret/req` / `#secret/opt` methods on
+;; `aero.core/reader`; there is nothing else to call. `aero` is not a
+;; dependency of this library — the namespace only compiles and loads for
+;; consumers who already have `aero` on their own classpath, which is also why
+;; this chapter describes it in prose rather than requiring it above: `aero`
+;; is a test-only dependency of this repo, not one the book carries.
+
+;; Two ways to supply the secrets config — the same opts map `reader-literals`
+;; takes above:
+
+;; ```clojure
+;; ;; process-wide, for one app reading its own config in one place
+;; (com.kirahowe.secrets.aero/register! {:app "myapp" :resource "secrets.edn.age"})
+;;
+;; ;; per read, through aero's own opts — read-config passes its whole opts
+;; ;; map to readers, so the config comes straight off a :secrets key
+;; (aero.core/read-config "config.edn"
+;;   {:secrets {:app "myapp" :resource "secrets.edn.age"}})
+;; ```
+
+;; A per-read `:secrets` opt always wins over a `register!`ed default. In a
+;; long-running REPL, `(com.kirahowe.secrets.aero/reset-cache!)` drops the
+;; cached decrypted store, so the next `#secret/…` read picks up a
+;; `bb secrets edit` made after the process started — without it, the store
+;; stays whatever it was at the first read for the life of the process.
+
+;; After registering, `#secret/req :database/url` works inside an aero config
+;; file like any other aero tag.
+
+;; ### A different key per profile
+
+;; A real case: eval runs need to authenticate with a different OpenRouter key
+;; than production, so benchmark spend stays off the key serving real
+;; traffic. Both keys live in the same store — the whole solution is one
+;; config line, combining aero's `#profile` with `#secret/req`:
+
+;; ```clojure
+;; :api-key #profile {:default #secret/req :openrouter/api-key
+;;                    :evals   #secret/req :openrouter/evals-api-key}
+;; ```
+
+;; with the caller passing `{:profile :evals}` to `read-config`. This is safe
+;; because aero evaluates *only the selected branch* — reading with `:default`
+;; decrypts and looks up `:openrouter/api-key` alone, and
+;; `:openrouter/evals-api-key` does not need to exist in the store at all;
+;; reading with `:evals` is the mirror image. That is a genuine advantage of
+;; building on aero rather than a bespoke reader: you can add a profile for a
+;; key some consumers don't have — a benchmark-only key, say — without
+;; breaking every `read-config` call that never selects it.
 
 ^{:kindly/hide-code true}
 (doseq [f (reverse (file-seq (io/file dir)))]

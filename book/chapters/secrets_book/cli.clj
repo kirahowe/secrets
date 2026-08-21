@@ -71,6 +71,8 @@
 ;; | `keygen` | `[env]` | generate the age key for an environment |
 ;; | `new` | `[env]` | create a secrets file from a template, via `$EDITOR` |
 ;; | `edit` | `[env]` | decrypt, edit, re-encrypt |
+;; | `set` | `[env] <key> [--edn]` | set a key's value from stdin (creates the file if missing) |
+;; | `rm` | `[env] <key>` | remove a key (fails if the key or file is absent) |
 ;; | `verify` | `[env]` | check the committed manifest against the secrets |
 ;; | `show-key` | `[env]` | print public keys for sharing |
 ;; | `add-recipient` | `[env] [key]` | add a public key to the recipients file |
@@ -82,6 +84,23 @@
 ;; Every command takes the environment first, and omitting it uses
 ;; `:default-environment`. `decrypt` writes bytes, not text, so certificates
 ;; and keystores round-trip as faithfully as EDN does.
+
+;; `set` and `rm` are the non-interactive path: no `$EDITOR`, value read from
+;; **stdin** so it never lands in shell history or `ps`, which is what makes
+;; them safe to call from a script or a CI step. `set`'s value is stored as a
+;; string unless `--edn` parses stdin as EDN first, so a set, a number, or a
+;; nested map can be set as itself rather than a string of digits or braces.
+;; A blank value on stdin is refused rather than stored — the same rule the
+;; library applies to a set-but-empty `SECRETS_AGE_IDENTITY`, because a blank
+;; is almost always an unset variable expanding to nothing, and `--edn` with
+;; `""` is the deliberate way to store an empty string on purpose. `set`
+;; creates the environment's secrets file from an empty map when it doesn't
+;; exist yet, which is what makes bootstrapping a brand-new environment
+;; scriptable end to end. `rm` fails, rather than quietly doing nothing, when
+;; the key or the file isn't there — a typo'd path is a mistake worth
+;; catching. In both, `<key>` is an EDN keyword (`:some/key`) or a vector path
+;; (`[:a :b]`), and both re-encrypt and refresh the manifest exactly like
+;; `edit`.
 
 ;; ## A whole workflow, live
 
