@@ -3,15 +3,18 @@
 ;; README.) The build/install/deploy tasks shell out to `clojure -T:build …`,
 ;; which needs a JDK on the PATH; everything else runs under babashka alone.
 {:paths ["src" "test"]
+ :deps  {aero/aero {:mvn/version "1.1.6"}}
 
  :tasks
  {test
   {:doc      "Run the test suite under babashka"
    :requires ([clojure.test :as t]
               [com.kirahowe.secrets-test]
-              [com.kirahowe.secrets.cli-test])
+              [com.kirahowe.secrets.cli-test]
+              [com.kirahowe.secrets.aero-test])
    :task     (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
-                                                     'com.kirahowe.secrets.cli-test)]
+                                                     'com.kirahowe.secrets.cli-test
+                                                     'com.kirahowe.secrets.aero-test)]
                (System/exit (if (pos? (+ fail error)) 1 0)))}
 
   clean

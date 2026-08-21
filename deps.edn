@@ -7,7 +7,8 @@
 
  :aliases
  {:test  {:extra-paths ["test"]
-          :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+          :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                        aero/aero           {:mvn/version "1.1.6"}}
           :main-opts   ["-m" "kaocha.runner"]}
 
   ;; The documentation book: Clay renders the literate chapters under
