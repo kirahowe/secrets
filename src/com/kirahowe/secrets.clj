@@ -207,6 +207,10 @@
           (io/copy in out))
         [tmp #(.delete tmp)]))))
 
+(def ^:private no-store-hint
+  "One-line remediation appended to \"no secrets file\" errors."
+  "Create it with `bb secrets new`.")
+
 (defn load-secrets
   "Decrypt and read an age-encrypted EDN file into a map.
 
@@ -217,8 +221,20 @@
     :identity-file  explicit identity path (wins over :app and the env vars)
     :app            app name for the default ~/.config/<app>/key.txt
   With neither, the identity comes from `resolve-identity-file` (the
-  SECRETS_AGE_IDENTITY* env vars). Throws when no identity resolves or the resolved
-  identity file does not exist.
+  SECRETS_AGE_IDENTITY* env vars).
+
+  Every reachable failure throws ex-info — never a bare java.io.* exception —
+  with a :reason a caller can branch on regardless of which API they used,
+  since it shares the vocabulary `#secret/req` uses:
+    :no-identity  no identity resolves, or the resolved file does not exist.
+                  Names every way to supply one (see `identity-options`).
+    :no-file      `source` is nil (almost always because
+                  `(io/resource \"secrets.edn.age\")` found nothing on the
+                  classpath), names a path/File that does not exist, or wraps
+                  any other IOException reading the source (a bad URL, a
+                  missing jar entry) with the original exception as :cause.
+  Checked identity first, then source — an existing identity failure always
+  wins even when the source is also missing.
 
   Reads with `clojure.edn` (no eval), so secret files are plain data and may use
   any EDN — including native sets for allowlists, e.g. `#{\"a@b.com\"}`."
@@ -232,8 +248,29 @@
        (throw (ex-info (str "No age identity found"
                             (when identity (str " (" identity " does not exist)"))
                             ". " identity-options)
-                       {:identity (some-> identity str) :source (str source)})))
-     (let [[file cleanup!] (source->file source)]
+                       {:identity (some-> identity str) :source (str source) :reason :no-identity})))
+     (when (nil? source)
+       (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
+                            " (io/resource \"secrets.edn.age\") found nothing on the classpath"
+                            " — check the encrypted file is present as a classpath resource. "
+                            no-store-hint)
+                       {:source nil :reason :no-file})))
+     ;; Opening is what decides whether a source is readable: a String may name
+     ;; a path *or* a URL (io/input-stream tries the URL first), so a
+     ;; missing-path check up front would reject `jar:file:…!/secrets.edn.age`
+     ;; as a nonexistent file. Let source->file try, and pick the message from
+     ;; what the source turned out to be.
+     (let [[file cleanup!]
+           (try
+             (source->file source)
+             (catch java.io.IOException e
+               (throw (ex-info (if (and (or (instance? java.io.File source) (string? source))
+                                        (not (.exists (io/file (str source)))))
+                                 (str "Secrets file not found: " source ". " no-store-hint)
+                                 (str "Could not read secrets source " (pr-str source)
+                                      ": " (.getMessage e)))
+                               {:source source :reason :no-file}
+                               e))))]
        (try
          (edn/read-string (age/decrypt identity (.getAbsolutePath ^java.io.File file)))
          (finally (cleanup!)))))))

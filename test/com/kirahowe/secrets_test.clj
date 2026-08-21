@@ -183,6 +183,43 @@
          (secrets/load-secrets enc {:identity-file (str *dir* "/nope")}))
         "a nonexistent identity file throws with the remediation options")))
 
+;; ---------- load-secrets error quality (mirrors reader-literals' :reason vocabulary) ----------
+
+(deftest load-secrets-nil-source-throws
+  (testing "source is nil: names the classpath-resource cause, not a bare IllegalArgumentException"
+    (let [e (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo #"(?i)source is nil"
+                 (secrets/load-secrets nil *key*)))]
+      (is (= :no-file (:reason (ex-data e))))
+      (is (nil? (:source (ex-data e))))
+      (is (re-find #"(?i)classpath" (ex-message e)))
+      (is (re-find #"bb secrets new" (ex-message e))))))
+
+(deftest load-secrets-missing-file-throws
+  (testing "source names a path that does not exist: names the path, not a bare FileNotFoundException"
+    (let [missing (str *dir* "/nope.edn.age")
+          e (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo #"(?i)secrets file not found"
+                 (secrets/load-secrets missing *key*)))]
+      (is (= :no-file (:reason (ex-data e))))
+      (is (= missing (:source (ex-data e))))
+      (is (re-find (re-pattern (java.util.regex.Pattern/quote missing)) (ex-message e))
+          "the error names the offending path")
+      (is (re-find #"bb secrets new" (ex-message e))))))
+
+(deftest load-secrets-missing-identity-throws
+  (testing "missing identity file: :reason :no-identity, wording unchanged"
+    (let [enc (encrypt-edn! {:k "v"})
+          e (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo #"(?i)no age identity.*SECRETS_AGE_IDENTITY_FILE"
+                 (secrets/load-secrets enc (str *dir* "/no-such-key.txt"))))]
+      (is (= :no-identity (:reason (ex-data e)))))))
+
+(deftest load-secrets-success-unaffected
+  (testing "a successful load is unaffected by the new error paths"
+    (let [enc (encrypt-edn! {:k "v"})]
+      (is (= {:k "v"} (secrets/load-secrets enc *key*))))))
+
 (deftest jar-resource-loading
   (testing "load-secrets reads an encrypted entry through a jar: URL"
     (let [enc (encrypt-edn! {:from :jar})
@@ -191,8 +228,10 @@
         (.putNextEntry zos (java.util.zip.ZipEntry. "secrets.edn.age"))
         (io/copy (io/file enc) zos)
         (.closeEntry zos))
-      (let [url (java.net.URL. (str "jar:file:" jar "!/secrets.edn.age"))]
-        (is (= {:from :jar} (secrets/load-secrets url *key*)))))))
+      (let [url (str "jar:file:" jar "!/secrets.edn.age")]
+        (is (= {:from :jar} (secrets/load-secrets (java.net.URL. url) *key*)))
+        (is (= {:from :jar} (secrets/load-secrets url *key*))
+            "a String source may be a URL, not only a path — io/input-stream tries the URL first")))))
 
 ;; ---------- Multi-recipient ----------
 
