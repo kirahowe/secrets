@@ -54,7 +54,7 @@ isn't in the build context):
 
 ```clojure
 ;; git
-io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "…"}
+io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}
 ;; or Maven, after `clojure -T:build install` / a Clojars deploy
 com.kirahowe/secrets {:mvn/version "0.1.0"}
 ```
