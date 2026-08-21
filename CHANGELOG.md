@@ -27,7 +27,10 @@ All notable changes to this project are documented here. The format follows
   contents; invalid base64 throws), checked in that order (`identity-from-env`),
   then `~/.config/<app>/key.txt` when an app name is known
   (`resolve-identity-file`). There is deliberately no default key path: loading
-  with no resolvable identity throws and lists the options.
+  with no resolvable identity throws and lists the options. A variable that is
+  set but empty throws, naming itself, instead of resolving to an unusable
+  identity — CI runners expand a missing secret to the empty string, and
+  falling back to the local key path would mask the broken deployment.
 - **Owner-only temp files.** Everything sensitive the library materializes
   (injected identities, plaintext during edit) is created 0600 atomically via
   NIO (`owner-only-temp-file!`), with a create-then-restrict fallback on

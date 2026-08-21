@@ -101,21 +101,53 @@
           (swap! identity-temp assoc contents path)
           path))))
 
+(def ^:private identity-env-help
+  "What each identity variable should contain, for the set-but-empty error."
+  {"SECRETS_AGE_IDENTITY_FILE" "a path to the age key file"
+   "SECRETS_AGE_IDENTITY"      "the age key file contents"
+   "SECRETS_AGE_IDENTITY_B64"  "the base64-encoded age key file contents"})
+
+(defn- identity-env-value
+  "The value of identity variable `k`, or nil when it is unset. A variable that
+  is set but blank throws rather than resolving. Takes the value rather than
+  reading it, so the rule is testable without setting process environment.
+
+  CI runners expand a missing or misnamed secret to the empty string
+  (`SECRETS_AGE_IDENTITY: ${{ secrets.AGE_KEY }}` with no such secret, and the
+  docker-compose equivalent), so blank means a broken deployment, not an absent
+  one. Neither alternative is safe: using the value resolves to an empty key
+  file and fails far downstream as \"wrong key, or you are not a recipient\",
+  and skipping to the next source would silently fall back to
+  ~/.config/<app>/key.txt — succeeding on a developer machine with the *local*
+  key while the deployment it was meant to configure is broken."
+  [k v]
+  (when (and v (str/blank? v))
+    (throw (ex-info (str k " is set but empty. Unset it to fall back to the next"
+                         " identity source, or set it to " (identity-env-help k) ".")
+                    {:env k})))
+  v)
+
+(defn- identity-env
+  "`identity-env-value` applied to the live environment."
+  [k]
+  (identity-env-value k (System/getenv k)))
+
 (defn identity-from-env
   "Resolve the age identity (private key) file path from the environment, or
   nil when no identity variable is set. Checked in order:
     $SECRETS_AGE_IDENTITY_FILE — a path to the key file, returned as-is.
     $SECRETS_AGE_IDENTITY      — the raw key file contents, used verbatim.
     $SECRETS_AGE_IDENTITY_B64  — base64-encoded key file contents (invalid base64 throws).
-  Contents are materialized to a 0600 temp file, written at most once per
-  process. Public (rather than folded into `resolve-identity-file`) so callers
-  like the CLI namespace can layer their own defaults under it when it
-  returns nil."
+  A variable that is set but blank throws (see `identity-env`); one that is
+  merely unset falls through to the next. Contents are materialized to a 0600
+  temp file, written at most once per process. Public (rather than folded into
+  `resolve-identity-file`) so callers like the CLI namespace can layer their
+  own defaults under it when it returns nil."
   []
-  (or (System/getenv "SECRETS_AGE_IDENTITY_FILE")
-      (when-let [c (System/getenv "SECRETS_AGE_IDENTITY")]
+  (or (identity-env "SECRETS_AGE_IDENTITY_FILE")
+      (when-let [c (identity-env "SECRETS_AGE_IDENTITY")]
         (materialize-identity! c))
-      (when-let [c (System/getenv "SECRETS_AGE_IDENTITY_B64")]
+      (when-let [c (identity-env "SECRETS_AGE_IDENTITY_B64")]
         (materialize-identity! (decode-b64-identity c)))))
 
 (defn resolve-identity-file

@@ -201,6 +201,13 @@ the local default path):
 | `SECRETS_AGE_IDENTITY`      | the key file *contents*, used verbatim (never decoded) — materialized to an owner-only (0600) temp file |
 | `SECRETS_AGE_IDENTITY_B64`  | base64 of the key file contents (newline-tolerant), for secret stores that mangle multi-line values; invalid base64 throws — no silent fallback |
 
+A variable that is **set but empty** throws, naming itself, rather than being
+treated as absent. CI runners expand a missing or misnamed secret to the empty
+string (`SECRETS_AGE_IDENTITY: ${{ secrets.AGE_KEY }}` with no such secret), and
+falling through to the local `~/.config/<app>/key.txt` would let that broken
+deployment config quietly succeed on a developer machine. Unset the variable to
+fall back deliberately.
+
 So a Fly / Docker / CI deployment sets exactly one secret:
 
 ```sh
@@ -310,7 +317,7 @@ drift. Disable the manifest for an environment with `:manifest false`.
 - `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
 - `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
-- `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil.
+- `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil when none is set. A variable that is set but empty throws.
 - `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.

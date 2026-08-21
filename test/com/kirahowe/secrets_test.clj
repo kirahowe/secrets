@@ -294,3 +294,21 @@
           a  (manifest/entries {:token "old"} hk)
           b  (manifest/entries {:token "new"} hk)]
       (is (= [[:token]] (:changed (manifest/diff a b)))))))
+
+(deftest blank-identity-env-var-throws
+  (let [check #'secrets/identity-env-value]
+    (testing "an unset variable is nil, and falls through to the next source"
+      (is (nil? (check "SECRETS_AGE_IDENTITY" nil))))
+    (testing "a set, non-blank value passes through verbatim"
+      (is (= "  AGE-SECRET-KEY-1X\n" (check "SECRETS_AGE_IDENTITY" "  AGE-SECRET-KEY-1X\n")))
+      (is (= "/keys/id.txt" (check "SECRETS_AGE_IDENTITY_FILE" "/keys/id.txt"))))
+    (testing "set-but-empty throws instead of resolving to an unusable identity"
+      (doseq [k ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY" "SECRETS_AGE_IDENTITY_B64"]]
+        (let [e (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                      #"is set but empty"
+                                      (check k "")))]
+          (is (= k (:env (ex-data e))) "the error names the offending variable")
+          (is (re-find (re-pattern k) (ex-message e))))))
+    (testing "whitespace-only counts as empty — never a usable path or key"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is set but empty"
+                            (check "SECRETS_AGE_IDENTITY" "   \n"))))))

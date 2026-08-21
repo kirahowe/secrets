@@ -28,6 +28,16 @@
 ;; written to an owner-only temp file once per process, since the `age`
 ;; binary wants a file.
 
+;; A variable that is **set but empty** throws, naming itself, rather than
+;; being treated as unset. This is the CI case worth knowing about: the
+;; workflow snippet later in this chapter maps a repository secret into
+;; `SECRETS_AGE_IDENTITY`, and if that secret is missing or misnamed the
+;; runner expands it to the empty string rather than leaving it unset. Falling
+;; through to the next variable — and eventually to the local
+;; `~/.config/<app>/key.txt` — would let a broken deployment succeed on a
+;; developer machine using the wrong key. Unset the variable when you want the
+;; fallback.
+
 ;; On Fly, that means one command:
 
 ;; ```sh
