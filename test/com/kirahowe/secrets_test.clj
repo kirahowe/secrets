@@ -80,8 +80,9 @@
   (let [enc     (encrypt-edn! {:present 1})
         readers (secrets/reader-literals {:file enc :identity-file *key*})]
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"missing from the secrets file"
-         (edn/read-string {:readers readers} "#secret/req :totally-absent")))))
+         clojure.lang.ExceptionInfo #":totally-absent is missing from the secrets file"
+         (edn/read-string {:readers readers} "#secret/req :totally-absent"))
+        "the error names the key that is missing rather than failing generically")))
 
 (deftest reader-absent-file
   (testing "no secrets file on disk: #secret/opt → nil, #secret/req → throws"
