@@ -54,23 +54,45 @@
 (defn keygen!
   "Generate a fresh age identity at `path`, creating parent directories and
   tightening the file to owner-only permissions. Returns the public key.
-  Does not overwrite — callers guard. Throws if `age-keygen` is missing or fails."
+
+  Replaces `path` when it already exists, so callers own the decision about
+  whether overwriting is allowed. `age-keygen -o` refuses to open an existing
+  output file, so the key is generated inside a sibling temp directory and
+  moved over `path` only once it succeeds — a failed generation leaves any
+  existing key untouched. Throws if `age-keygen` is missing or fails."
   [path]
-  (let [f      (io/file (str path))
+  (let [f      (.getAbsoluteFile (io/file (str path)))
         parent (.getParentFile f)]
-    (when parent (.mkdirs parent))
-    (let [{:keys [exit err]} (try
-                               (shell/sh "age-keygen" "-o" (str path))
-                               (catch java.io.IOException _
-                                 {:exit 127 :err "age-keygen not found on PATH"}))]
-      (when-not (zero? exit)
-        (throw (ex-info "age-keygen failed"
-                        {:path (str path) :error err
-                         :install "macOS: brew install age"})))
-      (doto f
-        (.setReadable false false) (.setReadable true true)
-        (.setWritable false false) (.setWritable true true))
-      (public-key path))))
+    (.mkdirs parent)
+    (let [tmp-dir (java.nio.file.Files/createTempDirectory
+                   (.toPath parent) (str "." (.getName f) ".keygen")
+                   (into-array java.nio.file.attribute.FileAttribute []))
+          tmp     (.toFile (.resolve tmp-dir (.getName f)))]
+      (try
+        (let [{:keys [exit err]} (try
+                                   (shell/sh "age-keygen" "-o" (str tmp))
+                                   (catch java.io.IOException _
+                                     {:exit 127 :err "age-keygen not found on PATH"}))]
+          (when-not (zero? exit)
+            (throw (ex-info "age-keygen failed"
+                            {:path (str path) :error err
+                             :install "macOS: brew install age"})))
+          (doto tmp
+            (.setReadable false false) (.setReadable true true)
+            (.setWritable false false) (.setWritable true true))
+          ;; Same directory, so this is a rename(2): the old key is never
+          ;; observable as a half-written file.
+          (java.nio.file.Files/move
+           (.toPath tmp) (.toPath f)
+           (into-array java.nio.file.CopyOption
+                       [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+          (public-key f))
+        (finally
+          ;; Never let cleanup mask a genuine age-keygen failure.
+          (try
+            (.delete tmp)
+            (java.nio.file.Files/deleteIfExists tmp-dir)
+            (catch Exception _ nil)))))))
 
 (defn encrypt-file!
   "Encrypt plaintext file `in` to ciphertext file `out`. Returns `out`; throws

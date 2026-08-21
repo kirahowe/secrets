@@ -331,3 +331,20 @@
             (with-out-str (cli/run! config ["decrypt" "dev" (str f ".age")]))
             (finally (System/setOut orig)))
           (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))
+
+;; ---------- regressions ----------
+
+(deftest keygen-overwrites-a-confirmed-existing-key
+  (testing "age-keygen refuses an existing -o file, so keygen! stages and moves"
+    (let [path (str *dir* "/regen.txt")
+          pub1 (age/keygen! path)
+          pub2 (age/keygen! path)]
+      (is (some? pub1))
+      (is (some? pub2))
+      (is (not= pub1 pub2) "the second call really did replace the key")
+      (is (= pub2 (age/public-key path)) "and the file on disk is the new one")
+      (is (= #{"regen.txt"}
+             (->> (.list (io/file *dir*)) (filter #(= "regen.txt" %)) set))
+          "no staging leftovers beside the key")
+      (is (empty? (filter #(re-find #"\.regen\.txt\.keygen" %) (.list (io/file *dir*))))
+          "the temp staging directory is cleaned up"))))
