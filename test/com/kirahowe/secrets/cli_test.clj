@@ -550,6 +550,64 @@
       (is (empty? (filter #(re-find #"\.regen\.txt\.keygen" %) (.list (io/file *dir*))))
           "the temp staging directory is cleaned up"))))
 
+(deftest keygen-reports-sharing-environments-and-app-default-clause
+  (testing "environments that omit :key-file share the app default, and the\n           output says so"
+    (let [home (str *dir* "/home")]
+      (.mkdirs (io/file home))
+      (let [orig-home (System/getProperty "user.home")]
+        (try
+          (System/setProperty "user.home" home)
+          (let [config (cli/normalize-config
+                        {:app "cli-test"
+                         :environments {:dev  {:secrets-file (str *dir* "/dev/secrets.edn.age")}
+                                        :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")}}})
+                out    (with-out-str (cli/keygen! config "dev"))]
+            (is (re-find #"Used by: dev, prod — every environment without its own :key-file" out)))
+          (finally (System/setProperty "user.home" orig-home)))))))
+
+(deftest keygen-excludes-an-environment-with-its-own-key-file
+  (let [home (str *dir* "/home2")]
+    (.mkdirs (io/file home))
+    (let [orig-home (System/getProperty "user.home")]
+      (try
+        (System/setProperty "user.home" home)
+        (let [config (cli/normalize-config
+                      {:app "cli-test"
+                       :environments {:dev  {:secrets-file (str *dir* "/dev/secrets.edn.age")}
+                                      :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")
+                                             :key-file     (str *dir* "/prod-key.txt")}}})
+              out    (with-out-str (cli/keygen! config "dev"))]
+          (is (re-find #"Used by: dev — every environment without its own :key-file" out)
+              "only dev shares the app-default key")
+          (is (not (re-find #"prod" out))
+              "prod has its own :key-file, so it is not listed as sharing dev's"))
+        (finally (System/setProperty "user.home" orig-home))))))
+
+(deftest keygen-with-no-env-and-no-default-succeeds-when-key-file-is-unambiguous
+  (let [shared (str *dir* "/shared-key.txt")
+        config (cli/normalize-config
+                {:app "cli-test"
+                 :environments {:dev     {:secrets-file (str *dir* "/dev/secrets.edn.age")
+                                          :key-file     shared}
+                                :staging {:secrets-file (str *dir* "/staging/secrets.edn.age")
+                                          :key-file     shared}}})
+        result (atom nil)
+        out    (with-out-str (reset! result (cli/keygen! config nil)))]
+    (is (= shared @result)
+        "no [env] and no :default-environment, but every environment agrees on :key-file")
+    (is (re-find #"Used by: dev, staging" out))))
+
+(deftest keygen-with-no-env-and-no-default-still-fails-when-key-files-differ
+  (let [config (cli/normalize-config
+                {:app "cli-test"
+                 :environments {:dev  {:secrets-file (str *dir* "/dev/secrets.edn.age")
+                                       :key-file     (str *dir* "/dev-key.txt")}
+                                :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")
+                                       :key-file     (str *dir* "/prod-key.txt")}}})]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing environment"
+                          (cli/keygen! config nil))
+        "differing key files really is ambiguous, so this is unchanged")))
+
 (deftest add-recipient-preserves-comments-and-layout
   (let [recipients (str *dir* "/recipients.txt")
         original   (str "# Team recipients — keep sorted by name\n"

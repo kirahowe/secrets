@@ -94,6 +94,20 @@
 
 ;; ---------- Config ----------
 
+(defn- canonical-path
+  "Canonicalize `path`, so aliases like `./key.txt` and `key.txt` compare
+  equal — used both for the artifact-collision check and for deciding which
+  environments share a key file."
+  [path]
+  (.getCanonicalPath (io/file (str path))))
+
+(defn- default-key-file
+  "The app-wide default key path an environment falls back to when it has no
+  explicit :key-file. One path per app, not one per environment: the common
+  case is a single key per developer."
+  [app]
+  (secrets/expand-home (str "~/.config/" app "/key.txt")))
+
 (defn- require-path!
   "Reject a blank artifact path, returning `path` otherwise. Only strings are
   checked, so documented non-string values (`:manifest false` to disable the
@@ -146,8 +160,9 @@
                                     "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
                                     "    explicitly.")
                                {:environment env :secrets-file secrets-file}))
-                      (let [key-file        (secrets/expand-home
-                                             (or key-file (str "~/.config/" app "/key.txt")))
+                      (let [key-file        (if key-file
+                                              (secrets/expand-home key-file)
+                                              (default-key-file app))
                             template        (if (contains? e :template)
                                               template
                                               (str/replace secrets-file #"\.age$" ".example"))
@@ -165,8 +180,7 @@
                                                   [:key-file key-file]
                                                   [:recipients-file recipients-file]]
                                                  (filter (fn [[_ path]] (string? path)))
-                                                 (map (fn [[kind path]]
-                                                        [kind (.getCanonicalPath (io/file path))]))
+                                                 (map (fn [[kind path]] [kind (canonical-path path)]))
                                                  (group-by second)
                                                  vals
                                                  (filter #(> (count %) 1)))]
@@ -511,12 +525,51 @@
 
 ;; ---------- Commands ----------
 
+(defn- sharing-environments
+  "Every environment name (sorted) whose :key-file canonically resolves to the
+  same file as `key-file`. :key-file defaults to one app-wide path rather than
+  one per environment, so more than one environment routinely shares a single
+  key; keygen! reports this set after writing so that naming one environment
+  on the command line does not read as having made a key just for it."
+  [environments key-file]
+  (let [target (canonical-path key-file)]
+    (->> (vals environments)
+         (filter #(= target (canonical-path (:key-file %))))
+         (map :name)
+         (sort-by name))))
+
+(defn- sole-shared-environment
+  "When every configured environment's :key-file resolves to the same file, an
+  environment argument cannot change keygen!'s outcome, so return that
+  (arbitrary) environment rather than making the caller pick one. Returns nil
+  when environments differ, leaving resolve-env's ambiguity error in place."
+  [{:keys [environments]}]
+  (let [envs (vals environments)]
+    (when (apply = (map (comp canonical-path :key-file) envs))
+      (first envs))))
+
 (defn keygen!
   "Generate an age identity at an environment's key-file. Returns the key-file
-  path, or :aborted when an existing key is kept."
+  path, or :aborted when an existing key is kept.
+
+  :key-file defaults to one path per app (~/.config/<app>/key.txt), not one
+  per environment, so `bb secrets keygen dev` reads as making a dev-specific
+  key when really it makes the one key every environment without its own
+  :key-file shares. After writing, prints which environments actually use the
+  written file (compared by canonical path) so that doubt cannot form.
+
+  With no `env-arg` and no :default-environment, resolve-env normally fails
+  outright (see its docstring) — but when every configured environment shares
+  one :key-file, an environment argument cannot change the outcome, so
+  keygen! picks one rather than demanding a choice with only one possible
+  answer. Environments that resolve to different key files still require a
+  choice, same as before."
   [config env-arg]
   (require-age!)
-  (let [{:keys [key-file name recipients-file]} (resolve-env config env-arg)
+  (let [{:keys [key-file name recipients-file]}
+        (or (when (and (nil? env-arg) (nil? (:default-environment config)))
+              (sole-shared-environment config))
+            (resolve-env config env-arg))
         proceed? (or (not (.exists (io/file key-file)))
                      (do (warn "Key already exists:" key-file)
                          (confirm! "Overwrite? Existing secrets encrypted to it become UNREADABLE.")))]
@@ -524,8 +577,13 @@
       (do (info "Aborted.") :aborted)
       (do
         (info "Generating age key for" (clojure.core/name name) "…")
-        (let [pub (age/keygen! key-file)]
+        (let [pub          (age/keygen! key-file)
+              sharing      (sharing-environments (:environments config) key-file)
+              app-default? (= (canonical-path key-file)
+                              (canonical-path (default-key-file (:app config))))]
           (ok "Key written:" key-file)
+          (println (str "    Used by: " (str/join ", " (map clojure.core/name sharing))
+                        (when app-default? " — every environment without its own :key-file")))
           (println)
           (println (paint :bold "  Public key:") pub)
           (println)
