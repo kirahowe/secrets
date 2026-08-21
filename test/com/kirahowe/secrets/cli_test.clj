@@ -332,6 +332,207 @@
             (finally (System/setOut orig)))
           (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))
 
+;; ---------- set / rm ----------
+
+(deftest set-creates-a-brand-new-store
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (is (not (.exists (io/file encrypted))) "no store yet")
+      (with-out-str
+        (with-in-str "s3cr3t" (cli/set-secret! config "dev" ":openrouter/api-key" false)))
+      (is (.exists (io/file encrypted)) "set creates the file")
+      (is (= {:openrouter/api-key "s3cr3t"}
+             (edn/read-string (age/decrypt *key* encrypted)))))))
+
+(deftest set-overwrites-an-existing-key-leaving-others-untouched
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (encrypt-edn! {:a "old" :b "keep"})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (with-out-str (with-in-str "new" (cli/set-secret! config "dev" ":a" false)))
+      (is (= {:a "new" :b "keep"} (edn/read-string (age/decrypt *key* encrypted)))))))
+
+(deftest set-nested-vector-path
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (with-out-str
+        (with-in-str "acct-123" (cli/set-secret! config "dev" "[:r2 :account-id]" false)))
+      (is (= {:r2 {:account-id "acct-123"}} (edn/read-string (age/decrypt *key* encrypted))))
+      (testing "a sibling key added under the same parent leaves the first untouched"
+        (with-out-str
+          (with-in-str "us-east" (cli/set-secret! config "dev" "[:r2 :region]" false)))
+        (is (= {:r2 {:account-id "acct-123" :region "us-east"}}
+               (edn/read-string (age/decrypt *key* encrypted))))))))
+
+(deftest set-edn-flag-parses-typed-values-and-manifest-records-type
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (with-out-str
+        (with-in-str "#{\"a@b.com\" \"c@d.com\"}" (cli/set-secret! config "dev" ":auth/admins" true)))
+      (is (= {:auth/admins #{"a@b.com" "c@d.com"}} (edn/read-string (age/decrypt *key* encrypted))))
+      (let [m (edn/read-string (slurp (str *dir* "/secrets.edn.manifest")))]
+        (is (= :set (get-in m [:keys [:auth/admins] :type]))
+            "manifest records the EDN-parsed value's real type, not :string")))))
+
+(deftest set-without-edn-stores-a-plain-string-even-when-it-looks-like-edn
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (with-out-str (with-in-str "42" (cli/set-secret! config "dev" ":n" false)))
+      (is (= {:n "42"} (edn/read-string (age/decrypt *key* encrypted)))
+          "default (no --edn) always stores a string, regardless of stdin's shape"))))
+
+(deftest set-strips-exactly-one-trailing-newline
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (testing "a single trailing \\n is stripped"
+        (with-out-str (with-in-str "secret\n" (cli/set-secret! config "dev" ":a" false)))
+        (is (= "secret" (:a (edn/read-string (age/decrypt *key* encrypted))))))
+      (testing "a single trailing \\r\\n is stripped"
+        (with-out-str (with-in-str "secret\r\n" (cli/set-secret! config "dev" ":b" false)))
+        (is (= "secret" (:b (edn/read-string (age/decrypt *key* encrypted))))))
+      (testing "only exactly one trailing newline is stripped — the rest is verbatim"
+        (with-out-str (with-in-str "line1\n\n" (cli/set-secret! config "dev" ":c" false)))
+        (is (= "line1\n" (:c (edn/read-string (age/decrypt *key* encrypted))))))
+      (testing "no trailing newline at all is untouched"
+        (with-out-str (with-in-str "bare" (cli/set-secret! config "dev" ":d" false)))
+        (is (= "bare" (:d (edn/read-string (age/decrypt *key* encrypted)))))))))
+
+(deftest set-refuses-a-blank-value
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (testing "empty stdin fails rather than storing \"\" — an unset CI variable expands to nothing"
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"(?i)nothing on stdin"
+             (with-out-str (with-in-str "" (cli/set-secret! config "dev" ":a" false)))))
+        (is (not (.exists (io/file encrypted))) "and nothing was written"))
+      (testing "whitespace-only stdin fails the same way"
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"(?i)nothing on stdin"
+             (with-out-str (with-in-str "\n" (cli/set-secret! config "dev" ":a" false))))))
+      (testing "--edn is the escape hatch for a deliberately empty value"
+        (with-out-str (with-in-str "\"\"" (cli/set-secret! config "dev" ":a" true)))
+        (is (= {:a ""} (edn/read-string (age/decrypt *key* encrypted))))))))
+
+(deftest set-writes-a-store-that-stays-readable
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:a :b]" false)))
+      (with-out-str (with-in-str "w" (cli/set-secret! config "dev" ":c" false)))
+      (let [plaintext (age/decrypt *key* encrypted)]
+        (is (= {:a {:b "v"} :c "w"} (edn/read-string plaintext)))
+        (is (re-find #"\n" plaintext)
+            "the regenerated store is pretty-printed, so the next `edit` is readable"))
+      (testing "print limits set in a REPL cannot truncate the store"
+        (binding [*print-length* 1 *print-level* 1]
+          (with-out-str (with-in-str "x" (cli/set-secret! config "dev" ":d" false))))
+        (is (= {:a {:b "v"} :c "w" :d "x"}
+               (edn/read-string (age/decrypt *key* encrypted))))))))
+
+(deftest set-refreshes-the-manifest-so-verify-passes
+  (let [config (cli/normalize-config (test-config))]
+    (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k" false)))
+    (let [{:keys [results exit]} (verify config "dev")]
+      (is (= 0 exit))
+      (is (= :ok (:dev results))))))
+
+(deftest rm-removes-a-key-and-verify-still-passes
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (encrypt-edn! {:a "keep" :b "gone"})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (with-out-str (cli/remove-secret! config "dev" ":b"))
+      (is (= {:a "keep"} (edn/read-string (age/decrypt *key* encrypted))))
+      (let [{:keys [results exit]} (verify config "dev")]
+        (is (= 0 exit))
+        (is (= :ok (:dev results)))))))
+
+(deftest rm-leaves-the-parent-map-in-place-for-a-nested-path
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (encrypt-edn! {:r2 {:account-id "acct-123"}})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (with-out-str (cli/remove-secret! config "dev" "[:r2 :account-id]"))
+      (is (= {:r2 {}} (edn/read-string (age/decrypt *key* encrypted)))
+          "the (now empty) parent map is left in place, not pruned"))))
+
+(deftest rm-of-an-absent-key-fails
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")]
+      (encrypt-edn! {:a 1})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No such key"
+                            (with-out-str (cli/remove-secret! config "dev" ":nope"))))
+      (is (= {:a 1} (edn/read-string (age/decrypt *key* encrypted)))
+          "a failed rm never touches the ciphertext"))))
+
+(deftest rm-on-a-missing-store-fails-pointing-at-new-or-set
+  (let [config (cli/normalize-config (test-config))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No secrets file"
+                          (with-out-str (cli/remove-secret! config "dev" ":a"))))))
+
+(deftest invalid-key-argument-fails
+  (let [config (cli/normalize-config (test-config))]
+    (testing "neither a keyword nor a vector"
+      (doseq [bad ["not-a-keyword" "42" "{}" "\"a string\"" "nil"]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
+                              (with-out-str (cli/set-secret! config "dev" bad false)))
+            bad)))
+    (testing "an empty vector"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
+                            (with-out-str (cli/set-secret! config "dev" "[]" false)))))
+    (testing "a vector of non-keyword/string elements"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
+                            (with-out-str (cli/set-secret! config "dev" "[1 2]" false)))))
+    (testing "malformed EDN"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
+                            (with-out-str (cli/set-secret! config "dev" "[:unfinished" false)))))
+    (testing "a missing key argument"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing key"
+                            (with-out-str (cli/set-secret! config "dev" nil false)))))
+    (testing "the same validation applies to rm"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
+                            (with-out-str (cli/remove-secret! config "dev" "42")))))))
+
+(deftest run!-dispatches-set-and-rm-with-the-edn-flag-parsed-out-anywhere
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config    (test-config)
+          encrypted (str *dir* "/secrets.edn.age")]
+      (testing "run! dispatches set as <key> alone via the default env, --edn before it"
+        (with-out-str (with-in-str "42" (cli/run! config ["set" "--edn" ":n"])))
+        (is (= 42 (:n (edn/read-string (age/decrypt *key* encrypted))))))
+      (testing "run! dispatches set as [env] <key>, --edn after both"
+        (with-out-str (with-in-str "\"s\"" (cli/run! config ["set" "dev" ":m" "--edn"])))
+        (is (= "s" (:m (edn/read-string (age/decrypt *key* encrypted))))))
+      (testing "without --edn the value is stored as a plain string"
+        (with-out-str (with-in-str "plain" (cli/run! config ["set" "dev" ":p"])))
+        (is (= "plain" (:p (edn/read-string (age/decrypt *key* encrypted))))))
+      (testing "run! dispatches rm as [env] <key>"
+        (with-out-str (cli/run! config ["rm" "dev" ":n"]))
+        (is (not (contains? (edn/read-string (age/decrypt *key* encrypted)) :n)))))))
+
 ;; ---------- regressions ----------
 
 (deftest keygen-overwrites-a-confirmed-existing-key

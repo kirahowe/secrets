@@ -40,8 +40,8 @@
                       own key. Absent ⇒ single-key mode (encrypt to own key).
     :manifest false   disable the manifest for this environment.
 
-  Commands: keygen · new · edit · verify · show-key · add-recipient ·
-  recipients · reencrypt · encrypt · decrypt · help.
+  Commands: keygen · new · edit · set · rm · verify · show-key ·
+  add-recipient · recipients · reencrypt · encrypt · decrypt · help.
 
   Two committed artifacts per environment: `secrets.edn.age` (ciphertext) and
   `secrets.edn.manifest` (its safe, value-free shape — regenerated on every
@@ -55,6 +55,7 @@
   (:refer-clojure :exclude [run!])
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.pprint :as pprint]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [com.kirahowe.secrets :as secrets]
@@ -339,6 +340,50 @@
                   "    Ciphertext and manifest were left unchanged.")
              {:secrets-file (str secrets-file) :error error}))))
 
+(defn- parse-key-path
+  "Parse a `set`/`rm` CLI key argument as EDN into the vector `assoc-in` /
+  `get-in` / `update-in` expect: a bare keyword becomes a one-element path,
+  a vector of keywords/strings is a nested path. Rejects anything else —
+  including a missing argument — with a `fail!` naming both accepted forms,
+  so a typo'd path is caught before any file is touched."
+  [s]
+  (when (str/blank? (str s))
+    (fail! "Missing key. Accepted forms: a keyword (:some/key) or a vector path ([:a :b])."))
+  (let [value (try (edn/read-string (str s))
+                   (catch Exception e
+                     (fail! (str "Invalid key: " (pr-str s) " (" (ex-message e) ").\n"
+                                 "    Accepted forms: a keyword (:some/key) or a vector path ([:a :b]).")
+                            {:key s})))]
+    (cond
+      (keyword? value) [value]
+      (and (vector? value) (seq value) (every? #(or (keyword? %) (string? %)) value)) value
+      :else (fail! (str "Invalid key: " (pr-str value) ".\n"
+                        "    Accepted forms: a keyword (:some/key) or a vector path ([:a :b]).")
+                   {:key value}))))
+
+(defn- render-secrets
+  "Render a secrets map as the plaintext `set`/`rm` re-encrypt. Pretty-printed
+  so the file stays readable to the next `bb secrets edit`, and printed with
+  the length/level limits unbound: a REPL that has set `*print-length*` would
+  otherwise write `...` into the store and silently truncate secrets.
+
+  Note the whole file is regenerated, so comments a human wrote in an edited
+  store do not survive a `set` — the values do."
+  [value]
+  (binding [*print-length* nil *print-level* nil]
+    (with-out-str (pprint/pprint value))))
+
+(defn- strip-trailing-newline
+  "Strip exactly one trailing newline (\\n or \\r\\n) from `s`, so
+  `echo secret | bb secrets set …` stores the obvious value; anything else —
+  including a value that itself ends with a blank line — passes through
+  verbatim."
+  [s]
+  (cond
+    (str/ends-with? s "\r\n") (subs s 0 (- (count s) 2))
+    (str/ends-with? s "\n")   (subs s 0 (- (count s) 1))
+    :else                     s))
+
 (defn- sibling-temp-file!
   "Create a temporary file beside `target`, ensuring an atomic move to the
   target is possible whenever the filesystem supports atomic moves."
@@ -544,6 +589,109 @@
                 (ok "Secrets updated:" secrets-file)
                 (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env))))))
         secrets-file
+        (finally (secure-delete! tmp))))))
+
+(defn set-secret!
+  "Set one key path's value, read from **stdin** — never a command-line
+  argument, which would land in shell history and `ps`; the same care `edit!`
+  already takes by never putting plaintext anywhere but its owner-only temp
+  file. Reads all of stdin and strips exactly one trailing newline (\\n or
+  \\r\\n), so `echo secret | bb secrets set …` does the obvious thing; every
+  other byte is kept verbatim. By default the value is stored as a string;
+  with `edn?` true, stdin is instead parsed as EDN, so typed values — sets,
+  numbers, nested maps — can be set from a script. `key-arg` is an EDN key
+  path: a keyword, or a vector of keywords/strings for a nested path.
+
+  Creates the environment's secrets file, starting from an empty map, when it
+  does not exist yet, and says so — this is what makes initial-setup and
+  add-a-second-key bootstrap scriptable, the whole point of this command.
+  Returns the secrets-file path."
+  [config env-arg key-arg edn?]
+  (require-age!)
+  (let [path    (parse-key-path key-arg)
+        env     (resolve-env config env-arg)
+        {:keys [secrets-file identity-file]} env
+        exists? (.exists (io/file secrets-file))]
+    (when exists? (require-identity! env))
+    (require-encrypt-target! env)
+    (let [raw   (strip-trailing-newline (slurp *in*))
+          _     (when (str/blank? raw)
+                  ;; The same rule the library applies to a set-but-empty
+                  ;; SECRETS_AGE_IDENTITY: blank almost always means an unset
+                  ;; variable expanded to nothing (`echo "$KEY" | bb secrets
+                  ;; set …` in CI), and storing it produces a secret that
+                  ;; fails much later, far from the cause.
+                  (fail! (str "Nothing on stdin — refusing to store a blank value for "
+                              (pr-str path) ".\n"
+                              "    Pipe the value in:  printf %s \"$VALUE\" | bb secrets set …\n"
+                              "    To store an empty value deliberately, use --edn with \"\".")
+                         {:key path}))
+          value (if edn?
+                  (let [{:keys [ok? value error]} (parse-edn raw)]
+                    (if ok? value
+                        (fail! (str "Value on stdin is not valid EDN (" error ").")
+                               {:key path :error error})))
+                  raw)
+          tmp   (temp-plaintext!)]
+      (try
+        (let [current (if exists?
+                        (do (info "Decrypting" secrets-file "…")
+                            (let [{:keys [ok? value error]} (parse-edn (age/decrypt identity-file secrets-file))]
+                              (if ok? value
+                                  (fail! (str "Secrets are not valid EDN (" error ").")
+                                         {:secrets-file secrets-file :error error}))))
+                        (do (info "No secrets file at" secrets-file "— creating it.")
+                            {}))]
+          (spit tmp (render-secrets (assoc-in current path value)))
+          (info (if exists? "Re-encrypting…" "Encrypting…"))
+          (write-secrets! env tmp)
+          (ok "Set" (pr-str path) "in" secrets-file)
+          (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env)))
+          secrets-file)
+        (finally (secure-delete! tmp))))))
+
+(defn remove-secret!
+  "Remove one key path from an environment's secrets: decrypt → dissoc →
+  re-encrypt, the same no-plaintext-on-disk discipline as `edit!`. `key-arg`
+  is an EDN key path: a keyword, or a vector of keywords/strings for a nested
+  path. Fails when the secrets file does not exist yet, or when the path is
+  absent, rather than quietly doing nothing — a typo'd key path is a mistake
+  worth catching. Removing a nested path leaves its (possibly now empty)
+  parent map in place rather than pruning it, so the shape stays predictable.
+  Returns the secrets-file path."
+  [config env-arg key-arg]
+  (require-age!)
+  (let [path (parse-key-path key-arg)
+        env  (resolve-env config env-arg)
+        {:keys [secrets-file identity-file name]} env]
+    (require-identity! env)
+    (require-encrypt-target! env)
+    (when-not (.exists (io/file secrets-file))
+      (fail! (str "No secrets file at " secrets-file "\n"
+                  "    Create one with:  bb secrets new " (clojure.core/name name) "\n"
+                  "    or:               bb secrets set " (clojure.core/name name) " " (pr-str key-arg))
+             {:secrets-file secrets-file :environment name}))
+    (let [tmp (temp-plaintext!)]
+      (try
+        (info "Decrypting" secrets-file "…")
+        (let [{:keys [ok? value error]} (parse-edn (age/decrypt identity-file secrets-file))
+              current (if ok? value
+                          (fail! (str "Secrets are not valid EDN (" error ").")
+                                 {:secrets-file secrets-file :error error}))]
+          (when (= ::missing (get-in current path ::missing))
+            (fail! (str "No such key: " (pr-str path) " in " secrets-file)
+                   {:secrets-file secrets-file :key path}))
+          (let [parent (butlast path)
+                k      (last path)
+                updated (if (seq parent)
+                          (update-in current (vec parent) dissoc k)
+                          (dissoc current k))]
+            (spit tmp (render-secrets updated))
+            (info "Re-encrypting…")
+            (write-secrets! env tmp)
+            (ok "Removed" (pr-str path) "from" secrets-file)
+            (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env)))
+            secrets-file))
         (finally (secure-delete! tmp))))))
 
 (defn show-key!
@@ -758,6 +906,8 @@
   [["keygen"        "[env]"        "Generate an age key for an environment"]
    ["new"           "[env]"        "Create a new encrypted secrets file (opens $EDITOR)"]
    ["edit"          "[env]"        "Edit an existing secrets file (decrypt → edit → re-encrypt)"]
+   ["set"           "[env] <key> [--edn]" "Set a key's value from stdin (creates the file if missing)"]
+   ["rm"            "[env] <key>"  "Remove a key (fails if the key or file is absent)"]
    ["verify"        "[env]"        "Check the committed manifest matches the secrets"]
    ["show-key"      "[env]"        "Print public key(s) for sharing"]
    ["add-recipient" "[env] [key]"  "Add a public key to the env's recipients file"]
@@ -766,6 +916,13 @@
    ["encrypt"       "[env] <file>" "Encrypt an arbitrary file to <file>.age"]
    ["decrypt"       "[env] <file>" "Decrypt a <file>.age to stdout"]
    ["help"          ""             "Show this help"]])
+
+(defn- extract-flag
+  "Pull a boolean `flag` out of `args`, returning [present? remaining-args].
+  Parsed out before positional dispatch (only `run!` calls this) so a flag can
+  appear anywhere among the args without shifting the optional [env]."
+  [flag args]
+  [(boolean (some #{flag} args)) (remove #{flag} args)])
 
 (defn- print-help [{:keys [environments default-environment]}]
   (println (paint :bold "Manage encrypted secrets (age).") "\n")
@@ -799,11 +956,22 @@
   [config args]
   (try
     (let [config (normalize-config config)
-          [cmd & more] args]
+          [cmd & more] args
+          ;; --edn only means anything to `set`, but pulling it out here (not
+          ;; inside that branch) keeps [env] positional and optional either way.
+          [edn? more] (extract-flag "--edn" more)]
       (case (some-> cmd str/lower-case)
         "keygen"        (keygen!        config (first more))
         "new"           (new!           config (first more))
         "edit"          (edit!          config (first more))
+        ;; set/rm take [env] <key>; with one arg it is the key, and the
+        ;; default environment applies — same convention as encrypt/decrypt.
+        "set"           (if (second more)
+                          (set-secret! config (first more) (second more) edn?)
+                          (set-secret! config nil (first more) edn?))
+        "rm"            (if (second more)
+                          (remove-secret! config (first more) (second more))
+                          (remove-secret! config nil (first more)))
         "verify"        (let [{:keys [exit]} (verify! config (first more))]
                           (when (pos? exit) (System/exit exit)))
         "show-key"      (show-key!      config (first more))
