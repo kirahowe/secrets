@@ -427,6 +427,23 @@
         (.delete ciphertext-temp)
         (when manifest-temp (.delete manifest-temp))))))
 
+(defn- append-recipient!
+  "Append `pub` to the recipients file `f`, preserving everything already in it.
+  A recipients file is hand-maintained — comments naming whose key each line is,
+  blank-line grouping, ordering — so the new key is appended to the existing
+  bytes rather than the file being regenerated from the keys we parsed out of
+  it. Written through a sibling temp file and an atomic move, so a failure
+  mid-write cannot truncate a file holding other people's keys."
+  [f pub]
+  (let [current (when (.exists f) (slurp f))
+        tmp     (sibling-temp-file! f ".recipients.tmp")]
+    (try
+      (spit tmp (str current
+                     (when-not (or (empty? current) (str/ends-with? current "\n")) "\n")
+                     pub "\n"))
+      (atomic-replace! tmp f)
+      (finally (.delete tmp)))))
+
 ;; ---------- Commands ----------
 
 (defn keygen!
@@ -607,8 +624,7 @@
           (do (info "Already a recipient of" (str nm ":") pub)
               pub)
           (let [f (io/file (str recipients-file))]
-            (when-let [p (.getParentFile f)] (.mkdirs p))
-            (spit f (str (str/join "\n" (conj (vec existing) pub)) "\n"))
+            (append-recipient! f pub)
             (ok "Added recipient to" recipients-file)
             (println "   " pub)
             (warn "Re-encrypt so the new recipient can read existing secrets:")

@@ -348,3 +348,43 @@
           "no staging leftovers beside the key")
       (is (empty? (filter #(re-find #"\.regen\.txt\.keygen" %) (.list (io/file *dir*))))
           "the temp staging directory is cleaned up"))))
+
+(deftest add-recipient-preserves-comments-and-layout
+  (let [recipients (str *dir* "/recipients.txt")
+        original   (str "# Team recipients — keep sorted by name\n"
+                        "\n"
+                        "# Kira (laptop)\n"
+                        "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\n"
+                        "\n"
+                        "# Bot (CI)\n"
+                        "age1wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n")
+        newkey     "age1eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        config     (cli/normalize-config (test-config {:recipients-file recipients}))]
+    (spit recipients original)
+    (with-out-str (cli/add-recipient! config "dev" newkey))
+    (let [after (slurp recipients)]
+      (testing "the existing bytes are left exactly as they were"
+        (is (= original (subs after 0 (count original)))))
+      (testing "and the new key is appended"
+        (is (= (str original newkey "\n") after)))
+      (testing "so comments survive a round trip"
+        (is (re-find #"# Kira \(laptop\)" after))
+        (is (re-find #"# Bot \(CI\)" after))))
+    (testing "a re-add is a no-op, not a rewrite"
+      (let [before (slurp recipients)]
+        (with-out-str (cli/add-recipient! config "dev" newkey))
+        (is (= before (slurp recipients)))))
+    (testing "a file with no trailing newline still gets a separated key"
+      (let [f (str *dir* "/nonl.txt")
+            c (cli/normalize-config (test-config {:recipients-file f}))]
+        (spit f "# lead\nage1rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr")
+        (with-out-str (cli/add-recipient! c "dev" newkey))
+        (is (= (str "# lead\n"
+                    "age1rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr\n"
+                    newkey "\n")
+               (slurp f)))))
+    (testing "a missing recipients file is created without a leading blank line"
+      (let [f (str *dir* "/fresh/recipients.txt")
+            c (cli/normalize-config (test-config {:recipients-file f}))]
+        (with-out-str (cli/add-recipient! c "dev" newkey))
+        (is (= (str newkey "\n") (slurp f)))))))
