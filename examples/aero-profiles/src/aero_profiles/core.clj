@@ -1,4 +1,5 @@
 (ns aero-profiles.core
+  (:refer-clojure :exclude [run!])
   (:require [aero.core :as aero]
             [com.kirahowe.secrets.aero :as secrets-aero]))
 
@@ -22,16 +23,16 @@
                                   {:profile profile
                                    ;; Per-read configuration is intentionally
                                    ;; explicit; no process-wide register! call.
-                                   :secrets secrets-config})]
-     (let [status {:profile profile
-                    :profile-name (:profile-name config)
-                    :api-key-configured (some? (:api-key config))
-                    :optional-integration-configured
-                    (some? (:optional-integration config))}]
-       (println (pr-str status))
-       ;; Return only the derived status as well, so a REPL caller cannot
-       ;; accidentally echo a resolved secret map.
-       status))))
+                                   :secrets secrets-config})
+         status {:profile profile
+                 :profile-name (:profile-name config)
+                 :api-key-configured (some? (:api-key config))
+                 :optional-integration-configured
+                 (some? (:optional-integration config))}]
+     (println (pr-str status))
+     ;; Return only the derived status as well, so a REPL caller cannot
+     ;; accidentally echo a resolved secret map.
+     status)))
 
 (defn -main [& args]
   (run! (first args) (second args)))
