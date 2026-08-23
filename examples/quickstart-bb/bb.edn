@@ -24,6 +24,7 @@
 
   run
   {:doc "Read config.edn with native clojure.edn and secret reader tags"
+   :override-builtin true
    :task (shell "bb" "-m" "quickstart")}
 
   verify
