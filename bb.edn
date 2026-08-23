@@ -1,7 +1,8 @@
 ;; Tasks for developing, building, and publishing the library itself.
 ;; (Consumers wire `com.kirahowe.secrets.cli` into their *own* bb.edn — see the
 ;; README.) The build/install/deploy tasks shell out to `clojure -T:build …`,
-;; which needs a JDK on the PATH; everything else runs under babashka alone.
+;; which needs a JDK on the PATH. The test task also needs Java because this
+;; bb.edn resolves Maven dependencies before Babashka can load them.
 {:paths ["src" "test"]
  :deps  {aero/aero {:mvn/version "1.1.6"}}
 

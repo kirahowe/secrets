@@ -5,7 +5,9 @@ This example uses `com.kirahowe/secrets` from the repository root via
 age public recipients, an encrypted fixture, and a value-free manifest that a
 CI job can verify without installing age or receiving a private identity.
 
-The keyless fixture gate needs only Babashka (`bb`); it does not need age, a
+From this checkout, the fixture gate needs Babashka (`bb`) and `java` because
+this example's `bb.edn` uses `{:local/root "../.."}` and Babashka `1.13.219`
+resolves that through Java-backed deps tooling. It does not need `age`, a
 private identity, or secret values. The Alice/Bob demo additionally needs the
 `age` CLI. From this directory, the committed fixture can be checked without
 any key:

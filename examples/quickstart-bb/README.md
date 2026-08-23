@@ -5,7 +5,10 @@ It encrypts a development EDN map with `age`, then reads `config.edn` using
 native `clojure.edn` and `secrets/merge-readers`. The sample program prints only
 safe configured/presence status; it never prints the endpoint or API key values.
 
-Requirements: `bb` (Babashka) and `age` on `PATH`. From this directory:
+Requirements from this checkout: `bb` (Babashka), `age`, and `java` on `PATH`,
+because this example's `bb.edn` uses a normal dependency entry
+(`{:local/root "../.."}`) and Babashka `1.13.219` resolves that through its
+Java-backed deps tooling. From this directory:
 
 ```sh
 bb bootstrap   # creates .local/age-key.txt and fake encrypted values

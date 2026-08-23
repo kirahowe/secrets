@@ -6,8 +6,9 @@ everything else — structure, defaults, and the encrypted ciphertext itself —
 lives in git, with a committed value-free manifest that makes each change
 reviewable.
 
-- **No dependencies.** Nothing beyond Clojure itself, and it loads and runs
-  the same under JVM Clojure and [babashka](https://babashka.org).
+- **No additional Clojure libraries.** It uses core Clojure APIs plus the
+  `age` CLI, and once on the classpath it runs the same under JVM Clojure and
+  [babashka](https://babashka.org).
 - **A `bb secrets` task.** `keygen` · `new` · `edit` · `set` · `rm` · `verify` ·
   `show-key` · `add-recipient` · `recipients` · `reencrypt` · `encrypt` ·
   `decrypt`, wired into any project with one task definition.
@@ -49,15 +50,26 @@ com.kirahowe/secrets {:local/root "../secrets"}
 ```
 
 For sharing across repos and remote/CI builds, prefer a git or Maven coordinate
-(a `:local/root` does not resolve inside a remote Docker build, where the sibling
-isn't in the build context):
+when running on JVM Clojure. In Babashka `1.13.219`, every normal `bb.edn`
+dependency mode tested here requires Java: `:local/root`, Git coordinates, and
+Maven coordinates. Warming the Git or Maven dependency caches does not remove
+that requirement. The Java-free Babashka path is an already materialized
+classpath, with the library source placed directly on `:paths` or supplied as
+an explicit classpath. (A `:local/root` does not resolve inside a remote Docker
+build, where the sibling isn't in the build context):
 
 ```clojure
 ;; git
 io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}
-;; or Maven, after `clojure -T:build install` / a Clojars deploy
+;; or Maven, after `clojure -T:build install` locally or a future Clojars deploy
 com.kirahowe/secrets {:mvn/version "0.1.0"}
 ```
+
+As of 2026-08-23 there is no public Maven artifact for `com.kirahowe/secrets`.
+The Maven example above is for local JVM installs and future publication, not a
+currently fetchable coordinate. With Babashka `1.13.219`, the CLI,
+`merge-readers`, `load-secrets`, `decrypt`, and `verify` run without Java only
+after the library is already on the classpath directly.
 
 ## Quick start
 
@@ -462,7 +474,7 @@ starters: [quickstart-bb](examples/quickstart-bb/README.md),
 ## Development
 
 ```sh
-bb test                    # run the suite under babashka (needs age installed)
+bb test                    # run the suite under babashka (needs age and Java/JDK for deps)
 bb secrets help            # demo the CLI against a throwaway tmp/ file
 clojure -T:build install   # build + install the jar to ~/.m2 (needs a JDK)
 ```

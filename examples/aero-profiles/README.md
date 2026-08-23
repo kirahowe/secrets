@@ -10,7 +10,10 @@ The config demonstrates three useful behaviours:
 - `#secret/opt` makes an absent optional integration resolve to `nil`.
 - `reset-cache!` is called by the REPL-friendly `run!` helper when requested.
 
-All setup data is disposable fake data. From this directory:
+All setup data is disposable fake data. From this checkout you need `bb`,
+`age`, and `java` on `PATH`: this example's `bb.edn` uses both Maven
+(`aero/aero`) and `:local/root` dependencies, and Babashka `1.13.219`
+resolves both through Java-backed deps tooling. From this directory:
 
 ```sh
 bb bootstrap
