@@ -9,7 +9,9 @@ reviewable.
 - **No additional Clojure libraries.** It uses core Clojure APIs plus the
   `age` CLI, and once on the classpath it runs the same under JVM Clojure and
   [babashka](https://babashka.org).
-- **A `bb secrets` task.** `keygen` · `new` · `edit` · `set` · `rm` · `verify` ·
+- **A safe project initializer and `bb secrets` task.** Bootstrap with a
+  previewed `bb.edn` merge, then use `keygen` · `new` · `edit` · `set` · `rm` ·
+  `verify` ·
   `show-key` · `add-recipient` · `recipients` · `reencrypt` · `encrypt` ·
   `decrypt`, wired into any project with one task definition.
 - **Two ways to consume secrets:** `#secret/req` / `#secret/opt` EDN reader
@@ -73,19 +75,71 @@ after the library is already on the classpath directly.
 
 ## Quick start
 
-**1. Wire the task** into your `bb.edn`:
+**1. Initialize the project.** Until a release containing the initializer is
+tagged, invoke it from this source checkout (replace the path with the checkout's
+absolute `src` path):
+
+```sh
+bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
+```
+
+The initializer proposes a minimal `dev` store, shows the complete `bb.edn` and
+template diff, and then offers to apply it, print the configuration for manual
+integration, or cancel. `--keygen` is an explicit request to generate the
+identity at `~/.config/myapp/key.txt`; it runs only after you accept and the
+public scaffold succeeds. Omit it to leave all private-key handling for a later
+`bb secrets keygen` command. Nothing is committed automatically.
+
+The default tracked layout is:
+
+```text
+bb.edn
+secrets/secrets.edn.example
+secrets/secrets.edn.age       # created by the first set/new; safe to commit
+secrets/secrets.edn.manifest  # created with the ciphertext; value-free
+~/.config/myapp/key.txt       # private identity; outside the repository
+```
+
+Existing `bb.edn` comments and unrelated forms are preserved. A conflicting
+dependency or `secrets` task is refused rather than overwritten. Existing valid
+templates and hand-maintained recipients files are also preserved.
+
+For a non-interactive scaffold, `--apply` is the explicit confirmation after
+the preview. Other layout options are described under [Initialization
+layouts](#initialization-layouts).
+
+**2. Set the first value through stdin.** This interactive shell form disables
+echo while reading and never places the value in shell history or a process
+argument:
+
+```sh
+IFS= read -rs SECRET; printf '%s' "$SECRET" | bb secrets set :example/api-key; unset SECRET
+```
+
+**3. Verify the resulting store:**
+
+```sh
+bb secrets verify
+```
+
+For comparison, the minimum configuration the initializer adds is the same
+manual wiring shown below. Use this directly when you choose the initializer's
+"manual" option or need a layout it should not infer:
 
 ```clojure
-{:deps  {com.kirahowe/secrets {:local/root "../secrets"}}
+{:deps  {io.github.kirahowe/secrets
+         {:git/tag "v0.1.0"
+          :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}}
  :tasks {secrets
          {:doc      "Manage encrypted secrets (age)"
           :requires ([com.kirahowe.secrets.cli :as secrets-cli])
           :task     (secrets-cli/run!
                      {:app "myapp"
-                      :default-environment :prod
+                      :default-environment :dev
                       :environments
-                      {:prod {:secrets-file "env/prod/resources/secrets.edn.age"}
-                       :dev  {:secrets-file "env/dev/resources/secrets.edn.age"}}}
+                      {:dev {:secrets-file "secrets/secrets.edn.age"
+                             :template "secrets/secrets.edn.example"
+                             :manifest "secrets/secrets.edn.manifest"}}}
                      *command-line-args*)}}}
 ```
 
@@ -99,35 +153,36 @@ collide with (and overwrite) the ciphertext itself — unless you set both
 `:template` and `:manifest` explicitly. Ciphertext, manifest, template, key,
 and recipients paths must resolve to distinct canonical paths.
 
-**2. Create secrets:**
+To create a store through an editor instead of the stdin-based three-command
+flow:
 
 ```sh
-bb secrets keygen prod    # → ~/.config/myapp/key.txt  (BACK THIS UP — not in git)
-bb secrets new prod       # opens $EDITOR with the template; fill in, save, encrypt
+bb secrets keygen dev    # → ~/.config/myapp/key.txt  (BACK THIS UP — not in git)
+bb secrets new dev       # opens $EDITOR with the template; fill in, save, encrypt
 ```
 
 `new` seeds your editor from `secrets.edn.example` (if present) so the shape is
 self-documenting. Saving writes `secrets.edn.age` (ciphertext) and
 `secrets.edn.manifest` (its value-free shape) — commit both.
 
-**3. Day to day:**
+Day to day:
 
 ```sh
-bb secrets edit prod      # decrypt → $EDITOR → re-encrypt (no plaintext left on disk)
+bb secrets edit dev      # decrypt → $EDITOR → re-encrypt (no plaintext left on disk)
 bb secrets show-key       # print public key(s) to share with teammates
-bb secrets decrypt prod env/prod/resources/secrets.edn.age  # plaintext to stdout
+bb secrets decrypt dev secrets/secrets.edn.age  # plaintext to stdout
 ```
 
 Every command takes the environment first (`bb secrets decrypt [env] <file>`);
 omit it to use the default environment. `decrypt` writes to stdout byte-for-byte,
 so it works for any `.age` file, not just EDN.
 
-**4. Non-interactively** (scripts, bootstrap, CI):
+Non-interactively (scripts, bootstrap, CI):
 
 ```sh
-printf %s "sk-live-…" | bb secrets set prod :openrouter/api-key
-echo '#{"a@b.com" "b@b.com"}' | bb secrets set prod :auth/admins --edn
-bb secrets rm prod :openrouter/old-key
+printf %s "sk-live-…" | bb secrets set dev :openrouter/api-key
+echo '#{"a@b.com" "b@b.com"}' | bb secrets set dev :auth/admins --edn
+bb secrets rm dev :openrouter/old-key
 ```
 
 `set` reads the value from **stdin**, never a command-line argument, so it
@@ -355,6 +410,37 @@ hold the value for production.
 | Container / VM | env var, `age` installed in the image |
 | Edge runtime (Workers, Deno Deploy) | **it doesn't** — use the platform's own secret store; this library covers dev and CI |
 
+## Initialization layouts
+
+The initializer requires `--app`, defaults to `--env dev`, and supports these
+explicit layouts:
+
+| Invocation | Template | Ciphertext + manifest | Identity | Recipients |
+| --- | --- | --- | --- | --- |
+| default tracked | `secrets/secrets.edn.example` | `secrets/secrets.edn.{age,manifest}` | `~/.config/<app>/key.txt` | none |
+| `--team` | same tracked template | same tracked store | external app key | tracked `secrets/recipients.txt` |
+| `--layout disposable` | tracked `secrets/secrets.edn.example` | ignored `.local/secrets/secrets.edn.{age,manifest}` | ignored `.local/secrets/key.txt` | ignored `.local/secrets/recipients.txt` with `--team` |
+
+The tracked template is safe documentation and contains placeholders, never
+real values. The ciphertext is safe encrypted data. The manifest is plaintext
+but value-free; it exposes key names and shapes as described below. A recipients
+file contains public keys only. These four public artifacts and `bb.edn` may be
+committed. Private identities, decrypted plaintext, and the explicit
+`.local/secrets/` disposable layout must not be committed.
+
+Team initialization creates or preserves the public recipients file, but does
+not silently add a key to it. After explicitly generating a personal identity,
+run `bb secrets add-recipient dev` before creating the first team ciphertext.
+All configured artifact paths must remain canonically distinct; aliases such as
+`secret.age` and `./secret.age` count as the same path and are rejected.
+
+The four included consumers illustrate different needs rather than four copies
+of one schema: quickstart, Aero, and team-CI carry CLI configuration in
+`bb.edn`; the Integrant service uses JVM runtime wiring and a shell bootstrap.
+The common CLI schema is only `:app`, `:default-environment`, and an environment
+with `:secrets-file`. Template, manifest, and key paths derive from that minimum;
+disposable and multi-recipient layouts make their exceptional paths explicit.
+
 ## Environments
 
 Each environment is an independent encrypted file. By default they share one key
@@ -462,6 +548,12 @@ drift. Disable the manifest for an environment with `:manifest false`.
 `com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
 
 `com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits; `(verify! config env)` returns `{:results {env status} :exit code}`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, no blank path strings, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side `:identity-file` resolves from the `SECRETS_AGE_IDENTITY*` env vars before falling back to its `:key-file`, so CI holding only `SECRETS_AGE_IDENTITY` can encrypt, decrypt, and verify.
+
+`com.kirahowe.secrets.init` — Babashka-only project bootstrap entrypoint.
+`(-main & args)` parses `--app`, optional `--env`, `--layout`, `--team`,
+`--keygen`, and `--apply`; `(init! opts)` exposes the preview/apply operation for
+programmatic use. It preserves `bb.edn` formatting with Babashka's bundled
+`rewrite-clj`, refuses conflicts and unsafe paths, and returns a status map.
 
 ## Examples
 

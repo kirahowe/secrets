@@ -65,6 +65,9 @@ jobs:
       - name: Run Babashka tests
         run: bb test
 
+      - name: Smoke-test project initialization
+        run: bash .github/scripts/smoke-project-initialization.sh
+
       - name: Smoke-test quickstart example
         working-directory: examples/quickstart-bb
         shell: bash

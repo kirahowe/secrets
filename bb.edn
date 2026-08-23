@@ -12,10 +12,12 @@
    :requires ([clojure.test :as t]
               [com.kirahowe.secrets-test]
               [com.kirahowe.secrets.cli-test]
-              [com.kirahowe.secrets.aero-test])
+              [com.kirahowe.secrets.aero-test]
+              [com.kirahowe.secrets.init-test])
    :task     (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
                                                      'com.kirahowe.secrets.cli-test
-                                                     'com.kirahowe.secrets.aero-test)]
+                                                     'com.kirahowe.secrets.aero-test
+                                                     'com.kirahowe.secrets.init-test)]
                (System/exit (if (pos? (+ fail error)) 1 0)))}
 
   clean
