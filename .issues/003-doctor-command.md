@@ -1,6 +1,6 @@
 # 003 — Doctor command
 
-Status: `open`
+Status: `completed`
 Priority: P1
 
 ## Problem
@@ -29,21 +29,21 @@ possible next.
 
 ## Acceptance criteria
 
-- [ ] Reports whether age is available and its version, without dumping command
+- [x] Reports whether age is available and its version, without dumping command
       environment or arguments.
-- [ ] Reports selected environment and canonical artifact paths plus existence
+- [x] Reports selected environment and canonical artifact paths plus existence
       for ciphertext, manifest, template, key, and recipients file.
-- [ ] Names the identity source (`:identity-file`, environment variable source,
+- [x] Names the identity source (`:identity-file`, environment variable source,
       or configured/default path) and reports usability only; never prints its
       path contents, raw value, or private key text where that would expose
       material.
-- [ ] Reports single-key versus multi-recipient mode, recipient validity, and
+- [x] Reports single-key versus multi-recipient mode, recipient validity, and
       recipient count without exposing private material.
-- [ ] States whether `verify` can run keylessly (manifest-only) or requires a
+- [x] States whether `verify` can run keylessly (manifest-only) or requires a
       usable identity for full verification.
-- [ ] Uses stable, scriptable exit behavior: healthy, warning/action-needed,
+- [x] Uses stable, scriptable exit behavior: healthy, warning/action-needed,
       and invalid configuration are distinguishable and documented.
-- [ ] Output remains safe when environment variables contain raw or base64
+- [x] Output remains safe when environment variables contain raw or base64
       identity contents; values are never echoed.
 
 ## Non-goals
@@ -56,11 +56,11 @@ possible next.
 
 ## Verification
 
-Exercise the command against missing and present artifacts, absent/invalid age,
-single-key and multi-recipient configurations, valid and invalid recipient
-lines, keyless fixtures, and identities supplied by each supported environment
-source. Assert that captured stdout/stderr contain no identity contents or
-secret values and that exit codes are stable.
+Focused coverage exercises healthy, warning, and invalid exits; missing and
+present artifacts; absent age; single-key and multi-recipient configurations;
+valid, invalid, empty, and missing recipient files; keyless/full/skipped
+capability; every identity source; raw/base64 sentinel non-disclosure; public
+REPL-safe return behavior; and pre-normalization CLI dispatch.
 
 ## Dependencies / related files
 

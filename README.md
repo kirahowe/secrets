@@ -11,9 +11,9 @@ reviewable.
   [babashka](https://babashka.org).
 - **A safe project initializer and `bb secrets` task.** Bootstrap with a
   previewed `bb.edn` merge, then use `keygen` · `new` · `edit` · `set` · `rm` ·
-  `verify` ·
-  `show-key` · `add-recipient` · `recipients` · `reencrypt` · `encrypt` ·
-  `decrypt`, wired into any project with one task definition.
+  `verify` · `doctor` · `show-key` · `add-recipient` · `recipients` ·
+  `reencrypt` · `encrypt` · `decrypt`, wired into any project with one task
+  definition.
 - **Two ways to consume secrets:** `#secret/req` / `#secret/opt` EDN reader
   literals, or a plain `load-secrets` map for Integrant/component setups.
 - **Solo or team.** Encrypt to your own key, or to a committed list of
@@ -531,6 +531,38 @@ two modes:
 `verify` also reads the manifest's `:version` and treats an unsupported one as
 drift. Disable the manifest for an environment with `:manifest false`.
 
+## Diagnosing configuration
+
+Run `bb secrets doctor [env]` before an operation to inspect one explicitly
+selected environment, or the configured default when `[env]` is omitted. It
+reports the installed `age` version, selected environment, single-key or
+multi-recipient mode, and canonical paths plus existence for the ciphertext,
+manifest, template, key, and recipients file. Disabled manifests and
+unconfigured recipients files are labeled explicitly.
+
+Recipient diagnostics contain only count and validity. Identity diagnostics
+contain only the source label (`SECRETS_AGE_IDENTITY_FILE`,
+`SECRETS_AGE_IDENTITY`, `SECRETS_AGE_IDENTITY_B64`, `:identity-file`,
+`configured key path`, or `default key path`) and whether it is usable. The
+command never returns or prints identity environment values, materialized
+raw/base64 identity paths, recipient lines, private-key text, or secret values.
+
+The verification fields distinguish a keyless freshness check from full
+verification. Keyless verification is available only when ciphertext exists
+and a readable version-1 manifest contains `:ciphertext-sha`; full verification
+requires `age`, a usable identity, ciphertext, and a manifest. A disabled
+manifest is reported as `skipped`.
+
+`doctor` has exact, scriptable exit meanings:
+
+- **0 — healthy:** the selected configuration is complete.
+- **1 — warning/action needed:** a required tool, file, or identity is missing,
+  recipients are unreadable, the manifest needs attention, or verification
+  cannot run.
+- **2 — invalid configuration:** normalization fails, the environment cannot be
+  selected, or a configured recipients file is empty or contains invalid
+  recipients.
+
 ## API
 
 `com.kirahowe.secrets`
@@ -543,11 +575,11 @@ drift. Disable the manifest for an environment with `:manifest false`.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
 
-`com.kirahowe.secrets.age` — `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte).
+`com.kirahowe.secrets.age` — `version`, `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte).
 
 `com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
 
-`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits; `(verify! config env)` returns `{:results {env status} :exit code}`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, no blank path strings, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side `:identity-file` resolves from the `SECRETS_AGE_IDENTITY*` env vars before falling back to its `:key-file`, so CI holding only `SECRETS_AGE_IDENTITY` can encrypt, decrypt, and verify.
+`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits. `(verify! config env)` returns `{:results {env status} :exit code}`; `(doctor! config env)` safely normalizes one raw selected/default environment and returns its structured age, artifact, identity-source, recipient, and verification-capability fields plus `:status` and `:exit`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :identity-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, no blank path strings, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side identity resolves from the `SECRETS_AGE_IDENTITY*` env vars before an explicit `:identity-file`, then falls back to its configured/default `:key-file`.
 
 `com.kirahowe.secrets.init` — Babashka-only project bootstrap entrypoint.
 `(-main & args)` parses `--app`, optional `--env`, `--layout`, `--team`,

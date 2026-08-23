@@ -5,6 +5,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.manifest :as manifest]))
@@ -41,6 +42,30 @@
   (is (= (str (System/getProperty "user.home") "/.config/x")
          (secrets/expand-home "~/.config/x")))
   (is (= "/abs/path" (secrets/expand-home "/abs/path"))))
+
+(deftest age-version-test
+  (testing "successful stdout is trimmed"
+    (with-redefs [shell/sh (fn [& args]
+                            (is (= ["age" "--version"] args))
+                            {:exit 0 :out "  age 1.2.3 \n" :err ""})]
+      (is (= "age 1.2.3" (age/version)))))
+  (testing "successful stderr is used when stdout is blank"
+    (with-redefs [shell/sh (fn [& _]
+                            {:exit 0 :out " \n" :err " age 1.2.3 \n"})]
+      (is (= "age 1.2.3" (age/version)))))
+  (testing "nonzero exit returns nil even with stderr"
+    (with-redefs [shell/sh (fn [& _]
+                            {:exit 1 :out "" :err "age failed with sensitive detail"})]
+      (is (nil? (age/version)))))
+  (testing "execution exceptions return nil"
+    (with-redefs [shell/sh (fn [& _]
+                            (throw (java.io.IOException. "age is unavailable")))]
+      (is (nil? (age/version)))))
+  (testing "installed status follows version presence"
+    (with-redefs [age/version (constantly "age 1.2.3")]
+      (is (true? (age/installed?))))
+    (with-redefs [age/version (constantly nil)]
+      (is (false? (age/installed?))))))
 
 (deftest age-roundtrip
   (testing "encrypt then decrypt returns the original bytes"

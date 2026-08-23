@@ -15,13 +15,22 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]))
 
+(defn version
+  "Return the installed `age` version string, or nil when `age` is unavailable
+  or its version query fails. Only successful version output is returned:
+  subprocess arguments, environment, and failure details are never exposed."
+  []
+  (try
+    (let [{:keys [exit out err]} (shell/sh "age" "--version")]
+      (when (zero? exit)
+        (let [s (str/trim (if (str/blank? out) err out))]
+          (when-not (str/blank? s) s))))
+    (catch Exception _ nil)))
+
 (defn installed?
   "True when the `age` binary is on the PATH (the decrypt path needs only this)."
   []
-  (boolean
-   (try
-     (zero? (:exit (shell/sh "age" "--version")))
-     (catch Exception _ false))))
+  (some? (version)))
 
 (defn ensure-installed!
   "Throw a helpful ex-info unless `age` is installed."

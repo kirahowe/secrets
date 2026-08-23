@@ -40,7 +40,7 @@
                       own key. Absent ⇒ single-key mode (encrypt to own key).
     :manifest false   disable the manifest for this environment.
 
-  Commands: keygen · new · edit · set · rm · verify · show-key ·
+  Commands: keygen · new · edit · set · rm · verify · doctor · show-key ·
   add-recipient · recipients · reencrypt · encrypt · decrypt · help.
 
   By default, each environment commits `secrets.edn.age` (ciphertext) and
@@ -108,6 +108,24 @@
   [app]
   (secrets/expand-home (str "~/.config/" app "/key.txt")))
 
+(def ^:private identity-env-sources
+  [["SECRETS_AGE_IDENTITY_FILE" :secrets-age-identity-file]
+   ["SECRETS_AGE_IDENTITY" :secrets-age-identity]
+   ["SECRETS_AGE_IDENTITY_B64" :secrets-age-identity-b64]])
+
+(defn- getenv [name]
+  (System/getenv name))
+
+(defn- configured-identity-source
+  "Name the first configured identity environment variable without retaining or
+  returning its value. `identity-from-env` remains responsible for validation
+  and materialization."
+  []
+  (some (fn [[variable source]]
+          (when (some? (getenv variable)) source))
+        identity-env-sources))
+
+
 (defn- require-path!
   "Reject a blank artifact path, returning `path` otherwise. Only strings are
   checked, so documented non-string values (`:manifest false` to disable the
@@ -142,7 +160,7 @@
   (assoc config
          :environments
          (into {}
-               (map (fn [[env {:keys [secrets-file key-file template manifest recipients-file] :as e}]]
+               (map (fn [[env {:keys [secrets-file key-file identity-file template manifest recipients-file] :as e}]]
                       (when-not (string? secrets-file)
                         (fail! (str "Environment " env " has no :secrets-file (a path string is required).")
                                {:environment env :env-config e}))
@@ -154,9 +172,21 @@
                                     "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
                                     "    explicitly.")
                                {:environment env :secrets-file secrets-file}))
-                      (let [key-file        (if key-file
+                      (let [configured-key-file?      (boolean key-file)
+                            configured-identity-file? (and (contains? e :identity-file)
+                                                           (some? identity-file))
+                            key-file        (if configured-key-file?
                                               (secrets/expand-home key-file)
                                               (default-key-file app))
+                            explicit-identity (when configured-identity-file?
+                                                (secrets/expand-home identity-file))
+                            env-identity     (secrets/identity-from-env)
+                            key-file-source  (if configured-key-file? :configured :default)
+                            identity-source  (or (when env-identity (configured-identity-source))
+                                                 (when configured-identity-file? :identity-file)
+                                                 (if configured-key-file?
+                                                   :configured-key-file
+                                                   :default-key-file))
                             template        (if (contains? e :template)
                                               template
                                               (str/replace secrets-file #"\.age$" ".example"))
@@ -165,6 +195,7 @@
                                               (str/replace secrets-file #"\.age$" ".manifest"))
                             recipients-file (some-> recipients-file secrets/expand-home)
                             _               (do (require-path! env :key-file key-file)
+                                                (require-path! env :identity-file explicit-identity)
                                                 (require-path! env :template template)
                                                 (require-path! env :manifest manifest)
                                                 (require-path! env :recipients-file recipients-file))
@@ -190,8 +221,11 @@
                                     :secrets-file secrets-file
                                     :key-file key-file
                                     ;; Decrypt-side identity: SECRETS_AGE_IDENTITY* env vars win,
-                                    ;; then the configured/default key path.
-                                    :identity-file (or (secrets/identity-from-env) key-file)
+                                    ;; then an explicit :identity-file, then the configured/default
+                                    ;; key path.
+                                    :identity-file (or env-identity explicit-identity key-file)
+                                    :identity-source identity-source
+                                    :key-file-source key-file-source
                                     ;; Explicit values (incl. :manifest false) are always
                                     ;; kept; absent ⇒ derive from the secrets file.
                                     :template template
@@ -932,6 +966,208 @@
                     (statuses :missing) 2
                     :else               0)}))
 
+;; ---------- Doctor ----------
+
+(defn- artifact-state
+  "Describe a configured artifact without reading it. Disabled and unconfigured
+  artifacts have no path; every configured path is canonical."
+  [path absent-state]
+  (if (string? path)
+    (let [f (io/file path)]
+      {:state :configured
+       :path (canonical-path path)
+       :exists? (boolean (.exists f))})
+    {:state absent-state
+     :path nil
+     :exists? false}))
+
+(defn- usable-file?
+  "True only for a readable regular file. Never returns or reports its path."
+  [path]
+  (try
+    (let [f (io/file (str path))]
+      (boolean (and path (.isFile f) (.canRead f))))
+    (catch Exception _ false)))
+
+(defn- recipient-state
+  "Summarize recipients without retaining any recipient line."
+  [recipients-file artifact]
+  (cond
+    (nil? recipients-file)
+    {:state :unconfigured :count 0 :valid? nil}
+
+    (not (:exists? artifact))
+    {:state :missing :count nil :valid? nil}
+
+    :else
+    (try
+      (let [recipients   (read-recipients recipients-file)
+            count-all   (count recipients)
+            invalid-all (count (remove age/valid-recipient? recipients))]
+        (cond
+          (zero? count-all)
+          {:state :empty :count 0 :valid? false}
+
+          (pos? invalid-all)
+          {:state :invalid
+           :count count-all
+           :valid? false
+           :invalid-count invalid-all}
+
+          :else
+          {:state :valid :count count-all :valid? true}))
+      (catch Exception _
+        {:state :unreadable :count nil :valid? nil}))))
+
+(defn- manifest-state
+  "Report whether a configured manifest supports a keyless freshness check.
+  Manifest contents and parse errors are deliberately omitted."
+  [manifest artifact]
+  (cond
+    (not (string? manifest)) {:state :disabled}
+    (not (:exists? artifact)) {:state :missing}
+    :else
+    (try
+      (let [value (edn/read-string (slurp (io/file manifest)))]
+        (cond
+          (not (map? value)) {:state :invalid}
+          (not= 1 (:version value)) {:state :unsupported}
+          (not (and (string? (:ciphertext-sha value))
+                    (not (str/blank? (:ciphertext-sha value)))))
+          {:state :missing-ciphertext-sha}
+          :else {:state :ready}))
+      (catch Exception _ {:state :invalid}))))
+
+(defn- age-state []
+  (let [version (try (age/version) (catch Exception _ nil))]
+    {:available? (some? version)
+     :version version}))
+
+(defn- doctor-data
+  [config env-arg]
+  (let [config      (normalize-config config)
+        {:keys [name secrets-file manifest template key-file recipients-file
+                identity-file identity-source]} (resolve-env config env-arg)
+        artifacts   {:ciphertext (artifact-state secrets-file :unconfigured)
+                     :manifest   (artifact-state manifest :disabled)
+                     :template   (artifact-state template :unconfigured)
+                     :key        (artifact-state key-file :unconfigured)
+                     :recipients (artifact-state recipients-file :unconfigured)}
+        identity    {:source identity-source
+                     :usable? (usable-file? identity-file)}
+        age         (age-state)
+        recipients  (recipient-state recipients-file (:recipients artifacts))
+        mode        (if recipients-file :multi-recipient :single-key)
+        manifest    (manifest-state manifest (:manifest artifacts))
+        ciphertext? (get-in artifacts [:ciphertext :exists?])
+        manifest?   (get-in artifacts [:manifest :exists?])
+        keyless?    (boolean (and ciphertext? (= :ready (:state manifest))))
+        full?       (boolean (and (:available? age)
+                                  (:usable? identity)
+                                  ciphertext?
+                                  manifest?))
+        verify      {:state (if (= :disabled (:state manifest))
+                              :skipped
+                              (:state manifest))
+                     :keyless? keyless?
+                     :full? full?}
+        invalid?    (contains? #{:empty :invalid} (:state recipients))
+        missing-artifact?
+        (or (some (fn [kind] (not (get-in artifacts [kind :exists?])))
+                  [:ciphertext :template :key])
+            (and (not= :disabled (:state manifest)) (not manifest?))
+            (= :missing (:state recipients)))
+        warning?    (or (not (:available? age))
+                        missing-artifact?
+                        (not (:usable? identity))
+                        (= :unreadable (:state recipients))
+                        (and (not= :disabled (:state manifest))
+                             (not= :ready (:state manifest)))
+                        (and (not= :skipped (:state verify))
+                             (not (or keyless? full?))))
+        status      (cond invalid? :invalid
+                          warning? :warning
+                          :else :healthy)]
+    {:configuration {:valid? true}
+     :age age
+     :environment name
+     :artifacts artifacts
+     :identity identity
+     :encryption {:mode mode :recipients recipients}
+     :verify verify
+     :status status
+     :exit (case status :healthy 0 :warning 1 :invalid 2)}))
+
+(defn- print-artifact-state!
+  [label {:keys [state path exists?]}]
+  (println (str label ": "
+                (case state
+                  :disabled "disabled"
+                  :unconfigured "unconfigured"
+                  (str (if exists? "present" "missing") " — " path)))))
+
+(def ^:private identity-source-display-label
+  {:secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
+   :secrets-age-identity      "SECRETS_AGE_IDENTITY"
+   :secrets-age-identity-b64  "SECRETS_AGE_IDENTITY_B64"
+   :identity-file             ":identity-file"
+   :configured-key-file       "configured key path"
+   :default-key-file          "default key path"})
+
+(defn- print-doctor!
+  [{:keys [configuration age environment artifacts identity encryption verify status]}]
+  (if-not (:valid? configuration)
+    (println "Configuration: invalid")
+    (do
+      (println "Age:" (if (:available? age)
+                         (str "available — " (:version age))
+                         "unavailable"))
+      (println "Environment:" (clojure.core/name environment))
+      (doseq [[kind label] [[:ciphertext "Ciphertext"]
+                            [:manifest "Manifest"]
+                            [:template "Template"]
+                            [:key "Key"]
+                            [:recipients "Recipients file"]]]
+        (print-artifact-state! label (artifacts kind)))
+      (println "Identity:" (str (identity-source-display-label (:source identity))
+                                " — " (if (:usable? identity) "usable" "unusable")))
+      (println "Encryption mode:" (clojure.core/name (:mode encryption)))
+      (let [{:keys [state count valid? invalid-count]} (:recipients encryption)]
+        (println "Recipients:"
+                 (str (clojure.core/name state)
+                      " — count " (if (nil? count) "unknown" count)
+                      " — valid " (if (nil? valid?) "unknown" valid?)
+                      (when invalid-count (str " — invalid count " invalid-count)))))
+      (println "Verify keyless:" (if (= :skipped (:state verify))
+                                   "skipped"
+                                   (if (:keyless? verify) "available" "unavailable")))
+      (println "Verify full:" (if (= :skipped (:state verify))
+                                "skipped"
+                                (if (:full? verify) "available" "unavailable")))))
+  (println "Status:" (clojure.core/name status)))
+
+(defn doctor!
+  "Safely diagnose one selected/default environment. Accepts raw config,
+  normalizes and validates it, prints stable value-free labels, and returns a
+  structured result containing :exit (0 healthy, 1 warning/action-needed, or 2
+  invalid configuration). It never exits and never returns an identity path,
+  recipient line, environment value, or secret."
+  [config env-arg]
+  (let [result (try
+                 (doctor-data config env-arg)
+                 (catch Exception _
+                   {:configuration {:valid? false}
+                    :age nil
+                    :environment nil
+                    :artifacts nil
+                    :identity nil
+                    :encryption nil
+                    :verify nil
+                    :status :invalid
+                    :exit 2}))]
+    (print-doctor! result)
+    result))
+
 ;; ---------- Dispatch ----------
 
 (def ^:private commands
@@ -941,6 +1177,7 @@
    ["set"           "[env] <key> [--edn]" "Set a key's value from stdin (creates the file if missing)"]
    ["rm"            "[env] <key>"  "Remove a key (fails if the key or file is absent)"]
    ["verify"        "[env]"        "Check the committed manifest matches the secrets"]
+   ["doctor"        "[env]"        "Safely diagnose configuration and verification capability"]
    ["show-key"      "[env]"        "Print public key(s) for sharing"]
    ["add-recipient" "[env] [key]"  "Add a public key to the env's recipients file"]
    ["recipients"    "[env]"        "List configured recipient public keys"]
@@ -965,7 +1202,8 @@
   (println "Environments:" (str/join ", " (map name (keys environments)))
            (if default-environment (str "(default: " (name default-environment) ")") ""))
   (println (paint :dim "\n  An omitted [env] uses the default environment."))
-  (println (paint :dim "  verify exits 0 (ok) · 1 (drift) · 2 (missing or unverifiable).")))
+  (println (paint :dim "  verify exits 0 (ok) · 1 (drift) · 2 (missing or unverifiable)."))
+  (println (paint :dim "  doctor exits 0 (healthy) · 1 (warning/action needed) · 2 (invalid configuration).")))
 
 (defn- print-error!
   "Print an ex-info the way `run!` reports failures: the message via `oops`,
@@ -983,44 +1221,51 @@
 (defn run!
   "Entry point. Dispatch `args` (typically *command-line-args*) against `config`.
   This is the only function in the namespace that exits the process. It prints
-  ex-info details and exits with :secrets/exit (default 1); `verify` supplies
-  its own exit code."
+  ex-info details and exits with :secrets/exit (default 1); `verify` and
+  `doctor` supply their own exit codes."
   [config args]
   (try
-    (let [config (normalize-config config)
-          [cmd & more] args
-          ;; --edn only means anything to `set`, but pulling it out here (not
-          ;; inside that branch) keeps [env] positional and optional either way.
-          [edn? more] (extract-flag "--edn" more)]
-      (case (some-> cmd str/lower-case)
-        "keygen"        (keygen!        config (first more))
-        "new"           (new!           config (first more))
-        "edit"          (edit!          config (first more))
-        ;; set/rm take [env] <key>; with one arg it is the key, and the
-        ;; default environment applies — same convention as encrypt/decrypt.
-        "set"           (if (second more)
-                          (set-secret! config (first more) (second more) edn?)
-                          (set-secret! config nil (first more) edn?))
-        "rm"            (if (second more)
-                          (remove-secret! config (first more) (second more))
-                          (remove-secret! config nil (first more)))
-        "verify"        (let [{:keys [exit]} (verify! config (first more))]
-                          (when (pos? exit) (System/exit exit)))
-        "show-key"      (show-key!      config (first more))
-        "add-recipient" (add-recipient! config (first more) (second more))
-        "recipients"    (recipients!    config (first more))
-        "reencrypt"     (reencrypt!     config (first more))
-        ;; encrypt/decrypt take [env] <file>; with one arg it is the file,
-        ;; and the default environment applies.
-        "encrypt"       (if (second more)
-                          (encrypt! config (first more) (second more))
-                          (encrypt! config nil (first more)))
-        "decrypt"       (if (second more)
-                          (decrypt! config (first more) (second more))
-                          (decrypt! config nil (first more)))
-        ("help" nil)    (print-help config)
-        (do (print-help config)
-            (fail! (str "Unknown command: " cmd) {:command cmd}))))
+    (let [[cmd & more] args
+          command (some-> cmd str/lower-case)]
+      ;; doctor owns normalization so configuration failures become a safe,
+      ;; structured exit 2. Every existing command retains the original
+      ;; normalize-before-dispatch behavior and failure exit.
+      (if (= "doctor" command)
+        (let [{:keys [exit]} (doctor! config (first more))]
+          (when (pos? exit) (System/exit exit)))
+        (let [config (normalize-config config)
+              ;; --edn only means anything to `set`, but pulling it out here
+              ;; keeps [env] positional and optional either way.
+              [edn? more] (extract-flag "--edn" more)]
+          (case command
+            "keygen"        (keygen!        config (first more))
+            "new"           (new!           config (first more))
+            "edit"          (edit!          config (first more))
+            ;; set/rm take [env] <key>; with one arg it is the key, and the
+            ;; default environment applies — same convention as encrypt/decrypt.
+            "set"           (if (second more)
+                              (set-secret! config (first more) (second more) edn?)
+                              (set-secret! config nil (first more) edn?))
+            "rm"            (if (second more)
+                              (remove-secret! config (first more) (second more))
+                              (remove-secret! config nil (first more)))
+            "verify"        (let [{:keys [exit]} (verify! config (first more))]
+                              (when (pos? exit) (System/exit exit)))
+            "show-key"      (show-key!      config (first more))
+            "add-recipient" (add-recipient! config (first more) (second more))
+            "recipients"    (recipients!    config (first more))
+            "reencrypt"     (reencrypt!     config (first more))
+            ;; encrypt/decrypt take [env] <file>; with one arg it is the file,
+            ;; and the default environment applies.
+            "encrypt"       (if (second more)
+                              (encrypt! config (first more) (second more))
+                              (encrypt! config nil (first more)))
+            "decrypt"       (if (second more)
+                              (decrypt! config (first more) (second more))
+                              (decrypt! config nil (first more)))
+            ("help" nil)    (print-help config)
+            (do (print-help config)
+                (fail! (str "Unknown command: " cmd) {:command cmd}))))))
     (catch clojure.lang.ExceptionInfo e
       (print-error! e)
       (System/exit (:secrets/exit (ex-data e) 1)))))
