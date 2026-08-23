@@ -1,0 +1,30 @@
+{:deps {com.kirahowe/secrets {:local/root "../.."}}
+ :tasks
+ {secrets
+  {:doc "Run the secrets CLI for the fixture or disposable demo"
+   :requires ([com.kirahowe.secrets.cli :as cli])
+   :task (cli/run! {:app "team-ci"
+                    :default-environment :fixture
+                    :environments
+                    {:fixture {:secrets-file "fixture/secrets.edn.age"
+                               :recipients-file "fixture/recipients.txt"
+                               :key-file ".local/fixture-identity.txt"
+                               :manifest "fixture/secrets.edn.manifest"}
+                     :demo {:secrets-file ".local/demo/secrets.edn.age"
+                            :recipients-file ".local/demo/recipients.txt"
+                            :key-file ".local/demo/alice-key.txt"
+                            :manifest ".local/demo/secrets.edn.manifest"
+                            :template "secrets.edn.example"}}}
+                   *command-line-args*)}
+
+  verify
+  {:doc "Run the keyless fixture manifest gate"
+   :task (shell "bb" "secrets" "verify" "fixture")}
+
+  demo
+  {:doc "Bootstrap Alice, add disposable Bob, re-encrypt, and prove Bob can read"
+   :task (shell "sh" "scripts/team-demo.sh")}
+
+  cleanup
+  {:doc "Remove only the demo's explicitly named local artifacts"
+   :task (shell "sh" "scripts/team-demo.sh" "cleanup")}}}
