@@ -841,7 +841,7 @@
   recipient added (or already present)."
   [config env-arg pubkey]
   (require-age!)
-  (let [{:keys [recipients-file key-file name]} (resolve-env config env-arg)
+  (let [{:keys [recipients-file key-file secrets-file name]} (resolve-env config env-arg)
         nm (clojure.core/name name)]
     (when-not recipients-file
       (fail! (str nm " has no :recipients-file configured (single-key mode).\n"
@@ -863,8 +863,14 @@
             (append-recipient! f pub)
             (ok "Added recipient to" recipients-file)
             (println "   " pub)
-            (warn "Re-encrypt so the new recipient can read existing secrets:")
-            (println (paint :dim (str "      bb secrets reencrypt " nm)))
+            (if (.exists (io/file secrets-file))
+              (do
+                (warn "Re-encrypt so the new recipient can read existing secrets:")
+                (println (paint :dim (str "      bb secrets reencrypt " nm))))
+              (do
+                (info "No ciphertext exists yet. Create the initial store with either:")
+                (println (paint :dim (str "      printf %s \"$VALUE\" | bb secrets set " nm " :secret/key")))
+                (println (paint :dim (str "      bb secrets new " nm)))))
             pub))))))
 
 (defn recipients!

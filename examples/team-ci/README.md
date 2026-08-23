@@ -23,59 +23,81 @@ artifacts. The fixture identity used to generate them was disposable and is
 not present here. The ciphertext contains only fake values. The manifest
 records paths and types plus the ciphertext SHA; it never records values.
 
-## Local Alice/Bob walkthrough
+## Disposable Alice/Bob and first-owner workflow
 
-The separate `demo` environment is disposable and lives entirely under the
-ignored `.local/` directory. It generates local demo identities, stores fake
-values through stdin, creates Bob's identity, adds Bob's public key, re-encrypts,
-then uses Bob's identity to verify and decrypt. Decrypted comparison files are
-removed automatically on exit (including failure) without printing them; the
-keys, ciphertext, and manifest remain until explicit cleanup so the run can be
-inspected:
+The separate `demo` environment lives entirely under ignored `.local/`. The
+script starts from an empty store, generates Alice's disposable identity, adds
+Alice's public recipient, and silently proves that there is still no
+ciphertext and that the command did not recommend `reencrypt`. It creates the
+first store from fake stdin values, adds Bob's public recipient, confirms that
+`reencrypt` is now recommended, re-encrypts, and asserts the exact two-recipient
+set. Finally, both private identities decrypt the resulting ciphertext to
+temporary comparison files and Bob runs `verify`.
+
+No secret value or private identity is printed. The comparison plaintext files
+are removed automatically on exit, including failure. Disposable identities,
+ciphertext, and manifest remain under `.local/demo` until explicit cleanup so
+the state can be inspected:
 
 ```sh
 bb demo
 bb cleanup
 ```
 
-The script passes only Bob's public key as a command argument. Values are
-provided to `bb secrets set` on stdin, so they do not enter shell history or
-process arguments. No identity or plaintext is committed. Cleanup removes only
-the exact named files in `.local/demo`; inspect or adapt the script if you add
-your own local artifacts.
+Values enter `bb secrets set` only on stdin, never as command arguments. Only
+Bob's public recipient is passed as an argument. Nothing under `.local/` is
+committed, and cleanup removes only the script's exact named artifacts.
 
-For a real project, each teammate generates a durable age identity locally,
-backs up its private half in an approved secure store, and gives the maintainer
-only the public half:
+For a real team's first store, the first owner follows the same state
+transition with a durable, securely backed-up private identity:
 
 ```sh
 bb secrets keygen demo
-bb secrets add-recipient demo age1...their-public-key...
-bb secrets reencrypt demo
+bb secrets add-recipient demo
+printf %s "$FIRST_SECRET_VALUE" | bb secrets set demo :service/token
+# Or use `bb secrets new demo` instead of `set`.
 ```
 
-After every recipient addition or removal, re-encrypt. `reencrypt` updates both
-the age ciphertext and its manifest atomically. `bb secrets recipients demo`
-lists the current public recipients.
+There is no `reencrypt` step before the first `set` or `new`: no ciphertext
+exists yet, and store creation encrypts directly to the current public
+recipients.
 
-## Onboarding, offboarding, and deployment
+## Onboarding, offboarding, deployment, and repository boundaries
 
-Onboarding is: add the new person's public key to the committed recipients
-file, then run `reencrypt`. Offboarding removes their public-key line and
-re-encrypts, which prevents access to future ciphertext. It cannot revoke an
-old clone, backup, or ciphertext that they already downloaded. Rotating the
-recipient set or age key also cannot revoke values from an old ciphertext if
-the old private key leaked; for real revocation, rotate the underlying secret
-values (and any affected credentials), then re-encrypt the artifacts with the
-new recipient identities. Keep a deployment recipient separate from human
-keys, and inject only that recipient's private identity into the deploy job
-(for example via `SECRETS_AGE_IDENTITY`); do not use a developer's identity for
-production deployment.
+When ciphertext already exists, a teammate creates and retains their private
+identity, gives a maintainer only its public `age1…` recipient, and is onboarded
+with:
 
-Commit the encrypted `*.age` file, its value-free `*.manifest`, public-only
-`recipients.txt`, safe templates, CLI configuration, and CI workflow. Never
-commit age identities, plaintext decrypts, or real values. The `.gitignore`
-keeps this example's `.local/` demo artifacts out of git.
+```sh
+bb secrets add-recipient demo age1...teammate-public-key...
+bb secrets reencrypt demo
+bb secrets recipients demo
+```
+
+The maintainer must be a current recipient able to decrypt the existing store.
+Adding the public key changes only `recipients.txt`; re-encryption writes the
+new ciphertext and value-free manifest. The teammate gains access to that new
+and future ciphertext, not by changing any private identity.
+
+To offboard someone, remove their public-key line from the committed recipients
+file and re-encrypt. This blocks their identity from future ciphertext only. An
+old clone, backup, downloaded ciphertext, or plaintext cannot be revoked. If a
+private identity or old ciphertext is compromised, changing recipients is
+insufficient: rotate the underlying secret values and affected credentials,
+then write new ciphertext for the remaining recipients.
+
+Use a dedicated, non-human deployment recipient and never a developer's
+identity. Commit the deployment public recipient and inject only its private
+identity into the job through one supported mechanism:
+`SECRETS_AGE_IDENTITY_FILE` for a secret-provided file path,
+`SECRETS_AGE_IDENTITY` for raw identity contents, or
+`SECRETS_AGE_IDENTITY_B64` for base64 identity contents.
+
+Commit only the public recipient list, encrypted `*.age` ciphertext, its
+value-free `*.manifest`, safe templates containing fake placeholders, CLI
+configuration, and the CI workflow. Never commit private identities, decrypted
+plaintext, or real secret values. The fixture's committed ciphertext contains
+explicitly fake values; its discarded generation identity is not present.
 
 ## Reading manifest changes
 

@@ -786,6 +786,58 @@
                           (cli/keygen! config nil))
         "differing key files really is ambiguous, so this is unchanged")))
 
+(deftest team-bootstrap-adds-first-owner-before-ciphertext-and-reencrypts-for-teammate
+  (if age-env-set?
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [recipients  (str *dir* "/recipients.txt")
+          ciphertext  (str *dir* "/secrets.edn.age")
+          bob-key     (str *dir* "/bob-key.txt")
+          secret-value "team-bootstrap-value-that-must-not-be-printed"
+          config      (cli/normalize-config (test-config {:recipients-file recipients}))
+          alice-public (age/public-key *key*)
+          added       (atom nil)
+          initial-out (with-out-str
+                        (reset! added (cli/add-recipient! config "dev" nil)))]
+      (testing "the first owner is added without creating or re-encrypting ciphertext"
+        (is (= alice-public @added))
+        (is (= [alice-public] (str/split-lines (slurp recipients))))
+        (is (not (.exists (io/file ciphertext))))
+        (is (str/includes? initial-out "bb secrets set dev"))
+        (is (str/includes? initial-out "bb secrets new dev"))
+        (is (not (str/includes? initial-out "reencrypt"))))
+      (let [set-out (with-out-str
+                      (with-in-str secret-value
+                        (cli/set-secret! config "dev" ":service/token" false)))
+            bob-public (age/keygen! bob-key)
+            teammate-added (atom nil)
+            teammate-out (with-out-str
+                           (reset! teammate-added
+                                   (cli/add-recipient! config "dev" bob-public)))
+            reencrypt-out (with-out-str (cli/reencrypt! config "dev"))
+            all-output (str initial-out set-out teammate-out reencrypt-out)
+            sensitive-values
+            (cons secret-value
+                  (->> [*key* bob-key]
+                       (mapcat #(str/split-lines (slurp %)))
+                       (filter #(str/starts-with? % "AGE-SECRET-KEY-"))))]
+        (testing "set creates the first store and the later add recommends re-encryption"
+          (is (.exists (io/file ciphertext)))
+          (is (= bob-public @teammate-added))
+          (is (str/includes? teammate-out "bb secrets reencrypt dev")))
+        (testing "the committed recipient set is exactly Alice and Bob"
+          (is (= #{alice-public bob-public}
+                 (->> (slurp recipients)
+                      str/split-lines
+                      (remove str/blank?)
+                      set))))
+        (testing "both private identities decrypt the final ciphertext"
+          (let [expected {:service/token secret-value}]
+            (is (= expected (edn/read-string (age/decrypt *key* ciphertext))))
+            (is (= expected (edn/read-string (age/decrypt bob-key ciphertext))))))
+        (testing "captured command output contains no secret values or private identities"
+          (doseq [sensitive-value sensitive-values]
+            (is (not (str/includes? all-output sensitive-value)))))))))
+
 (deftest add-recipient-preserves-comments-and-layout
   (let [recipients (str *dir* "/recipients.txt")
         original   (str "# Team recipients — keep sorted by name\n"

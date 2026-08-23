@@ -32,19 +32,53 @@ cleanup
 
 echo "Generating disposable Alice identity…"
 bb secrets keygen demo >/dev/null
-bb secrets add-recipient demo >/dev/null
+test ! -e "$ciphertext"
+initial_add_output=$(bb secrets add-recipient demo 2>&1)
+case $initial_add_output in
+  *reencrypt*) exit 1 ;;
+esac
+case $initial_add_output in
+  *"bb secrets set demo"*) ;;
+  *) exit 1 ;;
+esac
+case $initial_add_output in
+  *"bb secrets new demo"*) ;;
+  *) exit 1 ;;
+esac
+test ! -e "$ciphertext"
+alice_public=$(age-keygen -y "$alice_key")
+awk -v alice="$alice_public" '
+  /^[[:space:]]*($|#)/ { next }
+  { count++; if ($0 == alice) alice_count++ }
+  END { exit !(count == 1 && alice_count == 1) }
+' "$recipients"
 
 # Values arrive on stdin; neither value is a shell argument or output.
 printf '%s\n' 'https://team-ci.local.invalid' |
   bb secrets set demo :demo/service-url >/dev/null
+test -s "$ciphertext"
+test -s "$manifest"
 printf '%s\n' 'alice-demo-api-key' |
   bb secrets set demo :demo/api-key >/dev/null
 
 echo "Generating disposable Bob identity and adding its public key…"
 age-keygen -o "$bob_key" >/dev/null 2>&1
 bob_public=$(age-keygen -y "$bob_key")
-bb secrets add-recipient demo "$bob_public" >/dev/null
+teammate_add_output=$(bb secrets add-recipient demo "$bob_public" 2>&1)
+case $teammate_add_output in
+  *"bb secrets reencrypt demo"*) ;;
+  *) exit 1 ;;
+esac
 bb secrets reencrypt demo >/dev/null
+awk -v alice="$alice_public" -v bob="$bob_public" '
+  /^[[:space:]]*($|#)/ { next }
+  {
+    count++
+    if ($0 == alice) alice_count++
+    if ($0 == bob) bob_count++
+  }
+  END { exit !(count == 2 && alice_count == 1 && bob_count == 1) }
+' "$recipients"
 
 # Save an Alice decrypt only for a byte-for-byte proof. The EXIT trap removes
 # both comparison files on success or failure; no plaintext reaches the terminal.

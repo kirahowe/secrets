@@ -453,8 +453,8 @@ so one set of reader literals serves every environment.
 
 The default single-key model means everyone shares one private key. For a team,
 point an environment at a **recipients file** — a committed list of age public
-keys — and it encrypts to all of them (`age -R`). Each person then decrypts with
-their *own* key; nobody shares a private key.
+keys — and it encrypts to all of them (`age -R`). Each person decrypts with
+their own private identity; private identities are never shared.
 
 ```clojure
 ;; bb.edn — add :recipients-file to an environment
@@ -462,22 +462,64 @@ their *own* key; nobody shares a private key.
         :recipients-file "env/prod/recipients.txt"}}
 ```
 
-Public keys are safe to commit, so `recipients.txt` lives in git. The workflow:
+### First owner: no ciphertext yet
+
+Team initialization creates or preserves an empty public recipients file. The
+first owner creates a personal identity, adds its public recipient, then creates
+the initial store:
 
 ```sh
-bb secrets keygen prod                 # each dev makes their own key
-bb secrets add-recipient prod          # …and adds their public key to the list
-#   (a maintainer can also add someone else's: bb secrets add-recipient prod age1…)
-bb secrets reencrypt prod              # re-encrypt so new recipients can decrypt
-bb secrets recipients prod             # list who can currently decrypt
+bb secrets keygen prod
+bb secrets add-recipient prod
+printf %s "$INITIAL_SECRET_VALUE" | bb secrets set prod :service/token
+# Or create the initial store in an editor instead:
+# bb secrets new prod
 ```
 
-- **Onboard** = add a key + `reencrypt`. **Offboard** = remove the line +
-  `reencrypt` (stops *future* access; see the key-rotation note below).
-- **Deploy/CI** gets its own recipient — include a dedicated deploy key so no
-  human needs to hold it. It's still injected as `SECRETS_AGE_IDENTITY` at runtime.
-- Runtime decryption is unchanged: any listed identity decrypts the file, so
-  `load-secrets` / `#secret/req` need no configuration for this.
+Run either `set` or `new` for the last step. There is nothing to `reencrypt`
+after `add-recipient` while the ciphertext is absent: the first `set` or `new`
+already encrypts to every public recipient currently in `recipients.txt`.
+
+### Existing ciphertext: add, then re-encrypt
+
+After ciphertext exists, a teammate generates and keeps their own private
+identity and sends only its `age1…` public recipient to a maintainer. A current
+recipient who can decrypt the store adds that public key and re-encrypts:
+
+```sh
+bb secrets add-recipient prod age1...teammate-public-key...
+bb secrets reencrypt prod
+bb secrets recipients prod
+```
+
+`add-recipient` changes only the public list. `reencrypt` is what writes a new
+ciphertext and value-free manifest for the current recipient set. Onboarding
+therefore grants access to ciphertext produced after that re-encryption.
+
+For offboarding, remove the person's public-key line from `recipients.txt` and
+run `bb secrets reencrypt prod`. This prevents that identity from decrypting
+future ciphertext only. It cannot revoke ciphertext, plaintext, clones, or
+backups the person already obtained. If a private identity or an old ciphertext
+is compromised, changing the recipient list is not enough: rotate every
+underlying secret value or credential that copy exposed, then write ciphertext
+for the remaining recipients.
+
+Deployments and CI use a separate, non-human recipient — never a developer's
+identity. Commit its public recipient, re-encrypt, and give the runtime only
+that deployment recipient's private identity through exactly one supported
+mechanism: `SECRETS_AGE_IDENTITY_FILE` (a secret-provided file path),
+`SECRETS_AGE_IDENTITY` (raw identity contents), or
+`SECRETS_AGE_IDENTITY_B64` (base64 identity contents).
+
+The repository boundary is explicit:
+
+- Commit public-only `recipients.txt`, encrypted `*.age` ciphertext, its
+  value-free `*.manifest`, and templates containing only safe fake placeholders.
+- Never commit private identities, decrypted plaintext, or real secret values.
+
+Runtime decryption is otherwise unchanged: any currently listed identity can
+decrypt the file, so `load-secrets` / `#secret/req` need no team-specific
+configuration.
 
 ## Manifest: seeing what changed
 

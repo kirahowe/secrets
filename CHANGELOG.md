@@ -3,6 +3,13 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed
+- `add-recipient` now distinguishes first-store bootstrap from recipient
+  changes to existing ciphertext: it recommends `set` or `new` before a store
+  exists, and `reencrypt` only when ciphertext already needs updating.
+
 ## [0.1.0] - 2026-08-21
 
 ### Added
