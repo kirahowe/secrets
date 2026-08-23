@@ -451,6 +451,14 @@ drift. Disable the manifest for an environment with `:manifest false`.
 
 `com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits; `(verify! config env)` returns `{:results {env status} :exit code}`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, no blank path strings, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side `:identity-file` resolves from the `SECRETS_AGE_IDENTITY*` env vars before falling back to its `:key-file`, so CI holding only `SECRETS_AGE_IDENTITY` can encrypt, decrypt, and verify.
 
+## Examples
+
+See the [examples guide](examples/README.md) for a choice matrix and runnable
+starters: [quickstart-bb](examples/quickstart-bb/README.md),
+[integrant-service](examples/integrant-service/README.md),
+[aero-profiles](examples/aero-profiles/README.md), and
+[team-ci](examples/team-ci/README.md).
+
 ## Development
 
 ```sh

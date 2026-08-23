@@ -41,6 +41,24 @@ jobs:
       - name: Run Babashka tests
         run: bb test
 
+      - name: Smoke-test quickstart example
+        working-directory: examples/quickstart-bb
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'bb cleanup >/dev/null 2>&1 || true' EXIT
+          bb bootstrap
+          bb run
+          bb verify
+
+      - name: Test Aero profiles example
+        working-directory: examples/aero-profiles
+        run: bb test
+
+      - name: Verify team CI fixture without a key
+        working-directory: examples/team-ci
+        run: bb verify
+
   jvm-test:
     name: JVM tests
     runs-on: ubuntu-latest
@@ -73,7 +91,7 @@ jobs:
             ~/.gitlibs
             ~/.deps.clj
             .cpcache
-          key: ${{ runner.os }}-clojure-${{ hashFiles('deps.edn', 'tests.edn', 'build.clj') }}
+          key: ${{ runner.os }}-clojure-${{ hashFiles('deps.edn', 'tests.edn', 'build.clj', 'examples/integrant-service/deps.edn', 'examples/integrant-service/build.clj') }}
           restore-keys: |
             ${{ runner.os }}-clojure-
 
@@ -84,6 +102,18 @@ jobs:
 
       - name: Run JVM tests
         run: clojure -M:test
+
+      - name: Bootstrap Integrant service example
+        working-directory: examples/integrant-service
+        run: ./scripts/bootstrap-demo.sh
+
+      - name: Run Integrant service JVM tests
+        working-directory: examples/integrant-service
+        run: clojure -M:test
+
+      - name: Build Integrant service uberjar
+        working-directory: examples/integrant-service
+        run: clojure -T:build uber
 
   build-and-inspect-jar:
     name: Build and inspect JAR
