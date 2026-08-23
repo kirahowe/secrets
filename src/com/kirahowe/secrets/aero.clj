@@ -72,9 +72,10 @@
   (atom {}))
 
 (defn reset-cache!
-  "Clear cached reader functions and decrypted stores. The next `#secret/…`
-  read resolves and decrypts its source again. Useful after editing secrets in
-  a long-running process."
+  "Clear every cached Aero reader map and decrypted store, including cached
+  decryption failures. The next `#secret/…` read resolves and decrypts its
+  source again. The process-wide default set by `register!` is left intact.
+  Useful after editing or repairing secrets in a long-running process."
   []
   (reset! readers-cache {})
   nil)

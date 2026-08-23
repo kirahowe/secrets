@@ -227,12 +227,46 @@ Then config files reference secrets inline:
 
 The file is resolved and decrypted **once, lazily**, on the first secret tag
 encountered — so dev/test configs with no secret tags never touch `age` or the
-key, even if a secrets file happens to be on the classpath. The two tags mirror
-required/optional env reads: `#secret/opt` returns `nil` when the secrets file
-is absent, when no identity (key) is available, or when the key is missing from
-the decrypted map; `#secret/req` throws in all three cases, saying which. A
-genuine decryption failure — the identity exists but `age` fails — always
-throws, for both tags.
+key, even if a secrets file happens to be on the classpath. Each readers map
+caches that first successful load **or genuine decryption failure** for its
+lifetime. This avoids repeated decryption across tags and prevents one config
+read from mixing values from ciphertext changed midway through the read. After
+editing the encrypted store, explicitly construct a new `reader-literals` or
+`merge-readers` map before re-reading the config; the old map deliberately
+continues serving its first successful load or rethrowing its first decryption
+failure. A process restart naturally constructs fresh readers and therefore
+observes the current ciphertext. There is no filesystem polling or automatic
+retry per tag.
+
+The two tags mirror required/optional env reads: `#secret/opt` returns `nil`
+when the secrets file is absent, when no identity (key) is available, or when
+the key is missing from the decrypted map; `#secret/req` throws in all three
+cases, saying which. A genuine decryption failure — the identity exists but
+`age` fails — always throws, for both tags.
+
+For a safe REPL reload, edit secrets out of process (for example, run
+`bb secrets edit dev` in another terminal), deliberately recreate the readers,
+then re-read the whole config. Inspect only non-secret status or structure:
+
+```clojure
+(require '[clojure.edn :as edn]
+         '[com.kirahowe.secrets :as secrets])
+
+(defn read-app-config []
+  (let [readers (secrets/merge-readers
+                 {'env (fn [k] (System/getenv k))}
+                 {:app "myapp" :resource "secrets.edn.age"})] ; new map every call
+    (edn/read-string {:readers readers} (slurp "config.edn"))))
+
+;; After the out-of-process edit:
+(def app-config (read-app-config))
+{:config-loaded? (map? app-config)
+ :section-count  (count app-config)}
+```
+
+Do not print the config or secret values while checking a reload. Make each
+reload an explicit action like this rather than polling or watching the
+ciphertext.
 
 ### Aero
 
@@ -274,14 +308,33 @@ A per-read `:secrets` opt always wins over a `register!`ed default. With
 neither supplied, reading a `#secret/…` tag throws rather than resolving to
 nil.
 
-In a long-running REPL, `reset-cache!` drops the cached decrypted store, so
-the next `#secret/…` read picks up a `bb secrets edit` made after the process
-started (without it, the store stays whatever it was at the first read for
-the life of the process):
+Each distinct Aero secrets configuration is likewise decrypted once and
+cached, including a genuine decryption failure. In a long-running REPL, edit
+the ciphertext out of process, call `reset-cache!`, and only then re-read the
+whole config:
 
 ```clojure
-(com.kirahowe.secrets.aero/reset-cache!)
+(require '[aero.core :as aero]
+         '[com.kirahowe.secrets.aero :as secrets-aero])
+
+(secrets-aero/register!
+ {:app "myapp" :resource "secrets.edn.age"})
+
+;; In another terminal: bb secrets edit dev
+(secrets-aero/reset-cache!)
+(def app-config (aero/read-config "config.edn"))
+{:config-loaded? (map? app-config)
+ :section-count  (count app-config)}
 ```
+
+`reset-cache!` invalidates **all** cached Aero reader maps and their decrypted
+stores, both successful and failed, so the next `#secret/…` read decrypts the
+current ciphertext. It leaves the process-wide default supplied by `register!`
+intact; the example therefore does not register again after reset. Without a
+reset, a successful load remains stale and a decryption failure keeps
+rethrowing. As with native readers, a process restart begins with an empty Aero
+cache and sees current ciphertext. Do not print the config or secret values,
+poll the file, or reset/re-read once per tag.
 
 #### A different key per profile
 

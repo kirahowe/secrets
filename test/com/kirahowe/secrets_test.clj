@@ -29,14 +29,16 @@
 
 (defn- encrypt-edn!
   "Write `m` as EDN, encrypt it to <dir>/secrets.edn.age, drop the plaintext,
-  and return the ciphertext path."
-  [m]
-  (let [plain (str *dir* "/plain.edn")
-        enc   (str *dir* "/secrets.edn.age")]
-    (spit plain (pr-str m))
-    (age/encrypt-file! *key* plain enc)
-    (.delete (io/file plain))
-    enc))
+  and return the ciphertext path. The optional identity makes wrong-key
+  ciphertext fixtures possible without bypassing the real age CLI."
+  ([m] (encrypt-edn! m *key*))
+  ([m identity-file]
+   (let [plain (str *dir* "/plain.edn")
+         enc   (str *dir* "/secrets.edn.age")]
+     (spit plain (pr-str m))
+     (age/encrypt-file! identity-file plain enc)
+     (.delete (io/file plain))
+     enc)))
 
 (deftest expand-home-test
   (is (= (str (System/getProperty "user.home") "/.config/x")
@@ -139,7 +141,58 @@
                        {:readers readers}
                        "[#secret/req :a #secret/req :b #secret/opt :c #secret/opt :missing]")]
           (is (= [1 2 3 nil] cfg))
-          (is (= 1 @calls) "decryption is memoized for the process"))))))
+          (is (= 1 @calls) "decryption is memoized for this readers map"))))))
+
+(deftest reader-cache-lifecycle
+  (testing "one readers map stays on its first successful load; a new map sees edited ciphertext"
+    (let [enc   (encrypt-edn! {:v :before})
+          calls (atom 0)
+          real  age/decrypt]
+      (with-redefs [age/decrypt (fn [& args] (swap! calls inc) (apply real args))]
+        (let [readers (secrets/reader-literals {:file enc :identity-file *key*})]
+          (is (= :before
+                 (edn/read-string {:readers readers} "#secret/req :v")))
+          (encrypt-edn! {:v :after})
+          (is (= :before
+                 (edn/read-string {:readers readers} "#secret/req :v"))
+              "the original readers map keeps its first loaded store")
+          (is (= :after
+                 (edn/read-string
+                  {:readers (secrets/reader-literals
+                             {:file enc :identity-file *key*})}
+                  "#secret/req :v"))
+              "recreating the readers map decrypts the current ciphertext")
+          (is (= 2 @calls)
+              "each native readers map decrypts its store at most once"))))))
+
+(deftest reader-caches-real-decryption-failure
+  (testing "a wrong-key failure stays cached until the readers map is recreated"
+    (let [wrong-key (str *dir* "/wrong-key.txt")
+          _         (age/keygen! wrong-key)
+          enc       (encrypt-edn! {:v :unreadable} wrong-key)
+          calls     (atom 0)
+          real      age/decrypt]
+      (with-redefs [age/decrypt (fn [& args] (swap! calls inc) (apply real args))]
+        (let [readers (secrets/reader-literals {:file enc :identity-file *key*})]
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"age decryption failed"
+               (edn/read-string {:readers readers} "#secret/req :v"))
+              "the first read genuinely asks age to decrypt wrong-key ciphertext")
+          (encrypt-edn! {:v :repaired})
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"age decryption failed"
+               (edn/read-string {:readers readers} "#secret/req :v"))
+              "repairing the ciphertext does not retry a cached failure")
+          (is (= 1 @calls)
+              "the same readers map rethrows the cached decryption failure")
+          (is (= :repaired
+                 (edn/read-string
+                  {:readers (secrets/reader-literals
+                             {:file enc :identity-file *key*})}
+                  "#secret/req :v"))
+              "a newly constructed readers map decrypts the repaired ciphertext")
+          (is (= 2 @calls)
+              "only the new readers map performs the successful retry"))))))
 
 (deftest identity-from-env-contents
   (testing "SECRETS_AGE_IDENTITY-style contents are materialized to a usable keyfile"

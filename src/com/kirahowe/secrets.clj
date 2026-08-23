@@ -280,7 +280,9 @@
     :identity-file explicit identity path (overrides resolution).
 
   The source is resolved and decrypted at most once, when the first tag is
-  read. Configs with no secret tags do not access the source or identity.
+  read. That first successful load or decryption failure is cached for the
+  lifetime of the returned readers map; recreate it after editing or repairing
+  ciphertext. Configs with no secret tags do not access the source or identity.
 
   Semantics, mirroring required/optional env reads:
     #secret/req k → required: throws when no secrets file is found, when no
@@ -331,6 +333,8 @@
            (get-secret secrets key-path))))}))
 
 (defn merge-readers
-  "Convenience: merge `reader-literals` into an existing `:readers` map."
+  "Merge `reader-literals` into an existing `:readers` map. The returned map
+  owns a fresh lazy load/cache; call `merge-readers` again after editing or
+  repairing ciphertext."
   [readers opts]
   (merge readers (reader-literals opts)))

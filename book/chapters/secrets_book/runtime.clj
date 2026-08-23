@@ -152,18 +152,44 @@
                 :identity-file (str dir "/nobody-home.txt")})]
   (edn/read-string {:readers keyless} "#secret/opt :database/url"))
 
-;; ## Lazy loading and caching
-
+;; ## Lazy loading, caching, and deliberate reloads
+;;
 ;; Building the readers map does not read the secrets. The file is resolved and
-;; decrypted once, on the first tag actually read, and the result is cached
-;; for the life of that readers value. A dev or test config with no secret
-;; tags never touches `age` and never needs a key, even when a secrets file
-;; sits on the classpath. A config with forty tags decrypts once, not forty
-;; times.
-
-;; The flip side: a failure is cached too. If the first tag hits a wrong-key
-;; error, every later tag rethrows it. Build a fresh readers map after fixing
-;; the environment.
+;; decrypted once, on the first tag actually read. That first successful load
+;; or genuine decryption failure is cached for the life of that readers map. A
+;; dev or test config with no secret tags never touches `age` and never needs a
+;; key, even when a secrets file sits on the classpath. A config with forty tags
+;; decrypts once, not forty times. Keeping one store stable across every tag also
+;; prevents a config read from mixing values from ciphertext changed midway
+;; through the read.
+;;
+;; The flip side is deliberate staleness. After ciphertext is edited, the old
+;; readers map keeps its loaded store. If its first tag hit a wrong-key
+;; decryption error, every later tag rethrows that cached failure even after the
+;; ciphertext is repaired. In both cases, construct a new `reader-literals` or
+;; `merge-readers` map and re-read the whole config. A process restart naturally
+;; creates fresh readers and observes the current ciphertext. Readers never poll
+;; or watch the file, and they never retry decryption once per tag.
+;;
+;; A safe long-running REPL workflow makes the reload boundary explicit and
+;; inspects only non-secret status or structure:
+;;
+;; ```clojure
+;; (defn read-app-config []
+;;   (let [readers (secrets/reader-literals
+;;                  {:app "myapp" :resource "secrets.edn.age"})] ; always fresh
+;;     (clojure.edn/read-string
+;;      {:readers readers}
+;;      (slurp "config.edn"))))
+;;
+;; ;; In another terminal: bb secrets edit dev
+;; (def app-config (read-app-config))
+;; {:config-loaded? (map? app-config)
+;;  :section-count  (count app-config)}
+;; ```
+;;
+;; Do not print the config or any secret value to confirm a reload. Edit out of
+;; process and reload deliberately rather than adding filesystem polling.
 
 ;; ## Merging with readers you already have
 
@@ -201,11 +227,26 @@
 ;;   {:secrets {:app "myapp" :resource "secrets.edn.age"}})
 ;; ```
 
-;; A per-read `:secrets` opt always wins over a `register!`ed default. In a
-;; long-running REPL, `(com.kirahowe.secrets.aero/reset-cache!)` drops the
-;; cached decrypted store, so the next `#secret/…` read picks up a
-;; `bb secrets edit` made after the process started — without it, the store
-;; stays whatever it was at the first read for the life of the process.
+;; A per-read `:secrets` opt always wins over a `register!`ed default. Aero
+;; caches a readers map and its first successful decrypted store or genuine
+;; decryption failure for each distinct secrets configuration. After editing or
+;; repairing ciphertext in a long-running process, call `reset-cache!` before
+;; re-reading the entire config:
+;;
+;; ```clojure
+;; ;; In another terminal: bb secrets edit dev
+;; (com.kirahowe.secrets.aero/reset-cache!)
+;; (def app-config (aero.core/read-config "config.edn"))
+;; {:config-loaded? (map? app-config)
+;;  :section-count  (count app-config)}
+;; ```
+;;
+;; `reset-cache!` invalidates every cached Aero reader map and decrypted store,
+;; including cached failures, but leaves the process-wide default supplied by
+;; `register!` intact. Without reset, a loaded store remains stale and a cached
+;; decryption failure keeps rethrowing. A process restart starts with an empty
+;; Aero cache and reads current ciphertext. Never print secret values to check a
+;; reload, poll the ciphertext, or reset and decrypt once per tag.
 
 ;; After registering, `#secret/req :database/url` works inside an aero config
 ;; file like any other aero tag.

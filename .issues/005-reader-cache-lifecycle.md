@@ -1,6 +1,6 @@
 # 005 — Reader cache lifecycle
 
-Status: `open`
+Status: `closed`
 Priority: P2
 
 ## Problem
@@ -29,19 +29,19 @@ Evaluate documentation and API ergonomics before changing behavior.
 
 ## Acceptance criteria
 
-- [ ] Native `clojure.edn` examples explicitly say to recreate the reader map
+- [x] Native `clojure.edn` examples explicitly say to recreate the reader map
       after an encrypted-store change.
-- [ ] Aero examples explicitly show when to call `reset-cache!` and what it
+- [x] Aero examples explicitly show when to call `reset-cache!` and what it
       invalidates.
-- [ ] Documents that successful loads and decryption failures are cached for a
+- [x] Documents that successful loads and decryption failures are cached for a
       reader map, including the reason this avoids repeated work and surprises.
-- [ ] Documents that a process restart creates fresh readers and therefore
+- [x] Documents that a process restart creates fresh readers and therefore
       observes the current ciphertext.
-- [ ] REPL guidance includes a safe reload workflow without printing secret
+- [x] REPL guidance includes a safe reload workflow without printing secret
       values or encouraging filesystem polling.
-- [ ] Tests cover stale-reader, reset/recreate-reader, and cached-failure
+- [x] Tests cover stale-reader, reset/recreate-reader, and cached-failure
       behavior for native and Aero paths as appropriate.
-- [ ] Any API ergonomics proposal preserves once-per-reader-map semantics and
+- [x] Any API ergonomics proposal preserves once-per-reader-map semantics and
       does not silently poll or decrypt on every tagged literal.
 
 ## Non-goals
@@ -49,6 +49,16 @@ Evaluate documentation and API ergonomics before changing behavior.
 - Background polling, filesystem watchers, or automatic secret refresh.
 - Weakening failure caching by retrying decryption on every read.
 - Changing the security boundary or exposing decrypted maps in diagnostics.
+
+## Resolution
+
+The existing lifecycle APIs are sufficient: native callers deliberately
+recreate `reader-literals` / `merge-readers` maps, while Aero callers use
+`reset-cache!`. The reset clears all Aero reader/decrypted-store cache entries,
+including failures, without clearing `register!`'s default configuration.
+Documentation and behavioral coverage now make those boundaries explicit.
+No runtime behavior or API was changed, and no polling, watcher, per-tag retry,
+or automatic refresh was introduced.
 
 ## Verification
 

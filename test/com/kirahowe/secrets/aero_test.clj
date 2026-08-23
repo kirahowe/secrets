@@ -42,14 +42,15 @@
 (defn- encrypt-edn!
   "Write `m` as EDN, encrypt it to <dir>/<filename>, drop the plaintext, and
   return the ciphertext path. `filename` defaults to secrets.edn.age; tests
-  that need two distinct secrets files (e.g. registered vs. per-read) pass
-  their own."
-  ([m] (encrypt-edn! m "secrets.edn.age"))
-  ([m filename]
+  that need two distinct secrets files or a wrong-key fixture pass their own
+  filename or identity."
+  ([m] (encrypt-edn! m "secrets.edn.age" *key*))
+  ([m filename] (encrypt-edn! m filename *key*))
+  ([m filename identity-file]
    (let [plain (str *dir* "/" filename ".plain.edn")
          enc   (str *dir* "/" filename)]
      (spit plain (pr-str m))
-     (age/encrypt-file! *key* plain enc)
+     (age/encrypt-file! identity-file plain enc)
      (.delete (io/file plain))
      enc)))
 
@@ -115,20 +116,50 @@
 
 (deftest reset-cache-picks-up-edits
   (testing "reset-cache! drops memoized readers so a later read decrypts the current file"
-    (let [enc (encrypt-edn! {:v :old})
-          cfg (spit-config! "{:v #secret/req :v}")]
-      (secrets-aero/register! {:file enc :identity-file *key*})
-      (is (= :old (:v (aero/read-config cfg))))
-      ;; Edit the underlying secrets file in place, the way `bb secrets edit` would.
-      (let [plain (str *dir* "/new-plain.edn")]
-        (spit plain (pr-str {:v :new}))
-        (age/encrypt-file! *key* plain enc)
-        (.delete (io/file plain)))
-      (is (= :old (:v (aero/read-config cfg)))
-          "without reset-cache!, the memoized readers still serve the stale value")
-      (secrets-aero/reset-cache!)
-      (is (= :new (:v (aero/read-config cfg)))
-          "after reset-cache!, the edited file is decrypted fresh"))))
+    (let [enc   (encrypt-edn! {:v :old})
+          cfg   (spit-config! "{:v #secret/req :v}")
+          calls (atom 0)
+          real  age/decrypt]
+      (with-redefs [age/decrypt (fn [& args] (swap! calls inc) (apply real args))]
+        (secrets-aero/register! {:file enc :identity-file *key*})
+        (is (= :old (:v (aero/read-config cfg))))
+        ;; Edit the underlying secrets file in place, the way `bb secrets edit` would.
+        (encrypt-edn! {:v :new})
+        (is (= :old (:v (aero/read-config cfg)))
+            "without reset-cache!, the memoized readers still serve the stale value")
+        (is (= 1 @calls) "the cached Aero readers do not decrypt the edit")
+        (secrets-aero/reset-cache!)
+        (is (= :new (:v (aero/read-config cfg)))
+            "after reset-cache!, the edited file is decrypted fresh")
+        (is (= 2 @calls)
+            "reset invalidates the cached reader and decrypted store")))))
+
+(deftest reset-cache-recovers-from-real-decryption-failure
+  (testing "a wrong-key failure remains cached after repair until reset-cache!"
+    (let [wrong-key (str *dir* "/wrong-key.txt")
+          _         (age/keygen! wrong-key)
+          enc       (encrypt-edn! {:v :unreadable} "secrets.edn.age" wrong-key)
+          cfg       (spit-config! "{:v #secret/req :v}")
+          calls     (atom 0)
+          real      age/decrypt]
+      (with-redefs [age/decrypt (fn [& args] (swap! calls inc) (apply real args))]
+        (secrets-aero/register! {:file enc :identity-file *key*})
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"age decryption failed"
+             (aero/read-config cfg))
+            "the first read genuinely asks age to decrypt wrong-key ciphertext")
+        (encrypt-edn! {:v :repaired})
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"age decryption failed"
+             (aero/read-config cfg))
+            "repairing the ciphertext does not retry the cached failure")
+        (is (= 1 @calls)
+            "the cached Aero reader rethrows without another decrypt attempt")
+        (secrets-aero/reset-cache!)
+        (is (= :repaired (:v (aero/read-config cfg)))
+            "reset retries against the repaired ciphertext without re-registering")
+        (is (= 2 @calls)
+            "reset causes exactly one fresh successful decrypt")))))
 
 (deftest profile-evaluates-only-the-selected-branch
   (testing "#profile picks a branch before the #secret tag in it is read, so the key
