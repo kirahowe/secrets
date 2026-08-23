@@ -1,0 +1,14 @@
+{:paths ["src" "resources/common"]
+
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+        integrant/integrant {:mvn/version "1.0.1"}
+        com.kirahowe/secrets {:local/root "../.."}}
+
+ :aliases
+ {:dev  {:extra-paths ["resources/dev"]}
+  :prod {:extra-paths ["resources/prod"]}
+  :test {:extra-paths ["test"]
+         :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
+         :main-opts   ["-m" "kaocha.runner"]}
+  :build {:deps      {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
+          :ns-default build}}}

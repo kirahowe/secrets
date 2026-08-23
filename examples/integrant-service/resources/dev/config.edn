@@ -1,0 +1,4 @@
+{:example.integrant-service/secrets {:resource "secrets.edn.age"
+                                     :app      "integrant-service"}
+ :example.integrant-service/http    {:port   8080
+                                     :secrets #ig/ref :example.integrant-service/secrets}}

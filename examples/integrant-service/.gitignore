@@ -1,0 +1,4 @@
+.demo/
+resources/dev/secrets.edn.age
+resources/prod/secrets.edn.age
+target/
