@@ -1,0 +1,3 @@
+;; This is configuration, not a secret store. The tagged value is resolved at read time.
+{:service {:endpoint #secret/req :demo/endpoint
+           :api-key #secret/req :demo/api-key}}

@@ -1,0 +1,39 @@
+{:paths ["src"]
+ :deps  {com.kirahowe/secrets {:local/root "../.."}}
+ :tasks
+ {secrets
+  {:doc "Manage this example's encrypted development secrets"
+   :requires ([com.kirahowe.secrets.cli :as cli])
+   :task (cli/run! {:app "example-quickstart"
+                    :default-environment :dev
+                    :environments {:dev {:secrets-file ".local/secrets.edn.age"
+                                         :key-file ".local/age-key.txt"
+                                         :template "secrets.edn.example"
+                                         :manifest ".local/secrets.edn.manifest"}}}
+                   *command-line-args*)}
+
+  bootstrap
+  {:doc "Create a throwaway identity and populate fake values via stdin"
+   :task (do
+           (shell "bb" "secrets" "keygen" "dev")
+           (shell {:in "https://example.test\n"}
+                  "bb" "secrets" "set" "dev" ":demo/endpoint")
+           (shell {:in "demo-api-key-for-local-only\n"}
+                  "bb" "secrets" "set" "dev" ":demo/api-key")
+           (println "Bootstrap complete. Generated files are under .local/ (gitignored)."))}
+
+  run
+  {:doc "Read config.edn with native clojure.edn and secret reader tags"
+   :task (shell "bb" "-m" "quickstart")}
+
+  verify
+  {:doc "Verify ciphertext and its manifest"
+   :task (shell "bb" "secrets" "verify" "dev")}
+
+  cleanup
+  {:doc "Remove only this example's generated .local artifacts"
+   :requires ([babashka.fs :as fs])
+   :task (let [dir (java.io.File. ".local")]
+           (when (.exists dir)
+             (fs/delete-tree dir))
+           (println "Removed .local/ generated artifacts (if present)."))}}}
