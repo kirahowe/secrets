@@ -37,15 +37,20 @@
 
 (def ^:private not-found ::not-found)
 
+(defn- user-home
+  "Return the current user's home directory."
+  []
+  (System/getProperty "user.home"))
+
 (defn expand-home
   "Expand a leading ~ to the user's home directory."
   [path]
   (let [s (str path)]
     (if (str/starts-with? s "~")
-      (str (System/getProperty "user.home") (subs s 1))
+      (str (user-home) (subs s 1))
       s)))
 
-;; ---------- 0600 temp files ----------
+;;;; Owner-only temp files
 
 (defn owner-only-temp-file!
   "Create a delete-on-exit temp file that is owner-only (0600) from the moment
@@ -68,11 +73,10 @@
               (.setWritable false false) (.setWritable true true))))
     (.deleteOnExit)))
 
-;; ---------- Identity (private key) resolution ----------
+;;;; Identity resolution
 
 (def ^:private identity-temp
-  "Caches the temp file materialized from $SECRETS_AGE_IDENTITY / $SECRETS_AGE_IDENTITY_B64 so
-  the key is written to disk at most once per process, keyed on its contents."
+  "Caches delayed identity temp-file paths by a SHA-256 digest of their contents."
   (atom {}))
 
 (defn- decode-b64-identity
@@ -90,22 +94,55 @@
                       {:env "SECRETS_AGE_IDENTITY_B64"}
                       e)))))
 
-(defn- materialize-identity!
-  "Write age identity `contents` (verbatim) to an owner-only 0600 temp file,
-  at most once per process per distinct contents, and return its path."
+(defn- identity-digest
+  "Return a stable SHA-256 cache key without retaining the raw identity contents."
   [contents]
-  (or (@identity-temp contents)
-      (let [f (owner-only-temp-file! "age-identity-" ".txt")]
-        (spit f contents)
-        (let [path (.getAbsolutePath f)]
-          (swap! identity-temp assoc contents path)
-          path))))
+  (let [bytes (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                       (.getBytes (str contents) "UTF-8"))]
+    (.encodeToString (java.util.Base64/getEncoder) bytes)))
+
+(defn- write-identity!
+  "Write identity contents verbatim to an owner-only temp file and return its path."
+  [contents]
+  (let [file (owner-only-temp-file! "age-identity-" ".txt")]
+    (spit file contents)
+    (.getAbsolutePath file)))
+
+(defn- materialize-identity!
+  "Materialize identity `contents` once per process and return its temp-file path.
+
+  The cache retains only a digest and, after materialization, the resulting path.
+  Installing a delay atomically ensures concurrent callers for identical contents
+  share one file write."
+  [contents]
+  (let [digest (identity-digest contents)
+        candidate (delay (write-identity! contents))
+        cache (swap! identity-temp
+                     #(if (contains? % digest)
+                        %
+                        (assoc % digest candidate)))
+        entry (get cache digest)]
+    (if-not (delay? entry)
+      entry
+      (try
+        (let [path @entry]
+          (swap! identity-temp
+                 #(if (identical? entry (get % digest))
+                    (assoc % digest path)
+                    %))
+          path)
+        (catch Exception error
+          (swap! identity-temp
+                 #(if (identical? entry (get % digest))
+                    (dissoc % digest)
+                    %))
+          (throw error))))))
 
 (def ^:private identity-env-help
   "What each identity variable should contain, for the set-but-empty error."
   {"SECRETS_AGE_IDENTITY_FILE" "a path to the age key file"
-   "SECRETS_AGE_IDENTITY"      "the age key file contents"
-   "SECRETS_AGE_IDENTITY_B64"  "the base64-encoded age key file contents"})
+   "SECRETS_AGE_IDENTITY" "the age key file contents"
+   "SECRETS_AGE_IDENTITY_B64" "the base64-encoded age key file contents"})
 
 (defn- identity-env-value
   "The value of identity variable `k`, or nil when it is unset. A variable that
@@ -176,7 +213,7 @@
        "{:app \"myapp\"} (→ ~/.config/myapp/key.txt); or create the key with "
        "`bb secrets keygen`."))
 
-;; ---------- Loading ----------
+;;;; Loading
 
 (defn- source->file
   "Coerce a secrets `source` to a [file cleanup!] pair. Path strings and Files
@@ -190,7 +227,7 @@
     (if (and f (.exists f))
       [f (fn [])]
       (let [tmp (owner-only-temp-file! "secrets-" ".age")]
-        (with-open [in  (io/input-stream source)
+        (with-open [in (io/input-stream source)
                     out (io/output-stream tmp)]
           (io/copy in out))
         [tmp #(.delete tmp)]))))
@@ -198,6 +235,52 @@
 (def ^:private no-store-hint
   "One-line remediation appended to \"no secrets file\" errors."
   "Create it with `bb secrets new`.")
+
+(defn- validate-load-identity!
+  "Resolve and validate the identity for `load-secrets`, returning its path."
+  [source identity-or-opts]
+  (let [identity (if (map? identity-or-opts)
+                   (or (:identity-file identity-or-opts)
+                       (resolve-identity-file identity-or-opts))
+                   (or identity-or-opts (resolve-identity-file)))]
+    (when-not (and identity (.exists (io/file (str identity))))
+      (throw (ex-info (str "No age identity found"
+                           (when identity (str " (" identity " does not exist)"))
+                           ". " identity-options)
+                      {:identity (some-> identity str)
+                       :source (str source)
+                       :reason :no-identity})))
+    identity))
+
+(defn- acquire-source!
+  "Acquire a file and cleanup function for `source`, translating read failures."
+  [source]
+  (when (nil? source)
+    (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
+                         " (io/resource \"secrets.edn.age\") found nothing on the classpath"
+                         " — check the encrypted file is present as a classpath resource. "
+                         no-store-hint)
+                    {:source nil :reason :no-file})))
+  ;; Opening decides whether a source is readable. A String may name a path or
+  ;; a URL, so checking for a missing path first would reject jar:file: URLs.
+  (try
+    (source->file source)
+    (catch java.io.IOException e
+      (throw (ex-info (if (and (or (instance? java.io.File source) (string? source))
+                               (not (.exists (io/file (str source)))))
+                        (str "Secrets file not found: " source ". " no-store-hint)
+                        (str "Could not read secrets source " (pr-str source)
+                             ": " (.getMessage e)))
+                      {:source source :reason :no-file}
+                      e)))))
+
+(defn- decrypt-and-read!
+  "Decrypt and read `file`, always running its source cleanup function."
+  [identity file cleanup!]
+  (try
+    (edn/read-string (age/decrypt identity (.getAbsolutePath ^java.io.File file)))
+    (finally
+      (cleanup!))))
 
 (defn load-secrets
   "Decrypt an age-encrypted EDN source and return its value.
@@ -220,40 +303,9 @@
   with `clojure.edn`, not `eval`."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
-   (let [identity (if (map? identity-or-opts)
-                    (or (:identity-file identity-or-opts)
-                        (resolve-identity-file identity-or-opts))
-                    (or identity-or-opts (resolve-identity-file)))]
-     (when-not (and identity (.exists (io/file (str identity))))
-       (throw (ex-info (str "No age identity found"
-                            (when identity (str " (" identity " does not exist)"))
-                            ". " identity-options)
-                       {:identity (some-> identity str) :source (str source) :reason :no-identity})))
-     (when (nil? source)
-       (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
-                            " (io/resource \"secrets.edn.age\") found nothing on the classpath"
-                            " — check the encrypted file is present as a classpath resource. "
-                            no-store-hint)
-                       {:source nil :reason :no-file})))
-     ;; Opening is what decides whether a source is readable: a String may name
-     ;; a path *or* a URL (io/input-stream tries the URL first), so a
-     ;; missing-path check up front would reject `jar:file:…!/secrets.edn.age`
-     ;; as a nonexistent file. Let source->file try, and pick the message from
-     ;; what the source turned out to be.
-     (let [[file cleanup!]
-           (try
-             (source->file source)
-             (catch java.io.IOException e
-               (throw (ex-info (if (and (or (instance? java.io.File source) (string? source))
-                                        (not (.exists (io/file (str source)))))
-                                 (str "Secrets file not found: " source ". " no-store-hint)
-                                 (str "Could not read secrets source " (pr-str source)
-                                      ": " (.getMessage e)))
-                               {:source source :reason :no-file}
-                               e))))]
-       (try
-         (edn/read-string (age/decrypt identity (.getAbsolutePath ^java.io.File file)))
-         (finally (cleanup!)))))))
+   (let [identity (validate-load-identity! source identity-or-opts)
+         [file cleanup!] (acquire-source! source)]
+     (decrypt-and-read! identity file cleanup!))))
 
 (defn get-secret
   "Read a secret from a loaded map. `key-path` is a single key (`:database/url`)
@@ -265,7 +317,52 @@
      (get-in secrets key-path default)
      (get secrets key-path default))))
 
-;; ---------- EDN reader literals ----------
+;;;; EDN reader literals
+
+(defn- reader-loaded-state
+  "Resolve and load one readers map's source, or describe why it is unavailable."
+  [{:keys [resource file]} identity]
+  (let [source (cond
+                 file (when (.exists (io/file (str file)))
+                        (io/file (str file)))
+                 resource (io/resource resource))]
+    (cond
+      (nil? source)
+      {:present? false :reason :no-file}
+
+      (not (and @identity (.exists (io/file (str @identity)))))
+      {:present? false :reason :no-identity}
+
+      :else
+      {:present? true :secrets (load-secrets source @identity)})))
+
+(defn- required-secret-handler
+  "Build the required-secret reader around a shared delayed loaded state."
+  [loaded describe]
+  (fn [key-path]
+    (let [{:keys [present? reason secrets]} @loaded]
+      (when-not present?
+        (throw (ex-info (if (= reason :no-identity)
+                          (str "Required secret " (pr-str key-path)
+                               " needs an age identity, but none is available. "
+                               identity-options)
+                          (str "Required secret " (pr-str key-path)
+                               " — but no secrets file found (" describe ")."))
+                        {:key key-path :source describe :reason reason})))
+      (let [value (get-secret secrets key-path not-found)]
+        (when (= value not-found)
+          (throw (ex-info (str "Required secret " (pr-str key-path)
+                               " is missing from the secrets file.")
+                          {:key key-path :source describe :reason :missing-key})))
+        value))))
+
+(defn- optional-secret-handler
+  "Build the optional-secret reader around a shared delayed loaded state."
+  [loaded]
+  (fn [key-path]
+    (let [{:keys [present? secrets]} @loaded]
+      (when present?
+        (get-secret secrets key-path)))))
 
 (defn reader-literals
   "Build the `#secret/req` / `#secret/opt` EDN reader-literal functions, bound
@@ -290,47 +387,12 @@
                     from the decrypted map.
     #secret/opt k → optional: nil in all three of those cases.
   If the identity exists but decryption fails, both tags throw."
-  [{:keys [resource file app identity-file]}]
+  [{:keys [app identity-file] :as opts}]
   (let [identity (delay (or identity-file (resolve-identity-file app)))
-        ;; One of {:present? false :reason :no-file}, {:present? false :reason
-        ;; :no-identity}, or {:present? true :secrets m} — computed once; a
-        ;; decryption failure is cached and re-thrown by every tag.
-        loaded   (delay
-                   (let [src (cond file     (when (.exists (io/file (str file))) (io/file (str file)))
-                                   resource (io/resource resource))]
-                     (cond
-                       (nil? src)
-                       {:present? false :reason :no-file}
-
-                       (not (and @identity (.exists (io/file (str @identity)))))
-                       {:present? false :reason :no-identity}
-
-                       :else
-                       {:present? true :secrets (load-secrets src @identity)})))
-        describe (or file resource "secrets")]
-    {'secret/req
-     (fn [key-path]
-       (let [{:keys [present? reason secrets]} @loaded]
-         (when-not present?
-           (throw (ex-info (if (= reason :no-identity)
-                             (str "Required secret " (pr-str key-path)
-                                  " needs an age identity, but none is available. "
-                                  identity-options)
-                             (str "Required secret " (pr-str key-path)
-                                  " — but no secrets file found (" describe ")."))
-                           {:key key-path :source describe :reason reason})))
-         (let [v (get-secret secrets key-path not-found)]
-           (when (= v not-found)
-             (throw (ex-info (str "Required secret " (pr-str key-path)
-                                  " is missing from the secrets file.")
-                             {:key key-path :source describe :reason :missing-key})))
-           v)))
-
-     'secret/opt
-     (fn [key-path]
-       (let [{:keys [present? secrets]} @loaded]
-         (when present?
-           (get-secret secrets key-path))))}))
+        loaded (delay (reader-loaded-state opts identity))
+        describe (or (:file opts) (:resource opts) "secrets")]
+    {'secret/req (required-secret-handler loaded describe)
+     'secret/opt (optional-secret-handler loaded)}))
 
 (defn merge-readers
   "Merge `reader-literals` into an existing `:readers` map. The returned map

@@ -1,4 +1,4 @@
-(ns build
+(ns example.integrant-service.build
   (:require [clojure.tools.build.api :as b]))
 
 (def class-dir "target/classes")

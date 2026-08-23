@@ -1,6 +1,6 @@
 ;; # Design and rationale
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.design
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))

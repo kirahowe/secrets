@@ -1,10 +1,10 @@
 ;; # The CLI: managing secrets from the terminal
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.cli
-  (:require [com.kirahowe.secrets.age :as age]
-            [com.kirahowe.secrets.cli :as cli]
-            [clojure.java.io :as io]))
+  (:require [clojure.java.io :as io]
+            [com.kirahowe.secrets.age :as age]
+            [com.kirahowe.secrets.cli :as cli]))
 
 ;; The management commands are exposed through one babashka task. The task is
 ;; a dispatcher over functions in
@@ -36,8 +36,8 @@
 ;; In that output, `:template` and `:manifest` derive from the
 ;; secrets file name, `:key-file` is the durable path `keygen` writes to, and
 ;; `:identity-file` is what decryption actually uses. The two are separate
-;; because the `SECRETS_AGE_IDENTITY*` environment variables override `:identity-file`
-;; but never `:key-file`. A CI runner holding one env var decrypts and
+;; because the `SECRETS_AGE_IDENTITY*` environment variables override
+;; `:identity-file` but never `:key-file`. A CI runner holding one env var decrypts and
 ;; verifies with it; `keygen` on your laptop still writes to the configured
 ;; path.
 
@@ -104,17 +104,19 @@
 ;; The interactive commands (`new`, `edit`) need an editor. This example uses
 ;; the non-interactive functions in a temporary directory:
 
-(def dir (str (java.nio.file.Files/createTempDirectory
-               "secrets-cli-" (into-array java.nio.file.attribute.FileAttribute []))))
+(def dir
+  (str (java.nio.file.Files/createTempDirectory
+        "secrets-cli-"
+        (into-array java.nio.file.attribute.FileAttribute []))))
 
 (def config
   (cli/normalize-config
    {:app "cli-demo"
     :default-environment :dev
     :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
-                         :key-file     (str dir "/key.txt")}}}))
+                         :key-file (str dir "/key.txt")}}}))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (age/keygen! (str dir "/key.txt"))
 
 ;; Create the encrypted file the way `bb secrets new` would, minus the editor:
@@ -140,8 +142,9 @@
 
 ;; `encrypt!` handles arbitrary files:
 
-(do (spit (str dir "/service-account.json") "{\"type\": \"service_account\"}")
-    (cli/encrypt! config "dev" (str dir "/service-account.json")))
+(do
+  (spit (str dir "/service-account.json") "{\"type\": \"service_account\"}")
+  (cli/encrypt! config "dev" (str dir "/service-account.json")))
 
 ;; ## Errors carry their remediation
 
@@ -161,6 +164,6 @@
 ;; Only `run!`, the entry point wired into `bb.edn`, translates failures into
 ;; process exit codes.
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]
   (.delete f))

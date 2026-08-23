@@ -1,10 +1,10 @@
 (ns aero-profiles.core-test
-  (:require [clojure.java.io :as io]
-            [clojure.test :refer [deftest is testing use-fixtures]]
-            [aero-profiles.bootstrap :as bootstrap]
-            [aero-profiles.core :as app]))
+  (:require [aero-profiles.bootstrap :as bootstrap]
+            [aero-profiles.core :as app]
+            [clojure.java.io :as io]
+            [clojure.test :refer [deftest is testing use-fixtures]]))
 
-(defn with-disposable-secrets [f]
+(defn- with-disposable-secrets [f]
   (try
     (bootstrap/run!)
     (f)
@@ -15,14 +15,14 @@
 
 (use-fixtures :each with-disposable-secrets)
 
-(deftest source-is-loadable
+(deftest source-is-loadable-test
   (testing "the starter exposes a REPL cache reset hook"
     (is (nil? (app/reset-cache!)))))
 
-(deftest profiles-select-different-safe-results
+(deftest profiles-select-different-safe-results-test
   (testing "default and evals select their own required key branches"
     (let [default (app/run!)
-          evals   (app/run! "evals")]
+          evals (app/run! "evals")]
       (is (= :default (:profile default)))
       (is (= "default" (:profile-name default)))
       (is (= :evals (:profile evals)))

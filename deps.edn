@@ -1,23 +1,29 @@
 {:paths ["src"]
 
- ;; Zero runtime dependencies beyond Clojure itself — the library shells out to
- ;; the `age` CLI and uses only clojure.core/edn/io/shell, so it loads and runs
- ;; identically under JVM Clojure and babashka.
+ ;;; Zero runtime dependencies beyond Clojure itself — the library shells out to
+ ;;; the `age` CLI and uses only clojure.core/edn/io/shell, so it loads and runs
+ ;;; identically under JVM Clojure and babashka.
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}}
 
  :aliases
- {:test  {:extra-paths ["test"]
-          :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}
-                        aero/aero           {:mvn/version "1.1.6"}
-                        rewrite-clj/rewrite-clj {:mvn/version "1.2.55"}}
-          :main-opts   ["-m" "kaocha.runner"]}
+ {:test {:extra-paths ["test"]
+         :extra-deps {aero/aero {:mvn/version "1.1.6"}
+                      lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                      rewrite-clj/rewrite-clj {:mvn/version "1.2.55"}}
+         :main-opts ["-m" "kaocha.runner"]}
 
-  ;; The documentation book: Clay renders the literate chapters under
-  ;; book/chapters into a Quarto book (see clay.edn and the book:* bb tasks).
-  :book  {:extra-paths ["book/chapters"]
-          :extra-deps  {org.scicloj/clay {:mvn/version "2.0.16"}
-                        aero/aero        {:mvn/version "1.1.6"}}}
+  ;;; The documentation book: Clay renders the literate chapters under
+  ;;; book/chapters into a Quarto book (see clay.edn and the book:* bb tasks).
+  :book {:extra-paths ["book/chapters"]
+         :extra-deps {aero/aero {:mvn/version "1.1.6"}
+                      org.scicloj/clay {:mvn/version "2.0.16"}}}
 
-  :build {:deps      {io.github.clojure/tools.build {:mvn/version "0.10.13"}
-                      slipset/deps-deploy           {:mvn/version "0.2.2"}}
-          :ns-default build}}}
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}
+                 slipset/deps-deploy {:mvn/version "0.2.2"}}
+          :ns-default build}
+
+  :format {:replace-deps {dev.weavejester/cljfmt {:mvn/version "0.16.5"}}
+           :main-opts ["-m" "cljfmt.main"]}
+
+  :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.05.25"}}
+         :main-opts ["-m" "clj-kondo.main"]}}}

@@ -5,10 +5,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Development tasks for formatting (`bb format`), non-mutating format checks
+  (`bb format:check`), and linting (`bb lint`), enforcing the project's
+  100-column Clojure style consistently.
+
 ### Changed
 - `add-recipient` now distinguishes first-store bootstrap from recipient
   changes to existing ciphertext: it recommends `set` or `new` before a store
   exists, and `reencrypt` only when ciphertext already needs updating.
+- Core, CLI, and Aero internals were simplified and reorganized for readability
+  while preserving public APIs, command behavior, and returned diagnostic
+  schemas.
+- Source style and behavior-oriented test names are now consistent, and example
+  task entrypoints use qualified function calls so static analysis is reliable
+  without changing how the examples run.
+
+### Fixed
+- Environment-injected identities are materialized through a race-safe,
+  SHA-256-digest-keyed cache. Concurrent callers with identical identity
+  contents now share one owner-only temporary-file write, and realized cache
+  entries retain only the digest and resulting path rather than the raw
+  identity contents.
 
 ## [0.1.0] - 2026-08-21
 

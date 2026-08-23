@@ -1,10 +1,10 @@
 ;; # Production and CI
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.production
-  (:require [com.kirahowe.secrets :as secrets]
-            [com.kirahowe.secrets.age :as age]
-            [clojure.java.io :as io]))
+  (:require [clojure.java.io :as io]
+            [com.kirahowe.secrets :as secrets]
+            [com.kirahowe.secrets.age :as age]))
 
 ;; A deployment needs the ciphertext and a matching identity. The ciphertext
 ;; can ship with the code in an image or jar. Supply the identity through the
@@ -83,26 +83,29 @@
 ;; The following example builds a jar containing an encrypted resource, then
 ;; loads it through the `jar:` URL form returned by `io/resource` inside a jar:
 
-(def dir (str (java.nio.file.Files/createTempDirectory
-               "secrets-prod-" (into-array java.nio.file.attribute.FileAttribute []))))
+(def dir
+  (str (java.nio.file.Files/createTempDirectory
+        "secrets-prod-"
+        (into-array java.nio.file.attribute.FileAttribute []))))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (def key-file (str dir "/key.txt"))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (age/keygen! key-file)
 
 (let [plain (str dir "/p.edn")
-      enc   (str dir "/secrets.edn.age")
-      jar   (str dir "/app.jar")]
+      enc (str dir "/secrets.edn.age")
+      jar (str dir "/app.jar")]
   (spit plain (pr-str {:from :inside-the-jar}))
   (age/encrypt-file! key-file plain enc)
   (with-open [zos (java.util.zip.ZipOutputStream. (io/output-stream jar))]
     (.putNextEntry zos (java.util.zip.ZipEntry. "secrets.edn.age"))
     (io/copy (io/file enc) zos)
     (.closeEntry zos))
-  (secrets/load-secrets (java.net.URL. (str "jar:file:" jar "!/secrets.edn.age"))
-                        key-file))
+  (secrets/load-secrets
+   (java.net.URL. (str "jar:file:" jar "!/secrets.edn.age"))
+   key-file))
 
 ;; The library detects that the source is not a plain file, streams it out to
 ;; an owner-only temp copy, hands that to `age`, and deletes the copy.
@@ -204,6 +207,6 @@
 ;; copy means recovering or replacing each secret value at its source. Back it
 ;; up in the team's approved secret storage when it is created.
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]
   (.delete f))

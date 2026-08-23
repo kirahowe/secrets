@@ -1,11 +1,11 @@
 ;; # Teams: multi-recipient encryption
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.teams
-  (:require [com.kirahowe.secrets :as secrets]
+  (:require [clojure.java.io :as io]
+            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
-            [com.kirahowe.secrets.cli :as cli]
-            [clojure.java.io :as io]))
+            [com.kirahowe.secrets.cli :as cli]))
 
 ;; In the single-key setup, every teammate shares one private key. Age also
 ;; supports multiple recipients: a file can encrypt to many
@@ -19,14 +19,16 @@
 ;; Alice and Bob each run `bb secrets keygen` on their own machines. Here,
 ;; one temp directory stands in for both machines:
 
-(def dir (str (java.nio.file.Files/createTempDirectory
-               "secrets-teams-" (into-array java.nio.file.attribute.FileAttribute []))))
+(def dir
+  (str (java.nio.file.Files/createTempDirectory
+        "secrets-teams-"
+        (into-array java.nio.file.attribute.FileAttribute []))))
 
 (def alice-key (str dir "/alice.txt"))
-(def bob-key   (str dir "/bob.txt"))
+(def bob-key (str dir "/bob.txt"))
 
 (def alice-pub (age/keygen! alice-key))
-(def bob-pub   (age/keygen! bob-key))
+(def bob-pub (age/keygen! bob-key))
 
 ;; The recipients file contains public keys and can be committed:
 
@@ -86,8 +88,8 @@
   (cli/normalize-config
    {:app "teams-demo"
     :default-environment :dev
-    :environments {:dev {:secrets-file    (str dir "/secrets.edn.age")
-                         :key-file        alice-key
+    :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
+                         :key-file alice-key
                          :recipients-file recipients-file}}}))
 
 (def carol-pub (age/keygen! (str dir "/carol.txt")))
@@ -137,6 +139,6 @@
 ;; does not. The [manifest chapter](secrets_book.manifest.html) has the
 ;; details.
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]
   (.delete f))

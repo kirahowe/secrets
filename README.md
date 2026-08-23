@@ -285,28 +285,29 @@ That's the whole thing — requiring the namespace registers the `#secret/req` /
 clean); the namespace only compiles and loads for consumers who already have
 `aero` on their own classpath.
 
-Two ways to supply the secrets config — the same opts map `reader-literals`
-takes (`:app`/`:resource`, `:file`, `:identity-file`):
+There are two ways to supply the secrets config — the same opts map
+`reader-literals` takes (`:app`/`:resource`, `:file`, `:identity-file`):
 
-- **Process-wide**, for the common case of one app reading its own config in
-  one place:
-
-  ```clojure
-  (com.kirahowe.secrets.aero/register! {:app "myapp" :resource "secrets.edn.age"})
-  ```
-
-- **Per read**, through aero's own opts — `aero.core/read-config` passes its
-  entire opts map to readers, so the config comes straight off a `:secrets`
-  key and can be varied per call (see the profile recipe below):
+- **Per read (preferred)**, through aero's own opts. `aero.core/read-config`
+  passes its entire opts map to readers, so the config comes from a `:secrets`
+  key and can vary per call (see the profile recipe below):
 
   ```clojure
   (aero.core/read-config "config.edn"
     {:secrets {:app "myapp" :resource "secrets.edn.age"}})
   ```
 
-A per-read `:secrets` opt always wins over a `register!`ed default. With
-neither supplied, reading a `#secret/…` tag throws rather than resolving to
-nil.
+- **Process-wide**, as an explicit convenience for an application with one
+  secrets configuration and a deliberate process lifecycle:
+
+  ```clojure
+  (com.kirahowe.secrets.aero/register! {:app "myapp" :resource "secrets.edn.age"})
+  ```
+
+`register!` stores mutable process state: a later call replaces the default,
+and `(register! nil)` clears it when that lifecycle ends. A per-read `:secrets`
+opt always wins over the registered default. With neither supplied, reading a
+`#secret/…` tag throws rather than resolving to nil.
 
 Each distinct Aero secrets configuration is likewise decrypted once and
 cached, including a genuine decryption failure. In a long-running REPL, edit
@@ -692,8 +693,20 @@ starters: [quickstart-bb](examples/quickstart-bb/README.md),
 
 ## Development
 
+Project Clojure code follows a 100-column policy. Tests require `age` and a
+JDK.
+
 ```sh
-bb test                    # run the suite under babashka (needs age and Java/JDK for deps)
+bb format          # format Clojure source with cljfmt
+bb format:check    # check formatting without changing files
+bb lint            # lint Clojure source with clj-kondo
+bb test            # run the suite under Babashka
+clojure -M:test    # run the suite under JVM Clojure
+```
+
+Other development tasks:
+
+```sh
 bb secrets help            # demo the CLI against a throwaway tmp/ file
 clojure -T:build install   # build + install the jar to ~/.m2 (needs a JDK)
 ```

@@ -5,8 +5,8 @@
   instead of exiting), plus `run!` for the dispatch/arg-order cases that don't
   exit on success.
 
-  Tests that pin a specific key skip themselves when an SECRETS_AGE_IDENTITY* env var
-  is set, because the env legitimately overrides :key-file."
+  Tests that pin a specific key skip themselves when an SECRETS_AGE_IDENTITY*
+  env var is set, because the env legitimately overrides :key-file."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
@@ -16,10 +16,10 @@
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.manifest :as manifest]))
 
-(def ^:dynamic *dir* nil)
-(def ^:dynamic *key* nil)
+(def ^:private ^:dynamic *dir* nil)
+(def ^:private ^:dynamic *key* nil)
 
-(defn with-tmp-key [f]
+(defn- with-tmp-key [f]
   (let [dir (str (java.nio.file.Files/createTempDirectory
                   "kira-secrets-cli-test"
                   (into-array java.nio.file.attribute.FileAttribute [])))
@@ -33,10 +33,14 @@
 
 (use-fixtures :each with-tmp-key)
 
-(def ^:private age-env-set?
-  "SECRETS_AGE_IDENTITY* overrides :key-file in :identity-file resolution, so tests
-  that must decrypt with the fixture's key can't run under it."
-  (boolean (some #(System/getenv %) ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY" "SECRETS_AGE_IDENTITY_B64"])))
+(defn- age-env-set?
+  "Whether an SECRETS_AGE_IDENTITY* variable overrides the fixture key."
+  []
+  (boolean
+   (some #(System/getenv %)
+         ["SECRETS_AGE_IDENTITY_FILE"
+          "SECRETS_AGE_IDENTITY"
+          "SECRETS_AGE_IDENTITY_B64"])))
 
 (defn- test-config
   "A single-env config rooted in the fixture's temp dir, key pinned to *key*."
@@ -45,7 +49,7 @@
    {:app "cli-test"
     :default-environment :dev
     :environments {:dev (merge {:secrets-file (str *dir* "/secrets.edn.age")
-                                :key-file     *key*}
+                                :key-file *key*}
                                env-overrides)}}))
 
 (defn- encrypt-edn!
@@ -53,7 +57,7 @@
   as a teammate bypassing the CLI would."
   [m]
   (let [plain (str *dir* "/plain.edn")
-        enc   (str *dir* "/secrets.edn.age")]
+        enc (str *dir* "/secrets.edn.age")]
     (spit plain (pr-str m))
     (age/encrypt-file! *key* plain enc)
     (.delete (io/file plain))
@@ -74,11 +78,15 @@
 (defn- cli-private [sym]
   (ns-resolve 'com.kirahowe.secrets.cli sym))
 
+(defn- under-default-key-file
+  [path f]
+  (with-redefs-fn {(cli-private 'default-key-file) (constantly path)} f))
+
 (defn- capture-doctor
   [config env-arg]
   (let [result (atom nil)
-        out    (java.io.StringWriter.)
-        err    (java.io.StringWriter.)]
+        out (java.io.StringWriter.)
+        err (java.io.StringWriter.)]
     (binding [*out* out *err* err]
       (reset! result (cli/doctor! config env-arg)))
     {:result @result :out (str out) :err (str err)}))
@@ -87,19 +95,20 @@
   "Run doctor with process boundaries replaced, including the app default key
   path so tests do not depend on the developer's home or environment."
   [config env-arg {:keys [environment identity-path version] :as opts}]
-  (with-redefs-fn {(cli-private 'getenv) (fn [name] (get environment name))
+  (with-redefs-fn {(cli-private 'getenv) (or environment {})
                    (cli-private 'default-key-file) (fn [_] *key*)
                    #'secrets/identity-from-env (fn [] identity-path)
                    #'age/version (fn [] (if (contains? opts :version)
                                           version
                                           "age test-version"))}
     #(capture-doctor config env-arg)))
+
 (defn- complete-doctor-config
   ([] (complete-doctor-config {}))
   ([overrides]
-   (let [config   (test-config overrides)
-         env      (get-in config [:environments :dev])
-         cipher   (:secrets-file env)
+   (let [config (test-config overrides)
+         env (get-in config [:environments :dev])
+         cipher (:secrets-file env)
          template (if (contains? env :template)
                     (:template env)
                     (str/replace cipher #"\.age$" ".example"))
@@ -112,9 +121,9 @@
        (spit manifest "{:version 1 :ciphertext-sha \"fixture-sha\"}"))
      config)))
 
-;; ---------- normalize-config ----------
+;;;; Normalize config
 
-(deftest normalize-config-defaults
+(deftest normalize-config-defaults-test
   (let [cfg (cli/normalize-config
              {:app "myapp"
               :environments {:prod {:secrets-file "env/secrets.edn.age"}}})
@@ -125,22 +134,22 @@
            (:key-file env)))
     (is (= :prod (:name env)))
     (is (= "myapp" (:app env)))
-    (if age-env-set?
+    (if (age-env-set?)
       (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
       (is (= (:key-file env) (:identity-file env))
           ":identity-file falls back to :key-file without SECRETS_AGE_IDENTITY*"))))
 
-(deftest normalize-config-explicit-values-respected
+(deftest normalize-config-explicit-values-respected-test
   (let [cfg (cli/normalize-config
              {:app "myapp"
               :environments {:dev {:secrets-file "s.edn.age"
-                                   :template     "tpl.edn"
-                                   :manifest     false}}})
+                                   :template "tpl.edn"
+                                   :manifest false}}})
         env (get-in cfg [:environments :dev])]
     (is (= "tpl.edn" (:template env)))
     (is (false? (:manifest env)) ":manifest false survives normalization")))
 
-(deftest normalize-config-validation
+(deftest normalize-config-validation-test
   (testing "no :environments"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #":environments"
                           (cli/normalize-config {:app "x"}))))
@@ -158,8 +167,8 @@
   (testing "non-.age accepted when :template and :manifest are both explicit"
     (let [env (-> {:app "x"
                    :environments {:dev {:secrets-file "secrets.enc"
-                                        :template     "secrets.example"
-                                        :manifest     false}}}
+                                        :template "secrets.example"
+                                        :manifest false}}}
                   cli/normalize-config
                   (get-in [:environments :dev]))]
       (is (= "secrets.enc" (:secrets-file env)))))
@@ -171,55 +180,59 @@
                                                  :manifest "s.age"}}}))))
   (testing "every pair of artifact paths is compared canonically"
     (let [fields [:secrets-file :manifest :template :key-file :recipients-file]
-          env    {:secrets-file "ciphertext.age"
-                  :manifest "manifest.edn"
-                  :template "template.edn"
-                  :key-file "key.txt"
-                  :recipients-file "recipients.txt"}]
+          env {:secrets-file "ciphertext.age"
+               :manifest "manifest.edn"
+               :template "template.edn"
+               :key-file "key.txt"
+               :recipients-file "recipients.txt"}]
       (doseq [left-index (range (count fields))
               right-index (range (inc left-index) (count fields))]
-        (let [left  (nth fields left-index)
+        (let [left (nth fields left-index)
               right (nth fields right-index)
-              env   (assoc env right (str "./" (get env left)))]
+              env (assoc env right (str "./" (get env left)))]
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"colliding artifact paths"
                                 (cli/normalize-config
                                  {:app "x" :environments {:dev env}}))
               (str left " and " right " alias the same canonical path")))))))
 
-(deftest unknown-environment-throws
+(deftest unknown-environment-throws-test
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown environment"
                         (cli/recipients! (cli/normalize-config (test-config)) "nope"))))
 
-;; ---------- doctor ----------
+;;;; Doctor
 
-(deftest doctor-healthy-warning-invalid-and-stable-output
-  (let [config (complete-doctor-config)
-        {:keys [result out err]} (doctor-under config nil {})]
-    (is (= 0 (:exit result)))
-    (is (= :healthy (:status result)))
-    (is (= :dev (:environment result)))
-    (is (= {:available? true :version "age test-version"} (:age result)))
-    (is (true? (get-in result [:verify :keyless?])))
-    (is (true? (get-in result [:verify :full?])))
-    (is (= (.getCanonicalPath (io/file (get-in config [:environments :dev :secrets-file])))
-           (get-in result [:artifacts :ciphertext :path])))
-    (is (str/starts-with? out "Age: available"))
-    (is (re-find #"(?m)^Age: available" out))
-    (is (re-find #"(?m)^Environment: dev$" out))
-    (is (re-find #"(?m)^Status: healthy$" out))
-    (is (= "" err)))
-  (let [{:keys [result]} (doctor-under (test-config) nil {:version nil})]
-    (is (= 1 (:exit result)))
-    (is (= :warning (:status result)))
-    (is (false? (get-in result [:age :available?]))))
-  (let [{:keys [result out err]}
-        (doctor-under {:environments {:dev {:secrets-file "s.age"}}} nil {})]
-    (is (= 2 (:exit result)))
-    (is (= :invalid (:status result)))
-    (is (= "Configuration: invalid\nStatus: invalid\n" out))
-    (is (= "" err))))
+(deftest doctor-healthy-warning-invalid-and-stable-output-test
+  (testing "a healthy configuration has stable output"
+    (let [config (complete-doctor-config)
+          {:keys [result out err]} (doctor-under config nil {})]
+      (is (= 0 (:exit result)))
+      (is (= :healthy (:status result)))
+      (is (= :dev (:environment result)))
+      (is (= {:available? true :version "age test-version"} (:age result)))
+      (is (true? (get-in result [:verify :keyless?])))
+      (is (true? (get-in result [:verify :full?])))
+      (is (= (.getCanonicalPath
+              (io/file (get-in config [:environments :dev :secrets-file])))
+             (get-in result [:artifacts :ciphertext :path])))
+      (is (str/starts-with? out "Age: available"))
+      (is (re-find #"(?m)^Age: available" out))
+      (is (re-find #"(?m)^Environment: dev$" out))
+      (is (re-find #"(?m)^Status: healthy$" out))
+      (is (= "" err))))
+  (testing "an unavailable age binary produces a warning"
+    (let [{:keys [result]} (doctor-under (test-config) nil {:version nil})]
+      (is (= 1 (:exit result)))
+      (is (= :warning (:status result)))
+      (is (false? (get-in result [:age :available?])))))
+  (testing "an invalid configuration produces only the stable diagnostic"
+    (let [{:keys [result out err]}
+          (doctor-under {:environments {:dev {:secrets-file "s.age"}}} nil {})]
+      (is (= 2 (:exit result)))
+      (is (= :invalid (:status result)))
+      (is (= "Configuration: invalid\nStatus: invalid\n" out))
+      (is (= "" err)))))
 
-(deftest doctor-identifies-every-identity-source-without-disclosure
+(deftest doctor-identifies-every-identity-source-without-disclosure-test
   (let [raw-value "RAW-IDENTITY-SENTINEL"
         b64-value "B64-IDENTITY-SENTINEL"
         file-value (str *dir* "/FILE-IDENTITY-SENTINEL")
@@ -253,16 +266,17 @@
                          :default-environment :dev
                          :environments {:dev {:secrets-file (str *dir* "/default.edn.age")}}}}]]
     (doseq [{:keys [source config sentinels] :as spec} specs]
-      (let [{:keys [result out err]}
-            (doctor-under (or config base) nil spec)
-            disclosed (str (pr-str result) out err)]
-        (is (= source (get-in result [:identity :source])))
-        (is (str/includes? out (str "Identity: " (:label spec) " — usable\n")))
-        (is (true? (get-in result [:identity :usable?])))
-        (doseq [sentinel sentinels]
-          (is (not (str/includes? disclosed sentinel))))))))
+      (testing (name source)
+        (let [{:keys [result out err]}
+              (doctor-under (or config base) nil spec)
+              disclosed (str (pr-str result) out err)]
+          (is (= source (get-in result [:identity :source])))
+          (is (str/includes? out (str "Identity: " (:label spec) " — usable\n")))
+          (is (true? (get-in result [:identity :usable?])))
+          (doseq [sentinel sentinels]
+            (is (not (str/includes? disclosed sentinel)))))))))
 
-(deftest doctor-recipient-modes-and-validity
+(deftest doctor-recipient-modes-and-validity-test
   (let [recipients (str *dir* "/recipients.txt")
         config (complete-doctor-config {:recipients-file recipients})
         valid-a "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -296,44 +310,51 @@
         (is (= {:state :unconfigured :count 0 :valid? nil}
                (get-in result [:encryption :recipients])))))))
 
-(deftest doctor-keyless-full-and-disabled-manifest-capability
+(deftest doctor-keyless-full-and-disabled-manifest-capability-test
   (let [config (complete-doctor-config)]
-    (is (= {:state :ready :keyless? true :full? true}
-           (:verify (:result (doctor-under config nil {})))))
-    (let [missing-identity (str *dir* "/missing-identity")
-          result (:result
-                  (doctor-under config nil
-                                {:environment {"SECRETS_AGE_IDENTITY_FILE" missing-identity}
-                                 :identity-path missing-identity}))]
-      (is (= 1 (:exit result)))
-      (is (= {:state :ready :keyless? true :full? false} (:verify result))))
-    (let [result (:result (doctor-under config nil {:version nil}))]
-      (is (= {:state :ready :keyless? true :full? false} (:verify result))))
-    (spit (str *dir* "/secrets.edn.manifest") "{:version 1}")
-    (let [result (:result (doctor-under config nil {}))]
-      (is (= 1 (:exit result)))
-      (is (= {:state :missing-ciphertext-sha :keyless? false :full? true}
-             (:verify result)))))
-  (let [result (:result
-                (doctor-under (complete-doctor-config {:manifest false}) nil {}))]
-    (is (= 0 (:exit result)))
-    (is (= {:state :skipped :keyless? false :full? false} (:verify result)))
-    (is (= :disabled (get-in result [:artifacts :manifest :state])))))
+    (testing "a complete setup supports keyless and full verification"
+      (is (= {:state :ready :keyless? true :full? true}
+             (:verify (:result (doctor-under config nil {}))))))
+    (testing "a missing identity preserves keyless verification"
+      (let [missing-identity (str *dir* "/missing-identity")
+            result (:result
+                    (doctor-under
+                     config
+                     nil
+                     {:environment {"SECRETS_AGE_IDENTITY_FILE" missing-identity}
+                      :identity-path missing-identity}))]
+        (is (= 1 (:exit result)))
+        (is (= {:state :ready :keyless? true :full? false} (:verify result)))))
+    (testing "an unavailable age binary preserves keyless verification"
+      (let [result (:result (doctor-under config nil {:version nil}))]
+        (is (= {:state :ready :keyless? true :full? false} (:verify result)))))
+    (testing "an incomplete manifest prevents keyless verification"
+      (spit (str *dir* "/secrets.edn.manifest") "{:version 1}")
+      (let [result (:result (doctor-under config nil {}))]
+        (is (= 1 (:exit result)))
+        (is (= {:state :missing-ciphertext-sha :keyless? false :full? true}
+               (:verify result))))))
+  (testing "a disabled manifest skips verification"
+    (let [result (:result
+                  (doctor-under (complete-doctor-config {:manifest false}) nil {}))]
+      (is (= 0 (:exit result)))
+      (is (= {:state :skipped :keyless? false :full? false} (:verify result)))
+      (is (= :disabled (get-in result [:artifacts :manifest :state]))))))
 
-(deftest run-dispatches-doctor-before-normalization
+(deftest run-dispatches-doctor-before-normalization-test
   (let [called (atom nil)]
     (with-redefs [cli/doctor! (fn [config env]
-                               (reset! called [config env])
-                               {:exit 0})]
+                                (reset! called [config env])
+                                {:exit 0})]
       (cli/run! {:deliberately :invalid} ["doctor" "prod"]))
     (is (= [{:deliberately :invalid} "prod"] @called))))
 
-;; ---------- validated, transactional saves ----------
+;;;; Validated, transactional saves
 
-(deftest new-rejects-invalid-edn-before-writing
-  (let [config   (cli/normalize-config (test-config))
+(deftest new-rejects-invalid-edn-before-writing-test
+  (let [config (cli/normalize-config (test-config))
         encrypted (str *dir* "/secrets.edn.age")
-        manifest  (str *dir* "/secrets.edn.manifest")]
+        manifest (str *dir* "/secrets.edn.manifest")]
     (doseq [invalid ["{:unfinished" "{:one 1} {:two 2}" ""]]
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"not valid EDN"
@@ -345,16 +366,16 @@
       (is (not (.exists (io/file manifest)))
           "invalid editor contents never create a manifest"))))
 
-(deftest edit-rejects-invalid-edn-without-replacing-valid-files
-  (if age-env-set?
+(deftest edit-rejects-invalid-edn-without-replacing-valid-files-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config        (cli/normalize-config (test-config))
-          encrypted     (str *dir* "/secrets.edn.age")
+    (let [config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
           manifest-path (str *dir* "/secrets.edn.manifest")]
       (encrypt-edn! {:valid true})
       (with-out-str (cli/reencrypt! config "dev"))
       (let [ciphertext-before (file-bytes encrypted)
-            manifest-before   (slurp manifest-path)]
+            manifest-before (slurp manifest-path)]
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"not valid EDN"
              (with-out-str
@@ -363,57 +384,60 @@
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
 
-(deftest edit-stages-all-output-before-replacing-either-file
-  (if age-env-set?
+(deftest edit-stages-all-output-before-replacing-either-file-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config        (cli/normalize-config (test-config))
-          encrypted     (str *dir* "/secrets.edn.age")
+    (let [config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
           manifest-path (str *dir* "/secrets.edn.manifest")]
       (encrypt-edn! {:version :old})
       (with-out-str (cli/reencrypt! config "dev"))
       (let [ciphertext-before (file-bytes encrypted)
-            manifest-before   (slurp manifest-path)]
+            manifest-before (slurp manifest-path)]
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"manifest rendering failed"
              (with-out-str
                (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:version :new}")
-                                 #'manifest/render (fn [& _]
-                                                     (throw (ex-info "manifest rendering failed" {})))}
+                                #'manifest/render (fn [& _]
+                                                    (throw
+                                                     (ex-info
+                                                      "manifest rendering failed"
+                                                      {})))}
                  #(cli/edit! config "dev")))))
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
 
-(deftest edit-rolls-back-an-interrupted-pair-commit
-  (if age-env-set?
+(deftest edit-rolls-back-an-interrupted-pair-commit-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config        (cli/normalize-config (test-config))
-          encrypted     (str *dir* "/secrets.edn.age")
+    (let [config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
           manifest-path (str *dir* "/secrets.edn.manifest")]
       (encrypt-edn! {:version :old})
       (with-out-str (cli/reencrypt! config "dev"))
       (let [ciphertext-before (file-bytes encrypted)
-            manifest-before   (slurp manifest-path)
-            atomic-var        (cli-private 'atomic-replace!)
-            atomic-replace!   @atomic-var
-            moves             (atom 0)]
+            manifest-before (slurp manifest-path)
+            atomic-var (cli-private 'atomic-replace!)
+            atomic-replace! @atomic-var
+            moves (atom 0)]
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"Could not commit"
              (with-out-str
                (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:version :new}")
-                                 atomic-var
-                                 (fn [source target]
-                                   (if (= 2 (swap! moves inc))
-                                     (throw (ex-info "simulated manifest move failure" {}))
-                                     (atomic-replace! source target)))}
+                                atomic-var
+                                (fn [source target]
+                                  (if (= 2 (swap! moves inc))
+                                    (throw (ex-info "simulated manifest move failure" {}))
+                                    (atomic-replace! source target)))}
                  #(cli/edit! config "dev")))))
         (is (= 3 @moves) "ciphertext commit, failed manifest commit, ciphertext rollback")
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
 
-;; ---------- reencrypt / verify ----------
+;;;; Re-encrypt and verify
 
-(deftest reencrypt-writes-manifest-and-verify-passes
-  (if age-env-set?
+(deftest reencrypt-writes-manifest-and-verify-passes-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))]
       (encrypt-edn! {:database/url "jdbc:x" :auth/admins #{"a@b.com"}})
@@ -428,8 +452,8 @@
         (is (= 0 exit))
         (is (= :ok (:dev results)))))))
 
-(deftest verify-detects-drift
-  (if age-env-set?
+(deftest verify-detects-drift-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))]
       (testing "shape change out-of-band"
@@ -448,10 +472,10 @@
           (is (= :drift (:dev results))
               "entries match but :ciphertext-sha does not"))))))
 
-(deftest verify-keyless-freshness
-  (if age-env-set?
+(deftest verify-keyless-freshness-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config  (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           keyless (cli/normalize-config
                    (test-config {:key-file (str *dir* "/no-such-key.txt")}))]
       (encrypt-edn! {:a 1})
@@ -466,8 +490,8 @@
           (is (= 1 exit))
           (is (= :drift (:dev results))))))))
 
-(deftest verify-version-gate
-  (if age-env-set?
+(deftest verify-version-gate-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))]
       (encrypt-edn! {:a 1})
@@ -477,21 +501,21 @@
         (is (= 1 exit))
         (is (= :drift (:dev results)) "an unsupported :version is reported, not misdiffed")))))
 
-(deftest verify-missing-is-exit-2-and-repl-safe
+(deftest verify-missing-is-exit-2-and-repl-safe-test
   (let [config (cli/normalize-config (test-config))
         {:keys [results exit]} (verify config nil)]
     (is (= 2 exit) "no secrets file yet is missing (2), not drift (1)")
     (is (= :missing (:dev results)))
     (is true "and verify! returned instead of killing the process")))
 
-;; ---------- encrypt / decrypt (env-first arg order) ----------
+;;;; Encrypt and decrypt (environment-first argument order)
 
-(deftest encrypt-decrypt-arg-order-and-binary-safety
-  (if age-env-set?
+(deftest encrypt-decrypt-arg-order-and-binary-safety-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config  (test-config)
-          f       (str *dir* "/note.txt")
-          g       (str *dir* "/other.txt")
+    (let [config (test-config)
+          f (str *dir* "/note.txt")
+          g (str *dir* "/other.txt")
           payload "hello from the cli"]
       (spit f payload)
       (spit g payload)
@@ -504,18 +528,20 @@
       (testing "decrypt streams the exact bytes to System/out"
         (let [baos (java.io.ByteArrayOutputStream.)
               orig System/out]
-          (System/setOut (java.io.PrintStream. baos))
-          (try
-            (with-out-str (cli/run! config ["decrypt" "dev" (str f ".age")]))
-            (finally (System/setOut orig)))
+          (with-open [replacement (java.io.PrintStream. baos)]
+            (System/setOut replacement)
+            (try
+              (with-out-str (cli/run! config ["decrypt" "dev" (str f ".age")]))
+              (finally
+                (System/setOut orig))))
           (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))
 
-;; ---------- set / rm ----------
+;;;; Set and remove
 
-(deftest set-creates-a-brand-new-store
-  (if age-env-set?
+(deftest set-creates-a-brand-new-store-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (is (not (.exists (io/file encrypted))) "no store yet")
       (with-out-str
@@ -524,20 +550,20 @@
       (is (= {:openrouter/api-key "s3cr3t"}
              (edn/read-string (age/decrypt *key* encrypted)))))))
 
-(deftest set-overwrites-an-existing-key-leaving-others-untouched
-  (if age-env-set?
+(deftest set-overwrites-an-existing-key-leaving-others-untouched-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (encrypt-edn! {:a "old" :b "keep"})
       (with-out-str (cli/reencrypt! config "dev"))
       (with-out-str (with-in-str "new" (cli/set-secret! config "dev" ":a" false)))
       (is (= {:a "new" :b "keep"} (edn/read-string (age/decrypt *key* encrypted)))))))
 
-(deftest set-nested-vector-path
-  (if age-env-set?
+(deftest set-nested-vector-path-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str
         (with-in-str "acct-123" (cli/set-secret! config "dev" "[:r2 :account-id]" false)))
@@ -548,31 +574,33 @@
         (is (= {:r2 {:account-id "acct-123" :region "us-east"}}
                (edn/read-string (age/decrypt *key* encrypted))))))))
 
-(deftest set-edn-flag-parses-typed-values-and-manifest-records-type
-  (if age-env-set?
+(deftest set-edn-flag-parses-typed-values-and-manifest-records-type-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str
-        (with-in-str "#{\"a@b.com\" \"c@d.com\"}" (cli/set-secret! config "dev" ":auth/admins" true)))
-      (is (= {:auth/admins #{"a@b.com" "c@d.com"}} (edn/read-string (age/decrypt *key* encrypted))))
+        (with-in-str "#{\"a@b.com\" \"c@d.com\"}"
+          (cli/set-secret! config "dev" ":auth/admins" true)))
+      (is (= {:auth/admins #{"a@b.com" "c@d.com"}}
+             (edn/read-string (age/decrypt *key* encrypted))))
       (let [m (edn/read-string (slurp (str *dir* "/secrets.edn.manifest")))]
         (is (= :set (get-in m [:keys [:auth/admins] :type]))
             "manifest records the EDN-parsed value's real type, not :string")))))
 
-(deftest set-without-edn-stores-a-plain-string-even-when-it-looks-like-edn
-  (if age-env-set?
+(deftest set-without-edn-stores-a-plain-string-even-when-it-looks-like-edn-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str (with-in-str "42" (cli/set-secret! config "dev" ":n" false)))
       (is (= {:n "42"} (edn/read-string (age/decrypt *key* encrypted)))
           "default (no --edn) always stores a string, regardless of stdin's shape"))))
 
-(deftest set-strips-exactly-one-trailing-newline
-  (if age-env-set?
+(deftest set-strips-exactly-one-trailing-newline-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (testing "a single trailing \\n is stripped"
         (with-out-str (with-in-str "secret\n" (cli/set-secret! config "dev" ":a" false)))
@@ -587,12 +615,13 @@
         (with-out-str (with-in-str "bare" (cli/set-secret! config "dev" ":d" false)))
         (is (= "bare" (:d (edn/read-string (age/decrypt *key* encrypted)))))))))
 
-(deftest set-refuses-a-blank-value
-  (if age-env-set?
+(deftest set-refuses-a-blank-value-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
-      (testing "empty stdin fails rather than storing \"\" — an unset CI variable expands to nothing"
+      (testing (str "empty stdin fails rather than storing \"\""
+                    " — an unset CI variable expands to nothing")
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"(?i)nothing on stdin"
              (with-out-str (with-in-str "" (cli/set-secret! config "dev" ":a" false)))))
@@ -605,10 +634,10 @@
         (with-out-str (with-in-str "\"\"" (cli/set-secret! config "dev" ":a" true)))
         (is (= {:a ""} (edn/read-string (age/decrypt *key* encrypted))))))))
 
-(deftest set-writes-a-store-that-stays-readable
-  (if age-env-set?
+(deftest set-writes-a-store-that-stays-readable-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:a :b]" false)))
       (with-out-str (with-in-str "w" (cli/set-secret! config "dev" ":c" false)))
@@ -622,17 +651,17 @@
         (is (= {:a {:b "v"} :c "w" :d "x"}
                (edn/read-string (age/decrypt *key* encrypted))))))))
 
-(deftest set-refreshes-the-manifest-so-verify-passes
+(deftest set-refreshes-the-manifest-so-verify-passes-test
   (let [config (cli/normalize-config (test-config))]
     (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k" false)))
     (let [{:keys [results exit]} (verify config "dev")]
       (is (= 0 exit))
       (is (= :ok (:dev results))))))
 
-(deftest rm-removes-a-key-and-verify-still-passes
-  (if age-env-set?
+(deftest rm-removes-a-key-and-verify-still-passes-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (encrypt-edn! {:a "keep" :b "gone"})
       (with-out-str (cli/reencrypt! config "dev"))
@@ -642,10 +671,10 @@
         (is (= 0 exit))
         (is (= :ok (:dev results)))))))
 
-(deftest rm-leaves-the-parent-map-in-place-for-a-nested-path
-  (if age-env-set?
+(deftest rm-leaves-the-parent-map-in-place-for-a-nested-path-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (encrypt-edn! {:r2 {:account-id "acct-123"}})
       (with-out-str (cli/reencrypt! config "dev"))
@@ -653,10 +682,10 @@
       (is (= {:r2 {}} (edn/read-string (age/decrypt *key* encrypted)))
           "the (now empty) parent map is left in place, not pruned"))))
 
-(deftest rm-of-an-absent-key-fails
-  (if age-env-set?
+(deftest rm-of-an-absent-key-fails-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (cli/normalize-config (test-config))
+    (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (encrypt-edn! {:a 1})
       (with-out-str (cli/reencrypt! config "dev"))
@@ -665,12 +694,12 @@
       (is (= {:a 1} (edn/read-string (age/decrypt *key* encrypted)))
           "a failed rm never touches the ciphertext"))))
 
-(deftest rm-on-a-missing-store-fails-pointing-at-new-or-set
+(deftest rm-on-a-missing-store-fails-pointing-at-new-or-set-test
   (let [config (cli/normalize-config (test-config))]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No secrets file"
                           (with-out-str (cli/remove-secret! config "dev" ":a"))))))
 
-(deftest invalid-key-argument-fails
+(deftest invalid-key-argument-fails-test
   (let [config (cli/normalize-config (test-config))]
     (testing "neither a keyword nor a vector"
       (doseq [bad ["not-a-keyword" "42" "{}" "\"a string\"" "nil"]]
@@ -693,10 +722,10 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
                             (with-out-str (cli/remove-secret! config "dev" "42")))))))
 
-(deftest run!-dispatches-set-and-rm-with-the-edn-flag-parsed-out-anywhere
-  (if age-env-set?
+(deftest run!-dispatches-set-and-rm-with-the-edn-flag-parsed-out-anywhere-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config    (test-config)
+    (let [config (test-config)
           encrypted (str *dir* "/secrets.edn.age")]
       (testing "run! dispatches set as <key> alone via the default env, --edn before it"
         (with-out-str (with-in-str "42" (cli/run! config ["set" "--edn" ":n"])))
@@ -711,9 +740,9 @@
         (with-out-str (cli/run! config ["rm" "dev" ":n"]))
         (is (not (contains? (edn/read-string (age/decrypt *key* encrypted)) :n)))))))
 
-;; ---------- regressions ----------
+;;;; Regressions
 
-(deftest keygen-overwrites-a-confirmed-existing-key
+(deftest keygen-overwrites-a-confirmed-existing-key-test
   (testing "age-keygen refuses an existing -o file, so keygen! stages and moves"
     (let [path (str *dir* "/regen.txt")
           pub1 (age/keygen! path)
@@ -728,74 +757,78 @@
       (is (empty? (filter #(re-find #"\.regen\.txt\.keygen" %) (.list (io/file *dir*))))
           "the temp staging directory is cleaned up"))))
 
-(deftest keygen-reports-sharing-environments-and-app-default-clause
-  (testing "environments that omit :key-file share the app default, and the\n           output says so"
-    (let [home (str *dir* "/home")]
+(deftest keygen-reports-sharing-environments-and-app-default-clause-test
+  (testing "environments without :key-file share the app default"
+    (let [home (str *dir* "/home")
+          default-key (str home "/.config/cli-test/key.txt")]
       (.mkdirs (io/file home))
-      (let [orig-home (System/getProperty "user.home")]
-        (try
-          (System/setProperty "user.home" home)
-          (let [config (cli/normalize-config
-                        {:app "cli-test"
-                         :environments {:dev  {:secrets-file (str *dir* "/dev/secrets.edn.age")}
-                                        :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")}}})
-                out    (with-out-str (cli/keygen! config "dev"))]
-            (is (re-find #"Used by: dev, prod — every environment without its own :key-file" out)))
-          (finally (System/setProperty "user.home" orig-home)))))))
-
-(deftest keygen-excludes-an-environment-with-its-own-key-file
-  (let [home (str *dir* "/home2")]
-    (.mkdirs (io/file home))
-    (let [orig-home (System/getProperty "user.home")]
-      (try
-        (System/setProperty "user.home" home)
-        (let [config (cli/normalize-config
+      (under-default-key-file
+       default-key
+       #(let [config (cli/normalize-config
                       {:app "cli-test"
-                       :environments {:dev  {:secrets-file (str *dir* "/dev/secrets.edn.age")}
-                                      :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")
-                                             :key-file     (str *dir* "/prod-key.txt")}}})
-              out    (with-out-str (cli/keygen! config "dev"))]
-          (is (re-find #"Used by: dev — every environment without its own :key-file" out)
-              "only dev shares the app-default key")
-          (is (not (re-find #"prod" out))
-              "prod has its own :key-file, so it is not listed as sharing dev's"))
-        (finally (System/setProperty "user.home" orig-home))))))
+                       :environments
+                       {:dev {:secrets-file (str *dir* "/dev/secrets.edn.age")}
+                        :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")}}})
+              out (with-out-str (cli/keygen! config "dev"))]
+          (is (re-find
+               #"Used by: dev, prod — every environment without its own :key-file"
+               out)))))))
 
-(deftest keygen-with-no-env-and-no-default-succeeds-when-key-file-is-unambiguous
+(deftest keygen-excludes-an-environment-with-its-own-key-file-test
+  (let [home (str *dir* "/home2")
+        default-key (str home "/.config/cli-test/key.txt")]
+    (.mkdirs (io/file home))
+    (under-default-key-file
+     default-key
+     #(let [config (cli/normalize-config
+                    {:app "cli-test"
+                     :environments
+                     {:dev {:secrets-file (str *dir* "/dev/secrets.edn.age")}
+                      :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")
+                             :key-file (str *dir* "/prod-key.txt")}}})
+            out (with-out-str (cli/keygen! config "dev"))]
+        (is (re-find
+             #"Used by: dev — every environment without its own :key-file"
+             out)
+            "only dev shares the app-default key")
+        (is (not (re-find #"prod" out))
+            "prod has its own :key-file, so it is not listed as sharing dev's")))))
+
+(deftest keygen-with-no-env-and-no-default-succeeds-when-key-file-is-unambiguous-test
   (let [shared (str *dir* "/shared-key.txt")
         config (cli/normalize-config
                 {:app "cli-test"
-                 :environments {:dev     {:secrets-file (str *dir* "/dev/secrets.edn.age")
-                                          :key-file     shared}
+                 :environments {:dev {:secrets-file (str *dir* "/dev/secrets.edn.age")
+                                      :key-file shared}
                                 :staging {:secrets-file (str *dir* "/staging/secrets.edn.age")
-                                          :key-file     shared}}})
+                                          :key-file shared}}})
         result (atom nil)
-        out    (with-out-str (reset! result (cli/keygen! config nil)))]
+        out (with-out-str (reset! result (cli/keygen! config nil)))]
     (is (= shared @result)
         "no [env] and no :default-environment, but every environment agrees on :key-file")
     (is (re-find #"Used by: dev, staging" out))))
 
-(deftest keygen-with-no-env-and-no-default-still-fails-when-key-files-differ
+(deftest keygen-with-no-env-and-no-default-still-fails-when-key-files-differ-test
   (let [config (cli/normalize-config
                 {:app "cli-test"
-                 :environments {:dev  {:secrets-file (str *dir* "/dev/secrets.edn.age")
-                                       :key-file     (str *dir* "/dev-key.txt")}
+                 :environments {:dev {:secrets-file (str *dir* "/dev/secrets.edn.age")
+                                      :key-file (str *dir* "/dev-key.txt")}
                                 :prod {:secrets-file (str *dir* "/prod/secrets.edn.age")
-                                       :key-file     (str *dir* "/prod-key.txt")}}})]
+                                       :key-file (str *dir* "/prod-key.txt")}}})]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing environment"
                           (cli/keygen! config nil))
         "differing key files really is ambiguous, so this is unchanged")))
 
-(deftest team-bootstrap-adds-first-owner-before-ciphertext-and-reencrypts-for-teammate
-  (if age-env-set?
+(deftest team-bootstrap-adds-first-owner-before-ciphertext-and-reencrypts-for-teammate-test
+  (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [recipients  (str *dir* "/recipients.txt")
-          ciphertext  (str *dir* "/secrets.edn.age")
-          bob-key     (str *dir* "/bob-key.txt")
+    (let [recipients (str *dir* "/recipients.txt")
+          ciphertext (str *dir* "/secrets.edn.age")
+          bob-key (str *dir* "/bob-key.txt")
           secret-value "team-bootstrap-value-that-must-not-be-printed"
-          config      (cli/normalize-config (test-config {:recipients-file recipients}))
+          config (cli/normalize-config (test-config {:recipients-file recipients}))
           alice-public (age/public-key *key*)
-          added       (atom nil)
+          added (atom nil)
           initial-out (with-out-str
                         (reset! added (cli/add-recipient! config "dev" nil)))]
       (testing "the first owner is added without creating or re-encrypting ciphertext"
@@ -816,10 +849,11 @@
             reencrypt-out (with-out-str (cli/reencrypt! config "dev"))
             all-output (str initial-out set-out teammate-out reencrypt-out)
             sensitive-values
-            (cons secret-value
-                  (->> [*key* bob-key]
-                       (mapcat #(str/split-lines (slurp %)))
-                       (filter #(str/starts-with? % "AGE-SECRET-KEY-"))))]
+            (into [secret-value]
+                  (comp
+                   (mapcat #(str/split-lines (slurp %)))
+                   (filter #(str/starts-with? % "AGE-SECRET-KEY-")))
+                  [*key* bob-key])]
         (testing "set creates the first store and the later add recommends re-encryption"
           (is (.exists (io/file ciphertext)))
           (is (= bob-public @teammate-added))
@@ -838,17 +872,17 @@
           (doseq [sensitive-value sensitive-values]
             (is (not (str/includes? all-output sensitive-value)))))))))
 
-(deftest add-recipient-preserves-comments-and-layout
+(deftest add-recipient-preserves-comments-and-layout-test
   (let [recipients (str *dir* "/recipients.txt")
-        original   (str "# Team recipients — keep sorted by name\n"
-                        "\n"
-                        "# Kira (laptop)\n"
-                        "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\n"
-                        "\n"
-                        "# Bot (CI)\n"
-                        "age1wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n")
-        newkey     "age1eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        config     (cli/normalize-config (test-config {:recipients-file recipients}))]
+        original (str "# Team recipients — keep sorted by name\n"
+                      "\n"
+                      "# Kira (laptop)\n"
+                      "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq\n"
+                      "\n"
+                      "# Bot (CI)\n"
+                      "age1wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww\n")
+        newkey "age1eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        config (cli/normalize-config (test-config {:recipients-file recipients}))]
     (spit recipients original)
     (with-out-str (cli/add-recipient! config "dev" newkey))
     (let [after (slurp recipients)]
@@ -878,15 +912,15 @@
         (with-out-str (cli/add-recipient! c "dev" newkey))
         (is (= (str newkey "\n") (slurp f)))))))
 
-(deftest blank-artifact-paths-are-rejected
+(deftest blank-artifact-paths-are-rejected-test
   (let [cfg (fn [env-overrides]
               {:app "x" :environments {:dev (merge {:secrets-file "s.age"} env-overrides)}})]
     (testing "every artifact path field rejects a blank string"
       (doseq [[field overrides]
-              [[:secrets-file    {:secrets-file "" :template "t" :manifest "m"}]
-               [:key-file        {:key-file ""}]
-               [:template        {:template ""}]
-               [:manifest        {:manifest ""}]
+              [[:secrets-file {:secrets-file "" :template "t" :manifest "m"}]
+               [:key-file {:key-file ""}]
+               [:template {:template ""}]
+               [:manifest {:manifest ""}]
                [:recipients-file {:recipients-file ""}]]]
         (let [e (is (thrown-with-msg? clojure.lang.ExceptionInfo
                                       #"blank"

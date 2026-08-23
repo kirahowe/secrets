@@ -1,26 +1,29 @@
 ;; # Reference
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.reference
-  (:require [com.kirahowe.secrets :as secrets]
-            [com.kirahowe.secrets.age :as age]
+  (:require [clojure.string :as str]
+            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.aero :as secrets-aero]
+            [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.manifest :as manifest]
-            [clojure.string :as str]
             [scicloj.kindly.v4.kind :as kind]))
 
 ;; The signatures and docstrings below come from var metadata at render time.
 
-^{:kindly/hide-code true}
-(defn- doc-section [& vars]
+^:kindly/hide-code
+(defn- doc-section
+  "Renders Vars' signatures and docstrings as a Markdown section."
+  [& vars]
   (kind/md
    (str/join
     "\n\n"
     (for [v vars
-          :let [{:keys [name arglists doc]} (meta v)]]
-      (str "#### `" name "`\n\n"
-           (str/join "  \n" (map #(str "`" (pr-str (cons name %)) "`") arglists))
+          :let [{:keys [arglists doc] var-name :name} (meta v)]]
+      (str "#### `" var-name "`\n\n"
+           (str/join "  \n"
+                     (map #(str "`" (pr-str (cons var-name %)) "`") arglists))
            "\n\n"
            (str/replace (or doc "") #"(?m)^  " ""))))))
 

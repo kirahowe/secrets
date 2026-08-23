@@ -1,0 +1,14 @@
+;;; cljfmt has no configured-width wrapping; clj-kondo enforces the 100-column policy.
+{:normalize-newlines-at-file-end? true
+ :paths ["src"
+         "test"
+         "book/chapters"
+         "examples/aero-profiles/src"
+         "examples/aero-profiles/test"
+         "examples/quickstart-bb/src"
+         "examples/integrant-service/src"
+         "examples/integrant-service/test"
+         "examples/integrant-service/build"
+         "build.clj"]
+ :remove-multiple-non-indenting-spaces? true
+ :sort-ns-references? true}

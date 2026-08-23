@@ -1,0 +1,3 @@
+{:linters {:line-length {:exclude-pattern "^;; \\|"
+                         :exclude-urls true
+                         :max-line-length 100}}}

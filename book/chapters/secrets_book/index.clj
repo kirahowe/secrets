@@ -1,11 +1,11 @@
 ;; # Quick start
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.index
-  (:require [com.kirahowe.secrets :as secrets]
-            [com.kirahowe.secrets.age :as age]
-            [clojure.edn :as edn]
-            [clojure.java.io :as io]))
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [com.kirahowe.secrets :as secrets]
+            [com.kirahowe.secrets.age :as age]))
 
 ;; `com.kirahowe/secrets` stores application secrets in an age-encrypted EDN
 ;; file that can be committed with the code. An age identity stays outside the
@@ -38,8 +38,10 @@
 ;;                      {:app "myapp"
 ;;                       :default-environment :prod
 ;;                       :environments
-;;                       {:prod {:secrets-file "env/prod/resources/secrets.edn.age"}
-;;                        :dev  {:secrets-file "env/dev/resources/secrets.edn.age"}}}
+;;                       {:prod
+;;                        {:secrets-file "env/prod/resources/secrets.edn.age"}
+;;                        :dev
+;;                        {:secrets-file "env/dev/resources/secrets.edn.age"}}}
 ;;                      *command-line-args*)}}}
 ;; ```
 
@@ -72,9 +74,11 @@
 ;; The lower-level age wrapper can create a ciphertext without opening an
 ;; editor. Unlike `bb secrets new`, this code does not write a manifest.
 
-^{:kindly/hide-code true}
-(def dir (str (java.nio.file.Files/createTempDirectory
-               "secrets-quickstart-" (into-array java.nio.file.attribute.FileAttribute []))))
+^:kindly/hide-code
+(def dir
+  (str (java.nio.file.Files/createTempDirectory
+        "secrets-quickstart-"
+        (into-array java.nio.file.attribute.FileAttribute []))))
 
 (def key-file (str dir "/key.txt"))
 
@@ -122,9 +126,10 @@
                  "{:db    {:jdbc-url #secret/req :database/url}
                    :email {:api-key  #secret/opt :postmark/api-key}}")
 
-;; The Postmark key is absent, so its value is nil. When the ciphertext is a
-;; classpath resource, pass `:resource "secrets.edn.age"` instead of `:file`;
-;; resources inside jars are supported.
+;; The Postmark key remains present with nil as its value. That is the intentional
+;; contract: nil means the optional integration is disabled; key presence carries no
+;; additional meaning. When the ciphertext is a classpath resource, pass
+;; `:resource "secrets.edn.age"` instead of `:file`; resources inside jars are supported.
 
 ;; ## Day to day
 
@@ -151,6 +156,6 @@
 ;; [runtime](secrets_book.runtime.html) for the application APIs and
 ;; [production and CI](secrets_book.production.html) for deployment details.
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]
   (.delete f))

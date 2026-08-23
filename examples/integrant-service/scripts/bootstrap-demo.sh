@@ -28,4 +28,6 @@ rm -f "$plain_file"
 
 echo "Created disposable demo identity at $key_file"
 echo "Created ignored classpath ciphertext under resources/dev and resources/prod"
-echo "For local run: SECRETS_AGE_IDENTITY_FILE=$key_file clojure -M:dev -m example.integrant-service.main"
+printf '%s%s\n' \
+  "For local run: SECRETS_AGE_IDENTITY_FILE=$key_file clojure -M:dev -m " \
+  "example.integrant-service.main"

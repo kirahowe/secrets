@@ -20,32 +20,33 @@
 (defn jar [_]
   (clean nil)
   (b/write-pom {:class-dir class-dir
-                :lib       lib
-                :version   version
-                :basis     @basis
-                :src-dirs  ["src"]
+                :lib lib
+                :version version
+                :basis @basis
+                :src-dirs ["src"]
                 ;; :tag lets cljdoc (and anyone reading the pom) find the exact
                 ;; revision the artifact was built from.
-                :scm       {:url "https://github.com/kirahowe/secrets"
-                            :tag (str "v" version)}
-                :pom-data  [[:description
-                             "Manage application secrets as a version-controlled, age-encrypted EDN file."]
-                            [:licenses
-                             [:license
-                              [:name "MIT"]
-                              [:url "https://opensource.org/license/mit"]]]]})
-  (b/copy-dir {:src-dirs   ["src"]
+                :scm {:url "https://github.com/kirahowe/secrets"
+                      :tag (str "v" version)}
+                :pom-data [[:description
+                            (str "Manage application secrets as a version-controlled, "
+                                 "age-encrypted EDN file.")]
+                           [:licenses
+                            [:license
+                             [:name "MIT"]
+                             [:url "https://opensource.org/license/mit"]]]]})
+  (b/copy-dir {:src-dirs ["src"]
                :target-dir class-dir})
   (b/jar {:class-dir class-dir
-          :jar-file  jar-file})
+          :jar-file jar-file})
   (println "Wrote" jar-file))
 
 (defn install [_]
   (jar nil)
-  (b/install {:basis     @basis
-              :lib       lib
-              :version   version
-              :jar-file  jar-file
+  (b/install {:basis @basis
+              :lib lib
+              :version version
+              :jar-file jar-file
               :class-dir class-dir})
   (println "Installed" lib version "to ~/.m2"))
 
@@ -53,6 +54,6 @@
   (jar nil)
   ((requiring-resolve 'deps-deploy.deps-deploy/deploy)
    {:installer :remote
-    :artifact  jar-file
-    :pom-file  (b/pom-path {:lib lib :class-dir class-dir})})
+    :artifact jar-file
+    :pom-file (b/pom-path {:lib lib :class-dir class-dir})})
   (println "Deployed" lib version "to Clojars"))

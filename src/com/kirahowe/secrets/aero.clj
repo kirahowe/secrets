@@ -10,7 +10,8 @@
 
       (:require [com.kirahowe.secrets.aero])
 
-  — is the whole integration. There is nothing else to call.
+  — installs the integration. Consumers can then pass a secrets configuration
+  with each `aero.core/read-config` call.
 
   Why a namespace instead of the README snippet it replaces: a bare
   `(defmethod aero.core/reader 'secret/req …)` needs `aero.core` resolvable at
@@ -24,28 +25,29 @@
   registration, and it happens exactly once no matter how many call sites read
   configs with these tags.
 
-  Two ways to supply the secrets config — the same opts map
-  `com.kirahowe.secrets/reader-literals` takes (`:app`/`:resource`, `:file`,
-  `:identity-file`):
+  The preferred way to supply the secrets config is per read, through aero's
+  own opts. `aero.core/read-config` passes its entire opts map to readers as the
+  first argument, so the config is read straight off its `:secrets` key:
 
-  • Per read, through aero's own opts. `aero.core/read-config` passes its
-    entire opts map to readers as the first argument, so the config is read
-    straight off its `:secrets` key:
+      (aero.core/read-config \"config.edn\"
+        {:profile :evals
+         :secrets {:app \"myapp\" :resource \"secrets.edn.age\"}})
 
-        (aero.core/read-config \"config.edn\"
-          {:profile :evals
-           :secrets {:app \"myapp\" :resource \"secrets.edn.age\"}})
+  `register!` remains available as a compatibility and convenience path for
+  applications with one process-wide config:
 
-  • Process-wide, via `register!`, for the common case of one app reading its
-    own config in one place:
+      (register! {:app \"myapp\" :resource \"secrets.edn.age\"})
 
-        (register! {:app \"myapp\" :resource \"secrets.edn.age\"})
-
-  A per-read `:secrets` opt always wins over the registered default — see
-  `secrets-config`. When neither is supplied, reading a `#secret/…` tag throws
-  rather than resolving to nil; see `secrets-config` for the error."
+  That registration is mutable process state: establish it explicitly during
+  application startup, replace it deliberately, and clear it with
+  `(register! nil)` when its lifecycle ends. A per-read `:secrets` opt always
+  wins over the registered default — see `secrets-config`. When neither is
+  supplied, reading a `#secret/…` tag throws rather than resolving to nil; see
+  `secrets-config` for the error."
   (:require [aero.core]
             [com.kirahowe.secrets :as secrets]))
+
+;;;; Process-wide configuration
 
 (defonce ^:private default-config
   (atom nil))
@@ -53,8 +55,11 @@
 (defn register!
   "Set the process-wide default secrets config used by `#secret/req` /
   `#secret/opt` when an `aero.core/read-config` call doesn't supply its own
-  `:secrets` opt. `config` is the same opts map `com.kirahowe.secrets/reader-literals`
-  takes (`:app`/`:resource`, `:file`, `:identity-file`).
+  `:secrets` opt. Prefer passing `:secrets` per read; registration is a
+  compatibility and convenience path for applications with an explicit
+  process-wide lifecycle. `config` is the same opts map
+  `com.kirahowe.secrets/reader-literals` takes (`:app`/`:resource`, `:file`,
+  `:identity-file`).
 
   A later call replaces the previous value. Per-read `:secrets` options take
   precedence. `(register! nil)` clears the default. Returns `config`."
@@ -62,12 +67,15 @@
   (reset! default-config config)
   config)
 
-;; {secrets-config -> readers-map}, memoizing `secrets/reader-literals` per
-;; distinct config so a config file with several `#secret/…` tags decrypts its
-;; store once, not once per tag — see `readers-for`. Keyed on the extracted
-;; secrets config map only (never the surrounding aero opts, which also carry
-;; `:profile`, `:resolver`, … and would make near-identical opts maps miss the
-;; cache for no reason).
+;;;; Reader cache
+
+;;; `readers-cache` maps each secrets config to a delay that realizes
+;;; `secrets/reader-literals`, so a config file with several `#secret/…` tags
+;;; decrypts its store once, not once per tag — see `readers-for`. It is keyed
+;;; on the extracted secrets config map only, never the surrounding aero opts.
+;;; Those opts also carry `:profile`, `:resolver`, and other unrelated values
+;;; that would make near-identical opts maps miss the cache for no reason.
+
 (defonce ^:private readers-cache
   (atom {}))
 
@@ -110,6 +118,8 @@
                    cache
                    (assoc cache config (delay (secrets/reader-literals config))))))
         config))
+
+;;;; Aero readers
 
 (defmethod aero.core/reader 'secret/req
   [aero-opts _tag value]

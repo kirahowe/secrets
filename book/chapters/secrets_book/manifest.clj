@@ -1,23 +1,25 @@
 ;; # The manifest: reviewable encrypted changes
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.manifest
-  (:require [com.kirahowe.secrets.age :as age]
+  (:require [clojure.java.io :as io]
+            [clojure.string :as str]
+            [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
-            [com.kirahowe.secrets.manifest :as manifest]
-            [clojure.java.io :as io]
-            [clojure.string :as str]))
+            [com.kirahowe.secrets.manifest :as manifest]))
 
 ;; Age uses randomized encryption, so two encryptions of the same plaintext
 ;; differ. A ciphertext diff therefore cannot describe the plaintext change:
 
-(def dir (str (java.nio.file.Files/createTempDirectory
-               "secrets-manifest-" (into-array java.nio.file.attribute.FileAttribute []))))
+(def dir
+  (str (java.nio.file.Files/createTempDirectory
+        "secrets-manifest-"
+        (into-array java.nio.file.attribute.FileAttribute []))))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (def key-file (str dir "/key.txt"))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (age/keygen! key-file)
 
 (let [plain (str dir "/p.edn")]
@@ -72,7 +74,7 @@
 ;; Two copies of the same native key, one with comments stripped, produce
 ;; identical hashes:
 
-(let [with-comments    (slurp key-file)
+(let [with-comments (slurp key-file)
       without-comments (->> (str/split-lines with-comments)
                             (filter #(str/starts-with? % "AGE-SECRET-KEY"))
                             first)]
@@ -91,7 +93,7 @@
   (manifest/render {:app "manifest-demo" :ciphertext-sha "0b7d9f31aa..."}
                    (manifest/entries secrets-v1 hkey)))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (print rendered)
 
 ;; Each key path occupies one line, so git shows entry-level changes.
@@ -117,9 +119,9 @@
    {:app "manifest-demo"
     :default-environment :dev
     :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
-                         :key-file     key-file}}}))
+                         :key-file key-file}}}))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (let [plain (str dir "/p2.edn")]
   (spit plain (pr-str secrets-v1))
   (age/encrypt-file! key-file plain (str dir "/secrets.edn.age"))
@@ -150,7 +152,7 @@
 ;; even `age` installed, can detect a ciphertext changed without regenerating
 ;; its manifest. Repair the environment, then verify with a missing key:
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (cli/reencrypt! config "dev")
 
 (def keyless-config
@@ -158,7 +160,7 @@
        {:app "manifest-demo"
         :default-environment :dev
         :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
-                             :key-file     (str dir "/no-key-here.txt")}}})
+                             :key-file (str dir "/no-key-here.txt")}}})
       ;; Environment identities normally override :key-file. Pin the resolved
       ;; path so this example stays keyless on every build machine.
       (assoc-in [:environments :dev :identity-file]
@@ -184,6 +186,6 @@
 ;; for that environment with `:manifest false`; its ciphertext diff will be
 ;; opaque.
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]
   (.delete f))

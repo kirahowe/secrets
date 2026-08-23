@@ -1,6 +1,9 @@
 target/
 .cpcache/
-.clj-kondo/.cache/
+# Track the project lint policy while ignoring clj-kondo caches and imported configs.
+!/.clj-kondo/
+/.clj-kondo/*
+!/.clj-kondo/config.edn
 .lsp/
 .nrepl-port
 .portal/

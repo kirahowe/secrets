@@ -1,11 +1,11 @@
 ;; # Runtime: reading secrets in your app
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.runtime
-  (:require [com.kirahowe.secrets :as secrets]
-            [com.kirahowe.secrets.age :as age]
-            [clojure.edn :as edn]
-            [clojure.java.io :as io]))
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [com.kirahowe.secrets :as secrets]
+            [com.kirahowe.secrets.age :as age]))
 
 ;; Your app can use the library in two ways: load the complete decrypted map
 ;; and pass it around, or register reader literals so EDN config files can
@@ -15,19 +15,21 @@
 ;; Setup for the examples: a fresh key and an encrypted file in a temp
 ;; directory.
 
-(def dir (str (java.nio.file.Files/createTempDirectory
-               "secrets-runtime-" (into-array java.nio.file.attribute.FileAttribute []))))
+(def dir
+  (str (java.nio.file.Files/createTempDirectory
+        "secrets-runtime-"
+        (into-array java.nio.file.attribute.FileAttribute []))))
 
 (def key-file (str dir "/key.txt"))
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (age/keygen! key-file)
 
 (let [plain (str dir "/plain.edn")]
   (spit plain (pr-str {:database/url "jdbc:postgresql://db/app"
-                       :llm/api-key  "sk-not-real"
-                       :r2           {:account-id "abc123"
-                                      :secret     "shhh"}}))
+                       :llm/api-key "sk-not-real"
+                       :r2 {:account-id "abc123"
+                            :secret "shhh"}}))
   (age/encrypt-file! key-file plain (str dir "/secrets.edn.age"))
   (io/delete-file plain))
 
@@ -203,15 +205,24 @@
 ;; ## Aero
 
 ;; [aero](https://github.com/juxt/aero) resolves tags through its own
-;; multimethod rather than a `:readers` map. Requiring
+;; multimethod rather than a `:readers` map. At a REPL, requiring
 ;; `com.kirahowe.secrets.aero` registers the two methods:
 
 ;; ```clojure
+;; ;; REPL usage
 ;; (require '[com.kirahowe.secrets.aero])
 ;; ```
 
+;; In application source, declare both dependencies in the namespace:
+
+;; ```clojure
+;; (ns my-app.config
+;;   (:require [aero.core :as aero]
+;;             [com.kirahowe.secrets.aero :as secrets-aero]))
+;; ```
+
 ;; `aero` is optional: consumers must already have it on their classpath. After
-;; requiring the integration namespace, supply the secrets options either to
+;; loading the integration namespace, supply the secrets options either to
 ;; `register!` or to each `read-config` call.
 
 ;; Two ways to supply the secrets config — the same opts map `reader-literals`
@@ -219,12 +230,15 @@
 
 ;; ```clojure
 ;; ;; process-wide, for one app reading its own config in one place
-;; (com.kirahowe.secrets.aero/register! {:app "myapp" :resource "secrets.edn.age"})
+;; (secrets-aero/register!
+;;  {:app "myapp"
+;;   :resource "secrets.edn.age"})
 ;;
 ;; ;; per read, through aero's own opts — read-config passes its whole opts
 ;; ;; map to readers, so the config comes straight off a :secrets key
-;; (aero.core/read-config "config.edn"
-;;   {:secrets {:app "myapp" :resource "secrets.edn.age"}})
+;; (aero/read-config
+;;  "config.edn"
+;;  {:secrets {:app "myapp" :resource "secrets.edn.age"}})
 ;; ```
 
 ;; A per-read `:secrets` opt always wins over a `register!`ed default. Aero
@@ -235,8 +249,8 @@
 ;;
 ;; ```clojure
 ;; ;; In another terminal: bb secrets edit dev
-;; (com.kirahowe.secrets.aero/reset-cache!)
-;; (def app-config (aero.core/read-config "config.edn"))
+;; (secrets-aero/reset-cache!)
+;; (def app-config (aero/read-config "config.edn"))
 ;; {:config-loaded? (map? app-config)
 ;;  :section-count  (count app-config)}
 ;; ```
@@ -268,6 +282,6 @@
 ;; reading with `:evals` selects only the other branch. A key used by one
 ;; profile can therefore be absent when another profile reads the config.
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]
   (.delete f))

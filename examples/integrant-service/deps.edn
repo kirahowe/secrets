@@ -10,5 +10,6 @@
   :test {:extra-paths ["test"]
          :extra-deps  {lambdaisland/kaocha {:mvn/version "1.91.1392"}}
          :main-opts   ["-m" "kaocha.runner"]}
-  :build {:deps      {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
-          :ns-default build}}}
+  :build {:extra-paths ["build"]
+          :deps        {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
+          :ns-default  example.integrant-service.build}}}

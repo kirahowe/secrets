@@ -1,3 +1,4 @@
-;; This is configuration, not a secret store. The tagged value is resolved at read time.
+;;; This is configuration, not a secret store. The tagged value is resolved
+;;; when read.
 {:service {:endpoint #secret/req :demo/endpoint
            :api-key #secret/req :demo/api-key}}

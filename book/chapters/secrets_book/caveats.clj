@@ -1,6 +1,6 @@
 ;; # Caveats and threat model
 
-^{:kindly/hide-code true}
+^:kindly/hide-code
 (ns secrets-book.caveats)
 
 ;; This chapter describes what the library protects and what remains the

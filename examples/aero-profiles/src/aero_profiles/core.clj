@@ -3,7 +3,7 @@
   (:require [aero.core :as aero]
             [com.kirahowe.secrets.aero :as secrets-aero]))
 
-;; Requiring the optional integration installs #secret/req and #secret/opt.
+;;; Requiring the optional integration installs #secret/req and #secret/opt.
 (def ^:private secrets-config
   {:file "tmp/secrets.edn.age"
    :identity-file "tmp/key.txt"})

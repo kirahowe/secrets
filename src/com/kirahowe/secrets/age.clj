@@ -28,7 +28,7 @@
     (catch Exception _ nil)))
 
 (defn installed?
-  "True when the `age` binary is on the PATH (the decrypt path needs only this)."
+  "Return true when the `age` binary is on the PATH (the decrypt path needs only this)."
   []
   (some? (version)))
 
@@ -37,9 +37,9 @@
   []
   (when-not (installed?)
     (throw (ex-info "The `age` encryption tool is not installed."
-                    {:tool    "age"
+                    {:tool "age"
                      :install "macOS: brew install age  •  Debian/Ubuntu: apt install age"
-                     :docs    "https://age-encryption.org"}))))
+                     :docs "https://age-encryption.org"}))))
 
 (defn public-key
   "Extract the public key (recipient) from an age identity file's
@@ -52,8 +52,8 @@
             (str/split-lines (slurp f))))))
 
 (defn valid-recipient?
-  "Cheap sanity check that `s` looks like an age recipient (an `age1…` public
-  key, or an `ssh-ed25519`/`ssh-rsa` line). Not a full validation — `age` itself
+  "Return true when `s` looks like an age recipient (an `age1…` public key, or
+  an `ssh-ed25519`/`ssh-rsa` line). This is not a full validation: `age` itself
   is the authority; this just catches obvious typos before writing a keys file."
   [s]
   (let [s (str/trim (str s))]
@@ -70,13 +70,13 @@
   moved over `path` only once it succeeds — a failed generation leaves any
   existing key untouched. Throws if `age-keygen` is missing or fails."
   [path]
-  (let [f      (.getAbsoluteFile (io/file (str path)))
+  (let [f (.getAbsoluteFile (io/file (str path)))
         parent (.getParentFile f)]
     (.mkdirs parent)
     (let [tmp-dir (java.nio.file.Files/createTempDirectory
                    (.toPath parent) (str "." (.getName f) ".keygen")
                    (into-array java.nio.file.attribute.FileAttribute []))
-          tmp     (.toFile (.resolve tmp-dir (.getName f)))]
+          tmp (.toFile (.resolve tmp-dir (.getName f)))]
       (try
         (let [{:keys [exit err]} (try
                                    (shell/sh "age-keygen" "-o" (str tmp))
@@ -128,12 +128,22 @@
                     {:recipients recipients})))
   (let [{:keys [identity-file recipients-file] rs :recipients}
         (if (map? recipients) recipients {:identity-file recipients})
-        args (concat ["age" "-e"]
-                     (when identity-file   ["-i" (str identity-file)])
-                     (when recipients-file ["-R" (str recipients-file)])
-                     (mapcat (fn [r] ["-r" (str r)]) rs)
-                     ["-o" (str out) (str in)])
-        {:keys [exit err]} (apply shell/sh args)]
+        argv (cond-> ["age" "-e"]
+               identity-file (conj "-i")
+               identity-file (conj (str identity-file))
+               recipients-file (conj "-R")
+               recipients-file (conj (str recipients-file)))
+        argv (reduce (fn [argv recipient]
+                       (-> argv
+                           (conj "-r")
+                           (conj (str recipient))))
+                     argv
+                     rs)
+        argv (-> argv
+                 (conj "-o")
+                 (conj (str out))
+                 (conj (str in)))
+        {:keys [exit err]} (apply shell/sh argv)]
     (when-not (zero? exit)
       (throw (ex-info "age encryption failed" {:out (str out) :error err})))
     out))
@@ -152,10 +162,10 @@
     (if (zero? exit)
       out
       (throw (ex-info "age decryption failed"
-                      {:identity-file  (str identity-file)
+                      {:identity-file (str identity-file)
                        :encrypted-file (str encrypted-file)
-                       :error          err
-                       :hint           "Wrong key, or you are not a recipient of this file."})))))
+                       :error err
+                       :hint "Wrong key, or you are not a recipient of this file."})))))
 
 (defn decrypt
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
