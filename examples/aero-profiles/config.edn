@@ -1,0 +1,5 @@
+;; Aero chooses one #profile branch before evaluating its secret tag.
+{:profile-name #profile {:default "default" :evals "evals"}
+ :api-key      #profile {:default #secret/req :openrouter/api-key
+                          :evals   #secret/req :openrouter/evals-api-key}
+ :optional-integration #secret/opt :optional/not-configured}

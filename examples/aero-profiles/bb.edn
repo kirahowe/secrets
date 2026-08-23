@@ -1,0 +1,21 @@
+{:paths ["src" "test"]
+ :deps {aero/aero {:mvn/version "1.1.6"}
+        com.kirahowe/secrets {:local/root "../.."}}
+ :tasks {bootstrap {:doc "Create disposable age key/ciphertext from fake values"
+                    :requires ([aero-profiles.bootstrap :as bootstrap])
+                    :task (bootstrap/run!)}
+         clean     {:doc "Remove only disposable bootstrap files"
+                    :requires ([aero-profiles.bootstrap :as bootstrap])
+                    :task (bootstrap/clean!)}
+         run       {:doc "Read config for the selected Aero profile"
+                    :override-builtin true
+                    :requires ([aero-profiles.core :as app])
+                    :task (apply app/run! *command-line-args*)}
+         test      {:doc "Run the focused consumer smoke tests"
+                    :requires ([clojure.test :as t]
+                               [aero-profiles.core-test])
+                    :task (let [{:keys [fail error] :as result}
+                                  (t/run-tests 'aero-profiles.core-test)]
+                            (when (pos? (+ fail error))
+                              (throw (ex-info "Consumer tests failed" result)))
+                            result)}}}
