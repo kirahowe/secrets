@@ -50,7 +50,7 @@
         (let [app-system (ig/init {system/secrets-key {:resource "missing.age"
                                                        :app "example-app"}
                                    system/http-key    {:port 0
-                                                       :secrets #ig/ref system/secrets-key}})]
+                                                       :secrets (ig/ref system/secrets-key)}})]
           (try
             (is (= loaded (get app-system system/secrets-key)))
             (is (= "missing.age" @requested))

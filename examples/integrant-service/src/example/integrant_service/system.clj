@@ -47,7 +47,7 @@
 
 (defn- respond! [^HttpExchange exchange body]
   (let [bytes (.getBytes body StandardCharsets/UTF_8)]
-    (.setHeader (.getResponseHeaders exchange) "Content-Type" "application/json")
+    (.set (.getResponseHeaders exchange) "Content-Type" "application/json")
     (.sendResponseHeaders exchange 200 (long (alength bytes)))
     (with-open [out (.getResponseBody exchange)]
       (.write out bytes))))

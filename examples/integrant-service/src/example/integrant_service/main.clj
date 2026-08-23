@@ -1,4 +1,5 @@
 (ns example.integrant-service.main
+  (:gen-class)
   (:require [clojure.java.io :as io]
             [integrant.core :as ig]
             [example.integrant-service.system :as system]))
