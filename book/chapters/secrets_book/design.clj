@@ -5,19 +5,15 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 
-;; This chapter explains why the library works the way it does. None of the
-;; ideas in it are new. The interesting part is which ideas it borrows, and
-;; which it refuses.
+;; This chapter explains the main design choices and their trade-offs.
 
 ;; ## The problem with environment variables
 
-;; Env vars are where most apps start, and they have three problems that get
-;; worse over time.
+;; Environment variables are a common starting point, but they have limits.
 
-;; They sprawl. Every integration adds another variable, and after two years
-;; nobody can say what the app actually needs to boot. The repo does not know;
-;; the deploy platform's web UI does, which means your configuration's source
-;; of truth is mutable state behind someone's login.
+;; Each integration adds more variables, while the repository may contain no
+;; complete list of what the application needs. The active configuration then
+;; lives in deployment settings rather than beside the code.
 
 ;; They are untyped. An env var is a string, so a list of admin emails becomes
 ;; a comma-separated string and a parser you now maintain. Compare the two
@@ -29,21 +25,20 @@
 
 (edn/read-string "#{\"kira@example.com\" \"sam@example.com\"}")
 
-;; One of these is a vector of strings that happens to look like a set, built
-;; by code that will mishandle a space after a comma someday. The other is a
-;; set. When your secrets file is EDN, every value is real data: nested maps
-;; for a service's settings, keywords for modes, numbers that are numbers.
+;; The first result is a vector and requires the application to define parsing
+;; rules. The second is a set. EDN also represents nested maps, keywords, and
+;; numbers without application-specific string parsing.
 
-;; They have no history. When a deploy breaks because a var changed, there is
-;; no diff to read, no commit message, no way to bisect. Someone changed
-;; something in a dashboard.
+;; Git does not record changes made in a deployment dashboard. A platform may
+;; have its own audit history, but it is separate from the code change that
+;; consumes the secret.
 
 ;; ## The model
 
 ;; The library commits the secrets to git, encrypted:
 
 ;; ```
-;; secrets.edn        plaintext, never committed, exists only during edits
+;; secrets.edn        temporary plaintext during management operations
 ;;      |  age -e -i key.txt
 ;;      v
 ;; secrets.edn.age    ciphertext, committed
@@ -52,80 +47,66 @@
 ;; {:database/url "..." :auth/admins #{...}}    a plain Clojure map, in memory
 ;; ```
 
-;; Now the repo is the source of truth. Adding a secret is a commit. Removing
-;; one is a commit. Reviewing a change is a pull request. The only thing that
-;; lives outside git is one private key, and the whole design hangs on keeping
-;; that one small thing safe, which is a much easier problem than keeping
-;; forty env vars coherent.
+;; The repository now records additions and removals. Private identities stay
+;; outside git: one shared identity in the basic setup, or one per recipient in
+;; team mode.
 
 ;; ## Why age
 
-;; [age](https://age-encryption.org) is a file encryption tool by Filippo
-;; Valsorda with a short spec, modern primitives (X25519, ChaCha20-Poly1305),
-;; and no configuration. A key is two lines of text. There is no keyring, no
-;; trust database, no expiry ceremony, none of the GPG surface area that makes
-;; teams give up on encrypted files.
+;; [age](https://age-encryption.org) is a file encryption tool with small text
+;; keys and support for X25519 and SSH recipients. It does not require a
+;; keyring or trust database.
 
-;; Two properties matter for this library. First, an identity file can both
-;; encrypt and decrypt, so a solo developer needs exactly one file. Second,
-;; age natively encrypts to multiple recipients, which is the entire
-;; [team story](secrets_book.teams.html): a committed list of public keys,
-;; each person decrypting with their own private one.
+;; Two properties matter here. An identity file can select its own recipient
+;; for encryption and can decrypt the result, so the single-key setup needs one
+;; file. Age can also encrypt to multiple recipients; the
+;; [teams chapter](secrets_book.teams.html) uses a committed list of public keys
+;; while each person retains a separate private identity.
 
-;; The library shells out to the `age` binary rather than reimplementing the
-;; format. That is a real trade-off (your production image needs the binary),
-;; but it means the cryptography in your secrets pipeline is the audited tool
-;; itself, not a port of it.
+;; The library shells out to the upstream `age` binary rather than implementing
+;; the format. Every environment that decrypts therefore needs that binary.
 
 ;; ## Why one file per environment
 
-;; A single EDN map per environment keeps the mental model flat: prod has a
-;; file, dev has a file, each encrypts on its own, and each can have its own
-;; key. There is no overlay algebra and no partial sharing. When the whole
-;; file decrypts in one motion, you always know exactly what the app sees.
+;; Each environment has one EDN map and one ciphertext. Environments share the
+;; app's default key unless a `:key-file` override separates them. There are no
+;; overlays or partially shared files, so the decrypted map is the complete
+;; value the application receives.
 
-;; The cost is coarseness, and it is deliberate. Per-secret granularity is
-;; what SOPS does, and it buys reviewable values at the price of a much more
-;; complicated tool. This library takes the other branch and then patches the
-;; one real casualty, reviewability, with the
-;; [manifest](secrets_book.manifest.html).
+;; The trade-off is coarse access: an identity opens the entire file. SOPS
+;; encrypts individual values, which makes encrypted diffs field-specific.
+;; This library keeps whole-file encryption and adds a
+;; [manifest](secrets_book.manifest.html) that records structural changes.
 
 ;; ## Prior art, and what got borrowed
 
-;; The model is not experimental. Rails has shipped it as a framework default
-;; since 5.2: an encrypted credentials file in the repo, one master key
-;; outside it. Years of production use across a very large community is the
-;; strongest evidence this shape holds up.
+;; Rails 5.2 also uses an encrypted credentials file in the repository and a
+;; master key outside it. Other tools make different choices about granularity
+;; and key management:
 
-;; | Tool | Granularity | Keys | What it taught this library |
-;; |------|-------------|------|------------------------------|
-;; | Rails credentials | whole file | one master key | the core model works |
-;; | SOPS | per value | KMS, age, GPG | reviewable diffs matter |
-;; | git-crypt | whole file, transparent | GPG | transparency hides too much |
-;; | Vault | per secret, dynamic | server-side | some needs deserve a server |
+;; | Tool | Granularity | Key model | Relevant design choice |
+;; |------|-------------|-----------|------------------------|
+;; | Rails credentials | whole file | master key outside git | encrypted file committed with the app |
+;; | SOPS | per value | KMS, age, or PGP | document keys stay visible; leaf values are encrypted |
+;; | git-crypt | whole file | GPG or symmetric key | encryption runs through git filters |
+;; | Vault | per secret, dynamic | server-side | central policy, audit, and dynamic credentials |
 
-;; From SOPS it takes the lesson that an opaque diff is a real cost, and
-;; answers with the manifest instead of per-value encryption. From git-crypt
-;; it takes a warning: when encryption is invisible, people forget it is
-;; there, so this library keeps encryption explicit. You run `bb secrets
-;; edit`; nothing happens behind your back.
+;; SOPS keeps document keys visible and encrypts leaf values, so a diff shows
+;; which encrypted field changed. This library uses a separate manifest for
+;; that information. Git-crypt applies encryption through git filters; this
+;; library instead uses explicit `bb secrets` commands.
 
-;; ## What it refuses to be
+;; ## Scope
 
-;; There is no server, no daemon, no cloud account, and no rotation scheduler.
-;; A secrets manager like Vault earns its complexity when you need dynamic
-;; database credentials, fine-grained access policy, or a central audit log.
-;; Most small apps need none of that, and the operational weight of running a
-;; secrets server dwarfs the problem it solves for them. The
-;; [caveats chapter](secrets_book.caveats.html) draws the line precisely, so
-;; you can tell when you have outgrown this tool.
+;; There is no server, daemon, cloud account, or rotation scheduler. Use a
+;; secrets manager when you need dynamic credentials, fine-grained access
+;; policy, or a central audit log. The [caveats chapter](secrets_book.caveats.html)
+;; describes those limits.
 
 ;; ## The EDN choice
 
-;; The file is EDN and reads with `clojure.edn`, never `eval`. This is worth a
-;; sentence of paranoia: the secrets file is data, and even a malicious one
-;; cannot execute code at load time. Sets, maps, keywords, and comments all
-;; work, and your secrets file can document itself:
+;; The file is read with `clojure.edn`, not `eval`, so reading it does not
+;; execute Clojure forms. Sets, maps, keywords, and comments are supported:
 
 ;; ```clojure
 ;; {;; Rotated 2026-06-01, next rotation due September.

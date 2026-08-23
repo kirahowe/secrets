@@ -6,10 +6,9 @@
             [com.kirahowe.secrets.age :as age]
             [clojure.java.io :as io]))
 
-;; A deployment of this library has two moving parts. The ciphertext travels
-;; with your code, inside the image or the jar, like any other resource. The
-;; key travels alone, as a single secret in whatever your platform provides.
-;; Everything in this chapter is a variation on that sentence.
+;; A deployment needs the ciphertext and a matching identity. The ciphertext
+;; can ship with the code in an image or jar. Supply the identity through the
+;; deployment platform's secret mechanism.
 
 ;; ## Injecting the key
 
@@ -21,22 +20,21 @@
 ;; | `SECRETS_AGE_IDENTITY` | the raw key file contents | the platform stores secret strings |
 ;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the contents | the platform mangles newlines |
 
-;; `SECRETS_AGE_IDENTITY` is used verbatim, never decoded. `SECRETS_AGE_IDENTITY_B64` is
-;; always decoded, and invalid base64 is an error rather than a silent
-;; fallback. The split exists because guessing whether a value is encoded is
-;; how keys get corrupted quietly; here nothing guesses. Key contents are
-;; written to an owner-only temp file once per process, since the `age`
-;; binary wants a file.
+;; `SECRETS_AGE_IDENTITY` is used verbatim, never decoded.
+;; `SECRETS_AGE_IDENTITY_B64` is always decoded, and invalid base64 is an error
+;; rather than a silent fallback. Separate variables avoid guessing whether a
+;; value is encoded. Key contents are written to an owner-only temp file once
+;; per distinct value because this wrapper passes the identity to `age` as a
+;; file path.
 
 ;; A variable that is **set but empty** throws, naming itself, rather than
-;; being treated as unset. This is the CI case worth knowing about: the
-;; workflow snippet later in this chapter maps a repository secret into
+;; being treated as unset. This matters in CI: the workflow snippet later in
+;; this chapter maps a repository secret into
 ;; `SECRETS_AGE_IDENTITY`, and if that secret is missing or misnamed the
 ;; runner expands it to the empty string rather than leaving it unset. Falling
 ;; through to the next variable — and eventually to the local
 ;; `~/.config/<app>/key.txt` — would let a broken deployment succeed on a
-;; developer machine using the wrong key. Unset the variable when you want the
-;; fallback.
+;; developer machine using the wrong key. Unset the variable to allow fallback.
 
 ;; On Fly, that means one command:
 
@@ -65,31 +63,25 @@
 ;; ## Runtimes without `age`
 
 ;; Decryption shells out to the `age` binary, so every runtime that decrypts
-;; needs it on `PATH` — a container, a VM, a CI runner, your laptop. Some
-;; platforms can't offer that at all: Cloudflare Workers, Deno Deploy, and
-;; edge runtimes generally run your code somewhere that can't exec a
-;; subprocess, `age` or otherwise.
+;; needs it on `PATH` — a container, a VM, a CI runner, or a laptop. Some
+;; serverless and edge runtimes do not allow application code to start
+;; subprocesses.
 
-;; That's not a gap in this library, it's a boundary of the design — it wraps
-;; a CLI tool, so anywhere a CLI tool can't run, it can't run either. The
-;; answer isn't to work around it; it's to use this library for what it's
-;; good at (development and CI, where the ciphertext and the manifest still
-;; do their job) and let the edge platform hold the one secret value itself
-;; in production.
+;; This library cannot decrypt in those runtimes because it wraps a CLI tool.
+;; You can still use it in development and CI, then supply the required values
+;; through the runtime's own secret store in production.
 
 ;; | Where | How the identity gets there |
 ;; |-------|------------------------------|
 ;; | Laptop | `~/.config/<app>/key.txt` |
 ;; | GitHub Actions | `SECRETS_AGE_IDENTITY` repository secret |
 ;; | Container / VM | env var, `age` installed in the image |
-;; | Edge runtime (Workers, Deno Deploy) | **it doesn't** — use the platform's own secret store; this library covers dev and CI |
+;; | Runtime without subprocess support | platform secret store; use this library in dev and CI |
 
 ;; ## Loading from inside a jar, demonstrated
 
-;; This is the part that must not break on a Friday deploy, so the book
-;; proves it rather than promising it. Build an actual jar containing an
-;; encrypted secrets entry, then load through a `jar:` URL, which is exactly
-;; what `io/resource` returns inside an uberjar:
+;; The following example builds a jar containing an encrypted resource, then
+;; loads it through the `jar:` URL form returned by `io/resource` inside a jar:
 
 (def dir (str (java.nio.file.Files/createTempDirectory
                "secrets-prod-" (into-array java.nio.file.attribute.FileAttribute []))))
@@ -128,17 +120,18 @@
 ;; On a laptop, that resolves to `~/.config/myapp/key.txt`. In the container,
 ;; `SECRETS_AGE_IDENTITY` overrides it. Same code, no branches.
 
-;; Secrets decrypt once, at startup. Changing a secret means a commit and a
-;; deploy, and a restart picks it up. There is no hot reload, and the
+;; In this wiring, the component decrypts during startup. `load-secrets` does
+;; not provide global caching or hot reload: each call decrypts the source.
+;; Changing a secret normally means a commit, deploy, and restart. The
 ;; [caveats chapter](secrets_book.caveats.html) discusses what that means
 ;; for emergency rotation.
 
 ;; ## CI: gate the manifest
 
-;; Two useful jobs, in increasing order of trust required.
+;; CI can run a keyless freshness check or a full check with an identity.
 
-;; The keyless job checks that nobody committed a ciphertext without its
-;; manifest. It holds no secrets at all, and does not even need `age`:
+;; The keyless job checks that each enabled manifest matches its ciphertext.
+;; It holds no secret material and does not need `age`:
 
 ;; ```yaml
 ;; verify-secrets-freshness:
@@ -152,11 +145,13 @@
 
 ;; With no identity available, `verify` compares the manifest's recorded
 ;; `:ciphertext-sha` against the file and exits 0, 1, or 2. Exit 1 means
-;; drift and should fail the build. Exit 2 means an artifact is missing,
-;; which on a fresh repo usually means someone forgot to commit the manifest.
+;; drift and should fail the build. Exit 2 means an artifact is missing or an
+;; older manifest has no ciphertext hash for a keyless check. On a fresh repo,
+;; this usually means someone forgot to commit the manifest.
 
-;; The full job decrypts and checks values too. Give the runner the deploy
-;; key (as a CI secret, not a person's key) and install `age`:
+;; The full job decrypts and regenerates the manifest entries. In single-key
+;; mode this includes the keyed value hashes; in team mode it checks structure.
+;; Give the runner a dedicated deploy identity and install `age`:
 
 ;; ```yaml
 ;; verify-secrets:
@@ -165,23 +160,21 @@
 ;;     SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ;;   steps:
 ;;     - uses: actions/checkout@v4
-;;     - run: sudo apt-get install -y age
+;;     - run: sudo apt-get update && sudo apt-get install -y age
 ;;     - uses: turtlequeue/setup-babashka@v1
 ;;       with: {babashka-version: 1.12.208}
 ;;     - run: bb secrets verify
 ;; ```
 
-;; Whether to run the full job is a judgment call: it makes CI a holder of
-;; your production key. The keyless job catches the common failure for free,
-;; so start there and add the keyed job only if you need value-level checks
-;; on every merge.
+;; The full job makes CI a holder of an identity that can decrypt the file.
+;; Use it only when that access is appropriate. The keyless job still detects
+;; a ciphertext that no longer matches its committed manifest.
 
 ;; ## A job that reads secrets
 
-;; The two jobs above only ever check freshness or shape — neither one
-;; decrypts a value into something that runs. A job that actually needs the
-;; secrets, an eval run hitting a real API, say, needs `age` installed and the
-;; identity in its environment, the same as the container does:
+;; Verification does not pass secret values to application code. A job that
+;; needs them, such as an evaluation that calls an external API, also needs
+;; `age` and the identity in its environment:
 
 ;; ```yaml
 ;; evals:
@@ -190,7 +183,7 @@
 ;;     - uses: actions/checkout@v4
 ;;     - name: Install age
 ;;       run: sudo apt-get update && sudo apt-get install -y age
-;;     - name: Run the thing
+;;     - name: Run evaluations
 ;;       run: bb evals
 ;;       env:
 ;;         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
@@ -198,23 +191,18 @@
 
 ;; The repository secret's value is the *contents* of `~/.config/<app>/key.txt`,
 ;; not a path — and the ciphertext it decrypts is the one already committed to
-;; the repo. That's the whole point of the design: the secret Actions holds is
-;; small and rotatable, and the thing it unlocks travels with the code. It
-;; still feels backwards the first time, though — you are not sending secrets
-;; to GitHub, you are giving GitHub the one key that reads the secrets already
-;; sitting in the checkout. Set it with:
+;; the repo. GitHub receives an identity that can decrypt the ciphertext in the
+;; checkout, so protect that repository secret accordingly. Set it with:
 
 ;; ```sh
 ;; gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
 ;; ```
 
-;; ## Back up the key like you mean it
+;; ## Back up the identity
 
-;; The key is two lines of text, it is not in git, and it does not regenerate.
-;; Losing every copy means re-creating every secret value from the upstream
-;; services. Put it in the team password manager the day you generate it, and
-;; treat "where is the key backed up?" as a deploy checklist item, not an
-;; afterthought.
+;; The identity is a small text file that is not stored in git. Losing every
+;; copy means recovering or replacing each secret value at its source. Back it
+;; up in the team's approved secret storage when it is created.
 
 ^{:kindly/hide-code true}
 (doseq [f (reverse (file-seq (io/file dir)))]

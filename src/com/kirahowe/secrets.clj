@@ -133,16 +133,13 @@
   (identity-env-value k (System/getenv k)))
 
 (defn identity-from-env
-  "Resolve the age identity (private key) file path from the environment, or
-  nil when no identity variable is set. Checked in order:
+  "Return an age identity file path from the environment, or nil. Sources are
+  checked in order:
     $SECRETS_AGE_IDENTITY_FILE — a path to the key file, returned as-is.
     $SECRETS_AGE_IDENTITY      — the raw key file contents, used verbatim.
     $SECRETS_AGE_IDENTITY_B64  — base64-encoded key file contents (invalid base64 throws).
-  A variable that is set but blank throws (see `identity-env`); one that is
-  merely unset falls through to the next. Contents are materialized to a 0600
-  temp file, written at most once per process. Public (rather than folded into
-  `resolve-identity-file`) so callers like the CLI namespace can layer their
-  own defaults under it when it returns nil."
+  A blank value throws. Raw or decoded contents are cached in owner-only temp
+  files, one per distinct value."
   []
   (or (identity-env "SECRETS_AGE_IDENTITY_FILE")
       (when-let [c (identity-env "SECRETS_AGE_IDENTITY")]
@@ -151,14 +148,9 @@
         (materialize-identity! (decode-b64-identity c)))))
 
 (defn resolve-identity-file
-  "Resolve the *conventional* age identity (private key) file path: the
-  environment first (see `identity-from-env`), then `~/.config/<app>/key.txt`
-  when an app name is given. The path returned is where the identity *would*
-  live — it is never checked for existence, so a non-nil result does not mean
-  a usable key is actually there. Use `identity-available?` to ask that
-  question. Returns nil when no env var is set and no app is known — there is
-  deliberately no default path, so callers fail loudly instead of reading some
-  other app's key. `app-or-opts` is an app-name string or a map with `:app`."
+  "Return the conventional identity path: `identity-from-env` first, then
+  `~/.config/<app>/key.txt` when `app-or-opts` supplies an app name. Does not
+  check whether the file exists. Returns nil when neither source is available."
   ([] (resolve-identity-file nil))
   ([app-or-opts]
    (let [app (if (map? app-or-opts) (:app app-or-opts) app-or-opts)]
@@ -166,13 +158,9 @@
          (when app (expand-home (str "~/.config/" app "/key.txt")))))))
 
 (defn identity-available?
-  "True when an age identity actually resolves AND its file exists on disk.
-  Exists for the \"do I have a key, or should I tell the user to run
-  keygen?\" check — `resolve-identity-file` alone can't answer that, since it
-  returns the conventional path whether or not anything is there.
-  `app-or-opts` takes the same app-name-string-or-opts-map `resolve-identity-file`
-  does, plus an opts-map `:identity-file` (an explicit path, taking priority
-  over :app and the env vars — as `load-secrets` treats it)."
+  "True when the resolved identity file exists. `app-or-opts` accepts an app
+  name or an options map with `:app` or `:identity-file`; an explicit
+  `:identity-file` takes priority."
   ([] (identity-available? nil))
   ([app-or-opts]
    (let [identity (if (map? app-or-opts)
@@ -212,32 +200,24 @@
   "Create it with `bb secrets new`.")
 
 (defn load-secrets
-  "Decrypt and read an age-encrypted EDN file into a map.
+  "Decrypt an age-encrypted EDN source and return its value.
 
-  `source` is the encrypted file: a path string, a File, or a URL/resource (as
-  returned by `clojure.java.io/resource`, including a jar: URL inside an
-  uberjar). `identity-or-opts` selects the identity (private key): a path
-  String/File, or an opts map:
+  `source` may be a path string, File, URL, classpath resource URL, or another
+  value accepted by `clojure.java.io/input-stream`. `identity-or-opts` is an
+  identity path or an options map:
     :identity-file  explicit identity path (wins over :app and the env vars)
     :app            app name for the default ~/.config/<app>/key.txt
-  With neither, the identity comes from `resolve-identity-file` (the
-  SECRETS_AGE_IDENTITY* env vars).
+  Without an explicit identity or app, only the SECRETS_AGE_IDENTITY*
+  environment variables are used.
 
-  Every reachable failure throws ex-info — never a bare java.io.* exception —
-  with a :reason a caller can branch on regardless of which API they used,
-  since it shares the vocabulary `#secret/req` uses:
+  Missing inputs throw ex-info with a :reason:
     :no-identity  no identity resolves, or the resolved file does not exist.
-                  Names every way to supply one (see `identity-options`).
     :no-file      `source` is nil (almost always because
                   `(io/resource \"secrets.edn.age\")` found nothing on the
-                  classpath), names a path/File that does not exist, or wraps
-                  any other IOException reading the source (a bad URL, a
-                  missing jar entry) with the original exception as :cause.
-  Checked identity first, then source — an existing identity failure always
-  wins even when the source is also missing.
-
-  Reads with `clojure.edn` (no eval), so secret files are plain data and may use
-  any EDN — including native sets for allowlists, e.g. `#{\"a@b.com\"}`."
+                  classpath), a path/File is absent, or reading the source
+                  raises an IOException.
+  Identity validation happens before source validation. The plaintext is read
+  with `clojure.edn`, not `eval`."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
    (let [identity (if (map? identity-or-opts)
@@ -299,18 +279,15 @@
     :app           app name for the default key path ~/.config/<app>/key.txt.
     :identity-file explicit identity path (overrides resolution).
 
-  The file is resolved and decrypted at most once, on the first tag
-  encountered — so configs with no secret tags (e.g. dev/test) never touch
-  `age` or the key, even when a secrets file happens to be on the classpath.
+  The source is resolved and decrypted at most once, when the first tag is
+  read. Configs with no secret tags do not access the source or identity.
 
   Semantics, mirroring required/optional env reads:
     #secret/req k → required: throws when no secrets file is found, when no
                     identity (key) is available, or when the key is missing
                     from the decrypted map.
     #secret/opt k → optional: nil in all three of those cases.
-  A genuine decryption failure — the identity file exists but `age` fails
-  (wrong key, not a recipient, `age` not installed) — always throws, for both
-  tags, on every use."
+  If the identity exists but decryption fails, both tags throw."
   [{:keys [resource file app identity-file]}]
   (let [identity (delay (or identity-file (resolve-identity-file app)))
         ;; One of {:present? false :reason :no-file}, {:present? false :reason

@@ -56,11 +56,8 @@
   `:secrets` opt. `config` is the same opts map `com.kirahowe.secrets/reader-literals`
   takes (`:app`/`:resource`, `:file`, `:identity-file`).
 
-  Idempotent — call it again (e.g. to point at a different app) and the new
-  value simply replaces the old one; there is no accumulation to undo. A
-  per-read `:secrets` key in `read-config`'s opts always takes precedence over
-  whatever is registered here. `(register! nil)` clears the default, restoring
-  the un-configured state. Returns `config`."
+  A later call replaces the previous value. Per-read `:secrets` options take
+  precedence. `(register! nil)` clears the default. Returns `config`."
   [config]
   (reset! default-config config)
   config)
@@ -75,13 +72,9 @@
   (atom {}))
 
 (defn reset-cache!
-  "Empty the reader-functions cache. `secrets/reader-literals` closes over a
-  `delay` that decrypts at most once for its own lifetime, so without a way to
-  drop the cached entry, a long-running process (a REPL, a server) would keep
-  serving whatever was decrypted at the first `#secret/…` read forever — in
-  particular, it would never notice a `bb secrets edit` made after that point
-  without a full restart. Call this after editing the underlying secrets file
-  to make the next `#secret/…` read pick up the change."
+  "Clear cached reader functions and decrypted stores. The next `#secret/…`
+  read resolves and decrypts its source again. Useful after editing secrets in
+  a long-running process."
   []
   (reset! readers-cache {})
   nil)

@@ -7,11 +7,10 @@
             [clojure.edn :as edn]
             [clojure.java.io :as io]))
 
-;; Your app touches the library in one of two ways: it loads the whole
-;; decrypted map and passes it around, or it registers reader literals so EDN
-;; config files can reference secrets inline. This chapter covers both, plus
-;; the part everything depends on, which is how the library finds your private
-;; key.
+;; Your app can use the library in two ways: load the complete decrypted map
+;; and pass it around, or register reader literals so EDN config files can
+;; reference secrets inline. This chapter covers both APIs and their identity
+;; resolution.
 
 ;; Setup for the examples: a fresh key and an encrypted file in a temp
 ;; directory.
@@ -34,16 +33,16 @@
 
 ;; ## Loading the map
 
-;; `load-secrets` takes a source and, optionally, something that identifies
-;; the key. The source can be a path string:
+;; `load-secrets` takes a source and an optional identity path or options map.
+;; The source can be a path string:
 
 (secrets/load-secrets (str dir "/secrets.edn.age") key-file)
 
-;; or a `java.io.File`, or any URL, which matters because
+;; It also accepts a `java.io.File` or URL. This matters because
 ;; `clojure.java.io/resource` returns URLs. Inside an uberjar those are `jar:`
 ;; URLs, and the library copies the ciphertext out to a temp file so `age` can
 ;; read it. The [production chapter](secrets_book.production.html) demonstrates
-;; that with a real jar. Here is the URL form with a plain file URL:
+;; that with a jar. Here is the same call with a file URL:
 
 (secrets/load-secrets (.toURL (.toURI (io/file (str dir "/secrets.edn.age"))))
                       key-file)
@@ -61,7 +60,7 @@
 
 (secrets/get-secret loaded :missing/key "fallback")
 
-;; `loaded` is an ordinary immutable map. There is no wrapper type to learn.
+;; `loaded` is an ordinary immutable map.
 ;; If you use Integrant, the component that provides it is one `defmethod`:
 
 ;; ```clojure
@@ -88,15 +87,13 @@
 ;; | `SECRETS_AGE_IDENTITY` | the raw key file contents, used verbatim |
 ;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the contents; invalid base64 throws |
 
-;; The env vars always win, even when you pass `{:app "myapp"}`. That is the
-;; deployment story in one sentence: code passes `{:app "myapp"}` so local
-;; development finds `~/.config/myapp/key.txt`, and production sets
-;; `SECRETS_AGE_IDENTITY`, which overrides it.
+;; The environment variables win even when you pass `{:app "myapp"}`. Local
+;; development can therefore use `~/.config/myapp/key.txt`, while production
+;; overrides it with an injected identity.
 
-;; There is deliberately no default key path when no app is named. A library
-;; that guessed `~/.config/something/key.txt` would sometimes guess a path
-;; belonging to a different app, and secrets are the wrong place for guessing.
-;; Instead, you get an error that lists every option:
+;; There is no default key path when no app is named. This prevents unrelated
+;; applications from sharing a conventional path by accident. The error lists
+;; the supported identity sources:
 
 (try
   (secrets/load-secrets (str dir "/secrets.edn.age")
@@ -116,8 +113,8 @@
 
 (keys readers)
 
-;; The tags are namespaced because the EDN spec reserves bare tags like
-;; `#secret` for EDN itself. In a config file they look like this:
+;; The tags contain a prefix because the EDN specification reserves
+;; unqualified tag names for built-ins. In a config file they look like this:
 
 (edn/read-string {:readers readers}
                  "{:db  {:jdbc-url #secret/req :database/url}
@@ -141,9 +138,8 @@
 ;; | no identity available | throws | nil |
 ;; | file and key exist, decryption fails | throws | throws |
 
-;; The last row is the one to remember. A wrong key is never silently
-;; ignored, because nil-ing your way past a decryption failure hides real
-;; breakage. Here is a missing required key:
+;; A wrong key is never ignored: it indicates a broken configuration rather
+;; than an absent optional feature. Here is a missing required key:
 
 (try
   (edn/read-string {:readers readers} "#secret/req :not/in-the-file")
@@ -156,9 +152,9 @@
                 :identity-file (str dir "/nobody-home.txt")})]
   (edn/read-string {:readers keyless} "#secret/opt :database/url"))
 
-;; ## Laziness, and why dev configs stay fast
+;; ## Lazy loading and caching
 
-;; Building the readers map costs nothing. The secrets file is resolved and
+;; Building the readers map does not read the secrets. The file is resolved and
 ;; decrypted once, on the first tag actually read, and the result is cached
 ;; for the life of that readers value. A dev or test config with no secret
 ;; tags never touches `age` and never needs a key, even when a secrets file
@@ -181,20 +177,16 @@
 ;; ## Aero
 
 ;; [aero](https://github.com/juxt/aero) resolves tags through its own
-;; multimethod rather than a `:readers` map, so the integration ships as a
-;; namespace, `com.kirahowe.secrets.aero`, instead of a snippet to paste into
-;; your own code. Requiring it is the whole thing:
+;; multimethod rather than a `:readers` map. Requiring
+;; `com.kirahowe.secrets.aero` registers the two methods:
 
 ;; ```clojure
 ;; (require '[com.kirahowe.secrets.aero])
 ;; ```
 
-;; That registers the `#secret/req` / `#secret/opt` methods on
-;; `aero.core/reader`; there is nothing else to call. `aero` is not a
-;; dependency of this library — the namespace only compiles and loads for
-;; consumers who already have `aero` on their own classpath, which is also why
-;; this chapter describes it in prose rather than requiring it above: `aero`
-;; is a test-only dependency of this repo, not one the book carries.
+;; `aero` is optional: consumers must already have it on their classpath. After
+;; requiring the integration namespace, supply the secrets options either to
+;; `register!` or to each `read-config` call.
 
 ;; Two ways to supply the secrets config — the same opts map `reader-literals`
 ;; takes above:
@@ -220,24 +212,20 @@
 
 ;; ### A different key per profile
 
-;; A real case: eval runs need to authenticate with a different OpenRouter key
-;; than production, so benchmark spend stays off the key serving real
-;; traffic. Both keys live in the same store — the whole solution is one
-;; config line, combining aero's `#profile` with `#secret/req`:
+;; For example, eval runs can select a different OpenRouter key from production
+;; by combining Aero's `#profile` tag with `#secret/req`:
 
 ;; ```clojure
 ;; :api-key #profile {:default #secret/req :openrouter/api-key
 ;;                    :evals   #secret/req :openrouter/evals-api-key}
 ;; ```
 
-;; with the caller passing `{:profile :evals}` to `read-config`. This is safe
-;; because aero evaluates *only the selected branch* — reading with `:default`
+;; Pass `{:profile :evals}` to `read-config` to select the second branch. Aero
+;; evaluates only the selected branch: reading with `:default`
 ;; decrypts and looks up `:openrouter/api-key` alone, and
 ;; `:openrouter/evals-api-key` does not need to exist in the store at all;
-;; reading with `:evals` is the mirror image. That is a genuine advantage of
-;; building on aero rather than a bespoke reader: you can add a profile for a
-;; key some consumers don't have — a benchmark-only key, say — without
-;; breaking every `read-config` call that never selects it.
+;; reading with `:evals` selects only the other branch. A key used by one
+;; profile can therefore be absent when another profile reads the config.
 
 ^{:kindly/hide-code true}
 (doseq [f (reverse (file-seq (io/file dir)))]

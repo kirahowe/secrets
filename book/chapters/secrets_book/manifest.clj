@@ -1,4 +1,4 @@
-;; # The manifest: reviewing what you cannot read
+;; # The manifest: reviewable encrypted changes
 
 ^{:kindly/hide-code true}
 (ns secrets-book.manifest
@@ -8,10 +8,8 @@
             [clojure.java.io :as io]
             [clojure.string :as str]))
 
-;; Committing encrypted secrets buys you history and review, in theory. In
-;; practice, age re-encrypts the whole file every time, so the diff of a
-;; ciphertext is noise. Two encryptions of the same plaintext do not even
-;; match each other:
+;; Age uses randomized encryption, so two encryptions of the same plaintext
+;; differ. A ciphertext diff therefore cannot describe the plaintext change:
 
 (def dir (str (java.nio.file.Files/createTempDirectory
                "secrets-manifest-" (into-array java.nio.file.attribute.FileAttribute []))))
@@ -28,14 +26,15 @@
   (age/encrypt-file! key-file plain (str dir "/two.age"))
   (= (slurp (str dir "/one.age")) (slurp (str dir "/two.age"))))
 
-;; So a pull request that changes `secrets.edn.age` tells the reviewer
-;; nothing. Did it add a key? Rotate one? Delete half the file? The manifest
-;; exists to answer exactly that question without exposing a single value.
+;; A pull request that changes only `secrets.edn.age` does not show which value
+;; changed. The manifest records that information without storing plaintext
+;; secret values.
 
 ;; ## What the manifest records
 
 ;; `entries` maps a secrets value to its shape: every key path, the type of
-;; its value, and a count for collections. Values themselves never appear:
+;; its value, and a count for collections. Plaintext secret values do not
+;; appear:
 
 (def secrets-v1
   {:database/url "jdbc:postgresql://db/app"
@@ -44,8 +43,8 @@
 
 (manifest/entries secrets-v1 nil)
 
-;; The CLI writes this, rendered as line-oriented EDN, to a `.manifest` file
-;; next to the ciphertext on every save. Committed together, the pair gives
+;; Secrets-writing CLI commands render this as line-oriented EDN in a
+;; `.manifest` file next to the ciphertext. Committed together, the pair gives
 ;; you a reviewable diff: the ciphertext changes opaquely, and the manifest
 ;; line for `[:auth :admins]` shows the set grew from 2 to 3.
 
@@ -62,15 +61,16 @@
 
 (manifest/entries {:token "new-value"} hkey)
 
-;; Same shape, different hash, visible diff. Two properties make this safe to
-;; commit. The hash is keyed, so someone with only the repo cannot brute-force
-;; a low-entropy value by hashing guesses; without the private key there is
-;; nothing to compare against. And it is truncated to 8 bytes, enough to show
-;; change, useless as a fingerprint.
+;; The shape is unchanged but the hash differs. Someone with only the
+;; repository cannot test guesses for a low-entropy value because the HMAC key
+;; is derived from the private identity. The stored hash is truncated to eight
+;; bytes; it is a change marker, not a general-purpose integrity check.
 
-;; The key derivation reads only the `AGE-SECRET-KEY` line of the identity
-;; file, so the comment lines age-keygen writes do not matter. Two copies of
-;; the same key, one with comments stripped, produce identical hashes:
+;; For a native age identity, key derivation reads only `AGE-SECRET-KEY` lines,
+;; so comments written by `age-keygen` do not matter. If the file has no such
+;; line, as with an SSH identity, derivation uses the complete trimmed contents.
+;; Two copies of the same native key, one with comments stripped, produce
+;; identical hashes:
 
 (let [with-comments    (slurp key-file)
       without-comments (->> (str/split-lines with-comments)
@@ -94,8 +94,7 @@
 ^{:kindly/hide-code true}
 (print rendered)
 
-;; One key path per line, so git diffs stay line-oriented and merge conflicts
-;; stay rare.
+;; Each key path occupies one line, so git shows entry-level changes.
 
 ;; ## Diffing two shapes
 
@@ -108,11 +107,10 @@
 ;; `:changed` covers type changes, count changes, and, when hashes are
 ;; present, value changes.
 
-;; ## verify: trust, then check
+;; ## Verifying the manifest
 
-;; A manifest is only useful while it is true. `bb secrets verify` decrypts
-;; the secrets, regenerates the entries, and compares them to the committed
-;; manifest. Set up an environment and watch it pass:
+;; `bb secrets verify` decrypts the secrets, regenerates the entries, and
+;; compares them to the committed manifest. First set up an environment:
 
 (def config
   (cli/normalize-config
@@ -131,8 +129,8 @@
 
 (cli/verify! config "dev")
 
-;; Now sabotage it. Re-encrypt different secrets out-of-band, the way a
-;; hurried teammate with raw `age` might, skipping the manifest write:
+;; Next, re-encrypt different secrets directly with `age`, without updating
+;; the manifest:
 
 (let [plain (str dir "/p3.edn")]
   (spit plain (pr-str (assoc secrets-v1 :sneaky/addition "oops")))
@@ -141,27 +139,30 @@
 
 (cli/verify! config "dev")
 
-;; Exit code 1, and the output names the path that appeared. Wiring this into
-;; CI means a stale manifest cannot merge.
+;; The returned map contains `:exit 1`, and the output names the added path. A
+;; CI job can use that status to reject a stale manifest.
 
 ;; ## Verifying without the key
 
 ;; The manifest header's `:ciphertext-sha` enables a check that needs no
 ;; secret material at all. When `verify` finds no identity, it compares the
 ;; recorded hash against the actual ciphertext. A CI job with no key, and not
-;; even `age` installed, still catches the most common drift, which is a
-;; ciphertext edited without regenerating its manifest. Repair the
-;; environment, then verify with a key that does not exist:
+;; even `age` installed, can detect a ciphertext changed without regenerating
+;; its manifest. Repair the environment, then verify with a missing key:
 
 ^{:kindly/hide-code true}
 (cli/reencrypt! config "dev")
 
 (def keyless-config
-  (cli/normalize-config
-   {:app "manifest-demo"
-    :default-environment :dev
-    :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
-                         :key-file     (str dir "/no-key-here.txt")}}}))
+  (-> (cli/normalize-config
+       {:app "manifest-demo"
+        :default-environment :dev
+        :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
+                             :key-file     (str dir "/no-key-here.txt")}}})
+      ;; Environment identities normally override :key-file. Pin the resolved
+      ;; path so this example stays keyless on every build machine.
+      (assoc-in [:environments :dev :identity-file]
+                (str dir "/no-key-here.txt"))))
 
 (cli/verify! keyless-config "dev")
 
@@ -173,16 +174,15 @@
 ;; ## Format versioning
 
 ;; Every manifest records `:version 1`. If a future library version changes
-;; the format, `verify` reports an unsupported version as drift with a clear
-;; message instead of producing a confusing pile of false differences. Small
-;; thing, but it means the file format can evolve without ambushing anyone.
+;; the format, `verify` reports an unsupported version as drift and asks you to
+;; regenerate the file or upgrade the library.
 
 ;; ## What the manifest leaks, and how to turn it off
 
 ;; Key names, value types, and collection counts are visible to anyone with
-;; repo access. Usually that is the point; occasionally even a key's
-;; existence is sensitive. Disable per environment with `:manifest false`,
-;; and that environment trades reviewability for opacity.
+;; repo access. If even a key's existence is sensitive, disable the manifest
+;; for that environment with `:manifest false`; its ciphertext diff will be
+;; opaque.
 
 ^{:kindly/hide-code true}
 (doseq [f (reverse (file-seq (io/file dir)))]

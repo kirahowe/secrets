@@ -4,14 +4,13 @@
 (ns secrets-book.reference
   (:require [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
+            [com.kirahowe.secrets.aero :as secrets-aero]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.manifest :as manifest]
             [clojure.string :as str]
             [scicloj.kindly.v4.kind :as kind]))
 
-;; This chapter is generated from the library itself: the signatures and
-;; docstrings below come from var metadata at render time, so they cannot
-;; drift from the code the way hand-written reference pages do.
+;; The signatures and docstrings below come from var metadata at render time.
 
 ^{:kindly/hide-code true}
 (defn- doc-section [& vars]
@@ -38,6 +37,14 @@
              #'secrets/identity-available?
              #'secrets/expand-home
              #'secrets/owner-only-temp-file!)
+
+;; ## com.kirahowe.secrets.aero
+
+;; Optional Aero integration. Requiring this namespace registers the reader
+;; methods; Aero must already be present in the consuming application.
+
+(doc-section #'secrets-aero/register!
+             #'secrets-aero/reset-cache!)
 
 ;; ## com.kirahowe.secrets.age
 
@@ -93,7 +100,7 @@
 ;; | Key | Required | Meaning |
 ;; |-----|----------|---------|
 ;; | `:app` | yes | names the default key path `~/.config/<app>/key.txt`; recorded in the manifest |
-;; | `:default-environment` | no | environment used when a command omits `[env]` |
+;; | `:default-environment` | no | environment keyword used when a command omits `[env]` |
 ;; | `:environments` | yes | map of environment keyword to environment config |
 
 ;; Per environment:
@@ -127,16 +134,16 @@
 ;; ## Exit codes
 
 ;; `bb secrets verify` exits 0 when every environment checks out (including
-;; keyless freshness passes), 1 on any drift, and 2 when artifacts or keys
-;; are missing and nothing drifted. Other commands exit 0 on success and 1 on
-;; failure.
+;; keyless freshness passes), 1 on any drift, and 2 when an artifact is missing
+;; or a keyless run cannot check an older manifest with no ciphertext hash.
+;; Other commands exit 0 on success and 1 on failure.
 
 ;; ## File conventions
 
 ;; | File | Committed | Contents |
 ;; |------|-----------|----------|
 ;; | `secrets.edn.age` | yes | the encrypted secrets |
-;; | `secrets.edn.manifest` | yes | value-free shape, written on every save |
-;; | `secrets.edn.example` | yes | template that seeds `bb secrets new` |
+;; | `secrets.edn.manifest` | by default | value-free shape, updated by secrets-writing commands |
+;; | `secrets.edn.example` | when used | optional template for `bb secrets new` |
 ;; | `recipients.txt` | yes | age public keys, one per line, team mode |
 ;; | `~/.config/<app>/key.txt` | never | the private key |

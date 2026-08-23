@@ -7,13 +7,12 @@
             [com.kirahowe.secrets.cli :as cli]
             [clojure.java.io :as io]))
 
-;; The single-key setup from the earlier chapters has one obvious problem for
-;; a team: everyone shares one private key, and sharing a private key is how
-;; keys leak. age solves this natively. A file can encrypt to many
+;; In the single-key setup, every teammate shares one private key. Age also
+;; supports multiple recipients: a file can encrypt to many
 ;; recipients at once, and any one of the matching private keys decrypts it.
-;; So the team model is: every person generates their own key, the list of
-;; public keys is committed to the repo, and nobody ever sends a private key
-;; anywhere.
+;; In team mode, every person generates their own key, the list of
+;; public keys is committed to the repo, and teammates do not exchange their
+;; private identities.
 
 ;; ## Two people, two keys
 
@@ -29,8 +28,7 @@
 (def alice-pub (age/keygen! alice-key))
 (def bob-pub   (age/keygen! bob-key))
 
-;; Public keys are safe to publish. That is what "public" means here, and it
-;; is why the recipients file can live in git:
+;; The recipients file contains public keys and can be committed:
 
 (def recipients-file (str dir "/recipients.txt"))
 
@@ -67,7 +65,7 @@
 ;;         :recipients-file "env/prod/recipients.txt"}}
 ;; ```
 
-;; From then on, every `new`, `edit`, and `reencrypt` encrypts to the whole
+;; From then on, every `new`, `edit`, and `reencrypt` encrypts to the complete
 ;; list. Onboarding a teammate is two commands run by the new person and one
 ;; by anyone who already has access:
 
@@ -77,9 +75,9 @@
 ;; bb secrets reencrypt prod       # existing member, so the newcomer can read
 ;; ```
 
-;; The `reencrypt` step is easy to forget and impossible to skip: encrypting
-;; to a new recipient requires re-encrypting, since the existing ciphertext
-;; was sealed before they existed. `add-recipient` prints a reminder.
+;; The existing ciphertext must be re-encrypted before the new recipient can
+;; read it. `add-recipient` updates the list and prints a reminder; it does not
+;; perform the re-encryption itself.
 
 ;; Here is `add-recipient!` live, using a config in team mode. A third
 ;; teammate joins:
@@ -96,31 +94,27 @@
 
 (cli/add-recipient! config "dev" carol-pub)
 
-;; And the re-encryption that makes Carol's access real:
+;; Re-encrypt so Carol can decrypt the file:
 
 (cli/reencrypt! config "dev")
 
 (secrets/load-secrets (str dir "/secrets.edn.age") (str dir "/carol.txt"))
 
-;; `recipients!` lists who a file currently encrypts to:
+;; `recipients!` lists the public keys in the configured recipients file:
 
 (cli/recipients! config "dev")
 
 ;; ## Offboarding
 
-;; Remove the person's line from `recipients.txt`, commit, and `reencrypt`.
-;; From that commit forward they cannot decrypt. But read that sentence
-;; carefully: *forward*. Git history is immutable, and every commit their key
-;; could decrypt remains decryptable by them forever. Removing a recipient is
-;; access control for the future, not revocation of the past. If the person
-;; leaving is a threat, rotate the secret values themselves. The
-;; [caveats chapter](secrets_book.caveats.html) treats this properly, because
-;; it is the sharpest edge in the whole model.
+;; Remove the person's line from `recipients.txt`, run `reencrypt`, and commit
+;; both files. They cannot decrypt the new ciphertext, but can still decrypt
+;; any version that included their recipient. If the old values must no longer
+;; be usable, rotate them at their source as well. See
+;; [caveats](secrets_book.caveats.html).
 
 ;; ## A key for the robots
 
-;; Deployment and CI should be a recipient too, with a dedicated key that no
-;; human uses:
+;; Deployment and CI can use a dedicated recipient instead of a person's key:
 
 ;; ```sh
 ;; age-keygen -o deploy-key.txt
@@ -130,8 +124,8 @@
 ;; # store deploy-key.txt in the team password manager, then delete it locally
 ;; ```
 
-;; A dedicated deploy key means offboarding a person never breaks production,
-;; and rotating the deploy credential never involves anyone's laptop.
+;; A dedicated deploy key keeps production independent of any person's
+;; identity and can be rotated separately.
 
 ;; ## What team mode costs you
 

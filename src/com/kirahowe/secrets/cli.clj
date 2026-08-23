@@ -43,10 +43,10 @@
   Commands: keygen · new · edit · set · rm · verify · show-key ·
   add-recipient · recipients · reencrypt · encrypt · decrypt · help.
 
-  Two committed artifacts per environment: `secrets.edn.age` (ciphertext) and
-  `secrets.edn.manifest` (its safe, value-free shape — regenerated on every
-  save so a diff shows which keys changed). The decrypt → edit → re-encrypt →
-  secure-delete cycle never leaves plaintext on disk.
+  By default, each environment commits `secrets.edn.age` (ciphertext) and
+  `secrets.edn.manifest` (key paths, types, counts, and optional keyed hashes).
+  Editing uses an owner-only plaintext temp file and deletes it afterward on a
+  best-effort basis.
 
   The command fns are a REPL-safe API: they return data (a path, a results
   map, or :aborted) and signal failures by throwing `ex-info` (carrying
@@ -125,17 +125,11 @@
 (defn normalize-config
   "Apply per-environment defaults (:key-file, :identity-file, :template,
   :manifest), validate the configuration, and stamp each env with its :name.
-  Throws (ex-info, as `run!` expects) when there are no environments, when
-  :app is missing (it names the default key path ~/.config/<app>/key.txt, so
-  defaulting it would make unrelated projects share a key), when an
-  environment lacks a :secrets-file string, when any artifact path is a blank
-  string (an empty path canonicalizes to the working directory, not a file),
-  or when a derived :template / :manifest name would collide with the
-  ciphertext (a :secrets-file that does not end in `.age` derives
-  template = manifest = the secrets file itself, and writing the manifest
-  would then overwrite the encrypted file). Ciphertext, manifest, template, key, and recipients paths
-  are compared by canonical path so aliases such as `./s.age` and `s.age`
-  cannot refer to different artifacts in the configuration."
+  Requires a non-blank :app, at least one environment, and a non-blank
+  :secrets-file string per environment. A secrets path not ending in `.age`
+  requires explicit :template and :manifest values. Ciphertext, manifest,
+  template, key, and recipients paths must be distinct after canonicalization.
+  Throws ex-info on invalid input."
   [{:keys [app environments] :as config}]
   (when (empty? environments)
     (fail! "secrets config has no :environments" {:config config}))
@@ -552,18 +546,10 @@
   "Generate an age identity at an environment's key-file. Returns the key-file
   path, or :aborted when an existing key is kept.
 
-  :key-file defaults to one path per app (~/.config/<app>/key.txt), not one
-  per environment, so `bb secrets keygen dev` reads as making a dev-specific
-  key when really it makes the one key every environment without its own
-  :key-file shares. After writing, prints which environments actually use the
-  written file (compared by canonical path) so that doubt cannot form.
-
-  With no `env-arg` and no :default-environment, resolve-env normally fails
-  outright (see its docstring) — but when every configured environment shares
-  one :key-file, an environment argument cannot change the outcome, so
-  keygen! picks one rather than demanding a choice with only one possible
-  answer. Environments that resolve to different key files still require a
-  choice, same as before."
+  The default key path is app-wide, so the function reports every environment
+  that shares it. With no environment or default, generation proceeds only
+  when all configured environments resolve to the same key path; otherwise it
+  throws. Existing keys require confirmation before replacement."
   [config env-arg]
   (require-age!)
   (let [{:keys [key-file name recipients-file]}
@@ -598,8 +584,9 @@
           key-file)))))
 
 (defn new!
-  "Create a new encrypted secrets file from a template via $EDITOR. Returns the
-  secrets-file path, or :aborted when an existing file is kept."
+  "Create an encrypted secrets file from its template using $VISUAL, $EDITOR,
+  or vim. Returns the secrets-file path, or :aborted when an existing file is
+  kept. Plaintext is held in an owner-only temp file during editing."
   [config env-arg]
   (require-age!)
   (let [{:keys [secrets-file name] :as env} (resolve-env config env-arg)]
@@ -623,8 +610,9 @@
             (finally (secure-delete! tmp))))))))
 
 (defn edit!
-  "Decrypt → edit → re-encrypt an existing secrets file (no plaintext left on
-  disk). Returns the secrets-file path."
+  "Edit an existing secrets file through an owner-only plaintext temp file.
+  Re-encrypts only when the plaintext changes and deletes the temp file on a
+  best-effort basis. Returns the secrets-file path."
   [config env-arg]
   (require-age!)
   (let [{:keys [secrets-file identity-file name] :as env} (resolve-env config env-arg)]
@@ -650,20 +638,12 @@
         (finally (secure-delete! tmp))))))
 
 (defn set-secret!
-  "Set one key path's value, read from **stdin** — never a command-line
-  argument, which would land in shell history and `ps`; the same care `edit!`
-  already takes by never putting plaintext anywhere but its owner-only temp
-  file. Reads all of stdin and strips exactly one trailing newline (\\n or
-  \\r\\n), so `echo secret | bb secrets set …` does the obvious thing; every
-  other byte is kept verbatim. By default the value is stored as a string;
-  with `edn?` true, stdin is instead parsed as EDN, so typed values — sets,
-  numbers, nested maps — can be set from a script. `key-arg` is an EDN key
-  path: a keyword, or a vector of keywords/strings for a nested path.
-
-  Creates the environment's secrets file, starting from an empty map, when it
-  does not exist yet, and says so — this is what makes initial-setup and
-  add-a-second-key bootstrap scriptable, the whole point of this command.
-  Returns the secrets-file path."
+  "Set a value read from stdin. `key-arg` is a keyword or a non-empty vector of
+  keyword/string path elements. One trailing newline is removed. The value is
+  a string unless `edn?` is true, in which case stdin must contain one EDN
+  value. Blank input is rejected. Creates a missing secrets file from an empty
+  map, then re-encrypts and updates the manifest. Returns the secrets-file
+  path. Re-rendering removes plaintext comments."
   [config env-arg key-arg edn?]
   (require-age!)
   (let [path    (parse-key-path key-arg)
@@ -709,14 +689,10 @@
         (finally (secure-delete! tmp))))))
 
 (defn remove-secret!
-  "Remove one key path from an environment's secrets: decrypt → dissoc →
-  re-encrypt, the same no-plaintext-on-disk discipline as `edit!`. `key-arg`
-  is an EDN key path: a keyword, or a vector of keywords/strings for a nested
-  path. Fails when the secrets file does not exist yet, or when the path is
-  absent, rather than quietly doing nothing — a typo'd key path is a mistake
-  worth catching. Removing a nested path leaves its (possibly now empty)
-  parent map in place rather than pruning it, so the shape stays predictable.
-  Returns the secrets-file path."
+  "Remove a keyword or vector key path, then re-encrypt and update the
+  manifest. Throws when the file or path is absent. Empty parent maps are not
+  pruned. Returns the secrets-file path. Re-rendering removes plaintext
+  comments."
   [config env-arg key-arg]
   (require-age!)
   (let [path (parse-key-path key-arg)
@@ -943,12 +919,10 @@
   "Check that each environment's committed manifest matches its encrypted
   secrets. With no env, verifies all of them. Never exits — returns
   {:results {env-name status} :exit code}, where each status is :ok,
-  :ok-keyless, :drift, or :missing, and code is 1 on any drift, else 2 on any
-  missing artifact/key, else 0 (:ok and :ok-keyless both pass). `run!` exits
-  with the code when it is non-zero, so `bb secrets verify` can gate CI.
-  Deliberately does not require `age` up front: the keyless freshness check
-  compares hashes only, so a CI job with neither a key nor the binary can
-  still gate on it (full verification decrypts, and `age` enforces itself)."
+  :ok-keyless, :drift, or :missing. The exit code is 1 on drift, 2 on a
+  missing artifact or an unverifiable legacy manifest, and 0 otherwise.
+  Keyless verification compares the ciphertext hash and does not require age;
+  full verification decrypts and compares manifest entries."
   [config env-arg]
   (let [envs     (if env-arg [(resolve-env config env-arg)] (vals (:environments config)))
         results  (into {} (map (juxt :name verify-one)) envs)
@@ -962,14 +936,14 @@
 
 (def ^:private commands
   [["keygen"        "[env]"        "Generate an age key for an environment"]
-   ["new"           "[env]"        "Create a new encrypted secrets file (opens $EDITOR)"]
+   ["new"           "[env]"        "Create a new encrypted secrets file (opens your editor)"]
    ["edit"          "[env]"        "Edit an existing secrets file (decrypt → edit → re-encrypt)"]
    ["set"           "[env] <key> [--edn]" "Set a key's value from stdin (creates the file if missing)"]
    ["rm"            "[env] <key>"  "Remove a key (fails if the key or file is absent)"]
    ["verify"        "[env]"        "Check the committed manifest matches the secrets"]
    ["show-key"      "[env]"        "Print public key(s) for sharing"]
    ["add-recipient" "[env] [key]"  "Add a public key to the env's recipients file"]
-   ["recipients"    "[env]"        "List the recipients an env encrypts to"]
+   ["recipients"    "[env]"        "List configured recipient public keys"]
    ["reencrypt"     "[env]"        "Re-encrypt to current recipients (after a change)"]
    ["encrypt"       "[env] <file>" "Encrypt an arbitrary file to <file>.age"]
    ["decrypt"       "[env] <file>" "Decrypt a <file>.age to stdout"]
@@ -991,7 +965,7 @@
   (println "Environments:" (str/join ", " (map name (keys environments)))
            (if default-environment (str "(default: " (name default-environment) ")") ""))
   (println (paint :dim "\n  An omitted [env] uses the default environment."))
-  (println (paint :dim "  verify exits 0 (ok) · 1 (drift) · 2 (missing artifacts/key).")))
+  (println (paint :dim "  verify exits 0 (ok) · 1 (drift) · 2 (missing or unverifiable).")))
 
 (defn- print-error!
   "Print an ex-info the way `run!` reports failures: the message via `oops`,
@@ -1008,9 +982,9 @@
 
 (defn run!
   "Entry point. Dispatch `args` (typically *command-line-args*) against `config`.
-  The ONLY fn in this namespace that exits the process: command failures arrive
-  as ex-info (printed with their :hint/:install/:error/:docs data; exit code
-  from :secrets/exit, default 1), and `verify` returns its own exit code."
+  This is the only function in the namespace that exits the process. It prints
+  ex-info details and exits with :secrets/exit (default 1); `verify` supplies
+  its own exit code."
   [config args]
   (try
     (let [config (normalize-config config)
