@@ -9,6 +9,13 @@ All notable changes to this project are documented here. The format follows
 - Development tasks for formatting (`bb format`), non-mutating format checks
   (`bb format:check`), and linting (`bb lint`), enforcing the project's
   100-column Clojure style consistently.
+- An optional top-level `:limits` config key bounding untrusted inputs before
+  any `age` subprocess starts: `:max-recipients` (256), `:max-recipient-chars`
+  (1024), and `:max-recipients-bytes` (262144). Supplied values are merged over
+  those defaults and resolved onto every environment; each must be a positive
+  integer, and an unknown key inside `:limits` is rejected rather than ignored,
+  because a typo in a security limit must not read as "leave it at the
+  default".
 
 ### Changed
 - **BREAKING** — the manifest format is now `:version 2`, and committed
@@ -40,6 +47,22 @@ All notable changes to this project are documented here. The format follows
   without changing how the examples run.
 
 ### Fixed
+- Every command that encrypts now reads, bounds, and validates the configured
+  recipients file exactly once — before an editor opens, before stdin is read,
+  before anything is decrypted — and encrypts to the resulting immutable list
+  of validated recipients, which `age` receives as repeated `-r` values. The
+  recipients pathname is no longer passed to `age` at all. Previously the file
+  was read once to check it was non-empty and then handed to `age` as `-R` to
+  be read again, so anyone able to write the worktree could substitute the list
+  during the interval between the two reads — an editor session, minutes long —
+  and choose the recipients of the resulting ciphertext, then restore the
+  original file (CWE-367). Recipient count, per-entry length, and total file
+  size are bounded by the new `:limits` before the file is read into memory,
+  and an entry that is not an age recipient, or an empty list, fails the
+  command with a diagnostic naming the file line number and quoting only a
+  truncated prefix of the offending line. `bb secrets recipients` remains an
+  unvalidated read-only listing, but now marks any line encryption would
+  refuse instead of presenting it as a recipient.
 - Environment-injected identities are materialized through a race-safe,
   SHA-256-digest-keyed cache. Concurrent callers with identical identity
   contents now share one owner-only temporary-file write, and realized cache

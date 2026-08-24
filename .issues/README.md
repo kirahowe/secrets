@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P0 | [009 — Snapshot recipients before encryption](009-snapshot-recipients-before-encryption.md) | Encrypt only to one bounded, fully validated recipient snapshot that cannot change after validation. |
 | P0 | [010 — Global artifact collision validation](010-global-artifact-collision-validation.md) | Reject incompatible canonical artifact roles globally across every configured environment. |
 | P0 | [015 — Reproducible guarded release publication](015-guard-release-publication.md) | Publish the exact inspected artifact only from a clean protected exact tag with version and HEAD agreement. |
 | P1 | [011 — Race-safe initializer writes](011-race-safe-initializer-writes.md) | Anchor initializer mutations to no-follow directory operations or fail closed where unavailable. |
@@ -52,3 +51,4 @@ weaken the release gate:
 | [006 — Age option boundary](006-age-option-boundary.md) | Closed the age argument boundary with an explicit option terminator plus `./` normalization of every path-valued argument, made blank and nil paths fail closed, and folded in the CLI secure-delete operand boundary. |
 | [007 — Secure plaintext file output](007-secure-plaintext-file-output.md) | Published decrypted plaintext only through an owner-only staging file with no-follow destination validation and atomic replacement, and made non-POSIX filesystems fail closed. |
 | [008 — Manifest v2 canonicalization](008-manifest-v2-canonicalization.md) | Replaced the collision-prone value encoding with typed, length-framed v2 frames hashed as lossless code units, bound the version into the HMAC key, and made verification reject v1. |
+| [009 — Snapshot recipients before encryption](009-snapshot-recipients-before-encryption.md) | Read, bound and validate the recipients file once up front and encrypt to those exact values as repeated `-r`, so the pathname never reaches age. |

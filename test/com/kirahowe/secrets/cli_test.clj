@@ -1126,3 +1126,173 @@
         (is (= "s.age" (:secrets-file e)))
         (is (= "s.manifest" (:manifest e)))
         (is (= "s.example" (:template e)))))))
+
+;;;; Recipient snapshotting
+
+(defn- recorded-sh-argvs
+  "Every argv `clojure.java.shell/sh` receives while `f` runs, with the real
+  subprocesses still running. `f` may throw; the throw is asserted separately."
+  [f]
+  (let [calls (atom [])
+        real-sh shell/sh]
+    (with-redefs [shell/sh (fn [& args]
+                             (swap! calls conj (vec (take-while string? args)))
+                             (apply real-sh args))]
+      (try (f) (catch Exception _ nil)))
+    @calls))
+
+(defn- age-argvs [argvs]
+  (filterv #(= "age" (first %)) argvs))
+
+(defn- fake-recipient
+  "A recipient of exactly `n` characters that `age/valid-recipient?` accepts.
+  Not a real key: only the pre-subprocess bounds are meant to see it."
+  [n filler]
+  (str "age1" (apply str (repeat (- n 4) filler))))
+
+(defn- store-through-stdin!
+  "Run `set` (the shortest command that encrypts) with its chatter captured."
+  [config]
+  (with-out-str
+    (with-in-str "snapshot-value" (cli/set-secret! config "dev" ":a" false))))
+
+(deftest recipients-are-snapshotted-before-the-editor-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [recipients (str *dir* "/recipients.txt")
+          ciphertext (str *dir* "/secrets.edn.age")
+          alice-public (age/public-key *key*)
+          bob-key (str *dir* "/bob-key.txt")
+          bob-public (age/keygen! bob-key)
+          config (cli/normalize-config (test-config {:recipients-file recipients}))
+          ;; Exactly what a shared-worktree attacker gets: the editor interval,
+          ;; during which the configured recipients file is replaced.
+          swapping-editor (fn [path]
+                            (spit path (pr-str {:a (str (gensym "value"))}))
+                            (spit recipients (str bob-public "\n")))]
+      (doseq [[label command] [["new" #(cli/new! config "dev")]
+                               ["edit" #(cli/edit! config "dev")]]]
+        (testing (str label " encrypts to the list validated before the editor ran")
+          (spit recipients (str alice-public "\n"))
+          (with-out-str
+            (with-redefs-fn {(cli-private 'run-editor!) swapping-editor} command))
+          (is (= [bob-public] (str/split-lines (slurp recipients)))
+              "the swap really happened, so the assertions below are not vacuous")
+          (is (map? (edn/read-string (age/decrypt *key* ciphertext)))
+              "the snapshotted recipient still decrypts")
+          (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))
+              "the recipient substituted during the editor interval cannot"))))))
+
+(deftest recipient-limits-fail-closed-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [recipients (str *dir* "/recipients.txt")
+          ciphertext (str *dir* "/secrets.edn.age")
+          bob-key (str *dir* "/bob-key.txt")
+          bob-public (age/keygen! bob-key)
+          alice-public (age/public-key *key*)
+          limited (fn [limits]
+                    (cli/normalize-config
+                     (assoc (test-config {:recipients-file recipients}) :limits limits)))]
+      (testing "each bound fails closed, naming the limit and its configured value"
+        (doseq [[label limits contents pattern]
+                [["more entries than :max-recipients"
+                  {:max-recipients 2}
+                  (str/join "\n" (map #(fake-recipient 24 %) ["q" "r" "s"]))
+                  #":max-recipients of 2"]
+                 ["an entry longer than :max-recipient-chars"
+                  {:max-recipient-chars 32}
+                  (fake-recipient 64 "q")
+                  #":max-recipient-chars of 32"]
+                 ["a file larger than :max-recipients-bytes"
+                  {:max-recipients-bytes 16}
+                  (fake-recipient 24 "q")
+                  #":max-recipients-bytes of 16"]]]
+          (testing label
+            (spit recipients (str contents "\n"))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo pattern
+                                  (store-through-stdin! (limited limits))))
+            (is (not (.exists (io/file ciphertext)))
+                "a refused recipient list never produces ciphertext"))))
+      (testing "a list sitting exactly on every limit encrypts"
+        (spit recipients (str alice-public "\n" bob-public "\n"))
+        (store-through-stdin!
+         (limited {:max-recipients 2
+                   :max-recipient-chars (count alice-public)
+                   :max-recipients-bytes (.length (io/file recipients))}))
+        (let [expected {:a "snapshot-value"}]
+          (is (= expected (edn/read-string (age/decrypt *key* ciphertext))))
+          (is (= expected (edn/read-string (age/decrypt bob-key ciphertext)))))))))
+
+(deftest malformed-recipients-fail-closed-test
+  (let [recipients (str *dir* "/recipients.txt")
+        config (cli/normalize-config (test-config {:recipients-file recipients}))
+        long-garbage "garbage-with-a-long-tail-that-must-not-be-echoed"]
+    (testing "every unusable line fails before encryption"
+      (doseq [[label contents pattern]
+              [["a garbage line, named by its file line number"
+                (str "# team\n\n" long-garbage "\n")
+                #"Not a valid age recipient on line 3"]
+               ["a truncated age1 key"
+                "age1short\n"
+                #"Not a valid age recipient on line 1"]
+               ["a file holding only comments and blanks"
+                "# nobody yet\n\n"
+                #"No recipients yet"]]]
+        (testing label
+          (spit recipients contents)
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo pattern
+                                (store-through-stdin! config))))))
+    (testing "the diagnostic quotes a truncated prefix, never the whole line"
+      (spit recipients (str long-garbage "\n"))
+      (let [message (ex-message (is (thrown? clojure.lang.ExceptionInfo
+                                             (store-through-stdin! config))))]
+        (is (str/includes? message "garbage-with-a-l…"))
+        (is (not (str/includes? message long-garbage)))))
+    (testing "no age subprocess beyond the installation probe ever starts"
+      (spit recipients (str long-garbage "\n"))
+      (let [argvs (recorded-sh-argvs #(store-through-stdin! config))]
+        (is (= [] (remove #{["age" "--version"]} (age-argvs argvs)))
+            "nothing was encrypted, decrypted, or handed to age at all")))))
+
+(deftest invalid-limits-config-fails-closed-test
+  (testing "resolved limits land on every normalized environment"
+    (is (= {:max-recipients 256 :max-recipient-chars 1024 :max-recipients-bytes 262144}
+           (get-in (cli/normalize-config (test-config)) [:environments :dev :limits]))))
+  (testing "a supplied limit overrides only itself"
+    (is (= {:max-recipients 4 :max-recipient-chars 1024 :max-recipients-bytes 262144}
+           (get-in (cli/normalize-config (assoc (test-config) :limits {:max-recipients 4}))
+                   [:environments :dev :limits]))))
+  (testing "a value that is not a positive integer is rejected"
+    (doseq [value [0 -1 2.5 "8" nil]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
+                            (cli/normalize-config
+                             (assoc (test-config) :limits {:max-recipients value})))
+          (str "limit value " (pr-str value)))))
+  (testing "an unknown limit key is rejected rather than silently read as a default"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown key"
+                          (cli/normalize-config
+                           (assoc (test-config) :limits {:max-recipient 8})))))
+  (testing "a :limits value that is not a map is rejected"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #":limits must be a map"
+                          (cli/normalize-config (assoc (test-config) :limits [8]))))))
+
+(deftest age-receives-repeated-r-arguments-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [team-list (str *dir* "/team-list.txt")
+          bob-key (str *dir* "/bob-key.txt")
+          bob-public (age/keygen! bob-key)
+          alice-public (age/public-key *key*)
+          config (cli/normalize-config (test-config {:recipients-file team-list}))]
+      (spit team-list (str "# team\n" alice-public "\n" bob-public "\n"))
+      (let [argvs (recorded-sh-argvs #(store-through-stdin! config))
+            encrypt-argv (first (filter #(some #{"-e"} %) (age-argvs argvs)))]
+        (is (some? encrypt-argv) "an encryption subprocess ran")
+        (testing "age gets one -r value per snapshotted recipient, in file order"
+          (is (= ["age" "-e" "-r" alice-public "-r" bob-public]
+                 (vec (take 6 encrypt-argv))))
+          (is (= 2 (count (filter #{"-r"} encrypt-argv)))))
+        (testing "and nothing that would make it re-read the list itself"
+          (is (not-any? #{"-R"} encrypt-argv))
+          (is (not-any? #(str/includes? % "team-list") encrypt-argv)))))))

@@ -36,9 +36,14 @@
   Optional per-environment keys:
     :recipients-file  path to a committed file of age public keys (one per
                       line). When set, the environment encrypts to *all* of
-                      them (`age -R`) so each teammate can decrypt with their
-                      own key. Absent ⇒ single-key mode (encrypt to own key).
+                      them, so each teammate can decrypt with their own key.
+                      Absent ⇒ single-key mode (encrypt to own key).
     :manifest false   disable the manifest for this environment.
+
+  Optional top-level key:
+    :limits           bounds applied to untrusted inputs before any subprocess
+                      starts, merged over `default-limits` and resolved onto
+                      every environment.
 
   Commands: keygen · new · edit · set · rm · verify · doctor · show-key ·
   add-recipient · recipients · reencrypt · encrypt · decrypt · help.
@@ -154,8 +159,40 @@
              {:environment environment-name
               :path-collision collision}))))
 
+(def ^:private default-limits
+  "Bounds applied to untrusted inputs before any subprocess starts, overridable
+  through the top-level `:limits` config key. The key is deliberately general
+  rather than recipient-specific: the source and plaintext size limits of issue
+  016 extend this same map."
+  {:max-recipients 256
+   :max-recipient-chars 1024
+   :max-recipients-bytes 262144})
+
+(defn- resolve-limits
+  "Merge a configured `:limits` map over `default-limits`. Rejects anything a
+  later read would silently see as a default: a non-map, an unknown key (a typo
+  in a security limit must not read as \"unset\"), or a value that is not a
+  positive integer."
+  [limits]
+  (when-not (or (nil? limits) (map? limits))
+    (fail! "secrets config :limits must be a map of limit name → positive integer."
+           {:limits limits}))
+  (let [unknown (sort (remove (set (keys default-limits)) (keys limits)))]
+    (when (seq unknown)
+      (fail! (str "secrets config :limits has unknown key(s): "
+                  (str/join ", " unknown) ".\n"
+                  "    Known limits: "
+                  (str/join ", " (sort (keys default-limits))) ".")
+             {:limits limits :unknown-keys (vec unknown)})))
+  (doseq [[limit value] limits]
+    (when-not (and (integer? value) (pos? value))
+      (fail! (str "secrets config :limits " limit " must be a positive integer, got "
+                  (pr-str value) ".")
+             {:limits limits :limit limit :value value})))
+  (merge default-limits limits))
+
 (defn- normalize-environment
-  [app environment-name
+  [{:keys [app limits]} environment-name
    {:keys [secrets-file key-file identity-file template manifest recipients-file]
     :as env-config}]
   (when-not (string? secrets-file)
@@ -213,6 +250,7 @@
     (assoc env-config
            :name environment-name
            :app app
+           :limits limits
            :secrets-file secrets-file
            :key-file key-file
            ;; Decrypt-side identity: SECRETS_AGE_IDENTITY* env vars win, then
@@ -228,12 +266,13 @@
 
 (defn normalize-config
   "Apply per-environment defaults (:key-file, :identity-file, :template,
-  :manifest), validate the configuration, and stamp each env with its :name.
-  Requires a non-blank :app, at least one environment, and a non-blank
-  :secrets-file string per environment. A secrets path not ending in `.age`
-  requires explicit :template and :manifest values. Ciphertext, manifest,
-  template, key, and recipients paths must be distinct after canonicalization.
-  Throws ex-info on invalid input."
+  :manifest), resolve the input :limits, validate the configuration, and stamp
+  each env with its :name and the resolved limits. Requires a non-blank :app,
+  at least one environment, and a non-blank :secrets-file string per
+  environment. A secrets path not ending in `.age` requires explicit :template
+  and :manifest values. Ciphertext, manifest, template, key, and recipients
+  paths must be distinct after canonicalization. Throws ex-info on invalid
+  input."
   [{:keys [app environments] :as config}]
   (when (empty? environments)
     (fail! "secrets config has no :environments" {:config config}))
@@ -245,14 +284,18 @@
                 "path\n"
                 "    by accident.")
            {:config config}))
-  (assoc config
-         :environments
-         (reduce-kv (fn [normalized environment-name env-config]
-                      (assoc normalized
-                             environment-name
-                             (normalize-environment app environment-name env-config)))
-                    {}
-                    environments)))
+  (let [limits (resolve-limits (:limits config))]
+    (assoc config
+           :limits limits
+           :environments
+           (reduce-kv (fn [normalized environment-name env-config]
+                        (assoc normalized
+                               environment-name
+                               (normalize-environment {:app app :limits limits}
+                                                      environment-name
+                                                      env-config)))
+                      {}
+                      environments))))
 
 (defn- resolve-env
   "Resolve an environment argument string to its (defaulted) config map.
@@ -360,7 +403,9 @@
 (defn- read-recipients
   "Read age public keys from a recipients file (one per line; blank lines and
   `#` comments ignored). Returns an eager seq of keys, or nil if the file is
-  absent."
+  absent. Deliberately unvalidated and unbounded, for the read-only `recipients`
+  listing and `doctor` diagnostics only. Encryption goes through
+  [[recipient-snapshot]]."
   [path]
   (let [f (io/file (str path))]
     (when (.exists f)
@@ -371,26 +416,101 @@
             (remove str/blank?)
             (remove #(str/starts-with? % "#")))))))
 
-(defn- encrypt-recipients
-  "The age recipient spec an environment encrypts to: its shared recipients file
-  in multi-recipient mode, otherwise the environment's own identity (single-key
-  mode — the resolved :identity-file, so SECRETS_AGE_IDENTITY* works in CI too)."
-  [{:keys [recipients-file identity-file]}]
-  (if recipients-file {:recipients-file recipients-file} {:identity-file identity-file}))
+(defn- line-prefix
+  "A short prefix of a rejected recipients line: enough to recognize the line,
+  never the whole of whatever a hand edit put there."
+  [s]
+  (if (> (count s) 16) (str (subs s 0 16) "…") s))
 
-(defn- require-encrypt-target!
-  "Ensure we can encrypt: a non-empty recipients file (multi-recipient mode), or
-  the identity (single-key mode, where we encrypt to our own identity)."
-  [{:keys [recipients-file] environment-name :name :as env}]
+(defn- recipient-entries
+  "The `[line-number recipient]` pairs in `content`, numbered from 1 against the
+  file as written, with blank lines and `#` comments dropped."
+  [content]
+  (->> (str/split-lines content)
+       (map-indexed (fn [i line] [(inc i) (str/trim line)]))
+       (remove (fn [[_ line]]
+                 (or (str/blank? line) (str/starts-with? line "#"))))))
+
+(defn- validate-recipient-entries!
+  "Reject any entry age could not use: one longer than `:max-recipient-chars`,
+  or one `age/valid-recipient?` refuses. Both name the 1-based line number and
+  quote only a truncated prefix — a hand-edited line may hold anything, and a
+  diagnostic is not the place to echo it."
+  [{:keys [recipients-file] environment-name :name} entries max-recipient-chars]
+  (let [label (clojure.core/name environment-name)]
+    (doseq [[n line] entries]
+      (when (> (count line) max-recipient-chars)
+        (fail! (str "Recipient on line " n " of " recipients-file " (" label ") is "
+                    (count line) " characters, exceeding the configured "
+                    ":max-recipient-chars of " max-recipient-chars ".")
+               {:recipients-file (str recipients-file) :line n
+                :limit :max-recipient-chars :configured max-recipient-chars}))
+      (when-not (age/valid-recipient? line)
+        (fail! (str "Not a valid age recipient on line " n " of " recipients-file
+                    " (" label "): " (pr-str (line-prefix line)) "\n"
+                    "    Every line must be an age1… public key, an ssh-ed25519/ssh-rsa\n"
+                    "    key, or a # comment.")
+               {:recipients-file (str recipients-file) :line n
+                :environment environment-name})))))
+
+(defn- recipient-snapshot
+  "Read the environment's recipients file exactly once and return the immutable
+  vector of validated recipients to encrypt to, deduplicated in first-seen
+  order.
+
+  Reading once is the point. A pathname handed to age is read again inside age,
+  and between a validating read and that one an editor session can run for
+  minutes — long enough for anyone who can write the worktree to swap the list
+  and choose the recipients (CWE-367). So everything the file says is decided
+  here, before the sensitive work starts, and the resulting *values* are what
+  gets encrypted to.
+
+  Fails closed before any subprocess runs on a file larger than
+  `:max-recipients-bytes`, more entries than `:max-recipients`, an entry longer
+  than `:max-recipient-chars`, an entry `age/valid-recipient?` rejects, or an
+  empty result."
+  [{:keys [recipients-file limits] environment-name :name :as env}]
+  (let [{:keys [max-recipients max-recipient-chars max-recipients-bytes]}
+        (merge default-limits limits)
+        label (clojure.core/name environment-name)
+        f (io/file (str recipients-file))
+        size (.length f)]
+    (when (> size max-recipients-bytes)
+      (fail! (str "Recipients file " recipients-file " (" label ") is " size
+                  " bytes, exceeding the configured :max-recipients-bytes of "
+                  max-recipients-bytes ".")
+             {:recipients-file (str recipients-file) :bytes size
+              :limit :max-recipients-bytes :configured max-recipients-bytes}))
+    (let [entries (if (.exists f) (recipient-entries (slurp f)) [])]
+      (when (> (count entries) max-recipients)
+        (fail! (str "Recipients file " recipients-file " (" label ") lists "
+                    (count entries) " recipients, exceeding the configured "
+                    ":max-recipients of " max-recipients ".")
+               {:recipients-file (str recipients-file) :count (count entries)
+                :limit :max-recipients :configured max-recipients}))
+      (when (empty? entries)
+        (fail! (str "No recipients yet for " label " in " recipients-file "\n"
+                    "    Add one with:  bb secrets add-recipient " label)
+               {:recipients-file (str recipients-file)
+                :environment environment-name}))
+      (validate-recipient-entries! env entries max-recipient-chars)
+      (vec (distinct (map second entries))))))
+
+(defn- encrypt-target!
+  "The immutable age recipient spec to encrypt with, resolved once before any
+  sensitive work begins — before an editor opens, before stdin is read, before
+  anything is decrypted — and threaded down to `age/encrypt-file!` from there.
+
+  Multi-recipient mode returns the validated `{:recipients [\"age1…\" …]}`
+  snapshot, so age receives repeated `-r` values and no pathname the worktree
+  could redirect after validation. Single-key mode returns the environment's
+  resolved `{:identity-file …}` (so SECRETS_AGE_IDENTITY* works in CI too); it
+  has no separate file to race."
+  [{:keys [recipients-file identity-file] :as env}]
   (if recipients-file
-    (when (empty? (read-recipients recipients-file))
-      (fail! (str "No recipients yet for " (clojure.core/name environment-name)
-                  " in " recipients-file "\n"
-                  "    Add one with:  bb secrets add-recipient "
-                  (clojure.core/name environment-name))
-             {:recipients-file (str recipients-file)
-              :environment environment-name}))
-    (require-identity! env)))
+    {:recipients (recipient-snapshot env)}
+    (do (require-identity! env)
+        {:identity-file identity-file})))
 
 ;;;; Manifest
 
@@ -566,16 +686,18 @@
           (.delete (io/file f)))))))
 
 (defn- write-secrets!
-  "Validate `plaintext-file`, then stage its ciphertext and optional manifest
-  beside their destinations and commit both through atomic replacements."
-  [{:keys [manifest app secrets-file] :as env} plaintext-file]
+  "Validate `plaintext-file`, then stage its ciphertext — encrypted to the
+  already-resolved `target` recipient spec, never to a pathname re-read here —
+  and optional manifest beside their destinations, and commit both through
+  atomic replacements."
+  [{:keys [manifest app secrets-file] :as env} target plaintext-file]
   (let [plaintext (slurp plaintext-file)
         value (validate-plaintext! secrets-file plaintext)
         ciphertext-temp (sibling-temp-file! secrets-file ".age.tmp")
         manifest-temp (when (string? manifest)
                         (sibling-temp-file! manifest ".manifest.tmp"))]
     (try
-      (age/encrypt-file! (encrypt-recipients env) plaintext-file ciphertext-temp)
+      (age/encrypt-file! target plaintext-file ciphertext-temp)
       (when manifest-temp
         (spit manifest-temp
               (manifest/render {:app app :ciphertext-sha (sha256 ciphertext-temp)}
@@ -691,29 +813,29 @@
   [config env-arg]
   (require-age!)
   (let [{:keys [secrets-file] environment-name :name :as env}
-        (resolve-env config env-arg)]
-    (require-encrypt-target! env)
-    (let [proceed? (or (not (.exists (io/file secrets-file)))
-                       (do
-                         (warn "Secrets file already exists:" secrets-file)
-                         (confirm!
-                          (str "Overwrite it? (To change values, use `bb secrets edit "
-                               (clojure.core/name environment-name)
-                               "` instead.)"))))]
-      (if-not proceed?
-        (do (info "Aborted.") :aborted)
-        (let [tmp (temp-plaintext!)]
-          (try
-            (spit tmp (template-content env))
-            (info "Opening" (editor) "…")
-            (run-editor! tmp)
-            (info "Encrypting…")
-            (write-secrets! env tmp)
-            (ok "Encrypted secrets written:" secrets-file)
-            (when (string? (:manifest env))
-              (info "Manifest updated:" (:manifest env)))
-            secrets-file
-            (finally (secure-delete! tmp))))))))
+        (resolve-env config env-arg)
+        target (encrypt-target! env)
+        proceed? (or (not (.exists (io/file secrets-file)))
+                     (do
+                       (warn "Secrets file already exists:" secrets-file)
+                       (confirm!
+                        (str "Overwrite it? (To change values, use `bb secrets edit "
+                             (clojure.core/name environment-name)
+                             "` instead.)"))))]
+    (if-not proceed?
+      (do (info "Aborted.") :aborted)
+      (let [tmp (temp-plaintext!)]
+        (try
+          (spit tmp (template-content env))
+          (info "Opening" (editor) "…")
+          (run-editor! tmp)
+          (info "Encrypting…")
+          (write-secrets! env target tmp)
+          (ok "Encrypted secrets written:" secrets-file)
+          (when (string? (:manifest env))
+            (info "Manifest updated:" (:manifest env)))
+          secrets-file
+          (finally (secure-delete! tmp)))))))
 
 (defn edit!
   "Edit an existing secrets file through an owner-only plaintext temp file.
@@ -724,14 +846,14 @@
   (let [{:keys [secrets-file identity-file] environment-name :name :as env}
         (resolve-env config env-arg)]
     (require-identity! env)
-    (require-encrypt-target! env)
     (when-not (.exists (io/file secrets-file))
       (fail! (str "No secrets file at " secrets-file "\n"
                   "    Create one with:  bb secrets new "
                   (clojure.core/name environment-name))
              {:secrets-file secrets-file
               :environment environment-name}))
-    (let [tmp (temp-plaintext!)]
+    (let [target (encrypt-target! env)
+          tmp (temp-plaintext!)]
       (try
         (info "Decrypting" secrets-file "…")
         (age/decrypt-to-file! identity-file secrets-file tmp)
@@ -741,7 +863,7 @@
             (warn "No changes — leaving" secrets-file "untouched.")
             (do
               (info "Re-encrypting…")
-              (write-secrets! env tmp)
+              (write-secrets! env target tmp)
               (ok "Secrets updated:" secrets-file)
               (when (string? (:manifest env))
                 (info "Manifest updated:" (:manifest env))))))
@@ -762,8 +884,8 @@
         {:keys [secrets-file identity-file]} env
         exists? (.exists (io/file secrets-file))]
     (when exists? (require-identity! env))
-    (require-encrypt-target! env)
-    (let [raw (strip-trailing-newline (slurp *in*))
+    (let [target (encrypt-target! env)
+          raw (strip-trailing-newline (slurp *in*))
           _ (when (str/blank? raw)
                   ;; The same rule the library applies to a set-but-empty
                   ;; SECRETS_AGE_IDENTITY: blank almost always means an unset
@@ -794,7 +916,7 @@
                             {}))]
           (spit tmp (render-secrets (assoc-in current path value)))
           (info (if exists? "Re-encrypting…" "Encrypting…"))
-          (write-secrets! env tmp)
+          (write-secrets! env target tmp)
           (ok "Set" (pr-str path) "in" secrets-file)
           (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env)))
           secrets-file)
@@ -811,7 +933,6 @@
         env (resolve-env config env-arg)
         {:keys [secrets-file identity-file] environment-name :name} env]
     (require-identity! env)
-    (require-encrypt-target! env)
     (when-not (.exists (io/file secrets-file))
       (fail! (str "No secrets file at " secrets-file "\n"
                   "    Create one with:  bb secrets new "
@@ -820,7 +941,8 @@
                   (clojure.core/name environment-name) " " (pr-str key-arg))
              {:secrets-file secrets-file
               :environment environment-name}))
-    (let [tmp (temp-plaintext!)]
+    (let [target (encrypt-target! env)
+          tmp (temp-plaintext!)]
       (try
         (info "Decrypting" secrets-file "…")
         (let [{:keys [ok? value error]}
@@ -840,7 +962,7 @@
                           (dissoc current k))]
             (spit tmp (render-secrets updated))
             (info "Re-encrypting…")
-            (write-secrets! env tmp)
+            (write-secrets! env target tmp)
             (ok "Removed" (pr-str path) "from" secrets-file)
             (when (string? (:manifest env))
               (info "Manifest updated:" (:manifest env)))
@@ -878,12 +1000,12 @@
   Returns the ciphertext path."
   [config env-arg file]
   (require-age!)
-  (let [env (resolve-env config env-arg)]
-    (require-encrypt-target! env)
+  (let [env (resolve-env config env-arg)
+        target (encrypt-target! env)]
     (when-not (and file (.exists (io/file file)))
       (fail! (str "No such file: " file) {:file file}))
     (let [out (str file ".age")]
-      (age/encrypt-file! (encrypt-recipients env) file out)
+      (age/encrypt-file! target file out)
       (ok "Encrypted:" out)
       out)))
 
@@ -904,26 +1026,27 @@
 (defn reencrypt!
   "Decrypt and immediately re-encrypt to the environment's current recipients —
   use after adding or removing a recipient (an `edit` with no change is a no-op
-  and would not pick up recipient changes). Rewrites the manifest too. Returns
-  the secrets-file path."
+  and would not pick up recipient changes). The recipient list is snapshotted
+  before the decryption, so it is exactly the list the command was started
+  against. Rewrites the manifest too. Returns the secrets-file path."
   [config env-arg]
   (require-age!)
   (let [{:keys [secrets-file identity-file] environment-name :name :as env}
         (resolve-env config env-arg)]
     (require-identity! env)
-    (require-encrypt-target! env)
     (when-not (.exists (io/file secrets-file))
       (fail! (str "No secrets file at " secrets-file "\n"
                   "    Create one with:  bb secrets new "
                   (clojure.core/name environment-name))
              {:secrets-file secrets-file
               :environment environment-name}))
-    (let [tmp (temp-plaintext!)]
+    (let [target (encrypt-target! env)
+          tmp (temp-plaintext!)]
       (try
         (info "Decrypting" secrets-file "…")
         (age/decrypt-to-file! identity-file secrets-file tmp)
         (info "Re-encrypting to current recipients…")
-        (write-secrets! env tmp)
+        (write-secrets! env target tmp)
         (ok "Re-encrypted:" secrets-file)
         (when (string? (:manifest env))
           (info "Manifest updated:" (:manifest env)))
@@ -982,7 +1105,9 @@
 
 (defn recipients!
   "List the recipients an environment encrypts to. Returns them as an eager seq
-  (nil in single-key mode)."
+  (nil in single-key mode). Read-only and non-failing: a line encryption would
+  reject is listed but marked, because listing it as a plain recipient would
+  read as an assurance the write path does not give it."
   [config env-arg]
   (let [{:keys [recipients-file] environment-name :name}
         (resolve-env config env-arg)
@@ -1000,7 +1125,11 @@
              (paint :bold
                     (str "Recipients for " environment-label " (" recipients-file "):")))
             (doseq [recipient recipients]
-              (println "  " recipient))))
+              (println "  " (if (age/valid-recipient? recipient)
+                              recipient
+                              (str recipient " "
+                                   (paint :yellow
+                                          "← invalid; encryption refuses this line")))))))
         recipients))))
 
 (defn- read-supported-manifest

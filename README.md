@@ -153,6 +153,21 @@ collide with (and overwrite) the ciphertext itself — unless you set both
 `:template` and `:manifest` explicitly. Ciphertext, manifest, template, key,
 and recipients paths must resolve to distinct canonical paths.
 
+An optional top-level `:limits` map bounds untrusted inputs before any `age`
+subprocess starts. It is merged over the defaults and resolved onto every
+environment:
+
+```clojure
+{:limits {:max-recipients       256      ; entries in a recipients file
+          :max-recipient-chars  1024     ; characters in one recipient entry
+          :max-recipients-bytes 262144}} ; total size of a recipients file
+```
+
+Supply only the keys you want to change. Every supplied value must be a
+positive integer, and an unknown key inside `:limits` is rejected rather than
+ignored — a typo in a security limit must not read as "leave it at the
+default".
+
 To create a store through an editor instead of the stdin-based three-command
 flow:
 
@@ -507,14 +522,25 @@ so one set of reader literals serves every environment.
 
 The default single-key model means everyone shares one private key. For a team,
 point an environment at a **recipients file** — a committed list of age public
-keys — and it encrypts to all of them (`age -R`). Each person decrypts with
-their own private identity; private identities are never shared.
+keys — and it encrypts to all of them. Each person decrypts with their own
+private identity; private identities are never shared.
 
 ```clojure
 ;; bb.edn — add :recipients-file to an environment
 {:prod {:secrets-file    "env/prod/resources/secrets.edn.age"
         :recipients-file "env/prod/recipients.txt"}}
 ```
+
+Every command that encrypts reads and validates that list exactly once, up
+front — before an editor opens, before stdin is read, before anything is
+decrypted — and encrypts to those exact public keys. The recipients pathname is
+never handed to `age`, so replacing, truncating, or restoring the file while
+the command is still running cannot change who can decrypt what it writes.
+Bounds and validation are applied to that one read: a file over
+`:max-recipients-bytes`, more entries than `:max-recipients`, an entry over
+`:max-recipient-chars`, a line that is not an age recipient, and an empty list
+each fail the command before `age` starts. `bb secrets recipients` stays a
+read-only listing and marks any line encryption would refuse.
 
 ### First owner: no ciphertext yet
 
