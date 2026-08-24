@@ -27,6 +27,23 @@ All notable changes to this project are documented here. The format follows
   contents now share one owner-only temporary-file write, and realized cache
   entries retain only the digest and resulting path rather than the raw
   identity contents.
+- Every `age` invocation that takes an input pathname now ends its options with
+  an explicit `--` terminator, and every path-valued argument — the positional
+  input, `-o`, `-i`, and `-R` — is normalized (a leading `-` is prefixed with
+  `./`) so a pathname can never be parsed as an option or as standard
+  input/output. Files whose names begin with a dash, including names identical
+  to age options, now encrypt and decrypt as data: previously an existing file
+  named `--armor` made encryption succeed against empty stdin, writing a
+  ciphertext of nothing while the real plaintext went unencrypted, and
+  decrypting a file named `--version` or `--help` exited 0 with age's own
+  version or help output standing in for plaintext. A blank or nil path now
+  fails closed with `ex-info` before any subprocess starts, instead of silently
+  resolving to standard input. `-r` recipient strings are values rather than
+  paths and are untouched. The CLI's best-effort plaintext secure delete passes
+  `--` plus an absolute operand to `rm` / `shred`, because exact `-` remains a
+  special operand after option parsing ends. The editor operand is likewise
+  made absolute before it reaches the shell/editor, because a relative
+  `java.io.tmpdir` can otherwise produce a dash-leading temporary pathname.
 
 ## [0.1.0] - 2026-08-21
 

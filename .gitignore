@@ -15,3 +15,16 @@ tmp/
 
 # Rendered documentation book (regenerate with `bb book:build`).
 book/rendered/
+
+# Age option-boundary regression fixtures. The tests create these in the repo
+# root and delete them in a `finally`; only a path relative to the JVM's
+# working directory produces a dash-leading argv element, so they cannot live
+# in a temp dir. These entries are the safety net for an interrupted run.
+/--version
+/--help
+/--armor
+/-
+/-secrets-boundary/
+/-secrets-cli-boundary/
+/-secrets-cli-boundary-delete
+/-secrets-cli-boundary-editor/

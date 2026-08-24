@@ -54,6 +54,17 @@
 ;; The wrapper over the `age` binary. Use it directly when you script your
 ;; own workflows; the CLI and runtime namespaces build on it.
 
+;; ### Path arguments
+
+;; The positional input is passed behind an option terminator (`--`), so a
+;; filename can never be read as an option, and every path-valued argument —
+;; that input, the `-o` output, the `-i` identity, the `-R` recipients file — is
+;; normalized so a dash-leading path becomes `./-name`: age reads a bare `-`
+;; from standard input even behind the terminator, so the prefix is what keeps
+;; a filename a filename. A blank or nil path throws instead of quietly falling
+;; back to standard input. Recipient strings passed as `:recipients` are values
+;; rather than paths, and are used as given.
+
 (doc-section #'age/installed?
              #'age/ensure-installed!
              #'age/keygen!

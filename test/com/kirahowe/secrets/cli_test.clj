@@ -9,6 +9,7 @@
   env var is set, because the env legitimately overrides :key-file."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [com.kirahowe.secrets :as secrets]
@@ -535,6 +536,136 @@
               (finally
                 (System/setOut orig))))
           (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))
+
+;;;; Command-line option boundary
+
+(defn- with-cwd-entry
+  "Run `(f entry)` on a working-directory entry named exactly `entry-name`,
+  then delete it. A dash-leading argv element can only come from a
+  cwd-relative path, so these fixtures cannot live in the absolute temp dir
+  the rest of the suite uses. Refuses to touch a pre-existing entry rather
+  than clobbering it, and cleans up even when an assertion fails."
+  [entry-name f]
+  (let [entry (io/file entry-name)]
+    (when (.exists entry)
+      (throw (ex-info "refusing to clobber an existing working-directory entry"
+                      {:entry entry-name})))
+    (try
+      (f entry)
+      (finally
+        (doseq [p (reverse (file-seq entry))] (.delete p))))))
+
+(deftest encrypt-decrypt-a-dash-leading-relative-path-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (with-cwd-entry "-secrets-cli-boundary"
+      (fn [_]
+        (let [config (cli/normalize-config (test-config))
+              rel "-secrets-cli-boundary/note.txt"
+              payload "hello from a dash-leading path"]
+          (io/make-parents rel)
+          (spit rel payload)
+          ;; The commands are called directly rather than through `run!`: `run!`
+          ;; turns a command failure into System/exit, which would kill the test
+          ;; runner instead of reporting a failing assertion.
+          (testing "encrypt takes a dash-leading path as a file, not as options"
+            (with-out-str (cli/encrypt! config "dev" rel))
+            (is (.exists (io/file (str rel ".age")))))
+          (testing "decrypt streams the exact bytes of a dash-leading ciphertext"
+            (let [baos (java.io.ByteArrayOutputStream.)
+                  orig System/out]
+              (with-open [replacement (java.io.PrintStream. baos)]
+                (System/setOut replacement)
+                (try
+                  (with-out-str (cli/decrypt! config "dev" (str rel ".age")))
+                  (finally
+                    (System/setOut orig))))
+              (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))))
+
+(deftest run-editor-receives-an-absolute-path-test
+  (with-cwd-entry "-secrets-cli-boundary-editor"
+    (fn [entry]
+      (.mkdir entry)
+      (let [relative-plaintext "-secrets-cli-boundary-editor/plain.edn"
+            script (io/file *dir* "capture-editor-operand.sh")
+            capture (io/file *dir* "editor-operand.txt")
+            run-editor! (cli-private 'run-editor!)]
+        (spit relative-plaintext "plaintext")
+        (spit script "#!/bin/sh\nprintf '%s' \"$2\" > \"$1\"\n")
+        (is (.setExecutable script true true) "the fixture editor must be executable")
+        (with-redefs-fn {(cli-private 'editor)
+                         (constantly (str (.getAbsolutePath script)
+                                          " "
+                                          (.getAbsolutePath capture)))}
+          #(run-editor! relative-plaintext))
+        (is (= (.getAbsolutePath (io/file relative-plaintext))
+               (slurp capture)))))))
+
+(deftest secure-delete-option-boundary-test
+  (let [secure-delete! (cli-private 'secure-delete!)
+        real-sh shell/sh
+        calls (atom [])
+        recording (fn [& args]
+                    (let [argv (vec (take-while string? args))
+                          result (apply real-sh args)]
+                      (swap! calls conj {:args argv :exit (:exit result)})
+                      result))
+        outcome (fn [path]
+                  (spit path "plaintext that must be overwritten, not just unlinked")
+                  (reset! calls [])
+                  (with-redefs [shell/sh recording]
+                    (secure-delete! path))
+                  @calls)
+        dash-path "-secrets-cli-boundary-delete"
+        control (outcome (str *dir* "/control-plaintext.edn"))
+        dash (with-cwd-entry dash-path (fn [_] (outcome dash-path)))
+        only-dash (with-cwd-entry "-" (fn [_] (outcome "-")))
+        mechanism (fn [calls] (mapv (juxt (comp first :args) :exit) calls))]
+    (testing "a dash-named path is shredded by the same mechanism, same status"
+      (doseq [[label observed] [["dash-leading" dash] ["exact -" only-dash]]]
+        (is (= (mechanism control) (mechanism observed))
+            (str label ": a platform whose rm/shred is unusable for both paths makes "
+                 "this comparison vacuous but never wrong: control " (pr-str control)
+                 " vs " (pr-str observed)))))
+    (testing "argv shape (the overwrite guarantee is otherwise unobservable)"
+      (doseq [[path observed] [[dash-path dash] ["-" only-dash]]]
+        (let [deletions (filterv #(#{"rm" "shred"} (first (:args %))) observed)
+              absolute (.getAbsolutePath (io/file path))]
+          (if (seq deletions)
+            (doseq [{:keys [args]} deletions]
+              (is (= ["--" absolute] (take-last 2 args))
+                  (str "argv " (pr-str args) " must end with -- then an absolute path")))
+            (is true (str "vacuous: no rm/shred subprocess ran for " path))))))))
+
+(deftest secure-delete-platform-argv-shape-test
+  (let [secure-delete! (cli-private 'secure-delete!)
+        absolute (.getAbsolutePath (io/file "-"))]
+    (testing "macOS uses rm -P with an option terminator and absolute operand"
+      (with-cwd-entry "-"
+        (fn [entry]
+          (spit entry "plaintext")
+          (let [calls (atom [])
+                recording (fn [& args]
+                            (swap! calls conj (vec args))
+                            {:exit 0})]
+            (with-redefs [str/starts-with? (constantly true)
+                          shell/sh recording]
+              (secure-delete! "-"))
+            (is (= [["rm" "-P" "--" absolute]] @calls))))))
+    (testing "non-macOS probes for shred, then uses the same safe operand shape"
+      (with-cwd-entry "-"
+        (fn [entry]
+          (spit entry "plaintext")
+          (let [calls (atom [])
+                recording (fn [& args]
+                            (swap! calls conj (vec args))
+                            {:exit 0})]
+            (with-redefs [str/starts-with? (constantly false)
+                          shell/sh recording]
+              (secure-delete! "-"))
+            (is (= [["sh" "-c" "command -v shred"]
+                    ["shred" "-u" "--" absolute]]
+                   @calls))))))))
 
 ;;;; Set and remove
 

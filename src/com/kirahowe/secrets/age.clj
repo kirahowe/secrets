@@ -60,6 +60,25 @@
     (boolean (or (re-matches #"age1[0-9a-z]{20,}" s)
                  (re-matches #"ssh-(ed25519|rsa) .+" s)))))
 
+(defn- path-arg
+  "Render `p`, the path argument playing `role`, as an age argument that can
+  only mean a filesystem path.
+
+  An option terminator is not enough on its own: age reads a positional `-`
+  (and an `-i`/`-R` value of `-`) from stdin and writes `-o -` to stdout, and a
+  blank path resolves to stdin rather than to a file. `./` names the same file
+  without the ambiguity; an absolute path never begins with `-`. Blank fails
+  closed naming its role, the way a blank identity variable does — a blank
+  input would otherwise exit 0 with a ciphertext of nothing, and CI is where
+  an unset variable expands to nothing."
+  ^String [role p]
+  (let [s (str p)]
+    (when (str/blank? s)
+      (throw (ex-info (str "age " (name role) " path is blank") {:argument role :path s})))
+    (if (str/starts-with? s "-")
+      (str "./" s)
+      s)))
+
 (defn keygen!
   "Generate a fresh age identity at `path`, creating parent directories and
   tightening the file to owner-only permissions. Returns the public key.
@@ -68,9 +87,10 @@
   whether overwriting is allowed. `age-keygen -o` refuses to open an existing
   output file, so the key is generated inside a sibling temp directory and
   moved over `path` only once it succeeds — a failed generation leaves any
-  existing key untouched. Throws if `age-keygen` is missing or fails."
+  existing key untouched. Throws if `path` is blank, or if `age-keygen` is
+  missing or fails."
   [path]
-  (let [f (.getAbsoluteFile (io/file (str path)))
+  (let [f (.getAbsoluteFile (io/file (path-arg :key path)))
         parent (.getParentFile f)]
     (.mkdirs parent)
     (let [tmp-dir (java.nio.file.Files/createTempDirectory
@@ -120,19 +140,20 @@
   Multi-recipient encryption (`:recipients-file` / `:recipients`) lets each
   person hold their *own* key: any one of the listed recipients can decrypt."
   [recipients in out]
-  (ensure-installed!)
   (when (and (string? recipients) (valid-recipient? recipients))
     (throw (ex-info (str "encrypt-file! got a bare public key, but a bare "
                          "recipients value means an identity-file path. Pass "
                          "public keys as {:recipients [\"age1…\"]}.")
                     {:recipients recipients})))
-  (let [{:keys [identity-file recipients-file] rs :recipients}
-        (if (map? recipients) recipients {:identity-file recipients})
+  (let [recipient-spec (if (map? recipients)
+                         recipients
+                         {:identity-file recipients})
+        {:keys [identity-file recipients-file] rs :recipients} recipient-spec
+        identity-file? (contains? recipient-spec :identity-file)
+        recipients-file? (contains? recipient-spec :recipients-file)
         argv (cond-> ["age" "-e"]
-               identity-file (conj "-i")
-               identity-file (conj (str identity-file))
-               recipients-file (conj "-R")
-               recipients-file (conj (str recipients-file)))
+               identity-file? (conj "-i" (path-arg :identity identity-file))
+               recipients-file? (conj "-R" (path-arg :recipients-file recipients-file)))
         argv (reduce (fn [argv recipient]
                        (-> argv
                            (conj "-r")
@@ -141,31 +162,37 @@
                      rs)
         argv (-> argv
                  (conj "-o")
-                 (conj (str out))
-                 (conj (str in)))
-        {:keys [exit err]} (apply shell/sh argv)]
-    (when-not (zero? exit)
-      (throw (ex-info "age encryption failed" {:out (str out) :error err})))
-    out))
+                 (conj (path-arg :output out))
+                 (conj "--")
+                 (conj (path-arg :input in)))]
+    ;; Local argument validation first: probing the environment must not be
+    ;; able to mask a path that never named a file.
+    (ensure-installed!)
+    (let [{:keys [exit err]} (apply shell/sh argv)]
+      (when-not (zero? exit)
+        (throw (ex-info "age encryption failed" {:out (str out) :error err})))
+      out)))
 
 (defn decrypt-bytes
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
   byte array (binary-safe — age encrypts arbitrary files, not just text).
   Throws an ex-info (with the captured stderr) on failure."
   ^bytes [identity-file encrypted-file]
-  (ensure-installed!)
-  ;; :out-enc :bytes leaves stdout undecoded; stderr is still returned as a
-  ;; string (both here and on the JVM).
-  (let [{:keys [exit out err]} (shell/sh "age" "-d" "-i" (str identity-file)
-                                         (str encrypted-file)
-                                         :out-enc :bytes)]
-    (if (zero? exit)
-      out
-      (throw (ex-info "age decryption failed"
-                      {:identity-file (str identity-file)
-                       :encrypted-file (str encrypted-file)
-                       :error err
-                       :hint "Wrong key, or you are not a recipient of this file."})))))
+  (let [identity-path (path-arg :identity identity-file)
+        input-path (path-arg :input encrypted-file)]
+    (ensure-installed!)
+    ;; :out-enc :bytes leaves stdout undecoded; stderr is still returned as a
+    ;; string (both here and on the JVM).
+    (let [{:keys [exit out err]} (shell/sh "age" "-d" "-i" identity-path
+                                           "--" input-path
+                                           :out-enc :bytes)]
+      (if (zero? exit)
+        out
+        (throw (ex-info "age decryption failed"
+                        {:identity-file (str identity-file)
+                         :encrypted-file (str encrypted-file)
+                         :error err
+                         :hint "Wrong key, or you are not a recipient of this file."}))))))
 
 (defn decrypt
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a

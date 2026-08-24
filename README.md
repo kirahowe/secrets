@@ -671,7 +671,7 @@ manifest is reported as `skipped`.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
 
-`com.kirahowe.secrets.age` — `version`, `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte).
+`com.kirahowe.secrets.age` — `version`, `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte). The positional input is passed behind an option terminator (`--`), and every path-valued argument — that input, the `-o` output, the `-i` identity, the `-R` recipients file — is normalized so a dash-leading path becomes `./-name`, so filenames beginning with `-` (including names identical to age options) work like any other file; a blank or nil path throws `ex-info` instead of falling back to stdin. `:recipients` strings are recipient *values*, not paths, and are passed through as given.
 
 `com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
 
@@ -792,6 +792,14 @@ you're trading for that simplicity.
   created owner-only (0600) atomically on POSIX filesystems. On non-POSIX
   filesystems (e.g. Windows) the permissions are applied best-effort after
   creation — the library targets POSIX systems.
+- **Pathnames reaching `age` are data, never options.** Encryption and
+  decryption shell out to the `age` binary, so a path that arrived on its
+  command line as an option would let a filename choose the operation instead of
+  naming the file it operates on. Every invocation that takes an input pathname
+  therefore terminates its options with `--` before it, and every path argument
+  that starts with a dash is passed as `./-name` — age reads a bare `-` from
+  standard input even behind a terminator, so the prefix is the part that keeps
+  a filename a filename.
 
 ## License
 

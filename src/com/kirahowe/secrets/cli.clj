@@ -276,9 +276,12 @@
   "Open `$EDITOR` on `path`, inheriting the terminal. The editor value goes
   through the shell because it may carry arguments (\"code --wait\",
   \"emacsclient -t\"); the path is passed as a positional argument, not
-  interpolated. Throws if the editor exits non-zero."
+  interpolated. An arbitrary editor would read a dash-leading path as its own
+  option and `--` is not portable across editors, so `path` is made absolute
+  before it reaches the editor. Throws if the editor exits non-zero."
   [path]
-  (let [argv ["sh" "-c" (str (editor) " \"$1\"") "editor" (str path)]
+  (let [path (.getAbsolutePath (io/file (str path)))
+        argv ["sh" "-c" (str (editor) " \"$1\"") "editor" path]
         proc (-> (ProcessBuilder. (into-array String argv))
                  (.inheritIO)
                  (.start))]
@@ -286,16 +289,19 @@
       (fail! "Editor exited with an error; leaving secrets unchanged."))))
 
 (defn- secure-delete!
-  "Best-effort secure delete of a plaintext temp file."
+  "Best-effort secure delete of a plaintext temp file. `rm`/`shred` receive
+  `--` and an absolute path, which can neither begin with a dash nor be the
+  bare `-` that `shred -u` rejects as a non-file — either one silently
+  downgrades the overwrite to the plain `.delete` fallback below."
   [path]
   (let [f (io/file (str path))]
     (when (.exists f)
       (try
         (cond
           (str/starts-with? (System/getProperty "os.name") "Mac")
-          (shell/sh "rm" "-P" (str path))
+          (shell/sh "rm" "-P" "--" (.getAbsolutePath f))
           (zero? (:exit (shell/sh "sh" "-c" "command -v shred")))
-          (shell/sh "shred" "-u" (str path))
+          (shell/sh "shred" "-u" "--" (.getAbsolutePath f))
           :else (.delete f))
         (catch Exception _ (.delete f)))
       (when (.exists f) (.delete f)))))

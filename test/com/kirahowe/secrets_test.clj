@@ -94,6 +94,254 @@
   (is (re-find #"^age1" (age/public-key *key*)))
   (is (nil? (age/public-key (str *dir* "/does-not-exist")))))
 
+;;;; Command-line option boundary
+
+(defn- with-cwd-entry
+  "Run `(f entry)` on a working-directory entry named exactly `entry-name`,
+  then delete it. A dash-leading argv element can only come from a
+  cwd-relative path, so these fixtures cannot live in the absolute temp dir
+  the rest of the suite uses. Refuses to touch a pre-existing entry rather
+  than clobbering it, and cleans up even when an assertion fails."
+  [entry-name f]
+  (let [entry (io/file entry-name)]
+    (when (.exists entry)
+      (throw (ex-info "refusing to clobber an existing working-directory entry"
+                      {:entry entry-name})))
+    (try
+      (f entry)
+      (finally
+        (doseq [p (reverse (file-seq entry))] (.delete p))))))
+
+(deftest encrypt-input-named-like-an-age-option-test
+  (testing "a plaintext file named --armor is encrypted, never read as a flag"
+    (let [payload "{:option/boundary \"encrypt\"}"
+          out (str *dir* "/armor-named-input.age")]
+      (with-cwd-entry "--armor"
+        (fn [in]
+          (spit in payload)
+          (age/encrypt-file! *key* (str in) out)
+          (is (= payload (age/decrypt *key* out))
+              "age encrypts the file rather than armoring an encryption of stdin"))))))
+
+(deftest decrypt-input-named-like-an-age-option-test
+  (let [payload "{:option/boundary \"decrypt\"}"
+        plain (str *dir* "/option-named.edn")
+        enc (str *dir* "/option-named.age")]
+    (spit plain payload)
+    (age/encrypt-file! *key* plain enc)
+    (doseq [entry-name ["--version" "--help"]]
+      (testing (str "a ciphertext named " entry-name " is decrypted as ciphertext")
+        (with-cwd-entry entry-name
+          (fn [ct]
+            (io/copy (io/file enc) ct)
+            (let [plaintext (String. (age/decrypt-bytes *key* (str ct)) "UTF-8")]
+              (is (= payload plaintext) "the authenticated plaintext is returned")
+              (is (seq plaintext) "age's empty option output is never plaintext")
+              (is (not (re-find #"^v?\d+\.\d+\.\d+" plaintext))
+                  "age's own version output is never plaintext"))))))))
+
+(deftest dash-only-filename-is-a-path-not-stdin-test
+  (let [payload "{:option/boundary \"dash\"}"]
+    (testing "a plaintext file named - is encrypted instead of reading stdin"
+      (let [out (str *dir* "/dash-input.age")]
+        (with-cwd-entry "-"
+          (fn [in]
+            (spit in payload)
+            (age/encrypt-file! *key* (str in) out)
+            (is (= payload (age/decrypt *key* out)))))))
+    (testing "a ciphertext named - is decrypted instead of reading stdin"
+      (let [plain (str *dir* "/dash-plain.edn")
+            enc (str *dir* "/dash-plain.age")]
+        (spit plain payload)
+        (age/encrypt-file! *key* plain enc)
+        (with-cwd-entry "-"
+          (fn [ct]
+            (io/copy (io/file enc) ct)
+            (is (= payload (age/decrypt *key* (str ct))))))))))
+
+(deftest dash-leading-relative-paths-work-for-every-path-argument-test
+  (let [payload "{:option/boundary \"relative\"}"
+        plain "-secrets-boundary/plain.edn"
+        identity-file "-secrets-boundary/key.txt"
+        recipients-file "-secrets-boundary/recipients.txt"]
+    (with-cwd-entry "-secrets-boundary"
+      (fn [_]
+        (io/make-parents plain)
+        (spit plain payload)
+        (io/copy (io/file *key*) (io/file identity-file))
+        (spit recipients-file (str (age/public-key *key*) "\n"))
+        (testing "input, output and identity file may all start with a dash"
+          (let [out "-secrets-boundary/identity.age"]
+            (age/encrypt-file! {:identity-file identity-file} plain out)
+            (is (= payload (age/decrypt identity-file out)))))
+        (testing "a dash-leading recipients file encrypts to that recipient"
+          (let [out "-secrets-boundary/recipients.age"]
+            (age/encrypt-file! {:recipients-file recipients-file} plain out)
+            (is (= payload (age/decrypt *key* out)))))
+        (testing "decrypt-to-file! restores the bytes to a dash-leading path"
+          (let [enc "-secrets-boundary/identity.age"
+                out "-secrets-boundary/plain-again.edn"]
+            (age/decrypt-to-file! identity-file enc out)
+            (is (= (vec (.getBytes payload "UTF-8"))
+                   (vec (java.nio.file.Files/readAllBytes
+                         (.toPath (io/file out))))))))))))
+
+(deftest a-file-named-dash-is-a-path-for-every-age-path-role-test
+  (let [payload "{:option/boundary \"dash-roles\"}"
+        plain (str *dir* "/dash-roles.edn")]
+    (spit plain payload)
+    (testing "an identity file named - is read from disk, never from stdin"
+      (let [enc (str *dir* "/dash-roles-identity.age")]
+        (age/encrypt-file! *key* plain enc)
+        (with-cwd-entry "-"
+          (fn [id]
+            (io/copy (io/file *key*) id)
+            (is (= payload (age/decrypt "-" enc)))))))
+    (testing "a recipients file named - is read from disk, never from stdin"
+      (let [out (str *dir* "/dash-roles-recipients.age")]
+        (with-cwd-entry "-"
+          (fn [rf]
+            (spit rf (str (age/public-key *key*) "\n"))
+            (age/encrypt-file! {:recipients-file "-"} plain out)))
+        (is (= payload (age/decrypt *key* out)))))
+    (testing "an output named - is a file, never stdout"
+      (with-cwd-entry "-"
+        (fn [out]
+          (age/encrypt-file! *key* plain "-")
+          (is (.isFile out) "age wrote a file rather than streaming to stdout")
+          (is (= payload (age/decrypt *key* "-"))))))))
+
+;; A deliberate argv-shape test. `path-arg` already rewrites a dash-leading
+;; positional to `./-name`, so dropping the `--` terminator changes nothing a
+;; behavioural test can observe; only the terminator's position in the argv
+;; pins it down. The `age --version` probe is answered so that
+;; `ensure-installed!` still passes.
+(deftest age-argv-shape-test
+  (let [calls (atom [])
+        recording (fn [result]
+                    (fn [& args]
+                      (let [argv (vec (take-while string? args))]
+                        (if (= ["age" "--version"] argv)
+                          {:exit 0 :out "v1.3.1" :err ""}
+                          (do (swap! calls conj argv) result)))))
+        encrypt-argv (fn [recipients in out]
+                       (reset! calls [])
+                       (with-redefs [shell/sh (recording {:exit 0 :err ""})]
+                         (age/encrypt-file! recipients in out))
+                       (first @calls))
+        decrypt-argv (fn [identity-file in]
+                       (reset! calls [])
+                       (with-redefs [shell/sh (recording {:exit 0 :out (byte-array 0) :err ""})]
+                         (age/decrypt-bytes identity-file in))
+                       (first @calls))]
+    (testing "the encrypt terminator sits immediately before the input operand"
+      (let [argv (encrypt-argv "key.txt" "-in.edn" "out.age")]
+        (is (= ["--" "./-in.edn"] (take-last 2 argv)) (pr-str argv))
+        (is (= ["age" "-e" "-i" "key.txt" "-o" "out.age" "--" "./-in.edn"] argv))))
+    (testing "the decrypt terminator sits immediately before the input operand"
+      (let [argv (decrypt-argv "key.txt" "-in.age")]
+        (is (= ["--" "./-in.age"] (take-last 2 argv)) (pr-str argv))
+        (is (= ["age" "-d" "-i" "key.txt" "--" "./-in.age"] argv))))
+    (testing "a recipient is a recipient string, not a path, so it passes verbatim"
+      (is (= ["age" "-e" "-r" "-not-a-path" "-o" "out.age" "--" "plain.edn"]
+             (encrypt-argv {:recipients ["-not-a-path"]} "plain.edn" "out.age"))))
+    (testing "-i, -R and -o render an exact - as ./-"
+      (is (= ["age" "-e" "-i" "./-" "-R" "./-" "-o" "./-" "--" "plain.edn"]
+             (encrypt-argv {:identity-file "-" :recipients-file "-"} "plain.edn" "-")))
+      (is (= ["age" "-d" "-i" "./-" "--" "plain.age"] (decrypt-argv "-" "plain.age"))))))
+
+(deftest blank-and-nil-age-paths-fail-closed-test
+  (let [plain (str *dir* "/blank-source.edn")
+        enc (str *dir* "/blank-source.age")]
+    (spit plain "{:option/boundary \"blank\"}")
+    (age/encrypt-file! *key* plain enc)
+    (testing "a blank or nil encrypt input is refused, never taken as stdin"
+      (doseq [[label in] [["empty" ""] ["spaces" "   "] ["nil" nil]]]
+        (let [out (str *dir* "/blank-" label ".age")]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                                (age/encrypt-file! *key* in out))
+              (str "input " (pr-str in) " names no file"))
+          (is (not (.exists (io/file out)))
+              (str "nothing is written for input " (pr-str in))))))
+    (testing "a blank or nil decrypt input is refused, never taken as stdin"
+      (doseq [in ["" "   " nil]]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                              (age/decrypt-bytes *key* in))
+            (str "input " (pr-str in) " names no file"))))
+    (testing "a blank identity file is refused on both paths"
+      (let [out (str *dir* "/blank-identity.age")]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                              (age/encrypt-file! "" plain out)))
+        (is (not (.exists (io/file out))) "nothing is written for a blank identity")
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                              (age/decrypt-bytes "" enc)))))
+    (testing "a blank output, a blank recipients file and a nil identity fail closed"
+      (let [out (str *dir* "/blank-role.age")]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                              (age/encrypt-file! *key* plain "")))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                              (age/encrypt-file! {:recipients-file ""} plain out)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
+                              (age/encrypt-file! nil plain out))
+            "a bare nil names a blank identity file, not \"no recipients at all\"")
+        (is (not (.exists (io/file out))) "nothing is written for any blank role")))
+    (testing "keygen! refuses a blank path instead of resolving to a directory"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (age/keygen! ""))))))
+
+(deftest invalid-age-paths-run-no-subprocesses-test
+  (let [shell-calls (atom 0)
+        invalid-calls
+        [["nil keygen path" #(age/keygen! nil)]
+         ["whitespace keygen path" #(age/keygen! "   ")]
+         ["nil identity-file map path"
+          #(age/encrypt-file! {:identity-file nil
+                               :recipients ["age1-valid-looking-recipient-value"]}
+                              "plain"
+                              "out")]
+         ["whitespace identity-file map path"
+          #(age/encrypt-file! {:identity-file "   "
+                               :recipients ["age1-valid-looking-recipient-value"]}
+                              "plain"
+                              "out")]
+         ["nil recipients-file map path"
+          #(age/encrypt-file! {:recipients-file nil} "plain" "out")]
+         ["whitespace recipients-file map path"
+          #(age/encrypt-file! {:recipients-file "   "} "plain" "out")]
+         ["nil encrypt output" #(age/encrypt-file! "key" "plain" nil)]
+         ["whitespace encrypt output" #(age/encrypt-file! "key" "plain" "   ")]
+         ["nil encrypt input" #(age/encrypt-file! "key" nil "out")]
+         ["whitespace encrypt input" #(age/encrypt-file! "key" "   " "out")]
+         ["nil decrypt identity" #(age/decrypt-bytes nil "cipher")]
+         ["whitespace decrypt identity" #(age/decrypt-bytes "   " "cipher")]
+         ["nil decrypt input" #(age/decrypt-bytes "key" nil)]
+         ["whitespace decrypt input" #(age/decrypt-bytes "key" "   ")]]]
+    (with-redefs [shell/sh (fn [& _]
+                             (swap! shell-calls inc)
+                             (throw (ex-info "subprocess ran" {})))]
+      (doseq [[label invoke] invalid-calls]
+        (reset! shell-calls 0)
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (invoke)) label)
+        (is (zero? @shell-calls)
+            (str label " must fail before probing or running a subprocess"))))))
+
+(deftest age-path-handling-control-test
+  (testing "no-regression control: absolute paths still round trip"
+    (let [payload "{:option/boundary \"control\"}"
+          plain (str *dir* "/control.edn")
+          out (str *dir* "/control.age")]
+      (spit plain payload)
+      (age/encrypt-file! *key* plain out)
+      (is (= payload (age/decrypt *key* out)))
+      (testing "and a :recipients list of literal age1… strings is untouched"
+        (let [multi (str *dir* "/control-multi.age")]
+          (age/encrypt-file! {:recipients [(age/public-key *key*)]} plain multi)
+          (is (= payload (age/decrypt *key* multi)))))
+      (testing "and the wrong key still fails with the original message"
+        (let [other (str *dir* "/control-other-key.txt")]
+          (age/keygen! other)
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"age decryption failed"
+                                (age/decrypt other out))))))))
+
 ;;;; Reader literals
 
 (deftest reader-literals-present-test
