@@ -104,6 +104,25 @@ All notable changes to this project are documented here. The format follows
   previous destination intact. A filesystem without POSIX permissions fails
   closed rather than downgrading to default permissions — use `decrypt-bytes`
   or `decrypt`, which never write plaintext to disk.
+- Configuration validation now builds one global table of canonical artifact
+  paths and semantic roles — ciphertext, manifest, template, key file,
+  recipients file, and the *resolved* identity each environment reads — and
+  rejects incompatible reuse of a path across the whole configuration before
+  any command performs I/O (CWE-73). Previously each environment was checked
+  independently and the resolved identity was left out of the model entirely,
+  so an identity path equal to a manifest path, or `dev`'s ciphertext path
+  equal to `prod`'s key path, was accepted and a destructive command could
+  overwrite private identity material or ciphertext — or encrypt private
+  identity material as input. Compatible sharing is now an explicit allow-list
+  rather than an inference from matching path strings: one identity/key
+  artifact (`:identity-file` defaults to `:key-file`, `:key-file` to one
+  app-wide path), one recipients list shared by several environments, and one
+  shared template. Everything else is rejected, including two environments
+  writing one ciphertext or one manifest, so a configuration that relied on any
+  other shared path now fails at startup with a diagnostic naming every
+  environment and role involved and the shared canonical path — never file
+  contents. A configured path that cannot be canonicalized is likewise a
+  configuration error rather than an unattributed failure later.
 
 ## [0.1.0] - 2026-08-21
 

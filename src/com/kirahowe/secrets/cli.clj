@@ -144,20 +144,96 @@
            {:environment env :field kind :path path}))
   path)
 
-(defn- validate-artifact-collisions!
-  [environment-name artifacts]
-  (let [collisions (->> artifacts
-                        (filter (fn [[_ path]] (string? path)))
-                        (map (fn [[kind path]] [kind (canonical-path path)]))
-                        (group-by second)
-                        vals
-                        (filter #(> (count %) 1)))]
-    (when-let [collision (first collisions)]
-      (fail! (str "Environment " environment-name " has colliding artifact paths: "
-                  (str/join ", " (map (comp name first) collision))
-                  " (canonical path " (second (first collision)) ").")
-             {:environment environment-name
-              :path-collision collision}))))
+(def ^:private artifact-roles
+  "Every path-valued artifact role a command can touch. `:identity-file` is the
+  *resolved* identity an environment carries — the value commands actually read
+  — not only an explicitly configured one."
+  [:secrets-file :manifest :template :key-file :recipients-file :identity-file])
+
+(def ^:private compatible-role-sets
+  "The only role combinations allowed to share one canonical path. Everything
+  else is rejected: compatible sharing is enumerated here, never inferred from
+  role names or matching path strings.
+
+  - `#{:key-file :identity-file}`, or either role alone — one underlying
+    identity artifact. `:identity-file` *defaults* to `:key-file`, so equality
+    inside one environment is the normal case rather than an error, and
+    `:key-file` defaults to one app-wide path, so several environments
+    legitimately share one key ([[sharing-environments]] reports that set).
+  - `#{:recipients-file}` alone — a committed list of public keys, read-only;
+    one team list shared by several environments is ordinary.
+  - `#{:template}` alone — a read-only example file; one template shared across
+    environments is ordinary.
+
+  `#{:secrets-file}` and `#{:manifest}` are deliberately absent: two
+  environments writing one ciphertext, or one manifest, is a configuration bug."
+  #{#{:key-file}
+    #{:identity-file}
+    #{:key-file :identity-file}
+    #{:recipients-file}
+    #{:template}})
+
+(defn- artifact-canonical-path
+  "`canonical-path` for a configured artifact, failing closed. `.getCanonicalPath`
+  raises IOException on a path it cannot resolve; falling back to a string
+  comparison there would let exactly the paths hardest to reason about skip the
+  collision check, and an escaping IOException would surface unattributed."
+  [environment-name role path]
+  (try
+    (canonical-path path)
+    (catch java.io.IOException e
+      (fail! (str "Environment " environment-name " has an unresolvable " (name role)
+                  " path — " path "\n    " (ex-message e))
+             {:environment environment-name :role role :path path}))))
+
+(defn- artifact-entries
+  "One entry — `{:environment :role :path :canonical}` — per path-valued
+  artifact of a normalized environment. Non-string values are skipped, so
+  `:manifest false` and an absent `:recipients-file` stay out of the table."
+  [env]
+  (into []
+        (keep (fn [role]
+                (let [path (get env role)]
+                  (when (string? path)
+                    {:environment (:name env)
+                     :role role
+                     :path path
+                     :canonical (artifact-canonical-path (:name env) role path)}))))
+        artifact-roles))
+
+(defn- role-collision-message
+  "Diagnostic for one canonical path carrying incompatible roles: every
+  environment and role in the group, and only the pathnames the configuration
+  already carried — never file contents."
+  [canonical entries]
+  (str "Configuration assigns one path to incompatible artifact roles:\n"
+       "    " canonical "\n"
+       (str/join "\n" (map (fn [{:keys [environment role path]}]
+                             (str "      " environment " " (name role) " — " path))
+                           entries))
+       "\n    A path may be shared only as one identity/key artifact, one shared"
+       "\n    recipients list, or one shared template."))
+
+(defn- validate-artifact-roles!
+  "Reject any canonical path carrying an incompatible combination of artifact
+  roles, over every environment at once: checking environments independently
+  accepted one environment's ciphertext path as another's key path.
+
+  Canonicalization resolves the configuration as it reads now. This is a
+  configuration check, not a defence against the filesystem changing
+  afterwards — race-safe operation is a separate concern."
+  [environments]
+  (let [groups (->> (vals environments)
+                    (mapcat artifact-entries)
+                    (group-by :canonical)
+                    (sort-by key))
+        incompatible? (fn [[_ entries]]
+                        (and (> (count entries) 1)
+                             (not (compatible-role-sets (set (map :role entries))))))]
+    (when-let [[canonical entries] (first (filter incompatible? groups))]
+      (let [entries (vec (sort-by (juxt (comp name :environment) (comp name :role)) entries))]
+        (fail! (role-collision-message canonical entries)
+               {:canonical-path canonical :path-collision entries})))))
 
 (def ^:private default-limits
   "Bounds applied to untrusted inputs before any subprocess starts, overridable
@@ -240,13 +316,6 @@
                          [:manifest manifest]
                          [:recipients-file recipients-file]]]
       (require-path! environment-name kind path))
-    (validate-artifact-collisions!
-     environment-name
-     [[:secrets-file secrets-file]
-      [:manifest manifest]
-      [:template template]
-      [:key-file key-file]
-      [:recipients-file recipients-file]])
     (assoc env-config
            :name environment-name
            :app app
@@ -270,9 +339,9 @@
   each env with its :name and the resolved limits. Requires a non-blank :app,
   at least one environment, and a non-blank :secrets-file string per
   environment. A secrets path not ending in `.age` requires explicit :template
-  and :manifest values. Ciphertext, manifest, template, key, and recipients
-  paths must be distinct after canonicalization. Throws ex-info on invalid
-  input."
+  and :manifest values. Every resolved artifact path is checked for role
+  collisions across all environments before any command performs I/O. Throws
+  ex-info on invalid input."
   [{:keys [app environments] :as config}]
   (when (empty? environments)
     (fail! "secrets config has no :environments" {:config config}))
@@ -284,18 +353,17 @@
                 "path\n"
                 "    by accident.")
            {:config config}))
-  (let [limits (resolve-limits (:limits config))]
-    (assoc config
-           :limits limits
-           :environments
-           (reduce-kv (fn [normalized environment-name env-config]
-                        (assoc normalized
-                               environment-name
-                               (normalize-environment {:app app :limits limits}
-                                                      environment-name
-                                                      env-config)))
-                      {}
-                      environments))))
+  (let [limits (resolve-limits (:limits config))
+        normalized (reduce-kv (fn [normalized environment-name env-config]
+                                (assoc normalized
+                                       environment-name
+                                       (normalize-environment {:app app :limits limits}
+                                                              environment-name
+                                                              env-config)))
+                              {}
+                              environments)]
+    (validate-artifact-roles! normalized)
+    (assoc config :limits limits :environments normalized)))
 
 (defn- resolve-env
   "Resolve an environment argument string to its (defaulted) config map.

@@ -185,7 +185,7 @@
                   (get-in [:environments :dev]))]
       (is (= "secrets.enc" (:secrets-file env)))))
   (testing "explicit ciphertext and manifest paths cannot be identical"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"colliding artifact paths"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"incompatible artifact roles"
                           (cli/normalize-config
                            {:app "x"
                             :environments {:dev {:secrets-file "s.age"
@@ -202,7 +202,7 @@
         (let [left (nth fields left-index)
               right (nth fields right-index)
               env (assoc env right (str "./" (get env left)))]
-          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"colliding artifact paths"
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"incompatible artifact roles"
                                 (cli/normalize-config
                                  {:app "x" :environments {:dev env}}))
               (str left " and " right " alias the same canonical path")))))))
@@ -1296,3 +1296,189 @@
         (testing "and nothing that would make it re-read the list itself"
           (is (not-any? #{"-R"} encrypt-argv))
           (is (not-any? #(str/includes? % "team-list") encrypt-argv)))))))
+
+;;;; Artifact role collisions
+;;; These normalize-config tests live here rather than in the section above
+;;; because one of them needs the subprocess recorder defined further up.
+
+(defn- normalize-without-env-identity
+  "`normalize-config` with SECRETS_AGE_IDENTITY* neutralized, so an
+  environment's resolved identity is its configured one and these tests do not
+  depend on the developer's environment."
+  [config]
+  (with-redefs-fn {#'secrets/identity-from-env (constantly nil)}
+    #(cli/normalize-config config)))
+
+(defn- normalize-failure
+  "The ex-info `normalize-without-env-identity` throws for `config`, or nil when
+  it succeeds."
+  [config]
+  (try
+    (normalize-without-env-identity config)
+    nil
+    (catch clojure.lang.ExceptionInfo e e)))
+
+(defn- role-collision
+  "Assert `config` is rejected as an artifact role collision, and return the
+  exception so callers can assert on what it names."
+  [config]
+  (let [e (normalize-failure config)]
+    (is (str/includes? (str (ex-message e)) "incompatible artifact roles")
+        (str "rejected as a role collision, got: " (pr-str (ex-message e))))
+    e))
+
+(deftest incompatible-artifact-roles-are-rejected-test
+  (doseq [[label environments tokens]
+          [["the resolved identity equals the manifest in one environment"
+            {:dev {:secrets-file "s.age" :manifest "id.txt" :identity-file "id.txt"}}
+            [":dev manifest" ":dev identity-file"]]
+           ["the resolved identity equals the ciphertext"
+            {:dev {:secrets-file "s.age" :identity-file "s.age"}}
+            [":dev secrets-file" ":dev identity-file"]]
+           ["the resolved identity equals the template"
+            {:dev {:secrets-file "s.age" :identity-file "s.example"}}
+            [":dev template" ":dev identity-file"]]
+           ["dev ciphertext equals the prod key file"
+            {:dev {:secrets-file "shared.age" :key-file "dev-key.txt"}
+             :prod {:secrets-file "prod.age" :key-file "shared.age"}}
+            [":dev secrets-file" ":prod key-file"]]
+           ["two environments write one manifest"
+            {:dev {:secrets-file "d.age" :manifest "m.edn" :key-file "k.txt"}
+             :prod {:secrets-file "p.age" :manifest "m.edn" :key-file "k.txt"}}
+            [":dev manifest" ":prod manifest"]]
+           ["two environments write one ciphertext"
+            {:dev {:secrets-file "s.age" :template "d.example" :manifest "d.manifest"}
+             :prod {:secrets-file "s.age" :template "p.example" :manifest "p.manifest"}}
+            [":dev secrets-file" ":prod secrets-file"]]
+           ["the template equals the ciphertext"
+            {:dev {:secrets-file "s.age" :template "s.age"}}
+            [":dev secrets-file" ":dev template"]]
+           ["the recipients file equals the key file"
+            {:dev {:secrets-file "s.age" :key-file "k.txt" :recipients-file "k.txt"}}
+            [":dev key-file" ":dev recipients-file"]]]]
+    (testing label
+      (let [message (str (ex-message (role-collision {:app "x" :environments environments})))]
+        (doseq [token tokens]
+          (is (str/includes? message token) (str "the diagnostic names " token)))))))
+
+(deftest compatible-artifact-sharing-is-allowed-test
+  (let [sharing-environments (cli-private 'sharing-environments)]
+    (testing "the app-wide default key file shared by two environments"
+      (let [default-key (str *dir* "/home/.config/x/key.txt")
+            config (under-default-key-file
+                    default-key
+                    #(normalize-without-env-identity
+                      {:app "x"
+                       :environments {:dev {:secrets-file (str *dir* "/dev/s.age")}
+                                      :prod {:secrets-file (str *dir* "/prod/s.age")}}}))]
+        (is (= [:dev :prod] (sharing-environments (:environments config) default-key))
+            "keygen still reports every environment sharing the one key")))
+    (testing "an explicit :identity-file equal to the environment's own :key-file"
+      (let [env (-> {:app "x"
+                     :environments {:dev {:secrets-file "s.age"
+                                          :key-file "k.txt"
+                                          :identity-file "./k.txt"}}}
+                    normalize-without-env-identity
+                    (get-in [:environments :dev]))]
+        (is (= "./k.txt" (:identity-file env))
+            "an explicit identity aliasing the key file is kept, not rejected")))
+    (testing "one recipients file shared by two environments"
+      (is (nil? (normalize-failure
+                 {:app "x"
+                  :environments {:dev {:secrets-file "d.age"
+                                       :key-file "dev-key.txt"
+                                       :recipients-file "team.txt"}
+                                 :prod {:secrets-file "p.age"
+                                        :key-file "prod-key.txt"
+                                        :recipients-file "team.txt"}}}))))
+    (testing "one template shared by two environments"
+      (is (nil? (normalize-failure
+                 {:app "x"
+                  :environments {:dev {:secrets-file "d.age" :template "shared.example"}
+                                 :prod {:secrets-file "p.age" :template "shared.example"}}}))))))
+
+(deftest canonical-aliases-collide-test
+  (testing "a ./x/.. detour resolves to the plain path"
+    (role-collision {:app "x"
+                     :environments {:dev {:secrets-file "./x/../secrets.edn.age"
+                                          :manifest "secrets.edn.age"
+                                          :template "t.example"}}}))
+  (testing "a trailing slash names the same file"
+    (role-collision {:app "x"
+                     :environments {:dev {:secrets-file "secrets.edn.age"
+                                          :manifest "secrets.edn.age/"
+                                          :template "t.example"}}}))
+  (testing "a symlink to another environment's key file resolves through it"
+    (let [key-file (str *dir* "/real-key.txt")
+          link (str *dir* "/linked-secrets.edn.age")]
+      (spit key-file "identity fixture")
+      (if-not (try
+                (java.nio.file.Files/createSymbolicLink
+                 (.toPath (io/file link))
+                 (.toPath (io/file key-file))
+                 (into-array java.nio.file.attribute.FileAttribute []))
+                true
+                (catch Exception _ false))
+        (is true "skipped: this platform does not allow creating a symlink")
+        (role-collision {:app "x"
+                         :environments {:dev {:secrets-file (str *dir* "/dev.age")
+                                              :key-file key-file}
+                                        :prod {:secrets-file link
+                                               :key-file (str *dir* "/prod-key.txt")}}})))))
+
+(deftest missing-leaf-paths-are-compared-consistently-test
+  (testing "neither path exists yet, as in a fresh project"
+    (let [missing (str *dir* "/fresh/secrets.edn.age")]
+      (is (not (.exists (io/file missing))) "the leaf really is absent")
+      (role-collision {:app "x"
+                       :environments {:dev {:secrets-file missing
+                                            :manifest (str *dir* "/fresh/nested/../secrets.edn.age")
+                                            :template (str *dir* "/fresh/t.example")}}})))
+  (testing "one existing path and one alias through a directory that does not exist"
+    (let [key-file (str *dir* "/existing-key.txt")
+          alias-path (str *dir* "/absent/../existing-key.txt")]
+      (spit key-file "identity fixture")
+      (role-collision {:app "x"
+                       :environments {:dev {:secrets-file (str *dir* "/dev.age")
+                                            :key-file key-file
+                                            :manifest alias-path}}}))))
+
+(deftest role-collision-is-rejected-before-any-filesystem-write-test
+  (let [ciphertext (str *dir* "/pre-write/secrets.edn.age")
+        identity-file (str *dir* "/pre-write/identity.txt")
+        key-file (str *dir* "/pre-write/key.txt")
+        config {:app "cli-test"
+                :default-environment :dev
+                :environments {:dev {:secrets-file ciphertext
+                                     :manifest identity-file
+                                     :identity-file identity-file
+                                     :key-file key-file}}}]
+    (doseq [[label command]
+            [["keygen" #(cli/keygen! (normalize-without-env-identity config) "dev")]
+             ["set" #(cli/set-secret! (normalize-without-env-identity config) "dev" ":a" false)]]]
+      (testing label
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"incompatible artifact roles"
+                              (with-out-str (with-in-str "value\n" (command)))))
+        (let [argvs (recorded-sh-argvs #(with-out-str (with-in-str "value\n" (command))))]
+          (is (= [] (filterv #(some-> (first %) (str/starts-with? "age")) argvs))
+              "no age or age-keygen subprocess ran"))
+        (doseq [path [ciphertext identity-file key-file]]
+          (is (not (.exists (io/file path))) (str path " was not created")))))))
+
+(deftest unresolvable-artifact-path-fails-closed-test
+  ;; No portable configured path makes .getCanonicalPath raise, so the
+  ;; IOException is injected at the boundary that has to catch it.
+  (let [canonical-path (cli-private 'canonical-path)
+        real @canonical-path]
+    (with-redefs-fn {canonical-path (fn [path]
+                                      (if (str/includes? (str path) "unresolvable")
+                                        (throw (java.io.IOException. "simulated failure"))
+                                        (real path)))}
+      #(let [e (normalize-failure
+                {:app "x"
+                 :environments {:dev {:secrets-file "s.age"
+                                      :manifest (str *dir* "/unresolvable/m.edn")}}})]
+         (is (str/includes? (str (ex-message e)) "unresolvable manifest path")
+             "the diagnostic names the environment's offending role")
+         (is (= {:environment :dev :role :manifest}
+                (select-keys (ex-data e) [:environment :role])))))))

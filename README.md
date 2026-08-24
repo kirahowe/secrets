@@ -150,8 +150,17 @@ Per-environment defaults fill in automatically: `:key-file` →
 default — unrelated projects must not share a key by accident), and the secrets
 file must end in `.age` — otherwise the derived template/manifest names would
 collide with (and overwrite) the ciphertext itself — unless you set both
-`:template` and `:manifest` explicitly. Ciphertext, manifest, template, key,
-and recipients paths must resolve to distinct canonical paths.
+`:template` and `:manifest` explicitly. Every resolved artifact path — the
+ciphertext, manifest, template, key file, recipients file, and the identity an
+environment actually reads — is canonicalized and checked as one global table
+across all environments, so reusing a path for an incompatible role is rejected
+before any command touches the filesystem, within one environment or between
+two. Exactly three kinds of sharing are permitted: one identity/key artifact
+(`:identity-file` defaults to `:key-file`, and `:key-file` defaults to one
+app-wide path), one recipients list shared by several environments, and one
+shared template. Anything else — two environments writing one ciphertext or one
+manifest, an identity path doubling as a manifest, a key file doubling as
+ciphertext — is a configuration error.
 
 An optional top-level `:limits` map bounds untrusted inputs before any `age`
 subprocess starts. It is merged over the defaults and resolved onto every
