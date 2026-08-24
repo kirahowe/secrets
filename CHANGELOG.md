@@ -18,6 +18,41 @@ All notable changes to this project are documented here. The format follows
   default".
 
 ### Changed
+- Publishing is now a guarded, receipted, two-step flow. `clojure -T:build
+  release` (`bb release`) refuses a working tree holding modified or untracked
+  files, a `HEAD` that is not exactly the tag naming the declared version — a
+  descendant of the tag is a refusal, not a pass — and a version `CHANGELOG.md`
+  does not document. It then exports that tag with `git worktree` and builds the
+  jar from the snapshot rather than from live files that can diverge after
+  validation, checks the jar's name, both embedded Maven descriptors, and the
+  `<scm><tag>` the pom claims it was built from against the version — a release
+  that records no tag claims no provenance and is refused — and records the jar,
+  the pom that is published beside it, the commit, and the jar's SHA-256 in
+  `target/release.edn`. `clojure -T:build deploy` no longer builds anything: it
+  re-reads that receipt, re-verifies the version, tag, commit, embedded
+  metadata, and digest, confirms the pom it is about to upload is byte-identical
+  to the one inside that jar — the pom, not the jar, is what defines the
+  coordinate and dependency list a consumer resolves, and it is served beside
+  the artifact rather than inside it — and hands the publisher exactly those two
+  files, so a jar or pom changed after inspection, a missing receipt, or a
+  `HEAD` that has moved off the tag each fail before any credential is used
+  (CWE-345). Previously the version was hardcoded beside the tag it claimed,
+  `jar` copied the live `src` tree while stamping it with tag metadata, and
+  `deploy` rebuilt and uploaded whatever that produced, with the published pom
+  taken from a path nothing had checked. The version now has one authoritative
+  source, `com.kirahowe.secrets.release/version`, on a new `build/` path that is
+  tested under both runtimes but never shipped in the jar. `clojure -T:build
+  jar` remains an unguarded development build from the live tree and now says
+  so: its pom records the repository URL without an `<scm><tag>`, because a
+  development build is not the tag.
+- A new `release` GitHub workflow publishes on a `v*` tag push (or an explicit
+  dispatch) from the protected `release` environment, whose protection rules —
+  required reviewers and the deployment tag restriction — are the enforcement a
+  build cannot perform on its own. It builds once from the tag, inspects those
+  exact bytes, uploads the jar and its receipt as a workflow artifact, and
+  exposes the Clojars credentials to nothing but its final deploy step. Every
+  action it uses is pinned to a full commit SHA, and it resolves dependencies
+  without a cache any earlier run could have written.
 - **BREAKING** — the manifest format is now `:version 2`, and committed
   manifests must be regenerated with `bb secrets reencrypt <env>`. Value hashes
   were derived from a rendered string that joined entries with `=` and `;` — the

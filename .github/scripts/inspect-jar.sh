@@ -54,7 +54,13 @@ grep -q '<description>Manage application secrets as a version-controlled, age-en
 grep -q '<name>MIT</name>' target/jar-pom.xml
 grep -q '<url>https://opensource.org/license/mit</url>' target/jar-pom.xml
 grep -q '<url>https://github.com/kirahowe/secrets</url>' target/jar-pom.xml
-grep -q '<tag>v0.1.0</tag>' target/jar-pom.xml
+# A release build records the tag it was built from; the development build makes
+# no provenance claim, because it copies the live tree at whatever ref is
+# checked out. Whichever this jar is, the pom may not advertise a tag that
+# disagrees with the version it declares.
+if grep -q '<tag>' target/jar-pom.xml; then
+  grep -q '<tag>v0.1.0</tag>' target/jar-pom.xml
+fi
 grep -q '<groupId>org.clojure</groupId>' target/jar-pom.xml
 grep -q '<artifactId>clojure</artifactId>' target/jar-pom.xml
 grep -q '<version>1.12.4</version>' target/jar-pom.xml

@@ -6,7 +6,10 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.4"}}
 
  :aliases
- {:test {:extra-paths ["test"]
+ ;;; The :test alias adds "build" so the release guards
+ ;;; (com.kirahowe.secrets.release) are tested under JVM Clojure too, without
+ ;;; ever shipping in the jar.
+ {:test {:extra-paths ["test" "build"]
          :extra-deps {aero/aero {:mvn/version "1.1.6"}
                       lambdaisland/kaocha {:mvn/version "1.91.1392"}
                       rewrite-clj/rewrite-clj {:mvn/version "1.2.55"}}
@@ -18,8 +21,10 @@
          :extra-deps {aero/aero {:mvn/version "1.1.6"}
                       org.scicloj/clay {:mvn/version "2.0.16"}}}
 
+  ;;; `-T` replaces :paths, so "." must stay for build.clj itself to resolve.
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}
                  slipset/deps-deploy {:mvn/version "0.2.2"}}
+          :paths ["." "build"]
           :ns-default build}
 
   :format {:replace-deps {dev.weavejester/cljfmt {:mvn/version "0.16.5"}}

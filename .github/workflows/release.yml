@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Two releases of the same ref must never race for the same coordinate.
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Build, inspect, and publish to Clojars
+    runs-on: ubuntu-latest
+    # The build cannot verify that the ref it was handed is protected — a
+    # workflow has no trustworthy view of branch or tag protection. That is what
+    # the `release` environment is for: its protection rules (required
+    # reviewers, and the deployment branch/tag restriction) decide whether this
+    # job runs at all, and it holds the only copy of the Clojars credentials, so
+    # an unreviewed ref cannot reach the upload even if it reaches the runner.
+    environment: release
+
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # Full history and tags: the guards refuse a HEAD that is not exactly
+          # the tag naming the declared version, which needs the tag present.
+          fetch-depth: 0
+
+      - name: Set up Temurin JDK 21
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Clojure CLI
+        uses: DeLaGuardo/setup-clojure@4c7a6f613e5089821bb3bb2a33a3ee115578580d # 13.6.1
+        with:
+          cli: 1.12.5.1664
+
+      # Deliberately uncached. A release resolves its dependencies from scratch
+      # rather than from a cache any earlier workflow run could have written.
+
+      - name: Show JVM and Clojure versions
+        run: |
+          java --version
+          clojure -Sdescribe
+
+      - name: Build the release artifact from the verified tag
+        run: clojure -T:build release
+
+      - name: Inspect the exact bytes that will be published
+        shell: bash
+        run: |
+          set -euo pipefail
+          jar_file="$(find target -maxdepth 1 -type f -name '*.jar' | head -n 1)"
+          test -n "${jar_file}"
+          bash .github/scripts/inspect-jar.sh "${jar_file}"
+
+      - name: Upload the release artifact and its receipt
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-artifacts
+          path: |
+            target/*.jar
+            target/release.edn
+            target/jar-entries.txt
+            target/jar-pom.xml
+            target/jar-pom.properties
+          if-no-files-found: error
+
+      # The only step that can see the Clojars credentials: nothing before it
+      # has them in its environment. `deploy` builds nothing — it re-verifies
+      # target/release.edn against the tag and the jar's digest, then uploads
+      # that same file.
+      - name: Publish the receipted artifact to Clojars
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
+        run: clojure -T:build deploy

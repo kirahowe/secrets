@@ -63,7 +63,8 @@ build, where the sibling isn't in the build context):
 ```clojure
 ;; git
 io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}
-;; or Maven, after `clojure -T:build install` locally or a future Clojars deploy
+;; or Maven, after `clojure -T:build install` locally or a Clojars release (see
+;; [Releasing](#releasing) — nothing is published yet)
 com.kirahowe/secrets {:mvn/version "0.1.0"}
 ```
 
@@ -772,6 +773,53 @@ bb book:build     # render the book into book/rendered (needs JDK + quarto + age
 bb book:preview   # serve the rendered book locally
 bb book:watch     # re-render chapters on save (Clay live reload)
 ```
+
+## Releasing
+
+A release is built once, from the tag, and the bytes that were inspected are the
+bytes that get published.
+
+1. Write the `CHANGELOG.md` entry under a `## [<version>]` heading and commit it.
+   The version lives in exactly one place —
+   `com.kirahowe.secrets.release/version`, under `build/`, so it never ships in
+   the jar — and the tag, jar name, pom, embedded `pom.properties`, and
+   CHANGELOG heading are all checked against it rather than maintained beside
+   it.
+2. Tag that commit `v<version>` and push the tag.
+3. The `release` workflow takes over: it is restricted to the protected
+   `release` GitHub environment, builds from the tag, inspects the artifact, and
+   uploads it. The Clojars credentials are visible only to its final deploy
+   step; checkout, build, and inspection never have them in their environment.
+
+The same flow by hand, when a release has to be cut locally:
+
+```sh
+clojure -T:build release   # guarded build, writes target/release.edn
+bash .github/scripts/inspect-jar.sh target/secrets-0.1.0.jar
+clojure -T:build deploy    # uploads exactly the files named in the receipt
+```
+
+`release` refuses a working tree with modified *or untracked* files, a `HEAD`
+that is not exactly the tag naming the declared version (a descendant of the tag
+is a refusal, not a pass), and a version the CHANGELOG does not document. It
+then exports the tag with `git worktree` and builds from that snapshot, so
+nothing that changes after the guards pass can reach the jar. The artifact must
+name the version in its file name, in both embedded Maven descriptors, and as
+the `<scm><tag>` it was built from — a release that claims no provenance is
+refused — and `target/release.edn` records the jar, the pom that ships beside
+it, the commit, and the jar's SHA-256.
+
+`deploy` builds nothing. It re-reads that receipt, re-checks the version, tag,
+commit, and embedded metadata, recomputes the digest, confirms the pom it is
+about to publish is byte-identical to the one inside that jar, and hands the
+publisher exactly those two files. A jar or pom changed after inspection, a
+missing receipt, or a `HEAD` that has moved off the tag each fail before any
+credential is used.
+
+`clojure -T:build jar` is a development build from the live working tree: it
+makes no provenance claim (its pom carries no `<scm><tag>`) and is not
+publishable. `clojure -T:build install` installs that same development jar into
+`~/.m2`.
 
 ## Trade-offs and limitations
 

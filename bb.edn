@@ -3,7 +3,7 @@
 ;;; README.) The build/install/deploy tasks shell out to `clojure -T:build …`,
 ;;; which needs a JDK on the PATH. The test task also needs Java because this
 ;;; bb.edn resolves Maven dependencies before Babashka can load them.
-{:paths ["src" "test"]
+{:paths ["src" "test" "build"]
  :deps {aero/aero {:mvn/version "1.1.6"}}
 
  :tasks
@@ -13,11 +13,13 @@
               [com.kirahowe.secrets-test]
               [com.kirahowe.secrets.aero-test]
               [com.kirahowe.secrets.cli-test]
-              [com.kirahowe.secrets.init-test])
+              [com.kirahowe.secrets.init-test]
+              [com.kirahowe.secrets.release-test])
    :task (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
                                                  'com.kirahowe.secrets.cli-test
                                                  'com.kirahowe.secrets.aero-test
-                                                 'com.kirahowe.secrets.init-test)]
+                                                 'com.kirahowe.secrets.init-test
+                                                 'com.kirahowe.secrets.release-test)]
            (System/exit (if (pos? (+ fail error)) 1 0)))}
 
   ;;;; Code quality
@@ -33,7 +35,7 @@
   lint
   {:doc "Lint Clojure source with clj-kondo"
    :task (clojure
-          (str "-M:lint --lint src test build.clj bb.edn book/chapters "
+          (str "-M:lint --lint src test build build.clj bb.edn book/chapters "
                "examples/aero-profiles/src examples/aero-profiles/test "
                "examples/aero-profiles/bb.edn examples/quickstart-bb/src "
                "examples/quickstart-bb/bb.edn examples/integrant-service/src "
@@ -47,15 +49,19 @@
    :task (clojure "-T:build clean")}
 
   build
-  {:doc "Build the library jar (target/secrets-<version>.jar)"
+  {:doc "Build the development library jar (target/secrets-<version>.jar)"
    :task (clojure "-T:build jar")}
 
   install
-  {:doc "Build + install the jar to the local Maven repo (~/.m2)"
+  {:doc "Build + install the development jar to the local Maven repo (~/.m2)"
    :task (clojure "-T:build install")}
 
+  release
+  {:doc "Guarded release build from the release tag (writes target/release.edn)"
+   :task (clojure "-T:build release")}
+
   deploy
-  {:doc "Build + publish to Clojars (needs CLOJARS_USERNAME / CLOJARS_PASSWORD)"
+  {:doc "Publish the receipted release artifact to Clojars (run `bb release` first)"
    :task (clojure "-T:build deploy")}
 
   secrets
