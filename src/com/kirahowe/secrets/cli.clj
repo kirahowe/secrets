@@ -1013,7 +1013,7 @@
         (oops environment-label "— manifest is not valid EDN:" (:error parsed))
         {:status :drift})
 
-      (not= 1 version)
+      (not= 2 version)
       (do
         (oops environment-label
               "— manifest version"
@@ -1215,7 +1215,7 @@
       (let [value (edn/read-string (slurp (io/file manifest)))]
         (cond
           (not (map? value)) {:state :invalid}
-          (not= 1 (:version value)) {:state :unsupported}
+          (not= 2 (:version value)) {:state :unsupported}
           (not (and (string? (:ciphertext-sha value))
                     (not (str/blank? (:ciphertext-sha value)))))
           {:state :missing-ciphertext-sha}

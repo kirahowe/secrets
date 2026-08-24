@@ -583,7 +583,7 @@ also writes a plaintext **manifest** next to it (`secrets.edn.manifest`) that
 records only the *shape* of the secrets — never a value:
 
 ```clojure
-{:version 1
+{:version 2
  :app "myapp"
  :ciphertext-sha "0b7d9f31…"   ; SHA-256 of secrets.edn.age when it was written
  :keys
@@ -599,6 +599,18 @@ file's comment lines and whitespace don't affect it and two copies of the same
 key always agree — and someone with only the repo can't brute-force a value
 from it. (In multi-recipient mode there's no single shared key, so the manifest
 is structure-only — no `:vhash`.)
+
+`:version` is the manifest encoding version, and it is part of the `:vhash`
+derivation, not just a label. Version 2 encodes a value as a recursively typed,
+length-framed string: every scalar, collection, map key, and map value carries
+its own type tag and its own length, so a `=` or `;` inside a value can't be
+mistaken for structure and `[[1]]` doesn't encode like `[(1)]`. That string is
+hashed as its raw UTF-16 code units rather than through a charset encoder, which
+would fold distinct values together by substituting for unpaired surrogates.
+Two different secret graphs therefore cannot share a `:vhash`. Version 1 did
+neither, so it is rejected outright rather than reinterpreted: `verify` reports
+an unsupported version as drift, and a v1 manifest must be regenerated with
+`bb secrets reencrypt <env>`.
 
 `:ciphertext-sha` is the SHA-256 of the encrypted `.age` file at the moment the
 manifest was written. It ties the manifest to the exact ciphertext, which lets
@@ -624,8 +636,9 @@ two modes:
   `verify` decrypts and checks the full shape and `:vhash`es, and also flags an
   out-of-band re-encryption via the sha even when the shape matches.
 
-`verify` also reads the manifest's `:version` and treats an unsupported one as
-drift. Disable the manifest for an environment with `:manifest false`.
+`verify` reads the manifest's `:version` and treats anything but 2 — including a
+legacy v1 manifest — as drift, never as a shape to diff. Disable the manifest
+for an environment with `:manifest false`.
 
 ## Diagnosing configuration
 

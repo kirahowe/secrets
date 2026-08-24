@@ -5,7 +5,7 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
-            [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.test :refer [are deftest is testing use-fixtures]]
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.manifest :as manifest]))
@@ -869,12 +869,96 @@
            (:vhash (get (manifest/entries {:s #{"b" "a"}} hk) [:s])))
         "set element order does not affect vhash")))
 
+(defn- leaf-vhash
+  "The `:vhash` a keyed manifest records for `v` under the single path `[:x]`."
+  [hkey v]
+  (:vhash (get (manifest/entries {:x v} hkey) [:x])))
+
+(deftest manifest-encoding-is-injective-test
+  (let [hk (manifest/hmac-key (slurp *key*))
+        vh #(leaf-vhash hk %)]
+    (testing "the collisions the v1 encoding produced"
+      (are [left right] (not= (vh left) (vh right))
+        '[{a=b c}] '[{a b=c}]
+        [[1]] [(list 1)]))
+    (testing "delimiters and digits inside payloads cannot be read as framing"
+      (are [left right] (not= (vh left) (vh right))
+        ["a=b" "c"] ["a" "b=c"]
+        ["a;b" "c"] ["a" "b;c"]
+        ["s:1:x"] ["s:1:y"]
+        ["12" "3"] ["1" "23"]
+        ["" "s:0:"] ["s:0:" ""]
+        [{"k" "v"} {"j" "w"}] [{"k" "v" "j" "w"}]
+        '[foo=bar] '[foo bar]
+        [":k" "{}" "}"] ["" ":k{}}"]))
+    (testing "nested collection types are distinguished"
+      (are [left right] (not= (vh left) (vh right))
+        [#{[1]}] [#{(list 1)}]
+        [[#{1}]] [#{[1]}]
+        [{:k (list 1)}] [{:k [1]}]
+        [(list {:k 1})] [[{:k 1}]]
+        [#{1}] [[1]]
+        [(list 1)] [[1]]))
+    (testing "every empty value hashes differently"
+      (is (= 6 (count (distinct (map vh [[] (list) #{} {} "" nil]))))))
+    (testing "ordering is significant exactly where it is semantic"
+      (is (not= (vh [1 2]) (vh [2 1])) "vector order")
+      (is (not= (vh [(list 1 2)]) (vh [(list 2 1)])) "list order")
+      (is (= (vh #{1 2}) (vh #{2 1})) "set order does not count")
+      (is (= (vh [{:a 1 :b 2}]) (vh [{:b 2 :a 1}])) "nor map entry order")
+      (let [pairs (map vector [:a :b :c :d :e :f :g :h :i :j] (range))
+            hashed (into {} pairs)
+            reversed (apply array-map (mapcat identity (reverse pairs)))]
+        (is (= 10 (count hashed)) "more than 8 entries, so a real hash map")
+        (is (= (vh [hashed]) (vh [reversed]))
+            "hash-map iteration order does not reach the encoding")))
+    (testing "payloads are framed by code-unit count, not by encoded byte length"
+      (is (= (vh ["héllo→"]) (vh ["héllo→"])))
+      (is (not= (vh ["héllo→"]) (vh ["héllo?"])))
+      (is (not= (vh ["é" "x"]) (vh ["éx"])))
+      (is (not= (vh ["→"]) (vh ["a"]))
+          "a multi-byte and an ASCII payload declare the same length and still differ"))
+    (testing "unpaired surrogates, which no charset encoder preserves, are distinguished"
+      (let [high (str (char 0xD800))
+            other-high (str (char 0xD801))
+            reversed-pair (str (char 0xDE00) (char 0xD83D))]
+        (is (= 5 (count (distinct (map vh [high other-high "?" "\ufffd" reversed-pair]))))
+            "though UTF-8 substitutes ? for each lone surrogate")
+        (is (not= (vh "\uD83D\uDE00") (vh reversed-pair))
+            "and a valid pair differs from the same code units reversed")))))
+
+(deftest manifest-entry-paths-do-not-collapse-test
+  ;; A symbol containing a space renders exactly like two symbols, so `pr-str`
+  ;; is ambiguous across path *elements*. `clojure.edn` cannot read such a
+  ;; symbol back, so no encrypted file can carry one — but `entries` is public
+  ;; and its ordering must be total for any Clojure data, and the old
+  ;; rendered-text comparator let one of these entries overwrite the other,
+  ;; silently dropping a manifest line. Hence a constructed key rather than an
+  ;; EDN-readable one: among values the reader can produce, `pr-str` is
+  ;; unambiguous, so no such pair exists to test with.
+  (let [spaced (symbol "a b")
+        e (manifest/entries {'a {'b 1} spaced 2} nil)]
+    (is (= 2 (count e)) "two distinct paths stay two entries")
+    (is (= #{'[a b] [spaced]} (set (keys e))))
+    (is (= "[a b]" (pr-str '[a b]) (pr-str [spaced]))
+        "and they really are indistinguishable once rendered")))
+
+(deftest manifest-entry-order-is-total-and-stable-test
+  (let [m {:b 2 :a {:d 4 :c 3} :e #{1} :f "x" :g nil}
+        shuffled #(apply array-map (mapcat identity (shuffle (vec m))))
+        paths (keys (manifest/entries m nil))]
+    (is (= #{[:a :c] [:a :d] [:b] [:e] [:f] [:g]} (set paths))
+        "no path is lost to a comparator that calls two of them equal")
+    (dotimes [_ 20]
+      (is (= paths (keys (manifest/entries (shuffled) nil)))
+          "and the order does not depend on the input map's iteration order"))))
+
 (deftest manifest-render-round-trips-test
   (let [e (manifest/entries {:a 1 :b {:c "x"} :d #{:e}} nil)
         sha "a3f1c2d4e5b6978012345678901234567890123456789012345678901234abcd"]
     (testing "with a :ciphertext-sha it round-trips through the EDN"
       (let [parsed (edn/read-string (manifest/render {:app "myapp" :ciphertext-sha sha} e))]
-        (is (= 1 (:version parsed)))
+        (is (= 2 (:version parsed)))
         (is (= "myapp" (:app parsed)))
         (is (= sha (:ciphertext-sha parsed)))
         (is (= e (:keys parsed)) "renders to EDN that reads back to the same entries")))

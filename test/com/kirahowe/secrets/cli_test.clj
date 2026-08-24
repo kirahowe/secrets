@@ -73,6 +73,17 @@
       (with-out-str (reset! res (cli/verify! config env-arg))))
     @res))
 
+(defn- capture-verify
+  "Run verify! with stdout and stderr captured separately; return its result
+  map plus both streams, for tests that assert on what was reported."
+  [config env-arg]
+  (let [result (atom nil)
+        out (java.io.StringWriter.)
+        err (java.io.StringWriter.)]
+    (binding [*out* out *err* err]
+      (reset! result (cli/verify! config env-arg)))
+    {:result @result :out (str out) :err (str err)}))
+
 (defn- file-bytes [path]
   (vec (java.nio.file.Files/readAllBytes (.toPath (io/file path)))))
 
@@ -119,7 +130,7 @@
      (spit cipher "age ciphertext fixture")
      (when (string? template) (spit template "{}"))
      (when (string? manifest)
-       (spit manifest "{:version 1 :ciphertext-sha \"fixture-sha\"}"))
+       (spit manifest "{:version 2 :ciphertext-sha \"fixture-sha\"}"))
      config)))
 
 ;;;; Normalize config
@@ -330,7 +341,7 @@
       (let [result (:result (doctor-under config nil {:version nil}))]
         (is (= {:state :ready :keyless? true :full? false} (:verify result)))))
     (testing "an incomplete manifest prevents keyless verification"
-      (spit (str *dir* "/secrets.edn.manifest") "{:version 1}")
+      (spit (str *dir* "/secrets.edn.manifest") "{:version 2}")
       (let [result (:result (doctor-under config nil {}))]
         (is (= 1 (:exit result)))
         (is (= {:state :missing-ciphertext-sha :keyless? false :full? true}
@@ -444,7 +455,7 @@
       (encrypt-edn! {:database/url "jdbc:x" :auth/admins #{"a@b.com"}})
       (with-out-str (cli/reencrypt! config "dev"))
       (let [m (edn/read-string (slurp (str *dir* "/secrets.edn.manifest")))]
-        (is (= 1 (:version m)))
+        (is (= 2 (:version m)))
         (is (string? (:ciphertext-sha m)) "manifest records the ciphertext hash")
         (is (contains? (:keys m) [:database/url]))
         (is (contains? (get-in m [:keys [:database/url]]) :vhash)
@@ -497,10 +508,57 @@
     (let [config (cli/normalize-config (test-config))]
       (encrypt-edn! {:a 1})
       (spit (str *dir* "/secrets.edn.manifest")
-            "{:version 2 :app \"cli-test\" :keys {}}")
+            "{:version 3 :app \"cli-test\" :keys {}}")
       (let [{:keys [results exit]} (verify config "dev")]
         (is (= 1 exit))
         (is (= :drift (:dev results)) "an unsupported :version is reported, not misdiffed")))))
+
+(deftest v1-manifest-is-rejected-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          manifest-path (str *dir* "/secrets.edn.manifest")]
+      (encrypt-edn! {:a 1})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [committed (edn/read-string (slurp manifest-path))]
+        (is (= 2 (:version committed)) "the CLI writes v2")
+        ;; Everything but :version stays consistent with the ciphertext, so only
+        ;; the version can be what fails: a v1 hash is never read as a v2 one.
+        (spit manifest-path (pr-str (assoc committed :version 1))))
+      (let [{:keys [results exit]} (verify config "dev")]
+        (is (= 1 exit) "a v1 manifest fails verification")
+        (is (= :drift (:dev results)) "and is never reported as :ok")))))
+
+(deftest public-recipient-forgery-fails-verification-test
+  ;; The two values here collided under the v1 encoding, so this exact forgery
+  ;; — ciphertext replaced using only the public recipient, :ciphertext-sha
+  ;; refreshed, every committed :vhash left alone — passed full verification
+  ;; before manifest v2.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")
+          sha256 (cli-private 'sha256)]
+      (encrypt-edn! {:x ['{a=b c}]})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [committed (edn/read-string (slurp manifest-path))
+            recipient (age/public-key *key*)
+            forged (str *dir* "/forged.edn")]
+        (is (age/valid-recipient? recipient)
+            "the public recipient is the attacker's only key material")
+        (spit forged (pr-str {:x ['{a b=c}]}))
+        (age/encrypt-file! {:recipients [recipient]} forged ciphertext)
+        (.delete (io/file forged))
+        (spit manifest-path
+              (pr-str (assoc committed :ciphertext-sha (sha256 ciphertext))))
+        (is (= (:keys committed) (:keys (edn/read-string (slurp manifest-path))))
+            "the forged manifest keeps every original :vhash"))
+      (let [{:keys [result out]} (capture-verify config "dev")]
+        (is (= 1 (:exit result)) "full verification fails")
+        (is (= :drift (get-in result [:results :dev])))
+        (is (str/includes? out "value or type changed")
+            "and names the forged entry as stale")))))
 
 (deftest verify-missing-is-exit-2-and-repl-safe-test
   (let [config (cli/normalize-config (test-config))

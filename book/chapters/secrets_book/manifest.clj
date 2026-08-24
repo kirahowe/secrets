@@ -175,9 +175,18 @@
 
 ;; ## Format versioning
 
-;; Every manifest records `:version 1`. If a future library version changes
-;; the format, `verify` reports an unsupported version as drift and asks you to
-;; regenerate the file or upgrade the library.
+;; Every manifest records `:version 2`. The version names the encoding used to
+;; hash values, and it is mixed into the HMAC key, so a hash written by one
+;; version can never be read as another's. Version 2 frames each value as
+;; `<type-tag>:<code-unit-count>:<payload>`, recursively: because every field
+;; carries its own length, a `=` or `;` *inside* a secret cannot be mistaken for
+;; the encoding's own punctuation, and because every field carries its own type
+;; tag, `[[1]]` and `[(1)]` hash differently. The framed string is hashed as its
+;; raw UTF-16 code units, not through a charset encoder, which would substitute
+;; a replacement character for an unpaired surrogate and fold two distinct
+;; secrets onto one hash. `verify` reports any other version — including a
+;; legacy `:version 1` file — as drift and asks you to regenerate the file with
+;; `reencrypt` or upgrade the library.
 
 ;; ## What the manifest leaks, and how to turn it off
 

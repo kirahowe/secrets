@@ -48,9 +48,11 @@
   secret key material is hashed (see `secret-material`), so the derivation is
   insensitive to age-keygen's `# created:` / `# public key:` comment lines and
   to surrounding whitespace — two copies of the same key always agree. It is
-  domain-separated from every other use of the key material."
+  domain-separated from every other use of the key material, and bound to the
+  manifest encoding version (see `encode`): the same value hashed under two
+  encoding versions can never produce the same `:vhash`."
   ^bytes [identity-contents]
-  (sha256 (.getBytes (str "com.kirahowe.secrets/manifest-v1\n"
+  (sha256 (.getBytes (str "com.kirahowe.secrets/manifest-v2\n"
                           (secret-material identity-contents))
                      "UTF-8")))
 
@@ -75,23 +77,66 @@
     (sequential? v) :list
     :else :other))
 
-(defn- canonical
-  "Return a deterministic string for a value. Sets and map keys are ordered, so
-  equal values serialize identically regardless of hash-map iteration order."
-  [v]
-  (cond
-    (map? v) (->> v (sort-by (comp pr-str key))
-                  (map (fn [[k vv]] (str (pr-str k) \= (canonical vv))))
-                  (str/join ";") (format "{%s}"))
-    (set? v) (->> v (map canonical) sort (str/join ";") (format "#{%s}"))
-    (sequential? v) (->> v (map canonical) (str/join ";") (format "[%s]"))
-    :else (pr-str v)))
+(def ^:private tags
+  "The frame tag of every `value-type` result. One tag per type, so a vector, a
+  list and a set holding equal elements encode differently."
+  {:nil "n" :boolean "b" :string "s" :keyword "k" :symbol "y" :integer "i"
+   :float "f" :inst "t" :map "m" :set "S" :vector "V" :list "L" :other "o"})
+
+(defn- frame
+  "Return `payload` framed as `<tag>:<code-unit-count>:<payload>`."
+  ^String [tag ^String payload]
+  (str tag \: (count payload) \: payload))
+
+(defn- encode
+  "Return the canonical manifest-v2 encoding of `v` as a `String`: exactly one
+  `frame` per value, nested for collections. Because every frame declares the
+  length of its payload in code units, and every character the framing itself
+  uses (the tag, the digits, `:`) is a single code unit, a delimiter character
+  *inside* a value can never be read as structure, so nothing needs escaping;
+  because every frame carries its `tags` entry, `[[1]]` and `[(1)]` differ. Map
+  entries (each the key frame followed by the value frame) and set elements are
+  sorted with `compare` so hash-map and hash-set iteration order cannot leak in;
+  vector and list elements keep their order, which is significant.
+
+  `vhash` hashes this string as `utf16-bytes`, a lossless code-unit stream, so
+  injectivity holds for every Java String rather than only for the ones a
+  charset encoder round-trips. Within a single scalar tag it rests on `pr-str`,
+  which is exact for every value the EDN reader can produce: a `Float` and a
+  `Double` of the same magnitude would collide, but `clojure.edn` only ever
+  produces `Double`. Likewise `:other` is a best-effort tag for values EDN
+  cannot produce."
+  ^String [v]
+  (let [t (value-type v)
+        tag (tags t)]
+    (case t
+      :map (frame tag (apply str (sort (map (fn [[k vv]] (str (encode k) (encode vv))) v))))
+      :set (frame tag (apply str (sort (map encode v))))
+      (:vector :list) (frame tag (apply str (map encode v)))
+      (frame tag (pr-str v)))))
+
+(defn- utf16-bytes
+  "Return the code units of `s` as big-endian byte pairs. A charset encoder is
+  deliberately not used: every JDK charset substitutes an unpaired surrogate
+  (`?` under UTF-8, U+FFFD under UTF-16BE), so two distinct Strings would encode
+  to the same bytes — and `clojure.edn` reads a lone surrogate back, so such a
+  String can reach here from a real secrets file. Copying the code units out
+  directly is lossless for any Java String."
+  ^bytes [^String s]
+  (let [n (count s)
+        out (byte-array (* 2 n))]
+    (dotimes [i n]
+      (let [c (int (.charAt s i))
+            j (* 2 i)]
+        (aset-byte out j (unchecked-byte (bit-shift-right c 8)))
+        (aset-byte out (inc j) (unchecked-byte (bit-and c 0xff)))))
+    out))
 
 (defn- vhash
   "Return the first 8 bytes of the keyed HMAC of `v` as 16 hex characters. This
   reveals that a value changed without revealing it or letting a repo-only attacker brute-force it."
   [^bytes hkey v]
-  (->> (hmac-sha256 hkey (.getBytes (canonical v) "UTF-8"))
+  (->> (hmac-sha256 hkey (utf16-bytes (encode v)))
        (take 8)
        (map #(format "%02x" (bit-and % 0xff)))
        (apply str)))
@@ -114,7 +159,7 @@
   Recurses into non-empty maps; every other value is a leaf. `hkey` is the HMAC
   key (from `hmac-key`) or nil for a structure-only manifest."
   [secrets hkey]
-  (collect-leaves (sorted-map-by (fn [a b] (compare (pr-str a) (pr-str b))))
+  (collect-leaves (sorted-map-by (fn [a b] (compare (encode a) (encode b))))
                   []
                   secrets
                   hkey))
@@ -130,7 +175,7 @@
   (str ";; Auto-generated by `bb secrets` — SAFE TO COMMIT (holds no secret values).\n"
        ";; The shape of the encrypted secrets: each key path and its value type,\n"
        ";; so `git diff` shows which keys changed. Check with `bb secrets verify`.\n"
-       "{:version 1\n"
+       "{:version 2\n"
        " :app " (pr-str app) "\n"
        (when ciphertext-sha
          (str " :ciphertext-sha " (pr-str ciphertext-sha) "\n"))

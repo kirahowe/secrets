@@ -11,6 +11,24 @@ All notable changes to this project are documented here. The format follows
   100-column Clojure style consistently.
 
 ### Changed
+- **BREAKING** — the manifest format is now `:version 2`, and committed
+  manifests must be regenerated with `bb secrets reencrypt <env>`. Value hashes
+  were derived from a rendered string that joined entries with `=` and `;` — the
+  same characters values may contain — and that flattened nested collections, so
+  two different secret graphs could receive the same `:vhash` and a party
+  holding only the public recipient could replace ciphertext, refresh
+  `:ciphertext-sha`, and still pass full verification. Version 2 encodes a value
+  recursively as `<type-tag>:<code-unit-count>:<payload>`, framing every scalar,
+  collection, map key, and map value with its own type and length, and hashes
+  the result as raw UTF-16 code units rather than through a charset encoder that
+  would substitute for unpaired surrogates: `=` and `;` inside a value can no
+  longer be read as structure, `[[1]]`, `[(1)]`, and `#{[1]}` all encode
+  differently, and no two distinct values share a hash. Manifest entry paths are
+  ordered by the same encoding instead of by rendered text, so two distinct
+  paths can no longer compare equal and drop a manifest line. The encoding
+  version is mixed into the HMAC key derivation, so a v1 and a v2 hash of the
+  same value can never coincide, and `verify` and `doctor` reject `:version 1`
+  as an unsupported version rather than diffing it as if it were v2.
 - `add-recipient` now distinguishes first-store bootstrap from recipient
   changes to existing ciphertext: it recommends `set` or `new` before a store
   exists, and `reencrypt` only when ciphertext already needs updating.
