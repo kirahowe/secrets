@@ -1,21 +1,54 @@
-# Dogfooding backlog
+# Dogfooding and alpha security backlog
 
-These issues came from dogfooding the examples on 2026-08-23. Priorities are
-relative ordering for the next pass; each open issue is independently ready to
-pick up in a clean session. Completed items remain linked as decision and
-verification history.
+These issues came from dogfooding the examples and the alpha security review
+on 2026-08-23. Priorities are relative ordering for the next pass; each open
+issue is independently ready to pick up in a clean session. Completed items
+remain linked as decision and verification history.
+
+## Security review classification
+
+Under the review's trusted-repository/private-identity model, no Critical or
+High findings were identified. Priorities are execution order only and do not
+weaken the release gate:
+
+- **Confirmed Medium / alpha release blockers:** 007–015. Every one of these
+  issues must be resolved before alpha, regardless of whether its priority is
+  P0 or P1.
+- **Conditional Medium:** 016–018.
+- **Low:** 019–025, of which 024–025 came from the security review of the 006
+  fix rather than the original audit.
 
 ## Open
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P1 | [004 — Team bootstrap workflow](004-team-bootstrap-workflow.md) | Make first-recipient creation, onboarding, offboarding, and deployment-recipient practice unambiguous and tested. |
-| P2 | [005 — Reader cache lifecycle](005-reader-cache-lifecycle.md) | Make lazy caching, cached failures, reload, and process-restart semantics easy to understand and use correctly. |
+| P0 | [006 — Age option boundary](006-age-option-boundary.md) | Establish an explicit option boundary so a caller-controlled input path can never be parsed as an age option. |
+| P0 | [007 — Secure plaintext file output](007-secure-plaintext-file-output.md) | Publish decrypted files through exclusive owner-only staging with no-follow and atomic replacement. |
+| P0 | [008 — Manifest v2 unambiguous canonicalization](008-manifest-v2-canonicalization.md) | Replace collision-prone value hashes with typed, length-framed v2 encoding and an explicit v1 policy. |
+| P0 | [009 — Snapshot recipients before encryption](009-snapshot-recipients-before-encryption.md) | Encrypt only to one bounded, fully validated recipient snapshot that cannot change after validation. |
+| P0 | [010 — Global artifact collision validation](010-global-artifact-collision-validation.md) | Reject incompatible canonical artifact roles globally across every configured environment. |
+| P0 | [015 — Reproducible guarded release publication](015-guard-release-publication.md) | Publish the exact inspected artifact only from a clean protected exact tag with version and HEAD agreement. |
+| P1 | [011 — Race-safe initializer writes](011-race-safe-initializer-writes.md) | Anchor initializer mutations to no-follow directory operations or fail closed where unavailable. |
+| P1 | [012 — Aero cache lifecycle invalidation](012-aero-cache-lifecycle-invalidation.md) | Retire cached plaintext and failures whenever a registration lifecycle is cleared or replaced. |
+| P1 | [013 — Scope CI identities to consuming steps](013-scope-ci-identities.md) | Expose private identities only to trusted consuming steps and pin the executable example dependencies. |
+| P1 | [014 — Pin CI executable dependencies](014-pin-ci-executable-dependencies.md) | Pin every CI action and container to reviewed immutable content while retaining least privilege. |
+| P1 | [016 — Bound source and plaintext sizes](016-bound-source-and-plaintext-sizes.md) | Enforce configurable limits while streaming sources and plaintext, with prompt cleanup at every boundary. |
+| P1 | [018 — Reduce release dependency exposure](018-reduce-release-dependency-exposure.md) | Isolate a smaller Clojars publisher and enforce an applicability-aware advisory policy before credential use. |
+| P2 | [017 — Sender-authenticity contract](017-sender-authenticity-contract.md) | Explicitly enforce either a protected deployment-channel boundary or separately keyed sender signatures. |
+| P2 | [019 — Safe initializer output](019-safe-initializer-output.md) | Keep credentials out of default initializer output while preserving useful path/action summaries. |
+| P2 | [020 — Shell-safe generated commands](020-shell-safe-generated-commands.md) | Quote every dynamic POSIX argument safely or stop emitting executable shell snippets. |
+| P2 | [021 — Self-host documentation scripts](021-self-host-documentation-scripts.md) | Serve reviewed documentation assets locally and reject unsafe external executable dependencies. |
+| P2 | [022 — Explicit injected-identity temp cleanup](022-injected-identity-temp-cleanup.md) | Delete materialized identities through an explicit concurrency-safe lifecycle while retaining mode `0600`. |
+| P2 | [023 — Redact sensitive exception context](023-redact-sensitive-exception-context.md) | Restrict exception and cache context to allowlisted sanitized source and profile metadata. |
+| P2 | [024 — CLI flag extraction boundary](024-cli-flag-extraction-boundary.md) | Extract `--edn` only where it is defined so an operand can never be consumed as a flag. |
+| P2 | [025 — Blank editor variable](025-blank-editor-variable.md) | Treat a set-but-blank editor variable as unset instead of letting it shadow the next source. |
 
 ## Completed
 
 | Issue | Resolution |
 | --- | --- |
 | [001 — Babashka without Java](001-babashka-without-java.md) | Documented and regression-tested the exact Java-free runtime boundary. |
-| [003 — Doctor command](003-doctor-command.md) | Added safe structured environment diagnostics, verification capability reporting, and stable 0/1/2 exits. |
 | [002 — Project initialization](002-project-initialization.md) | Added a preview-first standalone initializer and verified three-command tracked and disposable consumer flows. |
+| [003 — Doctor command](003-doctor-command.md) | Added safe structured environment diagnostics, verification capability reporting, and stable 0/1/2 exits. |
+| [004 — Team bootstrap workflow](004-team-bootstrap-workflow.md) | Clarified and tested first-owner bootstrap, teammate re-encryption, offboarding, and deployment-recipient practice (`48f6e55`). |
+| [005 — Reader cache lifecycle](005-reader-cache-lifecycle.md) | Documented and tested native reader recreation, Aero reset, cached failures, and restart semantics (`e49294f`). |
