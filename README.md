@@ -671,7 +671,7 @@ manifest is reported as `skipped`.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
 
-`com.kirahowe.secrets.age` — `version`, `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte). The positional input is passed behind an option terminator (`--`), and every path-valued argument — that input, the `-o` output, the `-i` identity, the `-R` recipients file — is normalized so a dash-leading path becomes `./-name`, so filenames beginning with `-` (including names identical to age options) work like any other file; a blank or nil path throws `ex-info` instead of falling back to stdin. `:recipients` strings are recipient *values*, not paths, and are passed through as given.
+`com.kirahowe.secrets.age` — `version`, `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte). The positional input is passed behind an option terminator (`--`), and every path-valued argument — that input, the `-o` output, the `-i` identity, the `-R` recipients file — is normalized so a dash-leading path becomes `./-name`, so filenames beginning with `-` (including names identical to age options) work like any other file; a blank or nil path throws `ex-info` instead of falling back to stdin. `:recipients` strings are recipient *values*, not paths, and are passed through as given. `decrypt-to-file!` publishes plaintext only through an owner-only (0600) sibling staging file that is then atomically moved over the destination: the published file is 0600 whatever the umask and whatever mode the destination had before, the destination's final component is validated without following links so a symlink or other non-regular destination is refused, and a decryption, write, or move failure removes the staging plaintext and leaves the previous destination intact. On a filesystem without POSIX permissions it fails closed rather than writing plaintext with default permissions — use `decrypt-bytes` or `decrypt`, which never write plaintext to disk.
 
 `com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
 
@@ -792,6 +792,14 @@ you're trading for that simplicity.
   created owner-only (0600) atomically on POSIX filesystems. On non-POSIX
   filesystems (e.g. Windows) the permissions are applied best-effort after
   creation — the library targets POSIX systems.
+- **Decrypted plaintext files are published 0600, never written in place.**
+  `decrypt-to-file!` writes into an owner-only sibling staging file and then
+  atomically renames it over the destination, so the result does not depend on
+  the umask or on the destination's previous mode and no permissive or partial
+  plaintext is ever observable there. A destination that is a symlink,
+  directory, or other non-regular file is refused rather than written through,
+  and a filesystem without POSIX permissions fails closed — decrypt in memory
+  with `decrypt-bytes` / `decrypt` instead.
 - **Pathnames reaching `age` are data, never options.** Encryption and
   decryption shell out to the `age` binary, so a path that arrived on its
   command line as an option would let a filename choose the operation instead of

@@ -44,6 +44,25 @@ All notable changes to this project are documented here. The format follows
   special operand after option parsing ends. The editor operand is likewise
   made absolute before it reaches the shell/editor, because a relative
   `java.io.tmpdir` can otherwise produce a dash-leading temporary pathname.
+- `age/decrypt-to-file!` no longer writes plaintext through the destination
+  pathname it was handed. Previously a newly created output inherited process
+  defaults — confirmed as mode `0644` under umask `022` — and an existing
+  destination symlink was followed, so the public API could disclose plaintext
+  through permissions or write through a link outside the selected directory.
+  Plaintext now reaches the filesystem only through a sibling staging file that
+  `createTempFile` opens `CREATE_NEW` with owner-only (`0600`) permissions as a
+  creation attribute, so the mode never depends on umask and a guessed staging
+  name can never be the file written; the permissions are read back and
+  verified before any bytes are written. The destination's final component is
+  validated without following links (a symlinked *parent* stays legitimate) and
+  a symlink, directory, or other non-regular destination is refused. Success
+  publishes by atomic rename in the same directory, so the destination is 0600
+  whatever mode it had before and is never observable as permissive or partial
+  plaintext; decryption runs before any staging file exists, and a write,
+  permission, or move failure removes the staging plaintext and leaves the
+  previous destination intact. A filesystem without POSIX permissions fails
+  closed rather than downgrading to default permissions — use `decrypt-bytes`
+  or `decrypt`, which never write plaintext to disk.
 
 ## [0.1.0] - 2026-08-21
 

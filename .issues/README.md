@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P0 | [007 — Secure plaintext file output](007-secure-plaintext-file-output.md) | Publish decrypted files through exclusive owner-only staging with no-follow and atomic replacement. |
 | P0 | [008 — Manifest v2 unambiguous canonicalization](008-manifest-v2-canonicalization.md) | Replace collision-prone value hashes with typed, length-framed v2 encoding and an explicit v1 policy. |
 | P0 | [009 — Snapshot recipients before encryption](009-snapshot-recipients-before-encryption.md) | Encrypt only to one bounded, fully validated recipient snapshot that cannot change after validation. |
 | P0 | [010 — Global artifact collision validation](010-global-artifact-collision-validation.md) | Reject incompatible canonical artifact roles globally across every configured environment. |
@@ -52,3 +51,4 @@ weaken the release gate:
 | [004 — Team bootstrap workflow](004-team-bootstrap-workflow.md) | Clarified and tested first-owner bootstrap, teammate re-encryption, offboarding, and deployment-recipient practice (`48f6e55`). |
 | [005 — Reader cache lifecycle](005-reader-cache-lifecycle.md) | Documented and tested native reader recreation, Aero reset, cached failures, and restart semantics (`e49294f`). |
 | [006 — Age option boundary](006-age-option-boundary.md) | Closed the age argument boundary with an explicit option terminator plus `./` normalization of every path-valued argument, made blank and nil paths fail closed, and folded in the CLI secure-delete operand boundary. |
+| [007 — Secure plaintext file output](007-secure-plaintext-file-output.md) | Published decrypted plaintext only through an owner-only staging file with no-follow destination validation and atomic replacement, and made non-POSIX filesystems fail closed. |

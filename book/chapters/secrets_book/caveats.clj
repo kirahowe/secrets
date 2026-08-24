@@ -93,10 +93,15 @@
 ;; The exception is keyless `verify`, which compares hashes and needs neither
 ;; an identity nor the binary.
 
-;; POSIX file permissions are assumed. On Windows, the owner-only guarantees
-;; on temp files degrade to best effort, and the secure-delete path does not
-;; exist. The library targets POSIX systems; treat Windows as unsupported for
-;; anything beyond reading.
+;; POSIX file permissions are assumed. Writing decrypted plaintext to a file
+;; now *requires* them: `decrypt-to-file!` stages plaintext in an owner-only
+;; sibling file and fails closed if that mode cannot be established and
+;; verified, rather than falling back to whatever the platform defaults to.
+;; In-memory decryption (`decrypt`, `decrypt-bytes`, `load-secrets`) needs no
+;; permissions and still works. On Windows the owner-only guarantees on temp
+;; files degrade to best effort and the secure-delete path does not exist. The
+;; library targets POSIX systems; treat Windows as unsupported for anything
+;; beyond reading — which this makes literal.
 
 ;; ## When to use something else
 
