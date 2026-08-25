@@ -1,5 +1,6 @@
 (ns com.kirahowe.secrets.init-test
-  (:require [clojure.java.io :as io]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer [are deftest is testing use-fixtures]]
@@ -91,13 +92,20 @@
             :layout :disposable
             :team? true
             :keygen? true
-            :apply? true}
+            :apply? true
+            :show-contents? true}
            (init/parse-args ["--app" "reader"
                              "--env" "prod"
                              "--layout" "disposable"
                              "--team"
                              "--keygen"
-                             "--apply"]))))
+                             "--apply"
+                             "--show-contents"]))))
+  (testing "unknown options"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"Unknown option: --show-content"
+                          (init/parse-args ["--app" "reader" "--show-content"]))
+        "a near miss for the content opt-in is refused, never ignored"))
   (testing "required values"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"required"
@@ -198,21 +206,155 @@
       (is (false? @called))
       (is (not (.exists (io/file *dir* "bb.edn")))))))
 
-(deftest preview-shows-before-and-after-content-test
-  (let [out (with-out-str
-              (init/print-preview!
-               {:changes
-                [{:path "bb.edn"
-                  :old "{:paths [\"src\"]}\n"
-                  :content "{:paths [\"src\"] :deps {x/y {}}}\n"}
-                 {:path "secrets/secrets.edn.example"
-                  :old nil
-                  :content "{:example/api-key \"replace-me\"}\n"}]}))]
-    (is (str/includes? out "--- a/bb.edn"))
-    (is (str/includes? out "-{:paths [\"src\"]}"))
-    (is (str/includes? out "+{:paths [\"src\"] :deps {x/y {}}}"))
-    (is (str/includes? out "--- /dev/null"))
-    (is (str/includes? out "+{:example/api-key \"replace-me\"}"))))
+(defn- captured
+  "Run `f`, returning everything it printed on both streams.
+
+  A preview that moved a credential from stdout to stderr is not a fix, so
+  every output assertion below sees both."
+  [f]
+  (let [err (java.io.StringWriter.)
+        out (with-out-str (binding [*err* err] (f)))]
+    {:out out :err (str err)}))
+
+(defn- bb-edn-with! [entry]
+  (spit (io/file *dir* "bb.edn") (str "{:paths [\"src\"]\n " entry "}\n")))
+
+(defn- interactive-preview [entry]
+  (bb-edn-with! entry)
+  (:out (captured #(init/init! {:root *dir*
+                                :app "reader"
+                                :tty? true
+                                :choice :cancel}))))
+
+(defn- hidden-from-preview?
+  "Does an interactive preview of `entry` hide `sentinel` while still reporting
+  the change?"
+  [entry sentinel]
+  (let [out (interactive-preview entry)]
+    (and (not (str/includes? out sentinel))
+         (not (str/includes? out "\u001b"))
+         (str/includes? out "bb.edn")
+         (str/includes? out "@@"))))
+
+(def ^:private long-token "kAT3xQ9pLm2ZbVn7RsW4YtE6uH1jG5dC")
+(def ^:private age-identity
+  (str "AGE-SECRET-KEY-1" "9QY7ZPTX4V2M6KLHW3RUJ8ND5SGAEF0C" "7XQ2VMTHKR"))
+(def ^:private long-line-tail "TAIL-SENTINEL-PAST-THE-LIMIT")
+
+(deftest apply-output-contains-no-file-bodies-test
+  (bb-edn-with! (str ":db-password \"" long-token "\""))
+  (let [{:keys [out err]} (captured #(init/init! {:root *dir*
+                                                  :app "reader"
+                                                  :apply? true
+                                                  :tty? false}))
+        bb (edn/read-string (slurp (io/file *dir* "bb.edn")))]
+    (testing "neither stream carries a body of a file being replaced"
+      (is (not (str/includes? out long-token)))
+      (is (not (str/includes? err long-token))))
+    (testing "every action is still named"
+      (is (str/includes? out "bb.edn: merge into the existing file"))
+      (is (str/includes? out "secrets/secrets.edn.example: create"))
+      (is (str/includes? out "bb.edn: merged")))
+    (testing "the merged file is still correct"
+      (is (= long-token (:db-password bb)))
+      (is (= ["src"] (:paths bb)))
+      (is (contains? (:deps bb) 'io.github.kirahowe/secrets))
+      (is (contains? (:tasks bb) 'secrets)))))
+
+(deftest interactive-preview-redacts-and-escapes-test
+  (testing "a planted sentinel never reaches an interactive preview verbatim"
+    (are [entry sentinel] (hidden-from-preview? entry sentinel)
+      (str ":build-id \"" long-token "\"") long-token
+      (str ":identity \"" age-identity "\"") age-identity
+      ":db-password \"hunter2-plaintext\"" "hunter2-plaintext"
+      ":notes \"\u001b[2J\u001b[1;31mrepainted\"" "\u001b[2J"
+      ":notes \"before\rafter\"" "\r"
+      (str ":notes \"" (apply str (repeat 300 \x)) long-line-tail "\"")
+      long-line-tail))
+  (testing "a control sequence is rendered as text, never emitted"
+    (let [out (interactive-preview ":notes \"\u001b[2Jrepainted\"")]
+      (is (str/includes? out "\\x1b"))
+      (is (str/includes? out "repainted")
+          "escaping the sequence keeps the surrounding line readable")))
+  (testing "a hidden value still says how much it hid"
+    (is (str/includes? (interactive-preview (str ":build-id \"" long-token "\""))
+                       (str "[redacted " (count long-token) " characters]"))))
+  (testing "an over-long line is marked as truncated"
+    (is (str/includes? (interactive-preview
+                        (str ":notes \"" (apply str (repeat 300 \x)) "\""))
+                       "more characters]"))))
+
+(deftest full-contents-require-explicit-opt-in-test
+  (let [entry (str ":db-password \"" long-token "\"")]
+    (testing "the opt-in prints whole bodies, warning first"
+      (bb-edn-with! entry)
+      (let [{:keys [out]} (captured #(init/init! {:root *dir*
+                                                  :app "reader"
+                                                  :tty? true
+                                                  :choice :cancel
+                                                  :show-contents? true}))]
+        (is (str/includes? out "--- a/bb.edn"))
+        (is (str/includes? out "--- /dev/null"))
+        (is (str/includes? out (str "- :db-password \"" long-token "\"}")))
+        (is (str/includes? out "+{:example/api-key \"replace-me\"}"))
+        (is (< (str/index-of out "WARNING") (str/index-of out "--- a/bb.edn"))
+            "the warning precedes the first body line")))
+    (testing "an interactive run without the flag prints no body"
+      (is (not (str/includes? (interactive-preview entry) "--- a/bb.edn"))))
+    (testing "--apply alone does not enable it"
+      (bb-edn-with! entry)
+      (let [{:keys [out]} (captured #(init/init! {:root *dir*
+                                                  :app "reader"
+                                                  :tty? true
+                                                  :apply? true}))]
+        (is (not (str/includes? out long-token))
+            "an interactive apply gets the safe mode, not the interactive one")
+        (is (not (str/includes? out "--- a/bb.edn")))))))
+
+(deftest summaries-remain-auditable-test
+  (testing "the tracked layout names every proposed path and action"
+    (let [{:keys [out]} (captured #(init/init! {:root *dir*
+                                                :app "reader"
+                                                :tty? false}))]
+      (is (str/includes? out "bb.edn: create"))
+      (is (str/includes? out "secrets/secrets.edn.example: create"))
+      (is (str/includes? out "2 files to write, 0 left as is."))))
+  (testing "the disposable team layout names all four"
+    (let [{:keys [out]} (captured #(init/init! {:root *dir*
+                                                :app "reader"
+                                                :layout :disposable
+                                                :team? true
+                                                :tty? false}))]
+      (is (str/includes? out "bb.edn: create"))
+      (is (str/includes? out ".gitignore: create"))
+      (is (str/includes? out ".local/secrets/recipients.txt: create"))
+      (is (str/includes? out "secrets/secrets.edn.example: create"))
+      (is (str/includes? out "4 files to write, 0 left as is."))))
+  (testing "a preserved file is reported rather than silently dropped"
+    (let [template (io/file *dir* "secrets/secrets.edn.example")]
+      (.mkdirs (.getParentFile template))
+      (spit template "{:custom/value 42}\n")
+      (let [{:keys [out]} (captured #(init/init! {:root *dir*
+                                                  :app "reader"
+                                                  :tty? false}))]
+        (is (str/includes?
+             out "secrets/secrets.edn.example: leave as is, existing file preserved"))
+        (is (str/includes? out "1 file to write, 1 left as is."))))))
+
+(deftest status-map-carries-no-file-bodies-test
+  (bb-edn-with! (str ":db-password \"" long-token "\""))
+  (let [applied (binding [*out* (java.io.StringWriter.)]
+                  (init/init! {:root *dir*
+                               :app "reader"
+                               :apply? true
+                               :tty? false}))]
+    (is (not (str/includes? (pr-str applied) long-token))
+        "a caller printing the status map is the same disclosure by another route")
+    (is (= :applied (:status applied)))
+    (is (true? (:trusted? (:trust applied))))
+    (is (= [{:path "bb.edn" :action :merge}
+            {:path "secrets/secrets.edn.example" :action :create}]
+           (:actions applied)))))
 
 (deftest injected-choice-function-is-invoked-test
   (is (= :manual
@@ -472,5 +614,6 @@
         (is (false? (:trusted? (:trust @result))))
         (is (= :world-writable (:reason (:trust @result))))
         (is (str/includes? out "would be refused"))
-        (is (str/includes? out "--- /dev/null") "the preview itself still runs")
+        (is (str/includes? out "secrets/secrets.edn.example: create")
+            "the preview itself still runs")
         (is (not (.exists (io/file project "bb.edn"))))))))

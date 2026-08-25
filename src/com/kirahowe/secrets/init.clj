@@ -55,6 +55,7 @@
         "--team" (recur (next xs) (assoc opts :team? true))
         "--keygen" (recur (next xs) (assoc opts :keygen? true))
         "--apply" (recur (next xs) (assoc opts :apply? true))
+        "--show-contents" (recur (next xs) (assoc opts :show-contents? true))
         "--help" (assoc opts :help? true)
         (throw (ex-info (str "Unknown option: " x) {:argument x})))
       (do
@@ -378,8 +379,15 @@
                       {:path path :cause (.getMessage e)}
                       e)))))
 
+(def ^:private write-actions #{:create :merge})
+
 (defn proposed-changes
-  "Plan all writes and run the CLI's canonical collision validation first."
+  "Plan all writes and run the CLI's canonical collision validation first.
+
+  Returns `:changes`, the entries to write, and `:actions`, one `:path` and
+  `:action` (`:create`, `:merge`, `:preserve`, or `:unchanged`) per proposed
+  file so every one of them stays auditable. Neither retains the existing
+  contents of a file it is about to replace."
   [{:keys [root layout team?] :as opts}]
   (let [root (or root ".")
         config (proposed-config opts)
@@ -425,42 +433,233 @@
                    (not preserve?))
           (throw (ex-info "Refusing to overwrite existing initializer artifact"
                           {:path path})))))
-    {:config config
-     :normalized-config normalized
-     :changes (->> raw
-                   (map (fn [{:keys [path] :as entry}]
-                          (assoc entry
-                                 :old
-                                 (when (.exists (io/file root path))
-                                   (slurp (io/file root path))))))
-                   (filter (fn [{:keys [content old replace? preserve?]}]
-                             (and (not preserve?)
-                                  (or (not replace?) (not= content old)))))
-                   vec)}))
+    (let [planned (mapv (fn [{:keys [path content preserve?] :as entry}]
+                          (let [file (io/file root path)
+                                ;; The old body is read to detect a change and
+                                ;; classify the action, then dropped. Nothing
+                                ;; downstream needs it — `apply-changes!` reads
+                                ;; the bytes it rolls back for itself — and a
+                                ;; plan that carries it can only disclose it.
+                                old (when (.exists file) (slurp file))]
+                            (-> entry
+                                (dissoc :replace? :preserve?)
+                                (assoc :action
+                                       (cond
+                                         preserve? :preserve
+                                         (= content old) :unchanged
+                                         (some? old) :merge
+                                         :else :create)))))
+                        raw)]
+      {:config config
+       :normalized-config normalized
+       :actions (mapv #(select-keys % [:path :action]) planned)
+       :changes (filterv (comp write-actions :action) planned)})))
+
+;;;; Safe Output
+;;; A previewed file is untrusted input to the terminal, and the file most
+;;; likely to be replaced is the consumer's own bb.edn, which may already hold
+;;; a credential nobody asked to see. Every character taken from file content
+;;; or from a path reaches stdout through `render-line` or `render-path`.
+
+(def ^:private max-line-width 160)
+
+(def ^:private named-escapes
+  {\newline "\\n"
+   \return "\\r"
+   \tab "\\t"
+   \formfeed "\\f"
+   \backspace "\\b"})
+
+(defn- control? [code]
+  (or (< code 0x20) (= code 0x7f) (<= 0x80 code 0x9f)))
+
+(defn- escape-control
+  "Render control characters, `ESC` first among them, as printable escapes.
+
+  A crafted file could otherwise repaint the terminal previewing it and hide
+  what is about to be written; a literal `\\x1b` cannot."
+  [s]
+  (str/join
+   (for [c s]
+     (cond
+       (named-escapes c) (named-escapes c)
+       (control? (int c)) (format "\\x%02x" (int c))
+       :else c))))
+
+(def ^:private sensitive-value
+  (let [name-part "[-\\w.:/*+!?<>$]*"
+        secretish "(?:secret|token|password|key|credential)"
+        ;; The separator is required, so the closing quote of one string cannot
+        ;; open a quoted "value" that runs on into the next one.
+        separator "(?:\"?\\s*[:=]\\s*|\"?\\s+)"
+        value "(\"[^\"]*\"|[-\\w+/=.:@~$]{4,})"]
+    (re-pattern (str "(?i)(" name-part secretish name-part separator ")" value))))
+(def ^:private age-secret-key #"AGE-SECRET-KEY-1[0-9A-Za-z]+")
+(def ^:private opaque-token #"[A-Za-z0-9+/=_-]{32,}")
+
+(defn- hidden-marker [s]
+  (str "[redacted " (count s) " characters]"))
+
+(defn- letters-and-digits? [s]
+  (boolean (and (re-find #"[A-Za-z]" s) (re-find #"[0-9]" s))))
+
+(defn- redact
+  "Replace the values that most obviously carry a credential with a marker
+  naming how many characters it hid.
+
+  Three deliberately simple rules — a value under a key named like a secret, an
+  `AGE-SECRET-KEY-1…` identity, and a long opaque token — and not a general
+  secret scanner, which is an explicit non-goal. It over-redacts on purpose: a
+  Git SHA and a `:secrets-file` path go the same way as a real credential, and
+  `--show-contents` is the way to read what a preview hid."
+  [s]
+  (-> s
+      (str/replace sensitive-value (fn [[_ k v]] (str k (hidden-marker v))))
+      (str/replace age-secret-key hidden-marker)
+      (str/replace opaque-token
+                   #(if (letters-and-digits? %) (hidden-marker %) %))))
+
+(defn- truncate [s]
+  (if (<= (count s) max-line-width)
+    s
+    (str (subs s 0 max-line-width)
+         " [truncated, " (- (count s) max-line-width) " more characters]")))
+
+(defn- render-path
+  "Make a path safe to print. Redaction is not applied: a path is a name, not a
+  value, and the rules would mangle `secrets/key.txt`."
+  [path]
+  (truncate (escape-control (str path))))
+
+(defn- render-line
+  "Make one line of file content safe to print: redacted, escaped, bounded."
+  [line]
+  (truncate (escape-control (redact line))))
 
 ;;;; Preview and Application
 
-(defn- print-content-diff! [{:keys [path old content]}]
-  (println (str "--- " (if (nil? old) "/dev/null" (str "a/" path))))
-  (println (str "+++ b/" path))
-  ;; A complete line-oriented replacement is deliberately simple, predictable,
-  ;; and dependency-free. It still makes every proposed byte visible before
-  ;; mutation, unlike a filename-only preview.
+(def ^:private proposed-labels
+  {:create "create"
+   :merge "merge into the existing file"
+   :preserve "leave as is, existing file preserved"
+   :unchanged "leave as is, already current"})
+(def ^:private applied-labels
+  {:create "created" :merge "merged"})
+
+(def ^:private contents-warning
+  [" WARNING: --show-contents prints complete file contents to stdout,"
+   " including whatever the files being replaced already hold. A credential"
+   " already sitting in one of them (an existing bb.edn, most likely) is"
+   " printed unredacted, so do not do this into a shared log."])
+
+(defn- print-action! [{:keys [path action]}]
+  (println (str " " (render-path path) ": " (proposed-labels action))))
+
+(defn- print-counts! [actions]
+  (let [writes (count (filter (comp write-actions :action) actions))]
+    (println (str " " writes (if (= 1 writes) " file to write, " " files to write, ")
+                  (- (count actions) writes) " left as is."))))
+
+(def ^:private hunk-context 3)
+
+(defn- common-count [xs ys]
+  (count (take-while true? (map = xs ys))))
+
+(defn- changed-region
+  "Bound the changed region between two vectors of lines, with context.
+
+  Common leading and trailing lines are peeled off, which is exactly right for
+  the merges the initializer proposes: they append to an existing file, so the
+  region is small however long the file is."
+  [olds news]
+  (let [prefix (common-count olds news)
+        tail (min (common-count (reverse olds) (reverse news))
+                  (- (count olds) prefix)
+                  (- (count news) prefix))
+        old-end (- (count olds) tail)
+        new-end (- (count news) tail)
+        from (max 0 (- prefix hunk-context))
+        until (min (count olds) (+ old-end hunk-context))]
+    {:from from
+     :before (subvec olds from prefix)
+     :removed (subvec olds prefix old-end)
+     :added (subvec news prefix new-end)
+     :after (subvec olds old-end until)}))
+
+(defn- lines [content]
+  (if (nil? content) [] (vec (str/split-lines content))))
+
+(defn- span [from n]
+  (str (if (zero? n) 0 (inc from)) "," n))
+
+(defn- print-hunk! [old content]
+  (let [olds (lines old)
+        news (lines content)
+        {:keys [from before removed added after]} (changed-region olds news)
+        context (+ (count before) (count after))]
+    (println (str "  @@ -" (span from (+ context (count removed)))
+                  " +" (span from (+ context (count added))) " @@"))
+    (doseq [line before]
+      (println (str "   " (render-line line))))
+    (doseq [line removed]
+      (println (str "  -" (render-line line))))
+    (doseq [line added]
+      (println (str "  +" (render-line line))))
+    (doseq [line after]
+      (println (str "   " (render-line line))))))
+
+(defn- print-content! [path old content]
+  (println (str "--- " (if (nil? old) "/dev/null" (str "a/" (render-path path)))))
+  (println (str "+++ b/" (render-path path)))
   (when (some? old)
     (doseq [line (str/split-lines old)]
       (println (str "-" line))))
   (doseq [line (str/split-lines content)]
     (println (str "+" line))))
 
+(defn- current-content
+  "Read what is on disk at `path` under `root`, to render it and let it go."
+  [root path]
+  (let [file (io/file (str root) path)]
+    (when (.exists file)
+      (slurp file))))
+
+(defn- print-body! [mode root {:keys [path content]}]
+  (if (= :full mode)
+    (print-content! path (current-content root path) content)
+    (print-hunk! (current-content root path) content)))
+
+(defn- print-plan! [mode root actions changes]
+  (let [bodies (when (not= :summary mode)
+                 (into {} (map (juxt :path identity)) changes))]
+    (doseq [{:keys [path] :as action} actions]
+      (print-action! action)
+      (when-let [change (get bodies path)]
+        (print-body! mode root change)))
+    (print-counts! actions)))
+
 (defn print-preview!
-  "Print the proposed initializer changes."
-  [{:keys [changes]}]
+  "Print the proposed initializer changes.
+
+  `:mode` decides how much of a file reaches stdout. `:summary`, the default and
+  what every noninteractive or `--apply` run gets, names each path and its
+  action and prints no file body at all. `:hunks` adds the changed region of
+  each file, redacted and escaped. `:full` prints whole bodies behind a warning,
+  and only because `--show-contents` asked for them."
+  [{:keys [root actions changes mode]}]
   (println "Secrets initializer preview:")
-  (if (seq changes)
-    (doseq [change changes]
-      (print-content-diff! change))
+  (when (= :full mode)
+    (run! println contents-warning))
+  (if (seq actions)
+    (print-plan! (or mode :summary) root actions changes)
     (println " no project changes are needed."))
   (println " Private identities are never created unless --keygen is supplied."))
+
+(defn- print-applied! [changes]
+  (when (seq changes)
+    (println "Applied:")
+    (doseq [{:keys [path action]} changes]
+      (println (str " " (render-path path) ": " (applied-labels action))))))
 
 (def ^:private staging-options
   ;; O_CREAT|O_EXCL: the open fails outright on any existing entry, a symlink
@@ -585,11 +784,27 @@
     (println (str " Race safety: not established, so applying would be refused. "
                   message))))
 
+(defn- output-mode
+  "Choose how much file content this run's preview may print.
+
+  `--show-contents` is the only route to complete bodies. Otherwise a
+  noninteractive or `--apply` run gets path-and-action summaries and an
+  interactive preview gets redacted hunks, so wherever two modes could apply the
+  safer one wins: an interactive `--apply` run prints no bodies either."
+  [{:keys [show-contents? apply? tty?]}]
+  (cond
+    show-contents? :full
+    (or apply? (not tty?)) :summary
+    :else :hunks))
+
 (defn init!
   "Preview and optionally apply. `:root`, `:tty?`, `:choice`, and `:input` are
   injectable for tests. A non-TTY caller must set :apply? to mutate files.
   The returned map carries `:trust`, the [[root-trust]] report the preview
-  printed, so no caller has to infer whether race safety was established."
+  printed, so no caller has to infer whether race safety was established, and
+  `:actions`, one path and action per proposed file. It deliberately carries no
+  file contents: a caller that prints its status map would otherwise disclose
+  whatever the files it touched already held."
   [opts]
   (let [opts (merge {:root "."
                      :tty? (some? (System/console))
@@ -598,17 +813,18 @@
                     opts)
         proposal (assoc (proposed-changes opts) :root (:root opts))
         trust (root-trust (:root opts))
-        _ (print-preview! proposal)
+        _ (print-preview! (assoc proposal :mode (output-mode opts)))
         _ (print-trust! trust)
         selected (cond
                    (:apply? opts) :apply
                    (:tty? opts) (choice! opts)
                    :else :preview)
-        result {:changes (:changes proposal) :trust trust}]
+        result {:actions (:actions proposal) :trust trust}]
     (case selected
       :apply
       (do
         (apply-changes! (:root opts) (:changes proposal))
+        (print-applied! (:changes proposal))
         (when (:keygen? opts)
           (cli/keygen! (:normalized-config proposal) (:env opts)))
         (assoc result :status :applied))
@@ -638,7 +854,8 @@
       (if (:help? opts)
         (println
          (str "Usage: bb -Sdeps '<coordinate>' -m com.kirahowe.secrets.init --app NAME "
-              "[--env dev] [--layout tracked|disposable] [--team] [--keygen] [--apply]"))
+              "[--env dev] [--layout tracked|disposable] [--team] [--keygen] [--apply] "
+              "[--show-contents]"))
         (init! opts)))
     (catch clojure.lang.ExceptionInfo e
       (binding [*out* *err*]

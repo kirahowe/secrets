@@ -84,12 +84,13 @@ absolute `src` path):
 bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
 ```
 
-The initializer proposes a minimal `dev` store, shows the complete `bb.edn` and
-template diff, and then offers to apply it, print the configuration for manual
-integration, or cancel. `--keygen` is an explicit request to generate the
-identity at `~/.config/myapp/key.txt`; it runs only after you accept and the
-public scaffold succeeds. Omit it to leave all private-key handling for a later
-`bb secrets keygen` command. Nothing is committed automatically.
+The initializer proposes a minimal `dev` store, names every file it would
+create, merge, or leave alone, and then offers to apply it, print the
+configuration for manual integration, or cancel. `--keygen` is an explicit
+request to generate the identity at `~/.config/myapp/key.txt`; it runs only
+after you accept and the public scaffold succeeds. Omit it to leave all
+private-key handling for a later `bb secrets keygen` command. Nothing is
+committed automatically.
 
 The default tracked layout is:
 
@@ -106,8 +107,10 @@ dependency or `secrets` task is refused rather than overwritten. Existing valid
 templates and hand-maintained recipients files are also preserved.
 
 For a non-interactive scaffold, `--apply` is the explicit confirmation after
-the preview. Other layout options are described under [Initialization
-layouts](#initialization-layouts).
+the preview; it prints paths and actions only. Other layout options are
+described under [Initialization layouts](#initialization-layouts), and what a
+preview does and does not print under [Preview
+output](#initializer-preview-output).
 
 **2. Set the first value through stdin.** This interactive shell form disables
 echo while reading and never places the value in shell history or a process
@@ -616,6 +619,39 @@ The common CLI schema is only `:app`, `:default-environment`, and an environment
 with `:secrets-file`. Template, manifest, and key paths derive from that minimum;
 disposable and multi-recipient layouts make their exceptional paths explicit.
 
+### Initializer preview output
+
+The file most likely to be replaced is the consumer's own `bb.edn`, which may
+already hold a credential. A preview therefore has three modes, and the safe
+one is the default:
+
+| Run | Printed |
+| --- | --- |
+| noninteractive, or `--apply` | every path and its action (create, merge, leave as is) plus the counts — no file bodies at all |
+| interactive, no flag | the same summary, plus the changed region of each file only: redacted, escaped, and line-length bounded |
+| `--show-contents` | complete old and new bodies, unredacted, behind a warning printed first |
+
+`--show-contents` is the only route to complete contents. Neither `--apply` nor
+a noninteractive run nor anything else implies it, and when both could apply the
+safe mode wins: an interactive `--apply` run prints no bodies either. The
+warning it prints says plainly that a credential already sitting in one of these
+files is about to reach stdout.
+
+Redaction in the interactive mode is a targeted guard, not a secret scanner:
+three rules cover a value under a key named like a secret, an
+`AGE-SECRET-KEY-1…` identity, and a long opaque token, each replaced by a marker
+naming how many characters it hid. It over-redacts by design — a Git SHA and a
+`:secrets-file` path go the same way as a real credential — and
+`--show-contents` is how to read what a preview hid. Control characters,
+`ESC` first among them, are rendered as printable escapes rather than emitted,
+because a previewed file is untrusted input to the terminal: a crafted `bb.edn`
+must not be able to repaint what the operator is deciding on.
+
+The plan behind the preview keeps no file bodies it does not need. Existing
+contents are read to detect a change and classify the action, then dropped;
+`init!`'s status map carries `:actions` and `:trust` and no contents at all, so
+a programmatic caller printing it discloses nothing either.
+
 ## Environments
 
 Each environment is an independent encrypted file. By default they share one key
@@ -855,13 +891,15 @@ manifest is reported as `skipped`.
 
 `com.kirahowe.secrets.init` — Babashka-only project bootstrap entrypoint.
 `(-main & args)` parses `--app`, optional `--env`, `--layout`, `--team`,
-`--keygen`, and `--apply`; `(init! opts)` exposes the preview/apply operation for
-programmatic use, returning a status map that carries the `:trust` report the
-preview printed. It preserves `bb.edn` formatting with Babashka's bundled
-`rewrite-clj`, refuses conflicts and unsafe paths, and refuses to mutate a
-project at all unless `(trusted-ancestry! root)` proves the root's ancestry
-untamperable and `(filesystem-capability)` reports the POSIX attributes that
-proof needs.
+`--keygen`, `--apply`, and `--show-contents`; `(init! opts)` exposes the
+preview/apply operation for programmatic use, returning a status map that
+carries the `:trust` report the preview printed and `:actions`, one path and
+action per proposed file, and deliberately no file contents. It preserves
+`bb.edn` formatting with Babashka's bundled `rewrite-clj`, refuses conflicts and
+unsafe paths, prints paths and actions rather than file bodies unless
+`--show-contents` explicitly asks for them, and refuses to mutate a project at
+all unless `(trusted-ancestry! root)` proves the root's ancestry untamperable
+and `(filesystem-capability)` reports the POSIX attributes that proof needs.
 
 ## Examples
 

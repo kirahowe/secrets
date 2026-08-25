@@ -172,6 +172,27 @@ All notable changes to this project are documented here. The format follows
   it writes nothing, but it now reports whether applying would be refused — and
   `init!`'s status map carries that `:trust` report — so a refusal is visible
   before apply is chosen rather than after.
+- Initializer output no longer prints file bodies by default. A noninteractive
+  or `--apply` run names every proposed and completed path with its action —
+  create, merge, or leave as is — and the honest counts, and prints no old or
+  new contents at all; an interactive preview adds only the changed region of
+  each file, with control characters rendered as printable escapes so a crafted
+  `bb.edn` cannot repaint the decision it is being previewed for, and with
+  obvious credentials replaced by a marker naming how many characters it hid.
+  Complete contents now require the new `--show-contents`, which prints a
+  warning first and is implied by nothing else: where both could apply the safe
+  mode wins, so an interactive `--apply` run prints no bodies either. Previously
+  a credential already sitting in a file the initializer was about to replace —
+  realistically the consumer's own `bb.edn`, since the merge preserves what is
+  there — was copied to stdout even in an unattended apply, and from there to
+  any captured log (CWE-532). Planning stopped retaining it too: existing
+  contents are read to detect a change and classify the action, then dropped,
+  and `init!`'s status map carries `:actions` and `:trust` in place of
+  `:changes`, so a caller printing the status map is no longer the same
+  disclosure by another route. Redaction is deliberately three simple rules and
+  not a secret scanner: it over-redacts, hiding a Git SHA or a `:secrets-file`
+  path as readily as a real credential, and `--show-contents` is how to read
+  what a preview hid.
 - **BREAKING** — the manifest format is now `:version 2`, and committed
   manifests must be regenerated with `bb secrets reencrypt <env>`. Value hashes
   were derived from a rendered string that joined entries with `=` and `;` — the
