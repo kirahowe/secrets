@@ -972,6 +972,19 @@ bb book:preview   # serve the rendered book locally
 bb book:watch     # re-render chapters on save (Clay live reload)
 ```
 
+The published book carries no third-party executable assets. Clay injects jQuery
+and jQuery UI into every page and this book calls neither, so `bb book:build`
+strips them — an unused dependency is removed rather than vendored — along with
+the Google Fonts stylesheet Quarto's Bootstrap theme imports, and Quarto's build
+cache. Each page then gets a `<meta>` Content Security Policy: `default-src
+'self'`, and a `script-src` that admits its own inline scripts and event
+handlers by SHA-256 hash, computed at build time from the exact bytes Quarto
+generated, never by `'unsafe-inline'` and never with `'unsafe-eval'`.
+`com.kirahowe.secrets.site-policy`, under `build/`, performs both the rewrite and
+the check, and `bb book:build` fails on any finding — an external script or
+stylesheet URL, an inline script no hash admits, an inline or eval allowance, a
+page without a policy — so a render cannot produce an artifact CI would reject.
+
 ## Releasing
 
 A release is built once, from the tag, and the bytes that were inspected are the

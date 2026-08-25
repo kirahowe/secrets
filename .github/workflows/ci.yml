@@ -264,6 +264,20 @@ jobs:
           test -f book/rendered/_quarto.yml
           touch book/rendered/.nojekyll
 
+      # `bb book:build` already ran this over its own output, so a failure here
+      # is either a non-reproducible render or a rewrite that did not hold. It
+      # runs as its own step so the reason names itself in the job log instead of
+      # arriving at the end of the render.
+      - name: Verify the Pages artifact carries no third-party assets
+        run: bb book:policy
+
+      - name: Prove no external script or stylesheet URL survives
+        shell: bash
+        run: |
+          set -euo pipefail
+          ! grep -rEn '<script[^>]*src[[:space:]]*=[[:space:]]*"?([a-zA-Z][a-zA-Z0-9+.-]*:)?//|<link[^>]*href[[:space:]]*=[[:space:]]*"?([a-zA-Z][a-zA-Z0-9+.-]*:)?//|@import[[:space:]]*(url\()?[[:space:]]*["'"'"']?([a-zA-Z][a-zA-Z0-9+.-]*:)?//' book/rendered
+          test "$(grep -rl 'http-equiv="Content-Security-Policy"' --include='*.html' book/rendered | wc -l)" -eq "$(find book/rendered -name '*.html' | wc -l)"
+
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0

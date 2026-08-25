@@ -19,12 +19,14 @@
               [com.kirahowe.secrets.cli-test]
               [com.kirahowe.secrets.init-test]
               [com.kirahowe.secrets.release-test]
+              [com.kirahowe.secrets.site-policy-test]
               [com.kirahowe.secrets.workflow-policy-test])
    :task (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
                                                  'com.kirahowe.secrets.cli-test
                                                  'com.kirahowe.secrets.aero-test
                                                  'com.kirahowe.secrets.init-test
                                                  'com.kirahowe.secrets.release-test
+                                                 'com.kirahowe.secrets.site-policy-test
                                                  'com.kirahowe.secrets.workflow-policy-test)]
            (System/exit (if (pos? (+ fail error)) 1 0)))}
 
@@ -90,7 +92,27 @@
    :requires ([babashka.fs :as fs])
    :task (do (when (fs/exists? "book/rendered")
                (fs/delete-tree "book/rendered"))
-             (clojure "-M:book -m scicloj.clay.v2.main -r"))}
+             (clojure "-M:book -m scicloj.clay.v2.main -r")
+             (run 'book:policy))}
+
+  book:policy
+  {:doc "Strip third-party assets from book/rendered, add its CSP, and check the result"
+   ;;; Part of book:build rather than a separate gate, so a local render cannot
+   ;;; produce an artifact that would fail CI. book:preview and book:watch do
+   ;;; not run it: quarto and Clay re-render into the same directory as you
+   ;;; save, overwriting the rewrite, and Clay's live reload injects a websocket
+   ;;; client that `connect-src 'self'` would refuse. Those tasks serve a
+   ;;; development render; `bb book:build` is what produces the published
+   ;;; artifact, and it is the only one CI uploads.
+   :requires ([com.kirahowe.secrets.site-policy :as site-policy])
+   :task (let [rewritten (site-policy/rewrite! "book/rendered")
+               found (site-policy/violations "book/rendered")]
+           (println "Rewrote" (count rewritten) "file(s) in book/rendered")
+           (when (seq found)
+             (run! (comp println site-policy/finding-message) found)
+             (println (count found) "site policy violation(s)")
+             (System/exit 1))
+           (println "book/rendered ships no third-party executable assets"))}
 
   book:preview
   {:doc "Serve the rendered book locally via `quarto preview` (builds first if needed)"

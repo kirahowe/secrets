@@ -75,6 +75,29 @@ All notable changes to this project are documented here. The format follows
   happened to agree was compared as a shape. It matters most in team mode,
   where there are no `:vhash`es to disagree: a foreign structure-only manifest
   with a refreshed `:ciphertext-sha` verified clean.
+- The published documentation book fetches nothing from a third party and
+  carries a hash-based Content Security Policy, enforced by
+  `com.kirahowe.secrets.site-policy` under `build/`. `bb book:build` now
+  rewrites its own output before checking it: the jQuery and jQuery UI tags Clay
+  injects into every page are removed rather than vendored, because nothing in
+  the book calls them (Bootstrap and `quarto.js` only use jQuery when it is
+  already present); the Google Fonts stylesheet Quarto's Bootstrap theme
+  `@import`s — the one remaining runtime fetch, and invisible in the HTML — goes
+  with them, leaving the theme's system font stack; Quarto's `.quarto` build
+  cache, which kept a copy of every removed reference, is no longer published.
+  Each page then declares `default-src 'self'` with a `script-src` that admits
+  its own inline scripts by SHA-256 hash and its `on…` handlers by the same
+  hashes under `'unsafe-hashes'`, never `'unsafe-inline'` and never
+  `'unsafe-eval'`; hashes are computed from the bytes Quarto generated, so a
+  Quarto upgrade cannot leave a stale hash behind a blank page. `style-src`
+  keeps `'unsafe-inline'`, and only that: `quarto-nav.js` writes `style`
+  attributes computed from the header height it measures at runtime, which no
+  build-time hash can cover. The check refuses an external script or stylesheet
+  URL anywhere in the artifact — page, `.qmd` source, or stylesheet `@import` —
+  an inline script or handler no hash admits, an inline or eval allowance, and a
+  page with no policy; `bb book:build` and CI's `build-book` job both fail on
+  any finding, and a browser confirms rendering, navigation, search, and
+  clipboard copy still work under the policy.
 
 ### Changed
 - Publication runs on a classpath of its own, and no longer resolves a
