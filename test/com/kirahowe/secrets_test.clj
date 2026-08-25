@@ -793,7 +793,8 @@
                  clojure.lang.ExceptionInfo #"(?i)secrets file not found"
                  (secrets/load-secrets missing *key*)))]
       (is (= :no-file (:reason (ex-data e))))
-      (is (= missing (:source (ex-data e))))
+      (is (= {:kind :file :path missing} (:source (ex-data e)))
+          "a caller-supplied path is kept: it is the caller's own, and it is the answer")
       (is (re-find (re-pattern (java.util.regex.Pattern/quote missing)) (ex-message e))
           "the error names the offending path")
       (is (re-find #"bb secrets new" (ex-message e))))))
@@ -1054,7 +1055,9 @@
   bytes, not about identities or EDN."
   [source limit]
   (try
-    (let [[f cleanup!] (#'secrets/source->file source limit)]
+    (let [[f cleanup!] (#'secrets/source->file source
+                                               (#'secrets/source-descriptor source)
+                                               limit)]
       (try [:ok (.length f)] (finally (cleanup!))))
     (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))
     (catch java.io.IOException _ :io)))
@@ -1264,6 +1267,213 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
                             (secrets/reader-literals {:file enc :identity-file *key*
                                                       :limits {:max-edn-depth 0}}))))))
+
+;;;; Redacted source diagnostics
+
+(def ^:private source-sentinels
+  "One sentinel per sensitive field a source can carry, so a leak names the
+  field it leaked from rather than only that something leaked."
+  {:userinfo "SENTINELuserinfoMUSTNEVERAPPEAR"
+   :query "SENTINELqueryMUSTNEVERAPPEAR"
+   :fragment "SENTINELfragmentMUSTNEVERAPPEAR"
+   :to-string "SENTINELtoStringMUSTNEVERAPPEAR"})
+
+(defn- leaked
+  "Every sentinel field name `text` contains, so an assertion reads as the list
+  of fields that leaked."
+  [text]
+  (vec (sort (for [[field sentinel] source-sentinels
+                   :when (str/includes? text sentinel)]
+               field))))
+
+(defn- rendered-chain
+  "Everything an exception chain can show a logger: each link's printed form —
+  `print-method` for a Throwable renders `:via`, so printing a wrapper prints
+  its causes' messages and data too — plus every message and every `ex-data` on
+  its own, so a wrapped cause is not the link nobody rendered."
+  [e]
+  (str/join "\n"
+            (for [link (take-while some? (iterate #(.getCause ^Throwable %) e))
+                  part [(pr-str link) (str (ex-message link)) (pr-str (ex-data link))]]
+              part)))
+
+(defn- closed-port
+  "A TCP port with nothing listening: bound to learn its number, then closed."
+  []
+  (let [server (java.net.ServerSocket. 0)
+        port (.getLocalPort server)]
+    (.close server)
+    port))
+
+(defn- sentinel-url
+  "A URL reaching `port` whose userinfo, query, and fragment each carry a
+  sentinel — the shape of a signed URL with an embedded password."
+  [port]
+  (str "http://user:" (:userinfo source-sentinels) "@127.0.0.1:" port "/store.age"
+       "?X-Amz-Signature=" (:query source-sentinels)
+       "#" (:fragment source-sentinels)))
+
+(defn- serve-sentinel-url!
+  "Serve `path`'s bytes once, and return the sentinel-bearing URL reaching them."
+  [path]
+  (let [served (serve-once! "Connection: close\r\n"
+                            (java.nio.file.Files/readAllBytes (.toPath (io/file path))))]
+    (sentinel-url (.getPort (java.net.URL. served)))))
+
+(defn- load-failure
+  "The exception `load-secrets` throws for `source` under `opts`, asserting that
+  the call really did fail: a case that stopped failing would otherwise pass
+  every sentinel check by rendering nothing. `opts` is passed exactly as given,
+  so a case that must resolve its identity from the environment can."
+  [source opts]
+  (let [e (try
+            (secrets/load-secrets source opts)
+            nil
+            (catch Exception e e))]
+    (is (some? e) "the case under test really failed")
+    e))
+
+(deftest source-descriptors-drop-credentials-test
+  (let [describe #(#'secrets/source-descriptor %)
+        signed (str "https://user:" (:userinfo source-sentinels)
+                    "@example.com:8443/store.age")]
+    (testing "a locator keeps scheme, host, port, and path, and nothing else"
+      (are [source expected] (= expected (describe source))
+        signed
+        {:kind :url :scheme "https" :host "example.com" :port 8443 :path "/store.age"}
+
+        (java.net.URL. signed)
+        {:kind :url :scheme "https" :host "example.com" :port 8443 :path "/store.age"}
+
+        (str "https://example.com/store.age?X-Amz-Signature=" (:query source-sentinels))
+        {:kind :url :scheme "https" :host "example.com" :path "/store.age"}
+
+        (str "https://example.com/store.age#" (:fragment source-sentinels))
+        {:kind :url :scheme "https" :host "example.com" :path "/store.age"}
+
+        "file:///srv/secrets/store.age"
+        {:kind :url :scheme "file" :path "/srv/secrets/store.age"}
+
+        "jar:file:/srv/app.jar!/secrets.edn.age"
+        {:kind :url :scheme "jar:file" :path "/srv/app.jar!/secrets.edn.age"}))
+    (testing "a path is kept; anything else contributes only its class"
+      (are [source expected] (= expected (describe source))
+        "/srv/secrets/store.age" {:kind :file :path "/srv/secrets/store.age"}
+        (io/file "/srv/secrets/store.age") {:kind :file :path "/srv/secrets/store.age"}
+        (java.io.ByteArrayInputStream. (byte-array 0))
+        {:kind :object :class "java.io.ByteArrayInputStream"}
+        (StringBuilder. (:to-string source-sentinels))
+        {:kind :object :class "java.lang.StringBuilder"}
+        nil nil))
+    (testing "no descriptor carries a sentinel, whichever field held it"
+      (doseq [source [signed
+                      (java.net.URL. signed)
+                      (str "https://example.com/s.age?sig=" (:query source-sentinels))
+                      (str "https://example.com/s.age#" (:fragment source-sentinels))
+                      (StringBuilder. (:to-string source-sentinels))]]
+        (is (= [] (leaked (pr-str (describe source)))))))))
+
+(deftest source-failures-carry-no-sentinel-test
+  (let [wrong-key (str *dir* "/wrong-key.txt")
+        _ (age/keygen! wrong-key)
+        enc (encrypt-edn! {:nested {:deep {:deeper "v"}}})
+        chain (fn [source opts]
+                (rendered-chain (load-failure source (merge {:identity-file *key*} opts))))]
+    (testing "a source that cannot be opened at all"
+      (is (= [] (leaked (chain (sentinel-url (closed-port)) nil)))))
+    (testing "a source past :max-source-bytes"
+      (is (= [] (leaked (chain (serve-sentinel-url! enc)
+                               {:limits {:max-source-bytes 1}})))))
+    (testing "a decryption that fails because the key is wrong"
+      (is (= [] (leaked (chain (serve-sentinel-url! enc) {:identity-file wrong-key})))))
+    (testing "a plaintext nested past :max-edn-depth"
+      (is (= [] (leaked (chain (serve-sentinel-url! enc)
+                               {:limits {:max-edn-depth 1}})))))
+    (testing "a source object whose toString is the credential"
+      (is (= [] (leaked (chain (StringBuilder. (:to-string source-sentinels)) nil)))))))
+
+(deftest materialized-identity-never-appears-in-diagnostics-test
+  (let [wrong-key (str *dir* "/wrong-key.txt")
+        _ (age/keygen! wrong-key)
+        enc (encrypt-edn! {:pad (apply str (repeat 2048 \a))})
+        tight {:limits {:max-plaintext-bytes 16}}
+        injected
+        (fn [contents opts]
+          (with-fresh-identities
+            (fn []
+              (with-redefs-fn {#'secrets/identity-env
+                               (fn [k] (when (= k "SECRETS_AGE_IDENTITY") contents))}
+                (fn []
+                  (let [e (load-failure enc opts)
+                        paths (keep :path (vals (:entries @@#'secrets/identity-state)))]
+                    (is (= 1 (count paths)) "exactly one identity was materialized")
+                    {:data (ex-data e)
+                     :message (ex-message e)
+                     :path (first paths)
+                     :rendered (rendered-chain e)}))))))]
+    (testing "a wrong injected key fails without naming the file it materialized"
+      (let [{:keys [data message path rendered]} (injected (slurp wrong-key) nil)]
+        (is (not (str/includes? rendered path)) "the temp path is nowhere in the chain")
+        (is (not (str/includes? rendered "age-identity-")) "nor is any path like it")
+        (is (nil? (:identity-file data)))
+        (is (= "age decryption failed" message) "and the failure still says what failed")
+        (is (str/includes? (:hint data) "Wrong key") "with its hint intact")))
+    (testing "an oversized plaintext under an injected key names it no more"
+      (let [{:keys [data path rendered]} (injected (slurp *key*) tight)]
+        (is (not (str/includes? rendered path)))
+        (is (not (str/includes? rendered "age-identity-")))
+        (is (nil? (:identity-file data)))
+        (is (= :plaintext-too-large (:reason data)))))
+    (testing "a caller-supplied identity is still named — the context was kept, not deleted"
+      (let [data (ex-data (load-failure enc (assoc tight :identity-file *key*)))]
+        (is (= *key* (:identity-file data)))
+        (is (= :plaintext-too-large (:reason data)))))))
+
+(deftest diagnostics-remain-actionable-test
+  (let [wrong-key (str *dir* "/wrong-key.txt")
+        _ (age/keygen! wrong-key)
+        enc (encrypt-edn! {:nested {:deep {:deeper "v"}}})
+        port (closed-port)
+        served (fn [] {:kind :url :scheme "http" :host "127.0.0.1" :path "/store.age"})
+        failure (fn [source opts]
+                  (load-failure source (merge {:identity-file *key*} opts)))]
+    (testing "an unopenable locator names the resource and which transport failed"
+      (let [e (failure (sentinel-url port) nil)
+            data (ex-data e)]
+        (is (= :no-file (:reason data)))
+        (is (= (assoc (served) :port port) (:source data)))
+        (is (str/includes? (ex-message e) (str "http://127.0.0.1:" port "/store.age")))
+        (is (re-find #"java\.net\.\w*Exception" (ex-message e))
+            "the transport is named even though its own message is withheld")))
+    (testing "an oversized source names the bound it refused and the source kind"
+      (let [url (serve-sentinel-url! enc)
+            e (failure url {:limits {:max-source-bytes 1}})
+            data (ex-data e)]
+        (is (= :source-too-large (:reason data)))
+        (is (= 1 (:limit data)))
+        (is (pos? (:bytes data)))
+        (is (= (served) (dissoc (:source data) :port)))
+        (is (str/includes? (ex-message e) ":max-source-bytes"))))
+    (testing "a wrong key still says so, and still says which source it was reading"
+      (let [e (failure (serve-sentinel-url! enc) {:identity-file wrong-key})
+            data (ex-data e)]
+        (is (= "age decryption failed" (ex-message e)))
+        (is (str/includes? (:hint data) "Wrong key"))
+        (is (seq (:error data)) "the captured stderr is still there")
+        (is (= (served) (dissoc (:source data) :port)))))
+    (testing "an EDN plaintext past its depth bound keeps its reason and its source"
+      (let [e (failure (serve-sentinel-url! enc) {:limits {:max-edn-depth 1}})
+            data (ex-data e)]
+        (is (= :edn-too-deep (:reason data)))
+        (is (= 1 (:limit data)))
+        (is (= (served) (dissoc (:source data) :port)))
+        (is (str/includes? (ex-message e) ":max-edn-depth"))))
+    (testing "an unopenable object says its class, never its toString"
+      (let [e (failure (StringBuilder. (:to-string source-sentinels)) nil)
+            data (ex-data e)]
+        (is (= :no-file (:reason data)))
+        (is (= {:kind :object :class "java.lang.StringBuilder"} (:source data)))
+        (is (str/includes? (ex-message e) "an instance of java.lang.StringBuilder"))))))
 
 ;;;; Manifest
 

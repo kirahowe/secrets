@@ -394,6 +394,11 @@
   ([] (resolve-identity-file nil))
   ([app-or-opts] (first (conventional-identity app-or-opts))))
 
+(defn- identity-file-exists?
+  "True when `path` names an identity file that exists."
+  [path]
+  (boolean (and path (.exists (io/file (str path))))))
+
 (defn identity-available?
   "True when the resolved identity file exists. `app-or-opts` accepts an app
   name or an options map with `:app` or `:identity-file`; an explicit
@@ -404,7 +409,7 @@
                     (or (:identity-file app-or-opts)
                         (resolve-identity-file app-or-opts))
                     (resolve-identity-file app-or-opts))]
-     (boolean (and identity (.exists (io/file (str identity))))))))
+     (identity-file-exists? identity))))
 
 (def ^:private identity-options
   "One-line remediation appended to \"no identity\" errors."
@@ -458,6 +463,107 @@
                       {:limits limits :limit limit :value value :reason :invalid-limits}))))
   (merge default-limits limits))
 
+;;;; Source descriptors
+
+;;; A secrets source can itself be a credential: a signed URL keeps its
+;;; signature in the query, `https://user:pass@host/store.age` keeps a password
+;;; in the userinfo, and a caller's own object can render anything at all from
+;;; `toString`. So no failure carries a source value — it carries a descriptor
+;;; built by allowlist, and every message about a source is written from that
+;;; descriptor rather than from the source.
+
+(def ^:private max-locator-schemes
+  "How many nested locator schemes a descriptor unwraps — `jar:file:` is two —
+  before it keeps only the schemes it has seen. A source string can spell
+  `a:b:c:…` to any depth, and describing one is bounded work."
+  4)
+
+(def ^:private uri-scheme
+  "A leading URI scheme, per RFC 3986. A source string carrying one is a
+  locator whose remainder may hold a credential, never a path to keep as-is."
+  #"^([A-Za-z][A-Za-z0-9+.\-]*):")
+
+(defn- parse-uri
+  "`s` as a `java.net.URI`, or nil when it does not parse. The
+  `URISyntaxException` is dropped rather than reported: its message quotes the
+  whole string it rejected."
+  [s]
+  (try
+    (java.net.URI. s)
+    (catch Exception _ nil)))
+
+(defn- locator-parts
+  "The scheme chain of the locator string `s` and its innermost parsed URI, as
+  `[schemes uri]`.
+
+  An opaque URI wraps another locator (`jar:file:/app.jar!/store.age`), and each
+  wrapper contributes only its scheme. Unwrapping stops at a part that is not
+  opaque, does not parse, or carries no scheme, and at `max-locator-schemes`
+  either way."
+  [s]
+  (loop [s s schemes []]
+    (let [scheme (second (re-find uri-scheme s))
+          uri (when scheme (parse-uri s))
+          schemes (cond-> schemes scheme (conj scheme))]
+      (if (and uri (.isOpaque uri) (< (count schemes) max-locator-schemes))
+        (recur (.getSchemeSpecificPart uri) schemes)
+        [schemes uri]))))
+
+(defn- locator-descriptor
+  "Allowlisted metadata for the locator string `s`: its scheme chain, host,
+  port, and path, and nothing else. Userinfo, query, and fragment are dropped —
+  a signed URL keeps its credential in the query and an embedded password in its
+  userinfo — and a locator whose remainder cannot be taken apart keeps only its
+  scheme.
+
+  A *path* can carry a token too (`/t/abc123/store.age`), so keeping it is a
+  judgement rather than a safe default: without it a diagnostic cannot say which
+  resource failed. That residual risk is real, not zero."
+  [s]
+  (let [[schemes uri] (locator-parts s)
+        host (some-> uri .getHost not-empty)
+        path (some-> uri .getPath not-empty)
+        port (or (some-> uri .getPort) -1)]
+    (cond-> {:kind :url :scheme (str/join ":" schemes)}
+      host (assoc :host host)
+      (pos? port) (assoc :port port)
+      path (assoc :path path))))
+
+(defn- source-descriptor
+  "Allowlisted metadata naming which secrets source a failure is about, safe to
+  attach to an exception or render into a message.
+
+  It is built kind by kind, never by rendering the value:
+
+  - A URL, URI, or scheme-carrying string keeps what [[locator-descriptor]]
+    keeps — scheme, host, port, path — with userinfo, query, and fragment gone.
+  - A File or a path string keeps its path. That path is the caller's own, and
+    naming it is most of a diagnostic's value.
+  - Anything else — an InputStream, a Reader, a caller's own type — keeps only
+    its class name. Nothing here calls `str` or `pr-str` on the value: a custom
+    `toString` is exactly how a credential-bearing object leaks.
+
+  `nil` describes nothing, so a nil source carries no descriptor at all."
+  [source]
+  (cond
+    (nil? source) nil
+    (instance? java.io.File source) {:kind :file :path (str source)}
+    (string? source) (if (re-find uri-scheme source)
+                       (locator-descriptor source)
+                       {:kind :file :path source})
+    (or (instance? java.net.URL source)
+        (instance? java.net.URI source)) (locator-descriptor (str source))
+    :else {:kind :object :class (.getName (class source))}))
+
+(defn- source-description
+  "A one-line rendering of a source `descriptor` for a message. It can say no
+  more than the descriptor kept: an object contributes its class name, never its
+  `toString`."
+  [{:keys [kind path scheme host port] class-name :class}]
+  (if (= :url kind)
+    (str scheme ":" (when host (str "//" host)) (when port (str ":" port)) path)
+    (or path (str "an instance of " class-name))))
+
 ;;;; Loading
 
 (def ^:private source-chunk-bytes
@@ -466,12 +572,12 @@
   65536)
 
 (defn- source-too-large!
-  "Throw the source size failure, naming only the byte count and the limit —
-  never any source content."
-  [source read-bytes limit]
+  "Throw the source size failure, naming only the source descriptor, the byte
+  count, and the limit — never any source content."
+  [descriptor read-bytes limit]
   (throw (ex-info (str "The secrets source is larger than the configured :max-source-bytes"
                        " limit of " limit " bytes.")
-                  {:source (str source)
+                  {:source descriptor
                    :bytes read-bytes
                    :limit limit
                    :reason :source-too-large})))
@@ -485,38 +591,39 @@
   the bound instead of being read to an end it does not have. Counting while
   copying is what makes a declared length irrelevant: a `Content-Length` that
   lies in either direction, or no length at all, changes nothing here."
-  [source ^java.io.InputStream in ^java.io.OutputStream out limit]
+  [descriptor ^java.io.InputStream in ^java.io.OutputStream out limit]
   (let [chunk (byte-array source-chunk-bytes)]
     (loop [total 0]
       (let [n (.read in chunk 0 source-chunk-bytes)]
         (when-not (neg? n)
           (let [total (+ total n)]
             (when (> total limit)
-              (source-too-large! source total limit))
+              (source-too-large! descriptor total limit))
             (.write out chunk 0 n)
             (recur total)))))))
 
 (defn- source->file
-  "Coerce a secrets `source` to a [file cleanup!] pair, refusing a source larger
-  than `limit` bytes. Path strings and Files naming an existing file are used in
-  place (no cleanup), so their length is checked directly. Anything else that
-  `io/input-stream` can open — any URL (including a jar: resource URL from
-  inside an uberjar), an InputStream, … — is copied to a 0600 temp file so
-  `age` can read it, counting bytes as it goes and deleting the partial copy at
-  once if the bound is passed; cleanup deletes that copy."
-  [source limit]
+  "Coerce a secrets `source`, described by `descriptor`, to a [file cleanup!]
+  pair, refusing a source larger than `limit` bytes. Path strings and Files
+  naming an existing file are used in place (no cleanup), so their length is
+  checked directly. Anything else that `io/input-stream` can open — any URL
+  (including a jar: resource URL from inside an uberjar), an InputStream, … — is
+  copied to a 0600 temp file so `age` can read it, counting bytes as it goes and
+  deleting the partial copy at once if the bound is passed; cleanup deletes that
+  copy."
+  [source descriptor limit]
   (let [f (when (or (instance? java.io.File source) (string? source))
             (io/file source))]
     (if (and f (.exists f))
       (do
         (when (> (.length f) limit)
-          (source-too-large! source (.length f) limit))
+          (source-too-large! descriptor (.length f) limit))
         [f (fn [])])
       (let [tmp (owner-only-temp-file! "secrets-" ".age")]
         (try
           (with-open [in (io/input-stream source)
                       out (io/output-stream tmp)]
-            (copy-source! source in out limit))
+            (copy-source! descriptor in out limit))
           (catch Exception e
             (.delete tmp)
             (throw e)))
@@ -544,37 +651,59 @@
   A caller-supplied path is named in the failure: the caller already has it, and
   naming it is most of the message's value. A path this library materialized is
   not — the caller never saw it, and it points at a file holding key material."
-  [source identity materialized?]
+  [descriptor identity materialized?]
   (let [nameable (and identity (not materialized?) (str identity))]
-    (when-not (and identity (.exists (io/file (str identity))))
+    (when-not (identity-file-exists? identity)
       (throw (ex-info (str "No age identity found"
                            (when nameable (str " (" nameable " does not exist)"))
                            ". " identity-options)
-                      (cond-> {:source (str source) :reason :no-identity}
+                      (cond-> {:reason :no-identity}
+                        descriptor (assoc :source descriptor)
                         nameable (assoc :identity nameable)))))))
 
+(defn- unreadable-source!
+  "Throw the `:no-file` failure for a source `io/input-stream` could not read.
+
+  A source that is a path is named, and the transport failure's own message and
+  the exception itself travel with it: that message can only name the path,
+  which the failure names anyway. For every other kind both are dropped —
+  `io/input-stream` builds its message out of the value it was given, a URL in
+  full or `pr-str` of a caller's object, and printing an exception prints its
+  causes' messages too — so the failure carries the exception's class instead,
+  which says which transport failed without quoting what it was handed."
+  [descriptor e]
+  (let [path (when (= :file (:kind descriptor)) (:path descriptor))]
+    (throw
+     (if path
+       (ex-info (if (.exists (io/file path))
+                  (str "Could not read secrets source " path ": " (.getMessage e))
+                  (str "Secrets file not found: " path ". " no-store-hint))
+                {:source descriptor :reason :no-file}
+                e)
+       (ex-info (str "Could not read secrets source " (source-description descriptor)
+                     " (" (.getName (class e)) "). The failure's own message is withheld:"
+                     " it is built from the source itself, userinfo and query included.")
+                {:source descriptor :reason :no-file})))))
+
 (defn- acquire-source!
-  "Acquire a file and cleanup function for `source` under `limits`, translating
-  read failures."
-  [source limits]
+  "Acquire a file and cleanup function for `source`, described by `descriptor`,
+  under `limits`, translating read failures."
+  [source descriptor limits]
   (when (nil? source)
     (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
                          " (io/resource \"secrets.edn.age\") found nothing on the classpath"
                          " — check the encrypted file is present as a classpath resource. "
                          no-store-hint)
-                    {:source nil :reason :no-file})))
+                    {:reason :no-file})))
   ;; Opening decides whether a source is readable. A String may name a path or
   ;; a URL, so checking for a missing path first would reject jar:file: URLs.
+  ;; IllegalArgumentException is what `io/input-stream` raises for a source it
+  ;; cannot open at all — a Reader, a caller's own type — and it reaches a
+  ;; caller for the same reason an IOException does.
   (try
-    (source->file source (:max-source-bytes limits))
-    (catch java.io.IOException e
-      (throw (ex-info (if (and (or (instance? java.io.File source) (string? source))
-                               (not (.exists (io/file (str source)))))
-                        (str "Secrets file not found: " source ". " no-store-hint)
-                        (str "Could not read secrets source " (pr-str source)
-                             ": " (.getMessage e)))
-                      {:source source :reason :no-file}
-                      e)))))
+    (source->file source descriptor (:max-source-bytes limits))
+    (catch java.io.IOException e (unreadable-source! descriptor e))
+    (catch IllegalArgumentException e (unreadable-source! descriptor e))))
 
 (defn- skip-string
   "Return the index just past the EDN string literal whose opening quote sits at
@@ -643,15 +772,45 @@
     (edn/read-string plaintext)))
 
 (defn- decrypt-and-read!
-  "Decrypt and read `file` under `limits`, always running its source cleanup
-  function."
-  [identity file limits cleanup!]
+  "Decrypt and read `file` under `opts` — `:limits`, the `:source` descriptor,
+  and whether the identity is `:materialized-identity?` — always running its
+  source cleanup function.
+
+  A failure below here knows the file `age` was handed, which for a copied
+  source is a temp file the caller never named, so it is re-thrown with the
+  source descriptor added and the original as its cause. Message, `:reason`, and
+  every other key are carried through unchanged: this adds the context the layer
+  below could not have, it does not restate the failure."
+  [identity file {:keys [limits source materialized-identity?]} cleanup!]
   (try
     (read-secrets-edn (age/decrypt identity (.getAbsolutePath ^java.io.File file)
-                                   {:limits limits})
+                                   {:limits limits
+                                    :identity-nameable? (not materialized-identity?)})
                       limits)
+    (catch clojure.lang.ExceptionInfo e
+      (throw (ex-info (ex-message e) (assoc (ex-data e) :source source) e)))
     (finally
       (cleanup!))))
+
+(defn- load-from
+  "Load `source` with the already-resolved identity `[path materialized?]` under
+  `limits`.
+
+  Provenance travels with the path rather than being re-derived: nothing can
+  recover from a path alone whether the caller supplied it or this library
+  materialized it from an injected key, and every diagnostic below here turns on
+  that difference."
+  [source [identity materialized?] limits]
+  (let [descriptor (source-descriptor source)]
+    (with-identity identity
+      (fn [path]
+        (validate-load-identity! descriptor path materialized?)
+        (let [[file cleanup!] (acquire-source! source descriptor limits)]
+          (decrypt-and-read! path file
+                             {:limits limits
+                              :source descriptor
+                              :materialized-identity? materialized?}
+                             cleanup!))))))
 
 (defn load-secrets
   "Decrypt an age-encrypted EDN source and return its value.
@@ -677,19 +836,20 @@
   Limits are resolved first, then the identity, then the source. The plaintext
   is read with `clojure.edn`, not `eval`.
 
+  Every failure about a source carries `:source`, allowlisted metadata naming
+  which source failed — a locator's scheme, host, port, and path, a file's path,
+  or an object's class — and never the source value, whose userinfo, query, or
+  `toString` can be a credential. An identity path is named only when the caller
+  supplied it.
+
   The identity is held with [[with-identity]] for the whole call, so a
   `reset-identity-cache!` cannot delete an injected identity while `age` is
   reading it. That covers the reader literals and the Aero readers, which load
   through here."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
-   (let [limits (resolve-limits (when (map? identity-or-opts) (:limits identity-or-opts)))
-         [identity materialized?] (load-identity identity-or-opts)]
-     (with-identity identity
-       (fn [path]
-         (validate-load-identity! source path materialized?)
-         (let [[file cleanup!] (acquire-source! source limits)]
-           (decrypt-and-read! path file limits cleanup!)))))))
+   (let [limits (resolve-limits (when (map? identity-or-opts) (:limits identity-or-opts)))]
+     (load-from source (load-identity identity-or-opts) limits))))
 
 (defn get-secret
   "Read a secret from a loaded map. `key-path` is a single key (`:database/url`)
@@ -705,7 +865,12 @@
 
 (defn- reader-loaded-state
   "Resolve and load one readers map's source under its resolved `:limits`, or
-  describe why it is unavailable."
+  describe why it is unavailable.
+
+  `identity` is a delay over `[path materialized?]`, and it is loaded through
+  [[load-from]] rather than [[load-secrets]] for that pair's sake: passing the
+  path back in as an explicit `:identity-file` would relabel a path this library
+  materialized as one the caller supplied, and diagnostics would then name it."
   [{:keys [resource file limits]} identity]
   (let [source (cond
                  file (when (.exists (io/file (str file)))
@@ -715,15 +880,18 @@
       (nil? source)
       {:present? false :reason :no-file}
 
-      (not (and @identity (.exists (io/file (str @identity)))))
+      (not (identity-file-exists? (first @identity)))
       {:present? false :reason :no-identity}
 
       :else
-      {:present? true
-       :secrets (load-secrets source {:identity-file @identity :limits limits})})))
+      {:present? true :secrets (load-from source @identity limits)})))
 
 (defn- required-secret-handler
-  "Build the required-secret reader around a shared delayed loaded state."
+  "Build the required-secret reader around a shared delayed loaded state.
+
+  A failure names the configured store under `:store`, never `:source`: a load
+  failure surfacing through this same reader carries `:source`, the allowlisted
+  descriptor of the source that failed, and one key must not mean two shapes."
   [loaded describe]
   (fn [key-path]
     (let [{:keys [present? reason secrets]} @loaded]
@@ -734,12 +902,12 @@
                                identity-options)
                           (str "Required secret " (pr-str key-path)
                                " — but no secrets file found (" describe ")."))
-                        {:key key-path :source describe :reason reason})))
+                        {:key key-path :store describe :reason reason})))
       (let [value (get-secret secrets key-path not-found)]
         (when (= value not-found)
           (throw (ex-info (str "Required secret " (pr-str key-path)
                                " is missing from the secrets file.")
-                          {:key key-path :source describe :reason :missing-key})))
+                          {:key key-path :store describe :reason :missing-key})))
         value))))
 
 (defn- optional-secret-handler
@@ -777,7 +945,9 @@
   If the identity exists but decryption fails, both tags throw."
   [{:keys [app identity-file] :as opts}]
   (let [limits (resolve-limits (:limits opts))
-        identity (delay (or identity-file (resolve-identity-file app)))
+        identity (delay (if identity-file
+                          [identity-file false]
+                          (conventional-identity app)))
         loaded (delay (reader-loaded-state (assoc opts :limits limits) identity))
         describe (or (:file opts) (:resource opts) "secrets")]
     {'secret/req (required-secret-handler loaded describe)

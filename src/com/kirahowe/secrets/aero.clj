@@ -69,6 +69,15 @@
 ;;; Those opts also carry `:profile`, `:resolver`, and other unrelated values
 ;;; that would make near-identical opts maps miss the cache for no reason.
 ;;;
+;;; Retaining that key for the life of a lifecycle is deliberate and is not a
+;;; disclosure route. It holds only what `secrets/reader-literals` accepts —
+;;; `:app`, `:resource`/`:file`, `:identity-file`, `:limits` — never a
+;;; credential value, and no code path renders it, returns it, or attaches it
+;;; to a failure: `aero-opts-descriptor` is what a failure gets. A digest key
+;;; would hide those paths while leaving the decrypted store, which is the
+;;; sensitive half, in the value beside it; retiring the value is what
+;;; `register!` and `reset-cache!` are for.
+;;;
 ;;; `:generation` gives a lifecycle an identity that tests and diagnostics can
 ;;; name. It is deliberately NOT part of the cache key: replacing `:cache`
 ;;; wholesale is the single mechanism that retires entries, and putting the
@@ -109,6 +118,17 @@
   (swap! state (fn [s] (-> s (update :generation inc) (assoc :cache {}))))
   nil)
 
+(defn- aero-opts-descriptor
+  "Allowlisted metadata about the aero opts one `#secret/…` read was given: the
+  `:profile`, which is Aero's own selector and part of what a reader needs to
+  know, and the *names* of the keys present.
+
+  Never a value. An opts map can hold a `:resolver`, a database password, or an
+  entire configuration, so its shape is diagnosable while its contents are not."
+  [aero-opts]
+  (cond-> {:aero-opt-keys (vec (sort-by str (keys aero-opts)))}
+    (:profile aero-opts) (assoc :profile (:profile aero-opts))))
+
 (defn- secrets-config
   "Resolve the secrets config for one `#secret/…` read: the aero opts' own
   `:secrets` key if present, else the process-wide default from `register!`.
@@ -128,7 +148,7 @@
                    "{:app \"myapp\" ...}) or per-read via the :secrets key in "
                    "the opts map passed to aero.core/read-config, e.g. "
                    "(aero.core/read-config \"config.edn\" {:secrets {:app \"myapp\"}}).")
-              {:aero-opts aero-opts}))))
+              (aero-opts-descriptor aero-opts)))))
 
 (defn- readers-for
   "The `#secret/req` / `#secret/opt` reader fns for `config`, built at most

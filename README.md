@@ -910,10 +910,41 @@ manifest is reported as `skipped`.
   selected, or a configured recipients file is empty or contains invalid
   recipients.
 
+### What a failure carries
+
+These exceptions are meant to be safe to hand to an error reporter, so their
+context is an allowlist rather than a rendering. Every failure about a secrets
+source carries `:source`: a locator's scheme, host, port, and path with
+**userinfo, query, and fragment dropped** — a signed URL keeps its credential
+in the query and `https://user:pass@host/…` keeps one in the userinfo; or a
+File's or path string's path, which is yours already; or, for an InputStream, a
+Reader, or any other value, its class name alone. Nothing calls `str` or
+`pr-str` on an object you passed in, because a `toString` you wrote is exactly
+how a credential-bearing object leaks. A *path* can carry a token too, so
+keeping it is a judgement rather than a safe default: a diagnostic that cannot
+name the failing resource is not one, and that residual risk is real, not zero.
+
+An identity path is named only when you supplied it. A path materialized from
+`SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64` appears in no message, no
+`ex-data`, and no `bb secrets` output: you never saw that path, and it points at
+key material. `age/decrypt`, `age/decrypt-bytes`, and `age/decrypt-to-file!`
+therefore leave the identity path out unless the call passes
+`{:identity-nameable? true}`; a wrong key still says so, with the captured
+stderr and its hint.
+
+A transport failure's own message travels only with a path source, where it can
+name nothing the failure does not already name. For a URL or a custom object,
+`clojure.java.io` builds that message out of the value it was handed, so the
+failure keeps the exception's *class* instead of its message and does not attach
+it as a cause — printing an exception prints its causes' messages too. Aero
+failures name the `:profile` and the opts map's *key names*, never a value: an
+opts map can hold a resolver, a database password, or a whole configuration. A
+bound that trips carries the byte count and the limit, never content.
+
 ## API
 
 `com.kirahowe.secrets`
-- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`. Every failure throws `ex-info` with a `:reason` — `:no-identity` (no identity resolves, or the resolved file doesn't exist) or `:no-file` (the source is nil, names a path that doesn't exist, or wraps another IOException) — the same vocabulary `#secret/req` uses, so a consumer can branch on it whichever way it reached the store.
+- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`. Every failure throws `ex-info` with a `:reason` — `:no-identity` (no identity resolves, or the resolved file doesn't exist) or `:no-file` (the source is nil, names a path that doesn't exist, or cannot be opened) — the same vocabulary `#secret/req` uses, so a consumer can branch on it whichever way it reached the store. Every failure about the source also carries `:source`, allowlisted metadata naming which source failed and never the source value — see *What a failure carries*.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
 - `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
 - `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil when none is set. A variable that is set but empty throws.

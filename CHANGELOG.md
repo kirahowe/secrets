@@ -406,6 +406,43 @@ All notable changes to this project are documented here. The format follows
   surrounding `"$(…)"` is unchanged: it is the shell's own construct, not
   interpolated configuration, and is what makes the key file one argument to
   `flyctl`.
+- Exception context is now an allowlist, so a failure no longer retains or
+  renders the source it was reading (CWE-209). Every failure about a secrets
+  source carries `:source`, type-aware metadata built kind by kind: a URL, URI,
+  or scheme-carrying string keeps its scheme chain, host, port, and path while
+  userinfo, query, and fragment are dropped — a signed URL keeps its credential
+  in the query and `https://user:pass@host/…` keeps one in the userinfo; a File
+  or path string keeps its path, which is the caller's own and most of the
+  message's value; anything else — an InputStream, a Reader, a caller's own type
+  — keeps only its class name, because `str` and `pr-str` on a value whose
+  `toString` the caller wrote is exactly how a credential-bearing object leaks.
+  Keeping a path is a judgement documented where it is made: a path can carry a
+  token, and the residual risk is stated rather than assumed away. The `:reason`
+  vocabulary is unchanged, and a source that cannot be opened at all — the
+  `IllegalArgumentException` `clojure.java.io` raises with `pr-str` of the value
+  in its message — is now translated to that same `:no-file` failure instead of
+  escaping. A transport failure's own message and the exception itself travel
+  only with a path source, where they can name nothing the failure does not
+  already name; for any other kind the failure keeps the exception's class,
+  since printing an exception prints its causes' messages too. Aero failures
+  carry the `:profile` and the *names* of the opts keys instead of the whole
+  opts map, which can hold a resolver, a database password, or an entire
+  configuration. A `#secret/req` failure names the configured store under
+  `:store` rather than `:source`, so one key never means two shapes on one read.
+- An identity path this library materialized no longer reaches a diagnostic
+  through `age` or the CLI, closing the two paths issue 022's audit left open.
+  `age/decrypt`, `age/decrypt-bytes`, and `age/decrypt-to-file!` omit
+  `:identity-file` from a failure unless the call passes
+  `{:identity-nameable? true}` — only the caller knows whether it passed a path
+  the user has or a temp file it materialized from injected key contents — and
+  a wrong key still reports the captured stderr and its hint. `bb secrets` says
+  `from SECRETS_AGE_IDENTITY` where it used to print that temp path, in
+  `require-identity!` and in a keyless `verify`, and keeps naming a
+  caller-supplied path, which is the overwhelmingly common case. The reader
+  literals stopped laundering provenance on the way to a load: an identity they
+  resolved internally is no longer passed back in as an explicit
+  `:identity-file`, which is how a materialized path reached the Aero readers'
+  diagnostics.
 
 ## [0.1.0] - 2026-08-21
 

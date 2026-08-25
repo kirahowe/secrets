@@ -137,6 +137,15 @@
    ["SECRETS_AGE_IDENTITY" :secrets-age-identity]
    ["SECRETS_AGE_IDENTITY_B64" :secrets-age-identity-b64]])
 
+(def ^:private identity-source-display-label
+  "How a message or a `doctor` report names where an identity came from."
+  {:secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
+   :secrets-age-identity "SECRETS_AGE_IDENTITY"
+   :secrets-age-identity-b64 "SECRETS_AGE_IDENTITY_B64"
+   :identity-file ":identity-file"
+   :configured-key-file "configured key path"
+   :default-key-file "default key path"})
+
 (defn- getenv [variable-name]
   (System/getenv variable-name))
 
@@ -148,6 +157,36 @@
   (some (fn [[variable source]]
           (when (some? (getenv variable)) source))
         identity-env-sources))
+
+(def ^:private materialized-identity-sources
+  "The identity sources `com.kirahowe.secrets` materializes into a temp file:
+  both carry key *contents*, and `age` reads its identity from a file."
+  #{:secrets-age-identity :secrets-age-identity-b64})
+
+(defn- nameable-identity
+  "The environment's decrypt-side identity path when a message may name it, else
+  nil. A caller-supplied path — an env var naming a file, an explicit
+  `:identity-file`, a configured or default key path — is the caller's own, and
+  naming it is most of a failure's value. A path materialized from key contents
+  is not: the caller never saw it, and it points at key material."
+  [{:keys [identity-file identity-source]}]
+  (when-not (materialized-identity-sources identity-source)
+    (str identity-file)))
+
+(defn- identity-location
+  "Where a message says the environment's decrypt-side identity is: `at <path>`
+  when the caller supplied that path, else `from <VARIABLE>` — the variable the
+  key contents arrived in, never the temp path they were materialized to."
+  [{:keys [identity-source] :as env}]
+  (if-let [path (nameable-identity env)]
+    (str "at " path)
+    (str "from " (identity-source-display-label identity-source))))
+
+(defn- decrypt-opts
+  "The trailing `age` options for decrypting with this environment's identity:
+  whether a failure may name the identity path."
+  [env]
+  {:identity-nameable? (some? (nameable-identity env))})
 
 (defn- require-path!
   "Reject a blank artifact path, returning `path` otherwise. Only strings are
@@ -472,18 +511,26 @@
                 "    Docs:   https://age-encryption.org"))))
 
 (defn- require-identity!
-  "Ensure the environment's decrypt-side identity file exists."
-  [{:keys [identity-file] environment-name :name}]
-  (when-not (.exists (io/file identity-file))
-    (fail! (str "No age identity for " (clojure.core/name environment-name)
-                " at " identity-file "\n"
-                "    Create one with:  bb secrets keygen "
-                (shell-quote (clojure.core/name environment-name)) "\n"
-                "    Or point at an existing key via SECRETS_AGE_IDENTITY_FILE (a path),\n"
-                "    SECRETS_AGE_IDENTITY (raw key contents), or "
-                "SECRETS_AGE_IDENTITY_B64 (base64 contents).")
-           {:identity-file (str identity-file)
-            :environment environment-name})))
+  "Ensure the environment's decrypt-side identity file exists.
+
+  The failure names a caller-supplied path, which is the overwhelmingly common
+  case and most of the message's value. A path materialized from
+  SECRETS_AGE_IDENTITY / SECRETS_AGE_IDENTITY_B64 is named by the variable it
+  came from instead: that path is a temp file holding key material, and the
+  caller never saw it."
+  [{environment-name :name :as env}]
+  (when-not (.exists (io/file (:identity-file env)))
+    (let [nameable (nameable-identity env)]
+      (fail! (str "No age identity for " (clojure.core/name environment-name)
+                  " " (identity-location env)
+                  "\n"
+                  "    Create one with:  bb secrets keygen "
+                  (shell-quote (clojure.core/name environment-name)) "\n"
+                  "    Or point at an existing key via SECRETS_AGE_IDENTITY_FILE (a path),\n"
+                  "    SECRETS_AGE_IDENTITY (raw key contents), or "
+                  "SECRETS_AGE_IDENTITY_B64 (base64 contents).")
+             (cond-> {:environment environment-name}
+               nameable (assoc :identity-file nameable))))))
 
 ;;;; Recipients (multi-recipient mode)
 
@@ -949,7 +996,7 @@
           tmp (temp-plaintext!)]
       (try
         (info "Decrypting" secrets-file "…")
-        (age/decrypt-to-file! identity-file secrets-file tmp)
+        (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
         (let [before (sha256 tmp)]
           (run-editor! tmp)
           (if (= before (sha256 tmp))
@@ -1001,7 +1048,8 @@
         (let [current (if exists?
                         (do (info "Decrypting" secrets-file "…")
                             (let [{:keys [ok? value error]}
-                                  (parse-edn (age/decrypt identity-file secrets-file))]
+                                  (parse-edn (age/decrypt identity-file secrets-file
+                                                          (decrypt-opts env)))]
                               (if ok? value
                                   (fail! (str "Secrets are not valid EDN (" error ").")
                                          {:secrets-file secrets-file :error error}))))
@@ -1043,7 +1091,7 @@
       (try
         (info "Decrypting" secrets-file "…")
         (let [{:keys [ok? value error]}
-              (parse-edn (age/decrypt identity-file secrets-file))
+              (parse-edn (age/decrypt identity-file secrets-file (decrypt-opts env)))
               current (if ok?
                         value
                         (fail! (str "Secrets are not valid EDN (" error ").")
@@ -1132,8 +1180,9 @@
     (when-not (and file (.exists (io/file file)))
       (fail! (str "No such file: " file) {:file file}))
     (let [bs (age/decrypt-bytes (:identity-file env) file
-                                {:limits {:max-plaintext-bytes
-                                          max-arbitrary-plaintext-bytes}})]
+                                (assoc (decrypt-opts env)
+                                       :limits {:max-plaintext-bytes
+                                                max-arbitrary-plaintext-bytes}))]
       (.write System/out ^bytes bs)
       (.flush System/out))
     file))
@@ -1159,7 +1208,7 @@
           tmp (temp-plaintext!)]
       (try
         (info "Decrypting" secrets-file "…")
-        (age/decrypt-to-file! identity-file secrets-file tmp)
+        (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
         (info "Re-encrypting to current recipients…")
         (write-secrets! env target tmp)
         (ok "Re-encrypted:" secrets-file)
@@ -1299,14 +1348,16 @@
       {:committed (:value parsed)})))
 
 (defn- verify-keyless
-  [environment-label secrets-file manifest-path identity-file committed]
+  "Verify freshness without a key. `identity-location` is where a message may say
+  the missing identity is — `at <path>` when the caller supplied that path, else
+  `from <VARIABLE>`, never a path this library materialized."
+  [environment-label secrets-file manifest-path identity-location committed]
   (let [ciphertext-sha (:ciphertext-sha committed)]
     (cond
       (nil? ciphertext-sha)
       (do
         (warn environment-label
-              "— no identity at"
-              identity-file
+              (str "— no identity " identity-location)
               "and the manifest records no :ciphertext-sha; cannot verify.")
         :missing)
 
@@ -1331,7 +1382,7 @@
    {:keys [secrets-file manifest identity-file] :as env}
    committed]
   (let [{:keys [ok? value error]}
-        (parse-edn (age/decrypt identity-file secrets-file))]
+        (parse-edn (age/decrypt identity-file secrets-file (decrypt-opts env)))]
     (if-not ok?
       (do
         (oops environment-label "— encrypted secrets are not valid EDN:" error)
@@ -1399,7 +1450,7 @@
           status
           (if-not (.exists (io/file identity-file))
             (verify-keyless
-             environment-label secrets-file manifest identity-file committed)
+             environment-label secrets-file manifest (identity-location env) committed)
             (verify-keyed-diff environment-label env committed)))))))
 
 (defn verify!
@@ -1591,14 +1642,6 @@
                   :disabled "disabled"
                   :unconfigured "unconfigured"
                   (str (if exists? "present" "missing") " — " path)))))
-
-(def ^:private identity-source-display-label
-  {:secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
-   :secrets-age-identity "SECRETS_AGE_IDENTITY"
-   :secrets-age-identity-b64 "SECRETS_AGE_IDENTITY_B64"
-   :identity-file ":identity-file"
-   :configured-key-file "configured key path"
-   :default-key-file "default key path"})
 
 (defn- print-doctor!
   [{:keys [configuration age environment artifacts identity encryption verify status]}]

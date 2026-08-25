@@ -10,6 +10,7 @@
   between scenarios."
   (:require [aero.core :as aero]
             [clojure.java.io :as io]
+            [clojure.string :as str]
             [clojure.test :refer [deftest is testing use-fixtures]]
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.aero :as secrets-aero]
@@ -114,6 +115,38 @@
                  (aero/read-config cfg)))]
       (is (re-find #"register!" (ex-message e)))
       (is (re-find #":secrets" (ex-message e))))))
+
+(deftest aero-failure-context-is-allowlisted-test
+  (let [sentinel "SENTINELaerooptsMUSTNEVERAPPEAR"
+        rendered (fn [e]
+                   (str/join "\n"
+                             (for [link (take-while some? (iterate #(.getCause ^Throwable %) e))
+                                   part [(pr-str link) (str (ex-message link))
+                                         (pr-str (ex-data link))]]
+                               part)))]
+    (testing "a missing secrets config names the profile and the opt keys, never a value"
+      (let [cfg (spit-config! "{:v #secret/opt :anything}")
+            e (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo #"No secrets config found"
+                   (aero/read-config cfg {:profile :staging :vault-token sentinel})))
+            data (ex-data e)]
+        (is (= :staging (:profile data)))
+        (is (= [:profile :resolver :source :vault-token] (:aero-opt-keys data))
+            "every key aero passed is named, including the two it adds itself")
+        (is (nil? (:aero-opts data)) "and the opts map itself is not retained")
+        (is (not (str/includes? (rendered e) sentinel)))))
+    (testing "a sentinel-bearing :secrets config reaches no failure either"
+      (let [cfg (spit-config! "{:v #secret/req :v}")
+            e (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo #"no secrets file found"
+                   (aero/read-config cfg {:profile :staging
+                                          :vault-token sentinel
+                                          :secrets {:file (str *dir* "/absent.edn.age")
+                                                    :identity-file *key*
+                                                    :tenant sentinel}})))]
+        (is (= :no-file (:reason (ex-data e))))
+        (is (not (str/includes? (rendered e) sentinel))
+            "the config is the cache key, and a cache key is not a diagnostic")))))
 
 ;;;; Reader cache
 

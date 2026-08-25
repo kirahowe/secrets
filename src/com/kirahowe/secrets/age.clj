@@ -280,6 +280,19 @@
   ["age" "-d" "-i" (path-arg :identity identity-file)
    "--" (path-arg :input encrypted-file)])
 
+(defn- decrypt-context
+  "The diagnostic context for one decryption.
+
+  The encrypted file is always named: it is the artifact the caller asked for.
+  The identity path is named only when `opts` says `:identity-nameable? true`.
+  An identity injected as key *contents* is materialized to a temp file by
+  whoever resolved it, so its path names a file holding key material that the
+  caller never saw — a disclosure with no diagnostic value. Only the caller
+  knows which of the two it passed, so only the caller can say."
+  [identity-file encrypted-file opts]
+  (cond-> {:encrypted-file (str encrypted-file)}
+    (:identity-nameable? opts) (assoc :identity-file (str identity-file))))
+
 (defn decrypt-bytes
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
   byte array (binary-safe — age encrypts arbitrary files, not just text).
@@ -292,13 +305,18 @@
   `opts` may carry `{:limits {:max-plaintext-bytes n}}`, defaulting to
   `default-max-plaintext-bytes`. The bound is enforced while `age` is writing:
   an oversized plaintext kills the subprocess and throws with
-  `:reason :plaintext-too-large` instead of being allocated in full first."
+  `:reason :plaintext-too-large` instead of being allocated in full first.
+
+  A failure names `:encrypted-file`, and names `identity-file` only when `opts`
+  says `{:identity-nameable? true}`: an identity injected as key *contents* is
+  materialized to a temp file the caller never saw, and only the caller knows
+  which of the two it passed. The failure always carries the captured stderr
+  and, for a non-zero exit, the wrong-key `:hint`."
   (^bytes [identity-file encrypted-file] (decrypt-bytes identity-file encrypted-file nil))
   (^bytes [identity-file encrypted-file opts]
    (let [argv (decrypt-argv identity-file encrypted-file)
          max-bytes (plaintext-limit opts)
-         context {:identity-file (str identity-file)
-                  :encrypted-file (str encrypted-file)}]
+         context (decrypt-context identity-file encrypted-file opts)]
      (ensure-installed!)
      (let [{:keys [exit out err]} (capture-bounded-stdout! argv max-bytes context)]
        (if (zero? exit)
@@ -312,8 +330,8 @@
 (defn decrypt
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
   UTF-8 string. Use `decrypt-bytes` for binary plaintexts. Throws an ex-info
-  (with the captured stderr) on failure. `opts` carries `:limits` exactly as
-  `decrypt-bytes` does."
+  (with the captured stderr) on failure. `opts` carries `:limits` and
+  `:identity-nameable?` exactly as `decrypt-bytes` does."
   ([identity-file encrypted-file] (decrypt identity-file encrypted-file nil))
   ([identity-file encrypted-file opts]
    (String. (decrypt-bytes identity-file encrypted-file opts) "UTF-8")))
@@ -447,7 +465,8 @@
 
   A filesystem without POSIX permissions fails closed instead of writing
   plaintext with default permissions: use `decrypt-bytes` or `decrypt`, which
-  never write plaintext to disk."
+  never write plaintext to disk. `opts` reaches `decrypt-bytes` unchanged, so
+  `:limits` and `:identity-nameable?` mean the same here."
   ([identity-file encrypted-file out]
    (decrypt-to-file! identity-file encrypted-file out nil))
   ([identity-file encrypted-file out opts]
