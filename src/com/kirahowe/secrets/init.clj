@@ -7,9 +7,11 @@
             [com.kirahowe.secrets.cli :as cli]
             [rewrite-clj.node :as node]
             [rewrite-clj.zip :as z])
-  (:import [java.nio.charset StandardCharsets]
-           [java.nio.file Files LinkOption OpenOption Path StandardCopyOption]
-           [java.nio.file.attribute FileAttribute]))
+  (:import [java.nio ByteBuffer]
+           [java.nio.charset StandardCharsets]
+           [java.nio.file FileSystems Files LinkOption OpenOption Path
+            StandardCopyOption StandardOpenOption]
+           [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 ;;;; Configuration
 
@@ -159,23 +161,191 @@
      :added-dependency? add-dependency?
      :added-task? add-task?}))
 
+;;;; Trusted Ancestry
+;;; Babashka cannot reach `SecureDirectoryStream`, so openat-style anchoring is
+;;; unavailable on the initializer's own runtime. Instead of re-walking ancestors
+;;; that an attacker could have swapped, this proves that no other principal is
+;;; able to swap them at all, and refuses to write when it cannot.
+
+(def ^:private no-follow
+  (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
+(def ^:private new-directory-attributes
+  ;; Create with an explicit 0755 rather than whatever the process umask yields.
+  ;; A umask can only narrow this, never widen it, so group and other write can
+  ;; never appear and the verification that follows creation cannot fail on the
+  ;; caller's umask.
+  (into-array FileAttribute
+              [(PosixFilePermissions/asFileAttribute
+                (PosixFilePermissions/fromString "rwxr-xr-x"))]))
+
+(def ^:private required-attribute-views ["posix" "unix"])
+
+(def ^:private sticky-bit 01000)
+(def ^:private group-write 020)
+(def ^:private other-write 002)
+
+(defn filesystem-capability
+  "Report the default filesystem's support for the attributes the ancestry proof
+  needs. `:views` is everything it reports, `:missing` names any required view it
+  cannot, and `:supported?` is false whenever one is missing. Tests redefine this
+  var to exercise the fail-closed branch."
+  []
+  (let [views (set (.supportedFileAttributeViews (FileSystems/getDefault)))
+        missing (vec (remove views required-attribute-views))]
+    {:views views :missing missing :supported? (empty? missing)}))
+
+(defn- capability! []
+  (let [{:keys [missing views]} (filesystem-capability)]
+    (when (seq missing)
+      (throw (ex-info (str "This filesystem cannot report its "
+                           (str/join " and " missing)
+                           " file attributes, so the initializer cannot prove that no other"
+                           " user is able to redirect its writes. It will not mutate a project"
+                           " while implying a race safety it has not established. Initialize"
+                           " the project on a POSIX filesystem.")
+                      {:reason :unsupported-filesystem :missing missing :views views})))))
+
+(defn- refuse-ancestor! [^Path path reason detail]
+  (throw (ex-info (str "Refusing to initialize under " path ": " detail
+                       " Move the project under a directory only you can write.")
+                  {:path (str path) :reason reason})))
+
+(defn- trusted-type! [^Path path]
+  (when-not (Files/exists path no-follow)
+    (refuse-ancestor! path :missing "it does not exist."))
+  (when (Files/isSymbolicLink path)
+    (refuse-ancestor! path :symlink "it is a symbolic link another user could repoint."))
+  (when-not (Files/isDirectory path no-follow)
+    (refuse-ancestor! path :not-a-directory "it is not a directory.")))
+
+(defn- trusted-owner!
+  "Refuse `path` unless the current user or `root` owns it, and return its owner."
+  [^Path path detail]
+  (let [owner (.getName (Files/getOwner path no-follow))]
+    (when-not (#{(System/getProperty "user.name") "root"} owner)
+      (refuse-ancestor! path :foreign-owner (str detail owner ", who could replace it.")))
+    owner))
+
+(defn- posix-group
+  "The name of `path`'s POSIX group. Tests redefine this var to stand in for a
+  user-private group, which no portable API can create."
+  [^Path path]
+  (.getName (get (Files/readAttributes path "posix:group" no-follow) "group")))
+
+(defn- trusted-group-write! [^Path path owner]
+  ;; A group whose name matches the owner's is a user-private group, as on
+  ;; Fedora, RHEL, and Debian: it holds nobody but the owner, so group write
+  ;; hands no other principal a rename and there is no attack to refuse.
+  (let [group (posix-group path)]
+    (when-not (= owner group)
+      (refuse-ancestor! path :shared-group-writable
+                        (str "it is writable by group " group
+                             ", which holds more than its owner, and is not sticky.")))))
+
+(defn- trusted-mode! [^Path path]
+  (let [owner (trusted-owner! path "it belongs to ")
+        mode (get (Files/readAttributes path "unix:mode" no-follow) "mode")
+        ;; Sticky restores the rename guarantee a write bit takes away: only an
+        ;; entry's own owner may rename or delete it.
+        sticky? (pos? (bit-and mode sticky-bit))]
+    (when (and (not sticky?) (pos? (bit-and mode other-write)))
+      (refuse-ancestor! path :world-writable
+                        "it is writable by others and is not sticky."))
+    (when (and (not sticky?) (pos? (bit-and mode group-write)))
+      (trusted-group-write! path owner))))
+
+(defn- trusted-directory! [^Path path]
+  (doto path trusted-type! trusted-mode!))
+
+(defn- trusted-component! [^Path path]
+  ;; A symlink's own mode bits are ignored by the kernel, so only its owner and
+  ;; its parent decide whether anyone else can repoint it: repointing means
+  ;; deleting and recreating that entry, which its parent's mode governs and
+  ;; which the walk has already checked.
+  (if (Files/isSymbolicLink path)
+    (trusted-owner! path "this symbolic link belongs to ")
+    (trusted-directory! path)))
+
+(defn- path-segments
+  "Each path from the child of `root` down to `path`, in order."
+  [^Path root ^Path path]
+  ;; A `path` equal to `root` relativizes to the empty path, whose one name
+  ;; element is the empty string. Drop it so nothing resolves back to `root`.
+  (rest (reductions (fn [^Path parent ^Path part] (.resolve parent part))
+                    root
+                    (remove #(str/blank? (str %)) (.relativize root path)))))
+
+(defn- ancestry [^Path path]
+  (let [anchor (.getRoot path)]
+    (cons anchor (path-segments anchor path))))
+
+(defn trusted-ancestry!
+  "Prove that no principal other than you or `root` can rename or relink any
+  directory on the way to project `root`, and return `root`'s real path.
+
+  Every component of the real path that `Path.toRealPath` resolves — from the
+  filesystem root down to and including the project root — must exist as a
+  directory under `NOFOLLOW_LINKS`, be owned by the current user or by `root`,
+  and not be writable by anyone else. Components are rechecked rather than
+  assumed from the resolution, because it is the check that makes the claim true
+  at operation time rather than at resolution time.
+
+  \"Anyone else\" is exact rather than approximate. Other-write is a refusal
+  unless the sticky bit is set. Group write is a refusal unless the sticky bit is
+  set or the directory's group name equals its owner's, which is a user-private
+  group as on Fedora, RHEL, and Debian: a group holding nobody but the owner is
+  not another principal, and a `umask 002` checkout at mode 0775 is exactly as
+  safe as one at 0755. Sticky, meanwhile, means only an entry's own owner may
+  rename or delete that entry, so another user with write access to `/tmp` can
+  create entries beside ours but cannot swap ours for a symlink — and that swap
+  is the whole attack. Refusing either case would reject ordinary working
+  configurations without taking one capability away from an attacker.
+
+  The path as written is walked too, because a symlink on the way in can be
+  repointed by whoever writes the *link's* own parent, and the resolved path does
+  not reveal that parent. A link component is judged on its owner alone — the
+  kernel ignores a symlink's mode bits — with its parent covered by the same
+  walk. Link components are permitted rather than refused: on macOS both `/tmp`
+  and `/var` are root-owned symlinks, and a checkout reached through a link the
+  user owns is ordinary.
+
+  Throws `ex-info` naming the offending directory under `:path`, with `:reason`
+  one of `:unsupported-filesystem`, `:missing`, `:not-a-directory`, `:symlink`,
+  `:foreign-owner`, `:world-writable`, or `:shared-group-writable`."
+  ^Path [root]
+  (capability!)
+  (let [given (.normalize (.toAbsolutePath (.toPath (io/file (str root)))))
+        real (.toRealPath given (make-array LinkOption 0))]
+    (run! trusted-component! (ancestry given))
+    (run! trusted-directory! (ancestry real))
+    real))
+
 ;;;; Change Planning
 
-(defn- target-path! [root rel]
-  (let [root (.normalize (.toAbsolutePath (.toPath (io/file root))))
+(defn- safe-segments! [rel segments]
+  (doseq [^Path segment segments]
+    (when (Files/isSymbolicLink segment)
+      (throw (ex-info "Refusing a path below a symbolic link"
+                      {:path rel :link (str segment)}))))
+  (doseq [^Path segment (butlast segments)]
+    (when (and (Files/exists segment no-follow)
+               (not (Files/isDirectory segment no-follow)))
+      (throw (ex-info "Refusing a path below a non-directory"
+                      {:path rel :entry (str segment)})))))
+
+(defn- target-path!
+  "Resolve `rel` under project `root`, which may be a string, `File`, or `Path`."
+  ^Path [root rel]
+  (let [root (.normalize (.toAbsolutePath (.toPath (io/file (str root)))))
         target (.normalize (.toAbsolutePath (.resolve root rel)))]
     (when-not (.startsWith target root)
       (throw (ex-info "Path escapes project" {:path rel})))
     ;; A safe leaf below a symlinked directory is not a safe project artifact:
-    ;; writes would escape the consumer checkout. Check every relative segment.
-    (loop [parent root
-           parts (seq (iterator-seq (.iterator (.relativize root target))))]
-      (when-let [part (first parts)]
-        (let [child (.resolve parent ^Path part)]
-          (when (Files/isSymbolicLink child)
-            (throw (ex-info "Refusing a path below a symbolic link"
-                            {:path rel :link (str child)})))
-          (recur child (next parts)))))
+    ;; writes would escape the consumer checkout. Every relative segment is
+    ;; rechecked here, and every mutation re-enters this function, so the check
+    ;; runs at write time and not only while planning.
+    (safe-segments! rel (path-segments root target))
     target))
 
 (defn- merge-gitignore [old line]
@@ -250,7 +420,7 @@
                  {:path path :content content :replace? false})))]
     (doseq [{:keys [path replace? preserve?]} raw]
       (let [target (target-path! root path)]
-        (when (and (Files/exists target (make-array LinkOption 0))
+        (when (and (Files/exists target no-follow)
                    (not replace?)
                    (not preserve?))
           (throw (ex-info "Refusing to overwrite existing initializer artifact"
@@ -292,50 +462,93 @@
     (println " no project changes are needed."))
   (println " Private identities are never created unless --keygen is supplied."))
 
-(defn- atomic-write! [^Path target content]
-  (let [parent (.getParent target)
-        _ (Files/createDirectories parent (make-array FileAttribute 0))
-        tmp (Files/createTempFile
-             parent
-             ".secrets-init-"
-             ".tmp"
-             (make-array FileAttribute 0))]
+(def ^:private staging-options
+  ;; O_CREAT|O_EXCL: the open fails outright on any existing entry, a symlink
+  ;; included, so the staging leaf is no-follow by construction and needs no
+  ;; separate link check of its own.
+  (into-array OpenOption [StandardOpenOption/CREATE_NEW StandardOpenOption/WRITE]))
+
+(defn- ensure-directories! [^Path root ^Path target]
+  ;; `Files/createDirectories` re-walks the whole pathname; this walks one
+  ;; segment at a time below the already-verified root. A directory created here
+  ;; is verified too: the window between creating it and writing into it is the
+  ;; same window as the window between finding it and writing into it.
+  (doseq [^Path segment (path-segments root (.getParent target))]
+    (when-not (Files/exists segment no-follow)
+      (Files/createDirectory segment new-directory-attributes))
+    (trusted-directory! segment)))
+
+(defn- publish! [^Path staging ^Path target]
+  ;; ATOMIC_MOVE is renameat(2): it replaces whatever entry sits at `target`
+  ;; without following a link there, so the leaf was never the exposure — the
+  ;; ancestors were. A leaf link check here would be redundant.
+  (try
+    (Files/move staging target
+                (into-array StandardCopyOption
+                            [StandardCopyOption/ATOMIC_MOVE
+                             StandardCopyOption/REPLACE_EXISTING]))
+    (catch Exception e
+      ;; Babashka cannot resolve AtomicMoveNotSupportedException, so identify
+      ;; that one exception by name. The previous copy-and-delete fallback is
+      ;; gone: it would follow a symlink planted at `target`.
+      (if (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e)))
+        (throw (ex-info (str "This filesystem cannot atomically publish " target)
+                        {:path (str target) :reason :atomic-move-unsupported}
+                        e))
+        (throw e)))))
+
+(defn- staging-path
+  "Name a staging file beside `target`, inside the already-verified parent."
+  ^Path [^Path target]
+  ;; A random name is unaimable, so nothing can be planted at it on purpose;
+  ;; CREATE_NEW then refuses whatever happens to be there anyway.
+  (.resolve (.getParent target) (str ".secrets-init-" (random-uuid) ".tmp")))
+
+(defn- atomic-write! [^Path root ^Path target ^String content]
+  (ensure-directories! root target)
+  (let [staging (staging-path target)]
     (try
-      (Files/write tmp
-                   (.getBytes content StandardCharsets/UTF_8)
-                   (make-array OpenOption 0))
-      (try
-        (Files/move
-         tmp
-         target
-         (into-array
-          StandardCopyOption
-          [StandardCopyOption/ATOMIC_MOVE StandardCopyOption/REPLACE_EXISTING]))
-        (catch Exception _
-          (Files/move
-           tmp
-           target
-           (into-array StandardCopyOption [StandardCopyOption/REPLACE_EXISTING]))))
+      (with-open [channel (Files/newByteChannel staging staging-options)]
+        (.write channel (ByteBuffer/wrap (.getBytes content StandardCharsets/UTF_8))))
+      (publish! staging target)
       (finally
-        (Files/deleteIfExists tmp)))))
+        (Files/deleteIfExists staging)))))
+
+(defn- rollback! [^Path root old]
+  (reduce (fn [failed [path bytes]]
+            ;; A path that no longer resolves safely under the verified root was
+            ;; never written through, so there is nothing there to undo.
+            (if-let [target (try (target-path! root path) (catch Exception _ nil))]
+              (try
+                (if bytes
+                  (atomic-write! root target (String. ^bytes bytes StandardCharsets/UTF_8))
+                  (Files/deleteIfExists target))
+                failed
+                (catch Exception _ (conj failed path)))
+              failed))
+          []
+          old))
 
 (defn- apply-changes! [root changes]
-  (let [old (into {}
+  (let [root (trusted-ancestry! root)
+        old (into {}
                   (for [{:keys [path]} changes
                         :let [target (target-path! root path)]]
                     [path
-                     (when (Files/exists target (make-array LinkOption 0))
+                     (when (Files/exists target no-follow)
                        (Files/readAllBytes target))]))]
     (try
       (doseq [{:keys [path content]} changes]
-        (atomic-write! (target-path! root path) content))
+        (atomic-write! root (target-path! root path) content))
       (catch Exception e
-        (doseq [[path bytes] old]
-          (let [target (target-path! root path)]
-            (if bytes
-              (atomic-write! target (String. ^bytes bytes StandardCharsets/UTF_8))
-              (Files/deleteIfExists target))))
-        (throw (ex-info "Initializer failed; previous project files were restored." {} e))))))
+        (let [failed (rollback! root old)]
+          (throw (ex-info (str "Initializer failed and "
+                               (if (seq failed)
+                                 "some previous project files could not be restored: "
+                                 "previous project files were restored: ")
+                               (or (ex-message e) (str e)))
+                          {:unrestored failed}
+                          e)))))))
 
 (defn- choice! [{:keys [choice input]}]
   (or choice
@@ -347,9 +560,36 @@
             ("m" "manual") :manual
             :cancel)))))
 
+(defn root-trust
+  "Report, without mutating anything, whether the initializer would be allowed to
+  write into project `root`. Preview prints this so a refusal is visible before
+  apply is chosen; the apply path re-establishes the guarantee itself rather than
+  trusting this report."
+  [root]
+  (let [capability (filesystem-capability)]
+    (try
+      {:trusted? true :capability capability :root (str (trusted-ancestry! root))}
+      (catch Exception e
+        (merge {:trusted? false
+                :capability capability
+                :message (or (ex-message e) (str e))}
+               (select-keys (ex-data e) [:reason :path]))))))
+
+(defn- print-trust! [{:keys [trusted? message]}]
+  (if trusted?
+    (println (str " Race safety: verified through the "
+                  (str/join " and " required-attribute-views)
+                  " file attributes that every directory from / down to this project is"
+                  " owned by you or root, is not other-writable unless sticky, and is not"
+                  " group-writable unless sticky or its group is just its owner."))
+    (println (str " Race safety: not established, so applying would be refused. "
+                  message))))
+
 (defn init!
   "Preview and optionally apply. `:root`, `:tty?`, `:choice`, and `:input` are
-  injectable for tests. A non-TTY caller must set :apply? to mutate files."
+  injectable for tests. A non-TTY caller must set :apply? to mutate files.
+  The returned map carries `:trust`, the [[root-trust]] report the preview
+  printed, so no caller has to infer whether race safety was established."
   [opts]
   (let [opts (merge {:root "."
                      :tty? (some? (System/console))
@@ -357,18 +597,21 @@
                      :layout :tracked}
                     opts)
         proposal (assoc (proposed-changes opts) :root (:root opts))
+        trust (root-trust (:root opts))
         _ (print-preview! proposal)
+        _ (print-trust! trust)
         selected (cond
                    (:apply? opts) :apply
                    (:tty? opts) (choice! opts)
-                   :else :preview)]
+                   :else :preview)
+        result {:changes (:changes proposal) :trust trust}]
     (case selected
       :apply
       (do
         (apply-changes! (:root opts) (:changes proposal))
         (when (:keygen? opts)
           (cli/keygen! (:normalized-config proposal) (:env opts)))
-        {:status :applied :changes (:changes proposal)})
+        (assoc result :status :applied))
 
       :manual
       (do
@@ -378,12 +621,12 @@
                   *print-level* nil]
           (pprint/pprint {:deps default-dependency
                           :tasks {'secrets (task-spec (:config proposal))}}))
-        {:status :manual :changes (:changes proposal)})
+        (assoc result :status :manual))
 
       :cancel
-      {:status :cancelled :changes (:changes proposal)}
+      (assoc result :status :cancelled)
 
-      {:status :preview :changes (:changes proposal)})))
+      (assoc result :status :preview))))
 
 ;;;; Entry Point
 

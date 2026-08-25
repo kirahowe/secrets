@@ -53,6 +53,41 @@ All notable changes to this project are documented here. The format follows
   exposes the Clojars credentials to nothing but its final deploy step. Every
   action it uses is pinned to a full commit SHA, and it resolves dependencies
   without a cache any earlier run could have written.
+- The project initializer now proves the project root untamperable before it
+  mutates anything, and refuses otherwise. It previously validated a pathname —
+  rejecting escapes and symlinked segments — and then wrote through that same
+  pathname, so another principal able to write an ancestor directory could
+  replace a validated directory with a symlink between the check and the write
+  and redirect the writes outside the project (CWE-367, CWE-59).
+  `SecureDirectoryStream` and openat-style anchored operations are unreachable
+  from Babashka, the initializer's own runtime, so instead of re-walking
+  ancestors an attacker might have swapped, `trusted-ancestry!` establishes that
+  nobody can swap them: every directory from the filesystem root down to and
+  including the project root must be a real directory under `NOFOLLOW_LINKS`,
+  owned by the current user or by `root`, and writable by nobody else.
+  Other-write needs the sticky bit, which restores the rename guarantee a write
+  bit takes away and keeps a root under `/tmp` usable; group write needs sticky
+  or a group whose name is the owner's, since the user-private group of Fedora,
+  RHEL, and Debian holds nobody but the owner and a `umask 002` checkout at mode
+  0775 is therefore exactly as safe as one at 0755. The path as written is
+  walked as well as the resolved one, because a symbolic link on the way in can
+  be repointed by whoever writes the link's own parent and the resolved path
+  never names that parent. A filesystem that cannot report the `posix` and
+  `unix` attributes the proof depends on fails closed rather than writing while
+  implying a race safety it never established.
+- Every initializer mutation re-verifies at the operation point. Directories are
+  created with an explicit `rwxr-xr-x` a umask can only narrow, and checked one
+  segment at a time below the verified root; each file is staged under an
+  unguessable name with `O_CREAT|O_EXCL`, which refuses any existing entry
+  including a symlink, and published with `ATOMIC_MOVE`, whose `renameat`
+  replaces an entry at the destination instead of following it. The non-atomic
+  copy-and-delete fallback is gone, because it would follow exactly the symlink
+  the atomic rename refuses. Rollback after a failed apply runs through those
+  same checked operations and reports any path it declined to touch rather than
+  claiming a restore it did not perform. Preview still needs none of this, since
+  it writes nothing, but it now reports whether applying would be refused — and
+  `init!`'s status map carries that `:trust` report — so a refusal is visible
+  before apply is chosen rather than after.
 - **BREAKING** — the manifest format is now `:version 2`, and committed
   manifests must be regenerated with `bb secrets reencrypt <env>`. Value hashes
   were derived from a rendered string that joined entries with `=` and `;` — the

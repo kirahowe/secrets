@@ -513,6 +513,30 @@ run `bb secrets add-recipient dev` before creating the first team ciphertext.
 All configured artifact paths must remain canonically distinct; aliases such as
 `secret.age` and `./secret.age` count as the same path and are rejected.
 
+Before applying anything, the initializer proves that no other principal can
+tamper with the project root's ancestry: every directory from the filesystem
+root down to and including the root itself is owned by you or by `root` and is
+writable by nobody else. Other-write needs the sticky bit; group write needs the
+sticky bit or a group whose name is the owner's, the user-private group of
+Fedora, RHEL, and Debian, because a group holding nobody but the owner is not
+another principal and a `umask 002` checkout at mode 0775 is exactly as safe as
+one at 0755. Sticky means only an entry's own owner may rename or delete it,
+which is why a root under `/tmp` is fine. The path as written is checked too, so
+a symbolic link on the way in that someone else could repoint is refused even
+when what it resolves to is private. Anything else is refused, naming the
+offending directory, and a filesystem that cannot report POSIX ownership and
+mode attributes is refused rather than assumed safe. This ancestry proof is what
+replaces openat-style anchoring: Babashka cannot reach `SecureDirectoryStream`,
+so instead of re-walking ancestors an attacker might have swapped, the
+initializer establishes that nobody is able to swap them and refuses to write
+when it cannot. Every mutation then re-verifies at the operation point —
+directories are created with an explicit mode a umask can only narrow, never
+widen, and checked one segment at a time under the verified root, each file is
+staged with `O_CREAT|O_EXCL` under an unguessable name and published with an
+atomic rename, and the rollback path uses those same checked operations. A
+preview never needs the guarantee, because it writes nothing, but it reports
+whether applying would be refused so you learn that before choosing to apply.
+
 The four included consumers illustrate different needs rather than four copies
 of one schema: quickstart, Aero, and team-CI carry CLI configuration in
 `bb.edn`; the Integrant service uses JVM runtime wiring and a shell bootstrap.
@@ -729,8 +753,12 @@ manifest is reported as `skipped`.
 `com.kirahowe.secrets.init` — Babashka-only project bootstrap entrypoint.
 `(-main & args)` parses `--app`, optional `--env`, `--layout`, `--team`,
 `--keygen`, and `--apply`; `(init! opts)` exposes the preview/apply operation for
-programmatic use. It preserves `bb.edn` formatting with Babashka's bundled
-`rewrite-clj`, refuses conflicts and unsafe paths, and returns a status map.
+programmatic use, returning a status map that carries the `:trust` report the
+preview printed. It preserves `bb.edn` formatting with Babashka's bundled
+`rewrite-clj`, refuses conflicts and unsafe paths, and refuses to mutate a
+project at all unless `(trusted-ancestry! root)` proves the root's ancestry
+untamperable and `(filesystem-capability)` reports the POSIX attributes that
+proof needs.
 
 ## Examples
 

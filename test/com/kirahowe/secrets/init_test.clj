@@ -1,11 +1,12 @@
 (ns com.kirahowe.secrets.init-test
   (:require [clojure.java.io :as io]
+            [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer [are deftest is testing use-fixtures]]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.init :as init])
-  (:import [java.nio.file Files]
-           [java.nio.file.attribute FileAttribute]))
+  (:import [java.nio.file Files LinkOption]
+           [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 ;;;; Fixtures
 
@@ -26,6 +27,58 @@
           (delete-tree! dir))))))
 
 (use-fixtures :each with-temp-dir)
+
+(def ^:private no-link-options (make-array LinkOption 0))
+
+(defn- running-as-root? []
+  (= "root" (System/getProperty "user.name")))
+
+(defn- real-path [file]
+  (str (.toRealPath (.toPath (io/file (str file))) no-link-options)))
+
+(defn- unix-mode [file]
+  (get (Files/readAttributes (.toPath (io/file (str file))) "unix:mode" no-link-options)
+       "mode"))
+
+(defn- set-permissions! [file rwx]
+  (Files/setPosixFilePermissions (.toPath (io/file (str file)))
+                                 (PosixFilePermissions/fromString rwx)))
+
+(def ^:private public-directory
+  (into-array FileAttribute
+              [(PosixFilePermissions/asFileAttribute
+                (PosixFilePermissions/fromString "rwxr-xr-x"))]))
+
+(defn- mkdirs!
+  "Create `file` and its missing parents at an explicit 0755, so no test depends
+  on the umask the suite happens to run under."
+  [file]
+  (let [f (io/file (str file))]
+    (when-not (.isDirectory f)
+      (mkdirs! (.getParentFile f))
+      (Files/createDirectory (.toPath f) public-directory))
+    f))
+
+(defn- make-sticky! [file]
+  ;; `PosixFilePermission` covers only the nine rwx bits, so the POSIX
+  ;; permission API cannot express the sticky bit at all; chmod can.
+  (let [{:keys [exit err]} (sh/sh "chmod" "+t" (str file))]
+    (when-not (zero? exit)
+      (throw (ex-info (str "chmod +t failed: " err) {:path (str file)})))))
+
+(defn- symlink! [link target]
+  (Files/createSymbolicLink (.toPath (io/file (str link)))
+                            (.toPath (io/file (str target)))
+                            (make-array FileAttribute 0)))
+
+(defn- ancestry-refusal
+  "Return the `:reason`/`:path` of the ancestry refusal for `root`, or nil."
+  [root]
+  (try
+    (init/trusted-ancestry! (str root))
+    nil
+    (catch clojure.lang.ExceptionInfo e
+      (select-keys (ex-data e) [:reason :path]))))
 
 ;;;; Argument Parsing and Configuration
 
@@ -261,3 +314,163 @@
       (is (and (:template? @seen) (:bb? @seen))
           "keygen follows successful scaffold writes")
       (is (= "dev" (:env @seen))))))
+
+;;;; Race Safety
+
+(deftest trusted-ancestry-accepts-a-private-root-test
+  (testing "a root under the system temp directory"
+    (is (= (real-path *dir*) (str (init/trusted-ancestry! *dir*)))))
+  (testing "a root under a sticky world-writable ancestor"
+    ;; /tmp is mode 1777 on macOS and Linux alike, and on macOS it is also a
+    ;; symlink to /private/tmp. A naive "nothing other-writable anywhere" rule
+    ;; would refuse every root beneath it.
+    (let [tmp (real-path "/tmp")
+          mode (unix-mode tmp)
+          root (Files/createTempDirectory (.toPath (io/file tmp))
+                                          "secrets-init-sticky"
+                                          (make-array FileAttribute 0))]
+      (try
+        (is (pos? (bit-and mode 022)) "premise: /tmp is writable by others")
+        (is (pos? (bit-and mode 01000)) "premise: /tmp is sticky")
+        (is (= (real-path root) (str (init/trusted-ancestry! (str root)))))
+        (finally
+          (delete-tree! root))))))
+
+(deftest trusted-ancestry-refuses-an-untrusted-ancestor-test
+  (if (running-as-root?)
+    (is (running-as-root?)
+        "skipped as root: root satisfies every ownership check by definition")
+    (let [open (mkdirs! (io/file *dir* "open"))
+          under-open (mkdirs! (io/file open "project"))
+          private-project (mkdirs! (io/file *dir* "private" "project"))
+          link (io/file open "link")]
+      (set-permissions! open "rwxrwxrwx")
+      (symlink! link private-project)
+      (testing "an ancestor anyone may rename"
+        (are [expected root] (= expected (ancestry-refusal root))
+          {:reason :world-writable :path (str open)} under-open
+          ;; This link resolves into a wholly private tree, so only the walk of
+          ;; the path as written can see that anyone may repoint it.
+          {:reason :world-writable :path (str open)} link))
+      (testing "the same ancestor with the sticky bit set"
+        (make-sticky! open)
+        (are [root] (nil? (ancestry-refusal root))
+          under-open
+          link))
+      (testing "group write"
+        (let [shared (mkdirs! (io/file *dir* "shared"))
+              under-shared (mkdirs! (io/file shared "project"))]
+          (set-permissions! shared "rwxrwxr-x")
+          (is (= {:reason :shared-group-writable :path (str shared)}
+                 (ancestry-refusal under-shared))
+              "a group that holds more than the owner can rename the directory")
+          ;; No portable API creates a group named after the current user, so the
+          ;; user-private group of Fedora, RHEL, and Debian is stood in for at the
+          ;; one read that decides it.
+          (with-redefs-fn {#'init/posix-group (constantly (System/getProperty "user.name"))}
+            (fn []
+              (is (nil? (ancestry-refusal under-shared))
+                  "a group holding nobody but the owner is not another principal"))))))))
+
+(deftest directory-swap-between-plan-and-apply-changes-nothing-outside-test
+  (let [root (mkdirs! (io/file *dir* "project"))
+        outside (mkdirs! (io/file *dir* "outside"))
+        sentinel (io/file outside "secrets.edn.example")
+        swapped (io/file root "secrets")
+        out (java.io.StringWriter.)]
+    (spit sentinel "sentinel\n")
+    (is (some #(= "secrets/secrets.edn.example" (:path %))
+              (:changes (init/proposed-changes {:root (str root) :app "reader"})))
+        "premise: the plan writes through the directory about to be swapped")
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"symbolic link"
+         (binding [*out* out]
+           (init/init! {:root (str root)
+                        :app "reader"
+                        :tty? true
+                        ;; The plan is complete and every path in it validated by
+                        ;; the time this runs, so the swap lands squarely between
+                        ;; planning and applying without racing a timer.
+                        :input (fn []
+                                 (symlink! swapped outside)
+                                 "a")}))))
+    (is (= "sentinel\n" (slurp sentinel)))
+    (is (= ["secrets.edn.example"]
+           (mapv #(.getName ^java.io.File %) (.listFiles outside))))
+    (is (not (.exists (io/file root "bb.edn")))
+        "the refusal precedes every write, not only the redirected one")))
+
+(deftest unsupported-filesystem-capability-fails-closed-test
+  ;; Injecting at the probe is the deterministic way into this branch: no
+  ;; filesystem here actually lacks the posix and unix attribute views.
+  (let [out (java.io.StringWriter.)]
+    (with-redefs [init/filesystem-capability
+                  (constantly {:views #{"basic"}
+                               :missing ["posix" "unix"]
+                               :supported? false})]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"cannot report its posix and unix file attributes"
+           (binding [*out* out]
+             (init/init! {:root *dir* :app "reader" :apply? true :tty? false}))))
+      (is (str/includes? (str out) "would be refused")))
+    (is (not (.exists (io/file *dir* "bb.edn"))))))
+
+(deftest staging-write-refuses-an-existing-entry-test
+  ;; The staging name is random by design, so a fixed one is injected here to
+  ;; plant an entry at it on purpose.
+  (let [root (mkdirs! (io/file *dir* "project"))
+        outside (mkdirs! (io/file *dir* "outside"))
+        sentinel (io/file outside "planted")
+        out (java.io.StringWriter.)]
+    (spit sentinel "sentinel\n")
+    (symlink! (io/file root ".secrets-init-fixed.tmp") sentinel)
+    (with-redefs-fn
+      {#'init/staging-path (fn [target]
+                             (.resolve (.getParent target) ".secrets-init-fixed.tmp"))}
+      (fn []
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"Initializer failed"
+             (binding [*out* out]
+               (init/init! {:root (str root)
+                            :app "reader"
+                            :apply? true
+                            :tty? false}))))))
+    (is (= "sentinel\n" (slurp sentinel))
+        "CREATE_NEW refuses the planted entry instead of writing through the link")
+    (is (not (.exists (io/file root "bb.edn"))))))
+
+(deftest created-directories-satisfy-the-ancestry-rule-test
+  ;; Directories are created with an explicit `rwxr-xr-x` the umask can only
+  ;; narrow, never widen, so group and other write can never appear and the
+  ;; verification that immediately follows creation cannot fail on the umask the
+  ;; caller happened to have.
+  (let [out (java.io.StringWriter.)]
+    (binding [*out* out]
+      (init/init! {:root *dir* :app "reader" :apply? true :tty? false}))
+    (let [created (io/file *dir* "secrets")]
+      (is (zero? (bit-and (unix-mode created) 022))
+          "no umask can give a created directory group or other write")
+      (is (nil? (ancestry-refusal created))
+          "a directory the initializer created passes the rule it enforces"))))
+
+(deftest preview-reports-whether-apply-would-be-refused-test
+  (if (running-as-root?)
+    (is (running-as-root?)
+        "skipped as root: root satisfies every ownership check by definition")
+    (let [open (mkdirs! (io/file *dir* "open"))
+          project (mkdirs! (io/file open "project"))
+          result (atom nil)]
+      (set-permissions! open "rwxrwxrwx")
+      (let [out (with-out-str
+                  (reset! result (init/init! {:root (str project)
+                                              :app "reader"
+                                              :tty? false})))]
+        (is (= :preview (:status @result)))
+        (is (false? (:trusted? (:trust @result))))
+        (is (= :world-writable (:reason (:trust @result))))
+        (is (str/includes? out "would be refused"))
+        (is (str/includes? out "--- /dev/null") "the preview itself still runs")
+        (is (not (.exists (io/file project "bb.edn"))))))))
