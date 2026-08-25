@@ -40,17 +40,42 @@
 
   That registration is mutable process state: establish it explicitly during
   application startup, replace it deliberately, and clear it with
-  `(register! nil)` when its lifecycle ends. A per-read `:secrets` opt always
-  wins over the registered default — see `secrets-config`. When neither is
-  supplied, reading a `#secret/…` tag throws rather than resolving to nil; see
-  `secrets-config` for the error."
+  `(register! nil)` when its lifecycle ends. Replacing or clearing it retires
+  every decrypted store and cached decryption failure held under it, even when
+  the replacement config compares equal — see `readers-for`. A per-read
+  `:secrets` opt always wins over the registered default — see
+  `secrets-config`. When neither is supplied, reading a `#secret/…` tag throws
+  rather than resolving to nil; see `secrets-config` for the error."
   (:require [aero.core]
             [com.kirahowe.secrets :as secrets]))
 
-;;;; Process-wide configuration
+;;;; Registration and cache lifecycle
 
-(defonce ^:private default-config
-  (atom nil))
+;;; `state` holds a registration and the cache that belongs to it:
+;;;
+;;;     {:generation 0 :config nil :cache {}}
+;;;
+;;; One atom rather than two, because a registration and the plaintext
+;;; decrypted under it have to move together. Held separately, clearing or
+;;; replacing the registration left matching cached plaintext — and cached
+;;; decryption failures — reachable, so a later registration whose config map
+;;; merely compared equal to a retired one inherited the retired lifecycle's
+;;; secrets.
+;;;
+;;; `:cache` maps each secrets config to a delay that realizes
+;;; `secrets/reader-literals`, so a config file with several `#secret/…` tags
+;;; decrypts its store once, not once per tag — see `readers-for`. It is keyed
+;;; on the extracted secrets config map only, never the surrounding aero opts.
+;;; Those opts also carry `:profile`, `:resolver`, and other unrelated values
+;;; that would make near-identical opts maps miss the cache for no reason.
+;;;
+;;; `:generation` gives a lifecycle an identity that tests and diagnostics can
+;;; name. It is deliberately NOT part of the cache key: replacing `:cache`
+;;; wholesale is the single mechanism that retires entries, and putting the
+;;; generation in the key would be a second mechanism doing that one job.
+
+(defonce ^:private state
+  (atom {:generation 0 :config nil :cache {}}))
 
 (defn register!
   "Set the process-wide default secrets config used by `#secret/req` /
@@ -61,23 +86,19 @@
   `com.kirahowe.secrets/reader-literals` takes (`:app`/`:resource`, `:file`,
   `:identity-file`).
 
-  A later call replaces the previous value. Per-read `:secrets` options take
-  precedence. `(register! nil)` clears the default. Returns `config`."
+  A later call replaces the previous value and ends the previous lifecycle:
+  every cached decrypted store and cached decryption failure held under it is
+  retired, including when `config` compares equal to the config it replaces —
+  equal maps from two lifecycles are not one secret. Per-read `:secrets`
+  options take precedence. `(register! nil)` is the same operation with no
+  config, and so also clears the cache. Returns `config`."
   [config]
-  (reset! default-config config)
+  ;; Always clears, even for an equal config: this is a start-up call, so the
+  ;; cost is one extra decryption at start-up rather than anything in a hot
+  ;; path, and comparing equal is exactly the case that must not share state.
+  (swap! state (fn [{:keys [generation]}]
+                 {:generation (inc generation) :config config :cache {}}))
   config)
-
-;;;; Reader cache
-
-;;; `readers-cache` maps each secrets config to a delay that realizes
-;;; `secrets/reader-literals`, so a config file with several `#secret/…` tags
-;;; decrypts its store once, not once per tag — see `readers-for`. It is keyed
-;;; on the extracted secrets config map only, never the surrounding aero opts.
-;;; Those opts also carry `:profile`, `:resolver`, and other unrelated values
-;;; that would make near-identical opts maps miss the cache for no reason.
-
-(defonce ^:private readers-cache
-  (atom {}))
 
 (defn reset-cache!
   "Clear every cached Aero reader map and decrypted store, including cached
@@ -85,7 +106,7 @@
   source again. The process-wide default set by `register!` is left intact.
   Useful after editing or repairing secrets in a long-running process."
   []
-  (reset! readers-cache {})
+  (swap! state (fn [s] (-> s (update :generation inc) (assoc :cache {}))))
   nil)
 
 (defn- secrets-config
@@ -95,8 +116,12 @@
   surface as an NPE or a confusing failure deep inside `secrets/reader-literals`,
   far from anything that tells the reader what to do."
   [aero-opts]
+  ;; The config is resolved once per read, so a `register!` racing a read
+  ;; affects subsequent reads: this read uses the config that was live when it
+  ;; resolved. That is a permitted observation of the old lifecycle, and far
+  ;; simpler than resolving the default inside the cache swap below.
   (or (:secrets aero-opts)
-      @default-config
+      (:config @state)
       (throw (ex-info
               (str "No secrets config found for a #secret/… tag. Supply one "
                    "either process-wide with (com.kirahowe.secrets.aero/register! "
@@ -107,17 +132,32 @@
 
 (defn- readers-for
   "The `#secret/req` / `#secret/opt` reader fns for `config`, built at most
-  once per distinct config and cached in `readers-cache` thereafter. The cache
-  holds a delay rather than the readers themselves, so two threads reading
-  configs at the same time (parallel component start-up) share one decryption
-  instead of both shelling out to `age` before either wins the swap."
+  once per distinct config within one lifecycle. The cache holds a delay
+  rather than the readers themselves, so two threads reading configs at the
+  same time (parallel component start-up) share one decryption instead of both
+  shelling out to `age` before either wins the swap.
+
+  The cache key is the whole secrets config map, which is also what tenancy
+  means here: two callers passing equal maps deliberately share one decrypted
+  store within a lifecycle, and any distinguishing key — a `:tenant`, a
+  distinct `:file` — makes a distinct entry. A caller needing isolation
+  expresses it in the config; the library cannot see a lifecycle boundary a
+  caller never expressed, which is what `register!` and `reset-cache!` are for."
   [config]
-  @(get (swap! readers-cache
-               (fn [cache]
-                 (if (contains? cache config)
-                   cache
-                   (assoc cache config (delay (secrets/reader-literals config))))))
-        config))
+  ;; One `swap!` installs the delay and hands back the map it was installed
+  ;; into, so the delay deref'd below is always the one live in that value. If
+  ;; a `register!` commits first, this `swap!` retries against the new state
+  ;; and installs into the NEW cache; a delay from a retired generation can
+  ;; never be written into a live one. A reader that took its delay before the
+  ;; swap keeps deref'ing it — that is a reader observing the lifecycle it was
+  ;; live in, not a resurrected entry.
+  (let [{:keys [cache]} (swap! state
+                               (fn [s]
+                                 (cond-> s
+                                   (not (contains? (:cache s) config))
+                                   (assoc-in [:cache config]
+                                             (delay (secrets/reader-literals config))))))]
+    @(get cache config)))
 
 ;;;; Aero readers
 

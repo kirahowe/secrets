@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P1 | [012 — Aero cache lifecycle invalidation](012-aero-cache-lifecycle-invalidation.md) | Retire cached plaintext and failures whenever a registration lifecycle is cleared or replaced. |
 | P1 | [013 — Scope CI identities to consuming steps](013-scope-ci-identities.md) | Expose private identities only to trusted consuming steps and pin the executable example dependencies. |
 | P1 | [014 — Pin CI executable dependencies](014-pin-ci-executable-dependencies.md) | Pin every CI action and container to reviewed immutable content while retaining least privilege. |
 | P1 | [016 — Bound source and plaintext sizes](016-bound-source-and-plaintext-sizes.md) | Enforce configurable limits while streaming sources and plaintext, with prompt cleanup at every boundary. |
@@ -52,3 +51,4 @@ weaken the release gate:
 | [010 — Global artifact collision validation](010-global-artifact-collision-validation.md) | Replaced per-environment path comparison with one global canonical role table covering the resolved identity, and an enumerated allow-list for the three safe kinds of sharing. |
 | [015 — Reproducible guarded release publication](015-guard-release-publication.md) | Build once from a clean exact tag through a worktree export, receipt the jar and pom, and let a protected credential-isolated workflow upload those exact bytes without rebuilding. |
 | [011 — Race-safe initializer writes](011-race-safe-initializer-writes.md) | Proved the project root's whole ancestry untamperable before mutating anything, since babashka cannot reach anchored directory handles, and re-verified every write at the operation point. |
+| [012 — Aero cache lifecycle invalidation](012-aero-cache-lifecycle-invalidation.md) | Merged the registration and its reader cache into one atom so replacing or clearing a registration retires its plaintext and cached failures, even for an equal config. |

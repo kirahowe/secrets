@@ -335,9 +335,11 @@ opt always wins over the registered default. With neither supplied, reading a
 `#secret/…` tag throws rather than resolving to nil.
 
 Each distinct Aero secrets configuration is likewise decrypted once and
-cached, including a genuine decryption failure. In a long-running REPL, edit
-the ciphertext out of process, call `reset-cache!`, and only then re-read the
-whole config:
+cached, including a genuine decryption failure. The cache key is the secrets
+config map itself: two reads passing equal maps deliberately share one
+decrypted store, and any distinguishing key — a `:tenant`, a different `:file`
+— is a distinct entry. In a long-running REPL, edit the ciphertext out of
+process, call `reset-cache!`, and only then re-read the whole config:
 
 ```clojure
 (require '[aero.core :as aero]
@@ -361,6 +363,16 @@ reset, a successful load remains stale and a decryption failure keeps
 rethrowing. As with native readers, a process restart begins with an empty Aero
 cache and sees current ciphertext. Do not print the config or secret values,
 poll the file, or reset/re-read once per tag.
+
+That cache belongs to the registration live when it was populated, so
+`register!` retires it: replacing the default, or clearing it with
+`(register! nil)`, drops every decrypted store and every cached failure held
+under the previous registration. An equal replacement is still a new
+lifecycle — re-registering a config map that compares equal to the one it
+replaces clears the cache exactly as a different map would, because equal maps
+from two lifecycles are not one secret. The cost is one decryption per config
+at start-up and nothing after it: inside one lifecycle a config is still
+decrypted once, however many tags or reads use it.
 
 #### A different key per profile
 

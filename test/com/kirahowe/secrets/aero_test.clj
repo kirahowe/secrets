@@ -4,12 +4,14 @@
   throwaway temp directory with a freshly generated key.
 
   `register!` is compatibility state with a process-wide lifecycle, and the
-  reader-functions cache is process-wide by design. `with-clean-registration`
-  explicitly resets both before and after every test so their mutable state
-  cannot bleed between scenarios."
+  reader cache belongs to that lifecycle: `(register! nil)` ends it and retires
+  every entry cached under it. `with-clean-registration` therefore starts and
+  ends every test from a cleared registration, so mutable state cannot bleed
+  between scenarios."
   (:require [aero.core :as aero]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing use-fixtures]]
+            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.aero :as secrets-aero]
             [com.kirahowe.secrets.age :as age]))
 
@@ -31,12 +33,11 @@
           (doseq [p (reverse (file-seq (io/file dir)))] (.delete p)))))))
 
 (defn- with-clean-registration [f]
-  (secrets-aero/reset-cache!)
+  ;; Clearing the registration retires its cache too, so this is one call.
   (secrets-aero/register! nil)
   (try
     (f)
     (finally
-      (secrets-aero/reset-cache!)
       (secrets-aero/register! nil))))
 
 (use-fixtures :each with-tmp-key with-clean-registration)
@@ -62,6 +63,21 @@
   (let [f (str *dir* "/config.edn")]
     (spit f contents)
     f))
+
+(defn- sentinel-loader
+  "A stand-in for `secrets/reader-literals` that reads no ciphertext at all:
+  every load hands out a fresh sentinel value, so a value read through a
+  `#secret/…` tag names the load that produced it and the config it was loaded
+  for. Returns `[produced loader]`, where `produced` is an atom holding every
+  sentinel handed out, oldest first — the loader's whole history."
+  []
+  (let [produced (atom [])]
+    [produced
+     (fn [config]
+       (let [v (peek (swap! produced
+                            #(conj % {:load (inc (count %)) :config config})))]
+         {'secret/req (constantly v)
+          'secret/opt (constantly v)}))]))
 
 ;;;; Registration and resolution
 
@@ -171,6 +187,129 @@
             "reset retries against the repaired ciphertext without re-registering")
         (is (= 2 @calls)
             "reset causes exactly one fresh successful decrypt")))))
+
+;;;; Cache lifecycle
+
+;;; These tests instrument the loader instead of the real `age` binary: the
+;;; question is which lifecycle a cached value belongs to, and a sentinel names
+;;; that unambiguously where a decrypted value cannot.
+
+(deftest clearing-a-registration-retires-its-cache-test
+  (testing "(register! nil) retires every entry cached under the registration"
+    (let [a {:file "store.age" :identity-file "key.txt"}
+          cfg (spit-config! "{:v #secret/req :v}")
+          [produced loader] (sentinel-loader)]
+      (with-redefs [secrets/reader-literals loader]
+        (secrets-aero/register! a)
+        (let [retired (:v (aero/read-config cfg))]
+          (is (= {:load 1 :config a} retired) "the first read loads once")
+          (secrets-aero/register! nil)
+          (let [fresh (:v (aero/read-config cfg {:secrets a}))]
+            (is (not= retired fresh) "the retired sentinel is never returned again")
+            (is (= {:load 2 :config a} fresh) "the read after the clear loads again")
+            (is (= 2 (count @produced)) "exactly one extra load, not a cache hit")))))))
+
+(deftest equal-replacement-cannot-reuse-the-retired-lifecycle-test
+  (testing "an equal replacement config is still a new lifecycle with an empty cache"
+    (let [a {:file "store.age" :identity-file "key.txt"}
+          b (into {} a)
+          cfg (spit-config! "{:v #secret/req :v}")
+          [produced loader] (sentinel-loader)]
+      (is (= a b) "the replacement compares equal to the config it replaces")
+      (is (not (identical? a b)) "and is genuinely a different map")
+      (with-redefs [secrets/reader-literals loader]
+        (secrets-aero/register! a)
+        (let [retired (:v (aero/read-config cfg))]
+          (secrets-aero/register! b)
+          (let [fresh (:v (aero/read-config cfg))]
+            (is (not= retired fresh)
+                "an equal config cannot inherit the retired lifecycle's plaintext")
+            (is (= [{:load 1 :config a} {:load 2 :config b}] @produced)
+                "each lifecycle performed its own load")))))))
+
+(deftest cached-failures-are-retired-too-test
+  (testing "a cached load failure is retired by reset-cache! and by register!"
+    (let [a {:file "store.age" :identity-file "key.txt"}
+          cfg (spit-config! "{:v #secret/req :v}")
+          calls (atom 0)
+          loader (fn [_config]
+                   (swap! calls inc)
+                   (throw (ex-info "sentinel load failure" {})))]
+      (with-redefs [secrets/reader-literals loader]
+        (secrets-aero/register! a)
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"sentinel load failure"
+                              (aero/read-config cfg)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"sentinel load failure"
+                              (aero/read-config cfg)))
+        (is (= 1 @calls) "the failure itself is cached rather than retried per read")
+        (secrets-aero/reset-cache!)
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"sentinel load failure"
+                              (aero/read-config cfg)))
+        (is (= 2 @calls) "reset-cache! retires the cached failure")
+        (secrets-aero/register! a)
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"sentinel load failure"
+                              (aero/read-config cfg)))
+        (is (= 3 @calls) "an equal re-registration retires it too")))))
+
+(deftest concurrent-reads-never-see-a-retired-entry-test
+  (testing "readers racing register! never observe a load from a retired lifecycle"
+    (let [configs [{:file "a.age" :tenant :a} {:file "b.age" :tenant :b}]
+          cfg (spit-config! "{:v #secret/req :v}")
+          [produced loader] (sentinel-loader)
+          read-once (fn [config]
+                      (try
+                        {:config config :v (:v (aero/read-config cfg {:secrets config}))}
+                        (catch Exception e {:config config :error (ex-message e)})))]
+      (with-redefs [secrets/reader-literals loader]
+        (dotimes [_ 4]
+          ;; Opening a round retires every load so far, so no read below may
+          ;; return one: that is the invariant, independent of interleaving.
+          (secrets-aero/register! (configs 0))
+          (let [retired (count @produced)
+                churn (future (dotimes [_ 20] (secrets-aero/register! (configs 0))))
+                readers (mapv (fn [i]
+                                (future (mapv (fn [_] (read-once (configs (mod i 2))))
+                                              (range 20))))
+                              (range 6))
+                settled (mapv #(deref % 60000 ::timeout) readers)
+                results (into [] cat (remove #{::timeout} settled))
+                sentinels (set @produced)]
+            (is (not= ::timeout (deref churn 60000 ::timeout)) "the churn thread finished")
+            (is (not-any? #{::timeout} settled) "every reader thread finished")
+            (is (empty? (keep :error results)) "no read threw")
+            (is (every? #(contains? sentinels (:v %)) results)
+                "every value is one the loader actually produced")
+            (is (every? #(= (:config %) (:config (:v %))) results)
+                "and was loaded for the config that read asked for")
+            (is (every? #(> (:load (:v %)) retired) results)
+                "no read returned a load from a lifecycle retired before it started")))))))
+
+(deftest distinct-tenant-configs-do-not-share-a-cache-entry-test
+  (testing "the config map is the cache key, so a distinguishing key isolates a tenant"
+    (let [a {:file "store.age" :tenant :a}
+          b {:file "store.age" :tenant :b}
+          cfg (spit-config! "{:v #secret/req :v}")
+          [produced loader] (sentinel-loader)]
+      (with-redefs [secrets/reader-literals loader]
+        (let [va (:v (aero/read-config cfg {:secrets a}))
+              vb (:v (aero/read-config cfg {:secrets b}))]
+          (is (not= va vb) "one differing key gives each config its own decrypted store")
+          (is (= [{:load 1 :config a} {:load 2 :config b}] @produced) "two separate loads")
+          (is (= va (:v (aero/read-config cfg {:secrets (into {} a)})))
+              "an equal config inside one lifecycle deliberately shares the entry")
+          (is (= 2 (count @produced)) "sharing means no third load"))))))
+
+(deftest one-load-per-live-lifecycle-test
+  (testing "many reads of one config inside one lifecycle load exactly once"
+    (let [a {:file "store.age" :identity-file "key.txt"}
+          cfg (spit-config! "{:v #secret/req :v :w #secret/opt :w}")
+          [produced loader] (sentinel-loader)]
+      (with-redefs [secrets/reader-literals loader]
+        (secrets-aero/register! a)
+        (let [reads (mapv (fn [_] (aero/read-config cfg)) (range 5))]
+          (is (= [{:load 1 :config a}] @produced) "five reads, ten tags, one load")
+          (is (apply = reads) "every read saw the same decrypted store")
+          (is (= {:load 1 :config a} (:v (first reads)))))))))
 
 ;;;; Aero evaluation
 

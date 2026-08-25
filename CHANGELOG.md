@@ -117,6 +117,22 @@ All notable changes to this project are documented here. The format follows
   without changing how the examples run.
 
 ### Fixed
+- The optional `aero` integration's registration and its decrypted-reader cache
+  are now one piece of state with one lifecycle, so `register!` retires the
+  cache it replaces: every decrypted store and every cached decryption failure
+  held under the previous registration is dropped, including when the new
+  config map compares equal to the retired one, and `(register! nil)` is the
+  same operation with no config. Previously the default config and the cache
+  were independent atoms, so clearing or replacing a registration left matching
+  plaintext — and cached failures — reachable, and a later registration whose
+  config merely compared equal to a retired one inherited the retired
+  lifecycle's secrets (CWE-672, CWE-668). Cache entries are now installed by
+  the same compare-and-set that reads them back, so a registration committing
+  first makes the installing swap retry against the new state rather than write
+  into a retired cache; readers already holding a reader map keep using it, and
+  once-per-lifecycle decryption, the cache key (the secrets config map alone,
+  so a distinguishing key is a distinct entry), and `reset-cache!`'s contract
+  are unchanged.
 - Every command that encrypts now reads, bounds, and validates the configured
   recipients file exactly once — before an editor opens, before stdin is read,
   before anything is decrypted — and encrypts to the resulting immutable list
