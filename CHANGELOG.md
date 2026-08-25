@@ -135,6 +135,23 @@ All notable changes to this project are documented here. The format follows
   than silent tag drift.
 
 ### Fixed
+- The CI examples in the production chapter and the README no longer grant a
+  private age identity to a whole job. `SECRETS_AGE_IDENTITY` is declared on the
+  `bb secrets verify` step alone, so checkout, the `age` install, and the
+  third-party Babashka setup action stop inheriting a key none of them needs
+  (CWE-522). Each keyed job also declares `permissions: contents: read` and
+  gates itself to trusted events — a fork pull request receives no secrets
+  anyway, but a workflow that looks like it grants one invites the edit to
+  `pull_request_target` that would hand the key to unreviewed code — and every
+  `uses:` in the chapter is pinned to a full commit SHA with the version beside
+  it (CWE-829), the keyless job included, since a job holding no secret still
+  runs third-party code. The workflow policy grew the matching rule: it reports
+  an identity declared anywhere wider than the step that consumes it, in all
+  three spellings (`SECRETS_AGE_IDENTITY`, `_FILE`, `_B64` — a path is not key
+  material, but a job-wide pointer to the identity grants the same decryption),
+  and a new extractor reads the fenced YAML out of a chapter's `;;` prose so the
+  documented examples are checked by the same rules as
+  `.github/workflows/*.yml`.
 - The optional `aero` integration's registration and its decrypted-reader cache
   are now one piece of state with one lifecycle, so `register!` retires the
   cache it replaces: every decrypted store and every cached decryption failure

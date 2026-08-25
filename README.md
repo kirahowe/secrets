@@ -470,6 +470,11 @@ install step and the identity in its environment:
     SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ```
 
+Those are steps, not a whole job. The job around them wants the hardening in
+[Verifying in CI](#verifying-in-ci): the identity on the consuming step only,
+minimal `permissions:`, every action pinned to a commit SHA, and fork pull
+requests kept out of the keyed path.
+
 The repository secret's value is the **contents** of `~/.config/<app>/key.txt`,
 not a path — and the ciphertext it decrypts is the one already committed to
 the repo. That's the whole point of the design (the secret Actions holds is
@@ -707,6 +712,37 @@ two modes:
 - **Full verification.** With a key (e.g. `SECRETS_AGE_IDENTITY` on the runner),
   `verify` decrypts and checks the full shape and `:vhash`es, and also flags an
   out-of-band re-encryption via the sha even when the shape matches.
+
+Placement matters in the keyed job. Give the identity to the one step that runs
+`verify`, keep untrusted code out of that job, ask for the least permission that
+can check the repository out, and pin every action to a commit:
+
+```yaml
+verify-secrets:
+  runs-on: ubuntu-latest
+  if: >-
+    github.event_name != 'pull_request' ||
+    github.event.pull_request.head.repo.full_name == github.repository
+  permissions:
+    contents: read
+  steps:
+    - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+    - run: sudo apt-get update && sudo apt-get install -y age
+    - uses: turtlequeue/setup-babashka@d78ec6570aea3b614bc695cafcceb82eb45c2af9 # v1.8.0
+      with: {babashka-version: 1.12.208}
+    - run: bb secrets verify
+      env:
+        SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
+```
+
+A job-level `env:` would hand that identity to checkout, the `apt-get` install,
+and a third-party setup action, none of which needs a key; a tag in place of a
+commit SHA would let upstream change what runs beside it. A fork's
+`pull_request` receives no repository secrets, so the `if:` is not what stops a
+leak today — it stops this from being edited into a `pull_request_target`
+workflow that hands the key to unreviewed code. The keyless variant needs none
+of the gating, because it holds nothing to take; the production chapter under
+`book/chapters` works through both.
 
 `verify` reads the manifest's `:version` and treats anything but 2 — including a
 legacy v1 manifest — as drift, never as a shape to diff. Disable the manifest

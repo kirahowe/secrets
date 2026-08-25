@@ -139,9 +139,11 @@
 ;; ```yaml
 ;; verify-secrets-freshness:
 ;;   runs-on: ubuntu-latest
+;;   permissions:
+;;     contents: read
 ;;   steps:
-;;     - uses: actions/checkout@v4
-;;     - uses: turtlequeue/setup-babashka@v1
+;;     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+;;     - uses: turtlequeue/setup-babashka@d78ec6570aea3b614bc695cafcceb82eb45c2af9 # v1.8.0
 ;;       with: {babashka-version: 1.12.208}
 ;;     - run: bb secrets verify
 ;; ```
@@ -152,6 +154,12 @@
 ;; older manifest has no ciphertext hash for a keyless check. On a fresh repo,
 ;; this usually means someone forgot to commit the manifest.
 
+;; This job holds no secret, so it needs no gate on which event triggered it —
+;; there is nothing here for an untrusted pull request to take. It still pins
+;; each action to a commit and asks for the least permission that can check a
+;; repository out, because a job with no secret is still a job running
+;; third-party code with a token.
+
 ;; The full job decrypts and regenerates the manifest entries. In single-key
 ;; mode this includes the keyed value hashes; in team mode it checks structure.
 ;; Give the runner a dedicated deploy identity and install `age`:
@@ -159,31 +167,62 @@
 ;; ```yaml
 ;; verify-secrets:
 ;;   runs-on: ubuntu-latest
-;;   env:
-;;     SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
+;;   if: >-
+;;     github.event_name != 'pull_request' ||
+;;     github.event.pull_request.head.repo.full_name == github.repository
+;;   permissions:
+;;     contents: read
 ;;   steps:
-;;     - uses: actions/checkout@v4
+;;     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 ;;     - run: sudo apt-get update && sudo apt-get install -y age
-;;     - uses: turtlequeue/setup-babashka@v1
+;;     - uses: turtlequeue/setup-babashka@d78ec6570aea3b614bc695cafcceb82eb45c2af9 # v1.8.0
 ;;       with: {babashka-version: 1.12.208}
 ;;     - run: bb secrets verify
+;;       env:
+;;         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ;; ```
 
 ;; The full job makes CI a holder of an identity that can decrypt the file.
 ;; Use it only when that access is appropriate. The keyless job still detects
 ;; a ciphertext that no longer matches its committed manifest.
 
+;; The identity is declared on the verify step rather than on the job. Checkout,
+;; the `apt-get` install, and the Babashka setup action all run in this job and
+;; none of them needs a key; a job-level `env:` would hand the identity to every
+;; one of them, so a change in any of them would be a change in code holding a
+;; private key. Every `uses:` is a full commit SHA with the version that commit
+;; is beside it, for the same reason: a tag is a name upstream can move, so a
+;; tagged action can become different code with no diff here — and that code
+;; would be the code running beside the credential.
+
+;; The `if:` keeps untrusted code out of the keyed path. A `pull_request` from a
+;; fork receives no repository secrets, so this job cannot leak the identity to
+;; one today; the condition says so explicitly anyway, because a job that looks
+;; like it grants a key to a pull request invites the next person to "fix" the
+;; empty variable by moving to `pull_request_target`, which runs with the
+;; secrets available and a contributor's unreviewed code checked out. The
+;; `permissions:` block is the other half of the same argument: without one the
+;; job inherits the repository or organization default, and `contents: read` is
+;; all a verification job needs.
+
 ;; ## A job that reads secrets
 
 ;; Verification does not pass secret values to application code. A job that
 ;; needs them, such as an evaluation that calls an external API, also needs
-;; `age` and the identity in its environment:
+;; `age` and the identity in its environment — on the step that runs the
+;; evaluation, under the same gate and permissions, because this job holds the
+;; same key:
 
 ;; ```yaml
 ;; evals:
 ;;   runs-on: ubuntu-latest
+;;   if: >-
+;;     github.event_name != 'pull_request' ||
+;;     github.event.pull_request.head.repo.full_name == github.repository
+;;   permissions:
+;;     contents: read
 ;;   steps:
-;;     - uses: actions/checkout@v4
+;;     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 ;;     - name: Install age
 ;;       run: sudo apt-get update && sudo apt-get install -y age
 ;;     - name: Run evaluations
@@ -200,6 +239,12 @@
 ;; ```sh
 ;; gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
 ;; ```
+
+;; None of this applies to a recipients file. The lines in `recipients.txt` are
+;; age *public* keys: they are what encryption needs rather than what decryption
+;; needs, they are meant to be committed and read, and a fork's pull request
+;; learns nothing from holding one. Scope, gate, and pin around the private
+;; identity — a public recipient is ordinary repository content.
 
 ;; ## Back up the identity
 

@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P1 | [013 — Scope CI identities to consuming steps](013-scope-ci-identities.md) | Expose private identities only to trusted consuming steps and pin the executable example dependencies. |
 | P1 | [016 — Bound source and plaintext sizes](016-bound-source-and-plaintext-sizes.md) | Enforce configurable limits while streaming sources and plaintext, with prompt cleanup at every boundary. |
 | P1 | [018 — Reduce release dependency exposure](018-reduce-release-dependency-exposure.md) | Isolate a smaller Clojars publisher and enforce an applicability-aware advisory policy before credential use. |
 | P2 | [017 — Sender-authenticity contract](017-sender-authenticity-contract.md) | Explicitly enforce either a protected deployment-channel boundary or separately keyed sender signatures. |
@@ -52,3 +51,4 @@ weaken the release gate:
 | [011 — Race-safe initializer writes](011-race-safe-initializer-writes.md) | Proved the project root's whole ancestry untamperable before mutating anything, since babashka cannot reach anchored directory handles, and re-verified every write at the operation point. |
 | [012 — Aero cache lifecycle invalidation](012-aero-cache-lifecycle-invalidation.md) | Merged the registration and its reader cache into one atom so replacing or clearing a registration retires its plaintext and cached failures, even for an equal config. |
 | [014 — Pin CI executable dependencies](014-pin-ci-executable-dependencies.md) | Pinned every action to a commit SHA and the container to a digest, confirmed Pages remains the only privileged job, and added a workflow policy test plus Dependabot so pinning cannot decay. |
+| [013 — Scope CI identities to consuming steps](013-scope-ci-identities.md) | Moved the documented identity onto the step that consumes it, gated and pinned the keyed jobs, and extended the workflow policy to catch a widely scoped credential in docs and workflows alike. |
