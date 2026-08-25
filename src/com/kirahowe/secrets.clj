@@ -213,23 +213,113 @@
        "{:app \"myapp\"} (→ ~/.config/myapp/key.txt); or create the key with "
        "`bb secrets keygen`."))
 
+;;;; Resource limits
+
+(def default-limits
+  "Bounds applied while a secrets source is streamed, decrypted, and parsed.
+
+  They exist so a hostile or accidentally enormous source fails fast rather than
+  exhausting the process (CWE-400), and each is checked *during* the work rather
+  than after it:
+
+    :max-source-bytes     ciphertext bytes read from a URL, InputStream, or
+                          file, counted while copying (16 MiB).
+    :max-plaintext-bytes  plaintext bytes `age` may produce before the
+                          subprocess is killed (8 MiB).
+    :max-edn-depth        collection nesting depth the decrypted EDN may reach,
+                          checked before it is parsed (100).
+
+  Pass `{:limits {…}}` to `load-secrets`, `reader-literals`, or `merge-readers`
+  to override any of them; the supplied map is merged over these defaults. The
+  defaults sit far above every documented example — a real store is kilobytes."
+  {:max-source-bytes 16777216
+   :max-plaintext-bytes age/default-max-plaintext-bytes
+   :max-edn-depth 100})
+
+(defn- resolve-limits
+  "Merge a supplied `:limits` map over `default-limits`. Rejects anything a
+  later read would silently see as a default: a non-map, an unknown key (a typo
+  in a security limit must not read as \"unset\"), or a value that is not a
+  positive integer."
+  [limits]
+  (when-not (or (nil? limits) (map? limits))
+    (throw (ex-info "secrets :limits must be a map of limit name → positive integer."
+                    {:limits limits :reason :invalid-limits})))
+  (let [unknown (vec (sort-by str (remove (set (keys default-limits)) (keys limits))))]
+    (when (seq unknown)
+      (throw (ex-info (str "secrets :limits has unknown key(s): "
+                           (str/join ", " unknown) ". Known limits: "
+                           (str/join ", " (sort (keys default-limits))) ".")
+                      {:limits limits :unknown-keys unknown :reason :invalid-limits}))))
+  (doseq [[limit value] limits]
+    (when-not (and (integer? value) (pos? value))
+      (throw (ex-info (str "secrets :limits " limit " must be a positive integer, got "
+                           (pr-str value) ".")
+                      {:limits limits :limit limit :value value :reason :invalid-limits}))))
+  (merge default-limits limits))
+
 ;;;; Loading
 
+(def ^:private source-chunk-bytes
+  "Sources are copied in fixed 64 KiB chunks so the running total is checked
+  before every further read rather than after the source is exhausted."
+  65536)
+
+(defn- source-too-large!
+  "Throw the source size failure, naming only the byte count and the limit —
+  never any source content."
+  [source read-bytes limit]
+  (throw (ex-info (str "The secrets source is larger than the configured :max-source-bytes"
+                       " limit of " limit " bytes.")
+                  {:source (str source)
+                   :bytes read-bytes
+                   :limit limit
+                   :reason :source-too-large})))
+
+(defn- copy-source!
+  "Copy `in` to `out` in fixed chunks, refusing to write more than `limit`
+  bytes.
+
+  A chunk that would push the total past `limit` is never written, so nothing
+  beyond the bound reaches the filesystem and an endless stream is abandoned at
+  the bound instead of being read to an end it does not have. Counting while
+  copying is what makes a declared length irrelevant: a `Content-Length` that
+  lies in either direction, or no length at all, changes nothing here."
+  [source ^java.io.InputStream in ^java.io.OutputStream out limit]
+  (let [chunk (byte-array source-chunk-bytes)]
+    (loop [total 0]
+      (let [n (.read in chunk 0 source-chunk-bytes)]
+        (when-not (neg? n)
+          (let [total (+ total n)]
+            (when (> total limit)
+              (source-too-large! source total limit))
+            (.write out chunk 0 n)
+            (recur total)))))))
+
 (defn- source->file
-  "Coerce a secrets `source` to a [file cleanup!] pair. Path strings and Files
-  naming an existing file are used in place (no cleanup). Anything else that
+  "Coerce a secrets `source` to a [file cleanup!] pair, refusing a source larger
+  than `limit` bytes. Path strings and Files naming an existing file are used in
+  place (no cleanup), so their length is checked directly. Anything else that
   `io/input-stream` can open — any URL (including a jar: resource URL from
   inside an uberjar), an InputStream, … — is copied to a 0600 temp file so
-  `age` can read it; cleanup deletes that copy."
-  [source]
+  `age` can read it, counting bytes as it goes and deleting the partial copy at
+  once if the bound is passed; cleanup deletes that copy."
+  [source limit]
   (let [f (when (or (instance? java.io.File source) (string? source))
             (io/file source))]
     (if (and f (.exists f))
-      [f (fn [])]
+      (do
+        (when (> (.length f) limit)
+          (source-too-large! source (.length f) limit))
+        [f (fn [])])
       (let [tmp (owner-only-temp-file! "secrets-" ".age")]
-        (with-open [in (io/input-stream source)
-                    out (io/output-stream tmp)]
-          (io/copy in out))
+        (try
+          (with-open [in (io/input-stream source)
+                      out (io/output-stream tmp)]
+            (copy-source! source in out limit))
+          (catch Exception e
+            (.delete tmp)
+            (throw e)))
         [tmp #(.delete tmp)]))))
 
 (def ^:private no-store-hint
@@ -253,8 +343,9 @@
     identity))
 
 (defn- acquire-source!
-  "Acquire a file and cleanup function for `source`, translating read failures."
-  [source]
+  "Acquire a file and cleanup function for `source` under `limits`, translating
+  read failures."
+  [source limits]
   (when (nil? source)
     (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
                          " (io/resource \"secrets.edn.age\") found nothing on the classpath"
@@ -264,7 +355,7 @@
   ;; Opening decides whether a source is readable. A String may name a path or
   ;; a URL, so checking for a missing path first would reject jar:file: URLs.
   (try
-    (source->file source)
+    (source->file source (:max-source-bytes limits))
     (catch java.io.IOException e
       (throw (ex-info (if (and (or (instance? java.io.File source) (string? source))
                                (not (.exists (io/file (str source)))))
@@ -274,11 +365,80 @@
                       {:source source :reason :no-file}
                       e)))))
 
+(defn- skip-string
+  "Return the index just past the EDN string literal whose opening quote sits at
+  `i` - 1, so a `\\` escape cannot hide the closing quote."
+  [^String s i]
+  (let [n (.length s)]
+    (loop [i i]
+      (cond
+        (>= i n) n
+        (= \\ (.charAt s i)) (recur (+ i 2))
+        (= \" (.charAt s i)) (inc i)
+        :else (recur (inc i))))))
+
+(defn- skip-comment
+  "Return the index of the newline ending the `;` comment that starts at `i`, or
+  the end of `s`."
+  [^String s i]
+  (let [n (.length s)]
+    (loop [i i]
+      (if (or (>= i n) (= \newline (.charAt s i)))
+        i
+        (recur (inc i))))))
+
+(defn- edn-max-depth
+  "Return the deepest collection nesting the EDN text `s` reaches, scanning it
+  once without parsing it.
+
+  Only delimiters that are structure count: string literals (including their
+  `\\` escapes), character literals such as `\\[`, and `;` comments are skipped,
+  so a delimiter inside any of them is text rather than depth. `#{` needs no
+  special case — its `{` is the opener. Surplus closing delimiters clamp at
+  zero: balance is `clojure.edn`'s job, not this scanner's."
+  [^String s]
+  (let [n (.length s)]
+    (loop [i 0 depth 0 deepest 0]
+      (if (>= i n)
+        deepest
+        (case (.charAt s i)
+          \" (recur (skip-string s (inc i)) depth deepest)
+          \\ (recur (+ i 2) depth deepest)
+          \; (recur (skip-comment s (inc i)) depth deepest)
+          (\( \[ \{) (recur (inc i) (inc depth) (max deepest (inc depth)))
+          (\) \] \}) (recur (inc i) (max 0 (dec depth)) deepest)
+          (recur (inc i) depth deepest))))))
+
+(defn- read-secrets-edn
+  "Parse decrypted `plaintext` as EDN under `limits`.
+
+  The whole parse policy is two bounds and one deliberate absence. EDN has no
+  aliasing, reference, or expansion mechanism, so a parsed graph's size is
+  linear in its plaintext's byte count: `:max-plaintext-bytes`, enforced while
+  `age` is still writing, already bounds the graph. What a byte bound does not
+  bound is parser *recursion*: a few hundred kilobytes of `[[[[…` overflows the
+  stack, and `StackOverflowError` is an `Error` no caller should be relying on a
+  `catch` for, so `:max-edn-depth` is checked by one linear scan
+  ([[edn-max-depth]]) before the parser sees the text. And `clojure.edn` with no
+  custom readers evaluates nothing at all — unlike `read`, it cannot construct
+  arbitrary classes or run code, so no input, of any size, buys execution."
+  [plaintext limits]
+  (let [limit (:max-edn-depth limits)
+        depth (edn-max-depth plaintext)]
+    (when (> depth limit)
+      (throw (ex-info (str "The decrypted secrets nest " depth " collections deep, past the"
+                           " configured :max-edn-depth limit of " limit ".")
+                      {:depth depth :limit limit :reason :edn-too-deep})))
+    (edn/read-string plaintext)))
+
 (defn- decrypt-and-read!
-  "Decrypt and read `file`, always running its source cleanup function."
-  [identity file cleanup!]
+  "Decrypt and read `file` under `limits`, always running its source cleanup
+  function."
+  [identity file limits cleanup!]
   (try
-    (edn/read-string (age/decrypt identity (.getAbsolutePath ^java.io.File file)))
+    (read-secrets-edn (age/decrypt identity (.getAbsolutePath ^java.io.File file)
+                                   {:limits limits})
+                      limits)
     (finally
       (cleanup!))))
 
@@ -290,6 +450,7 @@
   identity path or an options map:
     :identity-file  explicit identity path (wins over :app and the env vars)
     :app            app name for the default ~/.config/<app>/key.txt
+    :limits         resource bounds merged over `default-limits`
   Without an explicit identity or app, only the SECRETS_AGE_IDENTITY*
   environment variables are used.
 
@@ -299,13 +460,17 @@
                   `(io/resource \"secrets.edn.age\")` found nothing on the
                   classpath), a path/File is absent, or reading the source
                   raises an IOException.
-  Identity validation happens before source validation. The plaintext is read
-  with `clojure.edn`, not `eval`."
+  An input past one of the `:limits` throws with `:source-too-large`,
+  `:plaintext-too-large`, or `:edn-too-deep`, and `:invalid-limits` rejects a
+  `:limits` map that is malformed rather than reading it as the defaults.
+  Limits are resolved first, then the identity, then the source. The plaintext
+  is read with `clojure.edn`, not `eval`."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
-   (let [identity (validate-load-identity! source identity-or-opts)
-         [file cleanup!] (acquire-source! source)]
-     (decrypt-and-read! identity file cleanup!))))
+   (let [limits (resolve-limits (when (map? identity-or-opts) (:limits identity-or-opts)))
+         identity (validate-load-identity! source identity-or-opts)
+         [file cleanup!] (acquire-source! source limits)]
+     (decrypt-and-read! identity file limits cleanup!))))
 
 (defn get-secret
   "Read a secret from a loaded map. `key-path` is a single key (`:database/url`)
@@ -320,8 +485,9 @@
 ;;;; EDN reader literals
 
 (defn- reader-loaded-state
-  "Resolve and load one readers map's source, or describe why it is unavailable."
-  [{:keys [resource file]} identity]
+  "Resolve and load one readers map's source under its resolved `:limits`, or
+  describe why it is unavailable."
+  [{:keys [resource file limits]} identity]
   (let [source (cond
                  file (when (.exists (io/file (str file)))
                         (io/file (str file)))
@@ -334,7 +500,8 @@
       {:present? false :reason :no-identity}
 
       :else
-      {:present? true :secrets (load-secrets source @identity)})))
+      {:present? true
+       :secrets (load-secrets source {:identity-file @identity :limits limits})})))
 
 (defn- required-secret-handler
   "Build the required-secret reader around a shared delayed loaded state."
@@ -375,6 +542,8 @@
     :file          an explicit file path, used instead of :resource.
     :app           app name for the default key path ~/.config/<app>/key.txt.
     :identity-file explicit identity path (overrides resolution).
+    :limits        resource bounds merged over `default-limits`, validated here
+                   rather than at the first tag read.
 
   The source is resolved and decrypted at most once, when the first tag is
   read. That first successful load or decryption failure is cached for the
@@ -388,8 +557,9 @@
     #secret/opt k → optional: nil in all three of those cases.
   If the identity exists but decryption fails, both tags throw."
   [{:keys [app identity-file] :as opts}]
-  (let [identity (delay (or identity-file (resolve-identity-file app)))
-        loaded (delay (reader-loaded-state opts identity))
+  (let [limits (resolve-limits (:limits opts))
+        identity (delay (or identity-file (resolve-identity-file app)))
+        loaded (delay (reader-loaded-state (assoc opts :limits limits) identity))
         describe (or (:file opts) (:resource opts) "secrets")]
     {'secret/req (required-secret-handler loaded describe)
      'secret/opt (optional-secret-handler loaded)}))

@@ -16,6 +16,33 @@ All notable changes to this project are documented here. The format follows
   integer, and an unknown key inside `:limits` is rejected rather than ignored,
   because a typo in a security limit must not read as "leave it at the
   default".
+- Runtime loading takes a `:limits` map — `secrets/default-limits`, overridable
+  through the opts of `load-secrets`, `reader-literals`, and `merge-readers` —
+  bounding the ciphertext copied from a URL or InputStream
+  (`:max-source-bytes`, 16 MiB), the plaintext `age` may produce
+  (`:max-plaintext-bytes`, 8 MiB), and the nesting depth of the decrypted EDN
+  (`:max-edn-depth`, 100). Each bound is enforced while the bytes move rather
+  than after they are all allocated: sources are counted chunk by chunk as they
+  are copied, so a misleading, absent, or chunked `Content-Length` cannot raise
+  or lower the effective bound, and decryption now streams through
+  `ProcessBuilder` instead of `clojure.java.shell/sh`, which materializes the
+  whole plaintext before any caller can look at its size. Passing a bound kills
+  the `age` process, drops the partial plaintext, deletes the partial temp copy
+  or staging file at once, and throws with `:source-too-large`,
+  `:plaintext-too-large`, or `:edn-too-deep` carrying the byte count and the
+  limit but no content; a malformed `:limits` throws `:invalid-limits` rather
+  than reading as the defaults. Previously an attacker-influenced source could
+  exhaust disk or heap (CWE-400). The EDN policy is documented where it is
+  enforced: `:max-plaintext-bytes` bounds graph size because EDN cannot expand,
+  a linear depth pre-scan bounds parser recursion (a `StackOverflowError` no
+  `catch` should be relying on), and `clojure.edn` with no custom readers
+  evaluates nothing. `age/decrypt-bytes`, `age/decrypt`, and
+  `age/decrypt-to-file!` take the same limits through an optional trailing opts
+  map; their existing arities are unchanged, as is the `--`/`path-arg` option
+  boundary the argv keeps. `bb secrets decrypt`, the general-purpose counterpart
+  to `bb secrets encrypt` for an arbitrary file, carries its own 1 GiB bound
+  instead of the store's 8 MiB: a store past that is hostile or broken, an
+  arbitrary file past it is ordinary.
 
 ### Changed
 - Publishing is now a guarded, receipted, two-step flow. `clojure -T:build

@@ -173,33 +173,142 @@
         (throw (ex-info "age encryption failed" {:out (str out) :error err})))
       out)))
 
+(def default-max-plaintext-bytes
+  "Default bound, in bytes, on the plaintext one decryption may produce (8 MiB).
+
+  It exists so a hostile or accidentally enormous ciphertext fails fast instead
+  of exhausting the process: the bound is checked while `age` is still writing,
+  not after a complete plaintext has been allocated. Override it per call with
+  `{:limits {:max-plaintext-bytes n}}`; `com.kirahowe.secrets` carries the same
+  value as one of its runtime `:limits`."
+  8388608)
+
+(def ^:private capture-chunk-bytes
+  "Plaintext is drained in fixed 64 KiB chunks so the running total is checked
+  before every further read rather than after the whole output exists."
+  65536)
+
+(defn- plaintext-limit
+  "Resolve the plaintext byte bound from the optional trailing options map
+  `opts`, rejecting anything a later read would silently see as the default."
+  [opts]
+  (let [limits (:limits opts)]
+    (when-not (or (nil? limits) (map? limits))
+      (throw (ex-info "age :limits must be a map of limit name → positive integer."
+                      {:limits limits :reason :invalid-limit})))
+    (let [n (get limits :max-plaintext-bytes default-max-plaintext-bytes)]
+      (when-not (and (integer? n) (pos? n))
+        (throw (ex-info (str "age :limits :max-plaintext-bytes must be a positive integer, got "
+                             (pr-str n) ".")
+                        {:limit :max-plaintext-bytes :value n :reason :invalid-limit})))
+      n)))
+
+(defn- destroy-process!
+  "Terminate `process`, escalating to a forcible kill when it does not exit
+  within a short bounded wait. A process still writing plaintext nobody will
+  read has to stop, not linger."
+  [^java.lang.Process process]
+  (.destroy process)
+  (when-not (.waitFor process 2 java.util.concurrent.TimeUnit/SECONDS)
+    (.destroyForcibly process)
+    (.waitFor process 2 java.util.concurrent.TimeUnit/SECONDS))
+  nil)
+
+(defn- read-bounded!
+  "Read `in` to its end and return the bytes, refusing an input larger than
+  `max-bytes`.
+
+  The running total is checked before every further read, so an oversized input
+  is refused while it is still arriving rather than after all of it has been
+  allocated. On refusal the partial buffer is discarded and the thrown ex-info
+  carries `context`, the byte count, and the limit, never a captured byte."
+  ^bytes [^java.io.InputStream in max-bytes context]
+  (let [captured (java.io.ByteArrayOutputStream.)
+        chunk (byte-array capture-chunk-bytes)]
+    (loop [total 0]
+      (let [n (.read in chunk 0 capture-chunk-bytes)]
+        (if (neg? n)
+          (.toByteArray captured)
+          (let [total (+ total n)]
+            (when (> total max-bytes)
+              ;; Discard what was captured before unwinding: the partial
+              ;; plaintext stays unreachable through the stream, the buffer is
+              ;; garbage the moment this frame goes, and nothing captured is
+              ;; attached to the exception.
+              (.reset captured)
+              (throw (ex-info (str "Decrypted plaintext is larger than the configured "
+                                   ":max-plaintext-bytes limit of " max-bytes " bytes.")
+                              (assoc context
+                                     :bytes total
+                                     :limit max-bytes
+                                     :reason :plaintext-too-large))))
+            (.write captured chunk 0 n)
+            (recur total)))))))
+
+(defn- capture-bounded-stdout!
+  "Run `argv`, returning `{:exit n :out bytes :err s}` the way
+  `clojure.java.shell/sh` does, but refusing an output larger than `max-bytes`.
+
+  `sh` cannot express that bound: it materializes the complete output before any
+  caller can look at its size. Here stdout is drained through [[read-bounded!]]
+  instead, and passing the bound kills the process on the way out. stderr is
+  drained on its own thread because a process that fills the stderr pipe while
+  nobody reads it deadlocks."
+  [argv max-bytes context]
+  (let [process (.start (java.lang.ProcessBuilder. ^java.util.List (vec argv)))
+        stderr (future (slurp (.getErrorStream process)))]
+    (try
+      ;; Nothing here writes to the child, so give it EOF on stdin at once
+      ;; rather than leaving it able to block on a pipe no one will fill.
+      (.close (.getOutputStream process))
+      (let [out (with-open [stdout (.getInputStream process)]
+                  (read-bounded! stdout max-bytes context))]
+        {:exit (.waitFor process) :out out :err @stderr})
+      (finally
+        (when (.isAlive process)
+          (destroy-process! process))))))
+
+(defn- decrypt-argv
+  "Build the `age -d` argv decrypting `encrypted-file` with `identity-file`.
+  Both paths go through `path-arg` and `--` sits immediately before the
+  positional input, so no path can be read as an option or as stdin."
+  [identity-file encrypted-file]
+  ["age" "-d" "-i" (path-arg :identity identity-file)
+   "--" (path-arg :input encrypted-file)])
+
 (defn decrypt-bytes
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
   byte array (binary-safe — age encrypts arbitrary files, not just text).
-  Throws an ex-info (with the captured stderr) on failure."
-  ^bytes [identity-file encrypted-file]
-  (let [identity-path (path-arg :identity identity-file)
-        input-path (path-arg :input encrypted-file)]
-    (ensure-installed!)
-    ;; :out-enc :bytes leaves stdout undecoded; stderr is still returned as a
-    ;; string (both here and on the JVM).
-    (let [{:keys [exit out err]} (shell/sh "age" "-d" "-i" identity-path
-                                           "--" input-path
-                                           :out-enc :bytes)]
-      (if (zero? exit)
-        out
-        (throw (ex-info "age decryption failed"
-                        {:identity-file (str identity-file)
-                         :encrypted-file (str encrypted-file)
-                         :error err
-                         :hint "Wrong key, or you are not a recipient of this file."}))))))
+  Throws an ex-info (with the captured stderr) on failure.
+
+  `opts` may carry `{:limits {:max-plaintext-bytes n}}`, defaulting to
+  `default-max-plaintext-bytes`. The bound is enforced while `age` is writing:
+  an oversized plaintext kills the subprocess and throws with
+  `:reason :plaintext-too-large` instead of being allocated in full first."
+  (^bytes [identity-file encrypted-file] (decrypt-bytes identity-file encrypted-file nil))
+  (^bytes [identity-file encrypted-file opts]
+   (let [argv (decrypt-argv identity-file encrypted-file)
+         max-bytes (plaintext-limit opts)
+         context {:identity-file (str identity-file)
+                  :encrypted-file (str encrypted-file)}]
+     (ensure-installed!)
+     (let [{:keys [exit out err]} (capture-bounded-stdout! argv max-bytes context)]
+       (if (zero? exit)
+         out
+         (throw (ex-info "age decryption failed"
+                         (assoc context
+                                :error err
+                                :hint (str "Wrong key, or you are not a recipient of "
+                                           "this file.")))))))))
 
 (defn decrypt
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
   UTF-8 string. Use `decrypt-bytes` for binary plaintexts. Throws an ex-info
-  (with the captured stderr) on failure."
-  [identity-file encrypted-file]
-  (String. (decrypt-bytes identity-file encrypted-file) "UTF-8"))
+  (with the captured stderr) on failure. `opts` carries `:limits` exactly as
+  `decrypt-bytes` does."
+  ([identity-file encrypted-file] (decrypt identity-file encrypted-file nil))
+  ([identity-file encrypted-file opts]
+   (String. (decrypt-bytes identity-file encrypted-file opts) "UTF-8")))
 
 (def ^:private no-follow-links
   (into-array java.nio.file.LinkOption [java.nio.file.LinkOption/NOFOLLOW_LINKS]))
@@ -323,23 +432,26 @@
   permissive or partial plaintext is ever observable at `out`. The destination's
   final component is validated without following links, so a symlink or other
   non-regular destination is refused rather than written through. Decryption
-  runs before any staging file exists — a wrong key therefore never creates one
-  — and any later failure removes the staging plaintext and leaves the previous
-  `out` intact.
+  runs before any staging file exists — a wrong key, or a plaintext past the
+  `:max-plaintext-bytes` bound in `opts`, therefore never creates one — and any
+  later failure removes the staging plaintext and leaves the previous `out`
+  intact.
 
   A filesystem without POSIX permissions fails closed instead of writing
   plaintext with default permissions: use `decrypt-bytes` or `decrypt`, which
   never write plaintext to disk."
-  [identity-file encrypted-file out]
-  (let [dest (plaintext-destination out)
-        plaintext (decrypt-bytes identity-file encrypted-file)
-        staging (owner-only-staging-file! dest)]
-    (try
-      ;; NOFOLLOW_LINKS here is defence in depth: it refuses the open if the
-      ;; staging name were swapped for a link between creation and write.
-      (java.nio.file.Files/write (.toPath staging) ^bytes plaintext staging-write-options)
-      (publish-plaintext! staging dest)
-      (catch Exception e
-        (try (.delete staging) (catch Exception _ nil))
-        (throw e)))
-    out))
+  ([identity-file encrypted-file out]
+   (decrypt-to-file! identity-file encrypted-file out nil))
+  ([identity-file encrypted-file out opts]
+   (let [dest (plaintext-destination out)
+         plaintext (decrypt-bytes identity-file encrypted-file opts)
+         staging (owner-only-staging-file! dest)]
+     (try
+       ;; NOFOLLOW_LINKS here is defence in depth: it refuses the open if the
+       ;; staging name were swapped for a link between creation and write.
+       (java.nio.file.Files/write (.toPath staging) ^bytes plaintext staging-write-options)
+       (publish-plaintext! staging dest)
+       (catch Exception e
+         (try (.delete staging) (catch Exception _ nil))
+         (throw e)))
+     out)))

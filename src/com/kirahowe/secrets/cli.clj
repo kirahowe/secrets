@@ -1077,16 +1077,34 @@
       (ok "Encrypted:" out)
       out)))
 
+(def ^:private max-arbitrary-plaintext-bytes
+  "Plaintext bound for `decrypt!`, the general-purpose file command (1 GiB).
+
+  Deliberately far above `secrets/default-limits`' 8 MiB, which bounds a
+  *secrets store*: a store is kilobytes, and a store past that bound is a
+  hostile or broken input. `encrypt!`/`decrypt!` are the counterpart pair for an
+  arbitrary file the operator names on the command line, so the same 8 MiB there
+  would refuse ordinary use of a documented command. This bound is a heap guard
+  rather than a policy — `decrypt-bytes` returns the whole plaintext as an
+  array, so an unbounded read is an allocation an attacker-supplied file could
+  choose."
+  1073741824)
+
 (defn decrypt!
   "Decrypt a <file>.age to stdout, byte-for-byte (binary-safe; plaintext is
-  never written to disk). Returns the input path."
+  never written to disk). Returns the input path.
+
+  Bounded by `max-arbitrary-plaintext-bytes`, not by the tighter secrets-store
+  limit: this command decrypts whatever file it is given."
   [config env-arg file]
   (require-age!)
   (let [env (resolve-env config env-arg)]
     (require-identity! env)
     (when-not (and file (.exists (io/file file)))
       (fail! (str "No such file: " file) {:file file}))
-    (let [bs (age/decrypt-bytes (:identity-file env) file)]
+    (let [bs (age/decrypt-bytes (:identity-file env) file
+                                {:limits {:max-plaintext-bytes
+                                          max-arbitrary-plaintext-bytes}})]
       (.write System/out ^bytes bs)
       (.flush System/out))
     file))

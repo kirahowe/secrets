@@ -595,6 +595,31 @@
                 (System/setOut orig))))
           (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))
 
+(deftest decrypt-is-not-bound-by-the-secrets-store-limit-test
+  ;; `encrypt`/`decrypt` are the general-purpose pair for an arbitrary file, so
+  ;; the 8 MiB bound that protects a *secrets store* must not apply here: a
+  ;; store past it is hostile, an ordinary file past it is Tuesday. Sized just
+  ;; over that bound, which is the only interesting size.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (test-config)
+          f (str *dir* "/big.bin")
+          payload (byte-array (inc (:max-plaintext-bytes secrets/default-limits))
+                              (byte 7))]
+      (with-open [out (io/output-stream f)]
+        (.write out payload))
+      (with-out-str (cli/run! config ["encrypt" "dev" f]))
+      (let [baos (java.io.ByteArrayOutputStream.)
+            orig System/out]
+        (with-open [replacement (java.io.PrintStream. baos)]
+          (System/setOut replacement)
+          (try
+            (with-out-str (cli/run! config ["decrypt" "dev" (str f ".age")]))
+            (finally
+              (System/setOut orig))))
+        (is (= (alength payload) (.size baos))
+            "a file larger than the store bound still round-trips")))))
+
 ;;;; Command-line option boundary
 
 (defn- with-cwd-entry

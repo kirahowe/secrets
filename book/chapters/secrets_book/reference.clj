@@ -35,6 +35,7 @@
              #'secrets/get-secret
              #'secrets/reader-literals
              #'secrets/merge-readers
+             #'secrets/default-limits
              #'secrets/identity-from-env
              #'secrets/resolve-identity-file
              #'secrets/identity-available?
@@ -73,7 +74,8 @@
              #'age/encrypt-file!
              #'age/decrypt
              #'age/decrypt-bytes
-             #'age/decrypt-to-file!)
+             #'age/decrypt-to-file!
+             #'age/default-max-plaintext-bytes)
 
 ;; ## com.kirahowe.secrets.manifest
 

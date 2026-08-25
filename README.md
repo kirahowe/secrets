@@ -421,6 +421,61 @@ An Integrant `init-key` is two lines:
   (secrets/load-secrets (io/resource resource) {:app "myapp"}))
 ```
 
+### Resource limits
+
+Every runtime entry point — `load-secrets`, `reader-literals`, `merge-readers`
+— takes an optional `:limits` map in its opts, merged over
+`secrets/default-limits`:
+
+| limit                  | default | bounds                                                 |
+| ---------------------- | ------- | ------------------------------------------------------ |
+| `:max-source-bytes`    | 16 MiB  | ciphertext bytes read from a URL, InputStream, or file  |
+| `:max-plaintext-bytes` | 8 MiB   | plaintext bytes `age` may produce                      |
+| `:max-edn-depth`       | 100     | collection nesting depth of the decrypted EDN          |
+
+```clojure
+(secrets/load-secrets (io/resource "secrets.edn.age")
+                      {:app "myapp" :limits {:max-source-bytes 65536}})
+```
+
+The defaults sit far above every example in this README — a real store is
+kilobytes — so ordinary use never meets them. They exist because a source you do
+not fully control (a URL, an InputStream, a ciphertext someone else can replace)
+is otherwise an unbounded write to your disk and heap (CWE-400).
+
+Each bound is enforced *while* the bytes move, not after they have all been
+allocated. A source is counted chunk by chunk as it is copied, so a
+`Content-Length` that lies in either direction — or is absent, or chunked —
+changes nothing: only bytes actually read decide, and the copy is abandoned
+before the first byte past the bound is written. Plaintext is captured from
+`age`'s stdout the same way, which is why decryption runs through
+`ProcessBuilder` rather than `clojure.java.shell/sh`: `sh` materializes the
+complete output before any caller can look at its size. Passing a bound kills
+the `age` process (`destroy`, escalating to `destroyForcibly`), drops the
+partial plaintext, removes the partial temp copy or staging file immediately
+rather than at JVM exit, and throws with a distinguishing `:reason` —
+`:source-too-large`, `:plaintext-too-large`, or `:edn-too-deep` — carrying the
+byte count and the limit, never any content.
+
+Parsing needs one further bound and no more. EDN has no aliasing or expansion
+mechanism, so a parsed graph's size is linear in the plaintext's byte count and
+`:max-plaintext-bytes` already covers it; what a byte bound cannot cover is
+parser recursion, so a linear pre-scan rejects nesting past `:max-edn-depth`
+before `clojure.edn` — which, having no custom readers, evaluates nothing at
+all — ever sees the text.
+
+A malformed `:limits` is refused rather than read as the defaults: a non-map, an
+unknown key, or a value that is not a positive integer throws with
+`:invalid-limits`, because a typo in a security limit must not read as "leave it
+at the default". (The management CLI's separate `:limits` config key bounds
+recipients; these are the runtime's own, on a different surface.)
+
+These bound a *secrets store*. `bb secrets decrypt <file>.age` is the
+general-purpose counterpart to `bb secrets encrypt <file>` — it decrypts
+whatever file you name — so it carries its own far larger 1 GiB bound instead.
+A store past 8 MiB is hostile or broken; an arbitrary file past it is ordinary,
+and refusing it would break a documented command.
+
 ## Production & CI: injecting the key
 
 Locally the key lives at `~/.config/<app>/key.txt`. Anywhere else, provide it
