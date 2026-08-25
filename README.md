@@ -498,11 +498,18 @@ falling through to the local `~/.config/<app>/key.txt` would let that broken
 deployment config quietly succeed on a developer machine. Unset the variable to
 fall back deliberately.
 
-So a Fly / Docker / CI deployment sets exactly one secret:
+So a Fly / Docker / CI deployment sets exactly one secret. `bb secrets keygen`
+prints this line for you, in the form every generated snippet uses: POSIX `sh`,
+one single-quoted word per dynamic argument, and `cat --` so a key path can
+never be read as an option. `:key-file` is already `~`-expanded, so the path is
+absolute:
 
 ```sh
-flyctl secrets set SECRETS_AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
+flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- '/Users/you/.config/myapp/key.txt')"
 ```
+
+The surrounding `"$(…)"` is the shell's own construct rather than interpolated
+configuration, and is what makes the whole key file one argument to `flyctl`.
 
 The container image needs the `age` binary (e.g. `apt-get install -y age`). The
 encrypted `secrets.edn.age` ships in the image — in the jar or on the classpath.

@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P2 | [020 — Shell-safe generated commands](020-shell-safe-generated-commands.md) | Quote every dynamic POSIX argument safely or stop emitting executable shell snippets. |
 | P2 | [021 — Self-host documentation scripts](021-self-host-documentation-scripts.md) | Serve reviewed documentation assets locally and reject unsafe external executable dependencies. |
 | P2 | [022 — Explicit injected-identity temp cleanup](022-injected-identity-temp-cleanup.md) | Delete materialized identities through an explicit concurrency-safe lifecycle while retaining mode `0600`. |
 | P2 | [023 — Redact sensitive exception context](023-redact-sensitive-exception-context.md) | Restrict exception and cache context to allowlisted sanitized source and profile metadata. |
@@ -52,3 +51,4 @@ weaken the release gate:
 | [018 — Reduce release dependency exposure](018-reduce-release-dependency-exposure.md) | Replaced deps-deploy with a maven-resolver publisher on its own replaced classpath, taking the credential-bearing graph from 108 jars to 25 with no S3, AWS, or logging branch left. |
 | [017 — Sender-authenticity contract](017-sender-authenticity-contract.md) | Accepted the protected channel explicitly rather than adding a second key infrastructure, pinned the single-key/team asymmetry with tests, and closed the wrong-app gap the audit found. |
 | [019 — Safe initializer output](019-safe-initializer-output.md) | Made path/action summaries the default and `--apply` shape, put full bodies behind a warned opt-in, and stopped the plan and status map carrying file contents at all. |
+| [020 — Shell-safe generated commands](020-shell-safe-generated-commands.md) | Routed every dynamic argument in all seventeen emitted snippets through one POSIX single-quoting helper, and gave the `cat` read an option terminator. |

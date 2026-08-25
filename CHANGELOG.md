@@ -349,6 +349,22 @@ All notable changes to this project are documented here. The format follows
   environment and role involved and the shared canonical path — never file
   contents. A configured path that cannot be canonicalized is likewise a
   configuration error rather than an unattributed failure later.
+- Every shell command the CLI prints for an operator to paste now renders its
+  dynamic arguments through one tested POSIX quoting routine, and the
+  `flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- '<key>')"` line gained the
+  `cat --` option boundary already used for `age`, `rm`, and `shred`. The CLI
+  never executed these strings, so the defect was a hazardous instruction
+  handed to an operator rather than command execution (CWE-78): an environment
+  name or key path carrying `;`, `$( )`, a quote, a newline, a glob, a
+  redirect, or a leading dash turned one suggested command into several the
+  moment it was pasted, and a key file named `-n` or `--help` changed what
+  `cat` did. Values are single-quoted — inside `'…'` every character but `'` is
+  literal, so there is no metacharacter set to keep current — which makes an
+  ordinary suggestion read `bb secrets add-recipient 'dev'`; `bb secrets` with
+  no arguments now states that generated commands are POSIX `sh`. The
+  surrounding `"$(…)"` is unchanged: it is the shell's own construct, not
+  interpolated configuration, and is what makes the key file one argument to
+  `flyctl`.
 
 ## [0.1.0] - 2026-08-21
 

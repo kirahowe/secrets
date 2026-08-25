@@ -838,6 +838,227 @@
                     ["shred" "-u" "--" absolute]]
                    @calls))))))))
 
+;;;; Generated shell commands
+
+;;; The CLI prints copy/paste commands and never runs them, so the defect
+;;; issue 020 fixes is what an operator's shell would do with an interpolated
+;;; configuration value. These tests hand the emitted text to a real /bin/sh
+;;; and look at the argv it produces.
+
+(def ^:private stub-cat-output
+  "What the `cat` stub prints, so a recorded flyctl argument is checkable
+  without any real key material reaching an assertion."
+  "STUB-CAT-OUTPUT")
+
+(defn- posix-sh? []
+  (.canExecute (io/file "/bin/sh")))
+
+(defn- sh-word
+  "Let a real /bin/sh parse `quoted` as command-line words; return how many
+  words it produced and the exact bytes of the first. Bytes rather than a
+  decoded string: what matters is what the shell hands the program. The two
+  capture paths arrive through the environment, so the script itself
+  interpolates nothing but the word under test."
+  [quoted]
+  (let [argc-file (io/file *dir* "sh-argc")
+        word-file (io/file *dir* "sh-word")]
+    (doseq [f [argc-file word-file]] (.delete f))
+    (let [{:keys [exit err]}
+          (shell/sh "/bin/sh" "-c"
+                    (str "set -- " quoted "\n"
+                         "printf %s \"$#\" > \"$ARGC_FILE\"\n"
+                         "printf %s \"$1\" > \"$WORD_FILE\"\n")
+                    :env {"PATH" "/usr/bin:/bin"
+                          "ARGC_FILE" (.getPath argc-file)
+                          "WORD_FILE" (.getPath word-file)})]
+      {:exit exit
+       :err err
+       :argc (when (.exists argc-file) (slurp argc-file))
+       :bytes (when (.exists word-file) (file-bytes (.getPath word-file)))})))
+
+(defn- write-stub!
+  "An executable `stub-name` in `dir` that appends its own argv to $STUB_LOG,
+  prints `stdout-text`, and creates nothing."
+  [dir stub-name stdout-text]
+  (let [f (io/file dir stub-name)]
+    (spit f (str "#!/bin/sh\n"
+                 "{ printf 'CMD %s\\n' \"$0\"\n"
+                 "  for a in \"$@\"; do printf 'ARG %s\\n' \"$a\"; done\n"
+                 "  printf 'END\\n'\n"
+                 "} >> \"$STUB_LOG\"\n"
+                 "printf %s " (pr-str stdout-text) "\n"))
+    (when-not (.setExecutable f true true)
+      (throw (ex-info "stub is not executable" {:stub stub-name})))
+    f))
+
+(defn- stub-invocations
+  "The argv of every stub invocation recorded in `log`, in order, with each
+  command reduced to its basename. One log line per argv element, so values
+  carrying newlines are out of scope here — those are what
+  `shell-quote-round-trips-adversarial-values-test` covers."
+  [log]
+  (->> (str/split-lines (slurp (io/file log)))
+       (partition-by #(= "END" %))
+       (remove #(= ["END"] %))
+       (mapv (fn [[cmd & args]]
+               (into [(last (str/split (subs cmd 4) #"/"))]
+                     (map #(subs % 4))
+                     args)))))
+
+(defn- emitted-snippets
+  "Every shell command the CLI printed in `guidance`, in emission order."
+  [guidance]
+  (into []
+        (comp (map str/trim)
+              (filter #(re-find #"^(flyctl|bb secrets|printf) " %)))
+        (str/split-lines guidance)))
+
+(defn- run-snippet
+  "Run one emitted snippet in `dir` with `stub-dir` first on PATH, so no real
+  bb or flyctl can be reached."
+  [snippet {:keys [dir stub-dir log]}]
+  (shell/sh "/bin/sh" "-c" snippet
+            :dir dir
+            :env {"PATH" (str stub-dir ":/usr/bin:/bin") "STUB_LOG" log}))
+
+(deftest shell-quote-round-trips-adversarial-values-test
+  (if-not (posix-sh?)
+    (is true "skipped: no executable /bin/sh")
+    (let [shell-quote (cli-private 'shell-quote)]
+      (doseq [[label value]
+              [["a space" "two words"]
+               ["a single quote" "it's"]
+               ["nothing but single quotes" "'''"]
+               ["a double quote" "say \"hi\""]
+               ["a newline" "first\nsecond"]
+               ["a leading dash" "-n"]
+               ["a long option" "--help"]
+               ["a command substitution" "$(id)"]
+               ["backticks" "`id`"]
+               ["a variable reference" "$HOME"]
+               ["a separator" "a;b"]
+               ["an and-list" "a&&b"]
+               ["a pipe" "a|b"]
+               ["a redirect" "a>b"]
+               ["a glob star" "*"]
+               ["a glob question mark" "?"]
+               ["a tilde" "~"]
+               ["history expansion" "!"]
+               ["a comment marker" "a#b"]
+               ["a backslash" "a\\b"]
+               ["a quote-escape payload" "';touch sentinel;'"]
+               ["utf-8" "clé δοκιμή 🔐"]
+               ["the empty string" ""]]]
+        (let [{:keys [exit err argc bytes]} (sh-word (shell-quote value))]
+          (is (zero? exit) (str label ": the shell parsed the word (" err ")"))
+          (is (= "1" argc) (str label ": exactly one argument"))
+          (is (= (vec (.getBytes value "UTF-8")) bytes)
+              (str label ": the argument's bytes are the original's")))))))
+
+(deftest generated-commands-execute-as-one-argument-test
+  (if-not (posix-sh?)
+    (is true "skipped: no executable /bin/sh")
+    (doseq [[i [label environment-name key-name]]
+            (map-indexed vector
+                         [["a separator"
+                           (keyword "dev; touch pwned-env")
+                           "key.txt; touch pwned-key"]
+                          ["a command substitution"
+                           (keyword "dev$(touch pwned-env)")
+                           "key$(touch pwned-key).txt"]
+                          ["a quote and a space"
+                           (keyword "dev' ; touch pwned-env #")
+                           "key' ; touch pwned-key .txt"]])]
+      (let [case-dir (doto (io/file *dir* (str "case-" i)) .mkdirs)
+            run-dir (doto (io/file case-dir "run") .mkdirs)
+            stub-dir (doto (io/file case-dir "stubs") .mkdirs)
+            log (.getPath (io/file case-dir "argv.log"))
+            key-file (.getPath (io/file case-dir key-name))
+            environment-label (name environment-name)
+            config (cli/normalize-config
+                    {:app "cli-test"
+                     :default-environment environment-name
+                     :environments
+                     {environment-name
+                      {:secrets-file (.getPath (io/file case-dir "secrets.edn.age"))
+                       :key-file key-file
+                       :recipients-file (.getPath (io/file case-dir "recipients.txt"))}}})]
+        (doseq [stub ["bb" "flyctl"]] (write-stub! stub-dir stub ""))
+        (write-stub! stub-dir "cat" stub-cat-output)
+        (let [guidance (str (with-out-str (cli/keygen! config nil))
+                            (with-out-str (cli/add-recipient! config nil nil)))
+              snippets (emitted-snippets guidance)
+              runs (mapv #(run-snippet % {:dir run-dir
+                                          :stub-dir (.getPath stub-dir)
+                                          :log log})
+                         snippets)]
+          (is (= 4 (count snippets)) (str label ": every snippet was emitted"))
+          (is (= [0 0 0 0] (mapv :exit runs))
+              (str label ": each snippet parsed and ran"))
+          (is (= [["cat" "--" key-file]
+                  ["flyctl" "secrets" "set"
+                   (str "SECRETS_AGE_IDENTITY=" stub-cat-output)]
+                  ["bb" "secrets" "add-recipient" environment-label]
+                  ["bb" "secrets" "set" environment-label ":secret/key"]
+                  ["bb" "secrets" "new" environment-label]]
+                 (stub-invocations log))
+              (str label ": exactly the intended argv ran, and nothing else"))
+          (is (empty? (filter #(str/starts-with? % "pwned")
+                              (concat (.list run-dir) (.list case-dir))))
+              (str label ": no sentinel file was created")))))))
+
+(deftest key-file-named-like-an-option-is-read-as-a-path-test
+  (if-not (posix-sh?)
+    (is true "skipped: no executable /bin/sh")
+    (doseq [[i entry-name] (map-indexed vector ["-n" "--help"])]
+      (with-cwd-entry entry-name
+        (fn [_]
+          (let [case-dir (doto (io/file *dir* (str "option-" i)) .mkdirs)
+                stub-dir (doto (io/file case-dir "stubs") .mkdirs)
+                log (.getPath (io/file case-dir "argv.log"))
+                marker "KEY-FILE-CONTENTS"
+                config (cli/normalize-config
+                        {:app "cli-test"
+                         :default-environment :dev
+                         :environments
+                         {:dev {:secrets-file (.getPath
+                                               (io/file case-dir "secrets.edn.age"))
+                                :key-file entry-name}}})
+                snippet (first (emitted-snippets
+                                (with-out-str (cli/keygen! config nil))))]
+            ;; Real cat, stub flyctl: the generated key is replaced by a marker
+            ;; because the question is only whether cat resolved a dash-leading
+            ;; name as a pathname, and no key material belongs in an assertion.
+            (spit entry-name marker)
+            (write-stub! stub-dir "flyctl" "")
+            (let [{:keys [exit]} (run-snippet snippet {:dir "."
+                                                       :stub-dir (.getPath stub-dir)
+                                                       :log log})]
+              (is (zero? exit) (str entry-name ": the snippet ran"))
+              (is (= [["flyctl" "secrets" "set"
+                       (str "SECRETS_AGE_IDENTITY=" marker)]]
+                     (stub-invocations log))
+                  (str entry-name ": cat read the file, not an option")))))))))
+
+(deftest ordinary-guidance-is-unchanged-in-substance-test
+  (let [key-file (.getPath (io/file *dir* "ordinary-key.txt"))
+        config (cli/normalize-config
+                {:app "cli-test"
+                 :default-environment :dev
+                 :environments
+                 {:dev {:secrets-file (.getPath (io/file *dir* "ordinary.edn.age"))
+                        :key-file key-file
+                        :recipients-file (.getPath
+                                          (io/file *dir* "ordinary-recipients.txt"))}}})
+        guidance (str (with-out-str (cli/keygen! config nil))
+                      (with-out-str (cli/add-recipient! config nil nil)))]
+    (is (= [(str "flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat -- '" key-file "')\"")
+            "bb secrets add-recipient 'dev'"
+            "printf %s \"$VALUE\" | bb secrets set 'dev' :secret/key"
+            "bb secrets new 'dev'"]
+           (emitted-snippets guidance))
+        "quoting changed the rendering, not the binary, subcommand, environment, or path")))
+
 ;;;; Set and remove
 
 (deftest set-creates-a-brand-new-store-test
@@ -1137,8 +1358,8 @@
         (is (= alice-public @added))
         (is (= [alice-public] (str/split-lines (slurp recipients))))
         (is (not (.exists (io/file ciphertext))))
-        (is (str/includes? initial-out "bb secrets set dev"))
-        (is (str/includes? initial-out "bb secrets new dev"))
+        (is (str/includes? initial-out "bb secrets set 'dev'"))
+        (is (str/includes? initial-out "bb secrets new 'dev'"))
         (is (not (str/includes? initial-out "reencrypt"))))
       (let [set-out (with-out-str
                       (with-in-str secret-value
@@ -1159,7 +1380,7 @@
         (testing "set creates the first store and the later add recommends re-encryption"
           (is (.exists (io/file ciphertext)))
           (is (= bob-public @teammate-added))
-          (is (str/includes? teammate-out "bb secrets reencrypt dev")))
+          (is (str/includes? teammate-out "bb secrets reencrypt 'dev'")))
         (testing "the committed recipient set is exactly Alice and Bob"
           (is (= #{alice-public bob-public}
                  (->> (slurp recipients)

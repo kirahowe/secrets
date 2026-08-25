@@ -67,6 +67,25 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.manifest :as manifest]))
 
+;;;; Generated shell commands
+
+;;; Every command this namespace prints for an operator to paste is POSIX `sh`,
+;;; and every value interpolated into one goes through `shell-quote`. The CLI
+;;; never executes these strings itself; the hazard is the instruction handed
+;;; to the operator, so the rendering is where it has to be fixed.
+
+(defn- shell-quote
+  "Render `s` as a single POSIX `sh` word: wrap it in `'`, splicing each
+  embedded `'` as `'\\''`. The empty string renders as `''`, one empty word.
+
+  Single quotes rather than backslash-escaping because inside `'…'` every
+  character except `'` is literal. There is no metacharacter set to keep up to
+  date and no interaction with `$`, backticks, `\\`, newlines, or globs —
+  escaping would need a character class that is correct for every shell and
+  every position, while this needs the one rule."
+  [s]
+  (str "'" (str/replace (str s) "'" "'\\''") "'"))
+
 ;;;; Output
 
 (def ^:private ansi
@@ -459,7 +478,7 @@
     (fail! (str "No age identity for " (clojure.core/name environment-name)
                 " at " identity-file "\n"
                 "    Create one with:  bb secrets keygen "
-                (clojure.core/name environment-name) "\n"
+                (shell-quote (clojure.core/name environment-name)) "\n"
                 "    Or point at an existing key via SECRETS_AGE_IDENTITY_FILE (a path),\n"
                 "    SECRETS_AGE_IDENTITY (raw key contents), or "
                 "SECRETS_AGE_IDENTITY_B64 (base64 contents).")
@@ -558,7 +577,8 @@
                 :limit :max-recipients :configured max-recipients}))
       (when (empty? entries)
         (fail! (str "No recipients yet for " label " in " recipients-file "\n"
-                    "    Add one with:  bb secrets add-recipient " label)
+                    "    Add one with:  bb secrets add-recipient "
+                    (shell-quote label))
                {:recipients-file (str recipients-file)
                 :environment environment-name}))
       (validate-recipient-entries! env entries max-recipient-chars)
@@ -861,8 +881,13 @@
            "    cannot be recovered. To deploy, set it as the SECRETS_AGE_IDENTITY secret:")
           (println
            (paint :dim
-                  (str "      flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat "
-                       key-file
+                  ;; `cat --` for the same reason `age`, `rm`, and `shred`
+                  ;; get one: a key file named `-n` or `--help` has to reach
+                  ;; cat as a pathname. The surrounding "$(…)" is the
+                  ;; shell's own construct, not interpolated data, and is
+                  ;; what makes the file contents one argument to flyctl.
+                  (str "      flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat -- "
+                       (shell-quote key-file)
                        ")\"")))
           (when recipients-file
             (println)
@@ -871,7 +896,7 @@
             (println
              (paint :dim
                     (str "      bb secrets add-recipient "
-                         (clojure.core/name environment-name)))))
+                         (shell-quote (clojure.core/name environment-name))))))
           key-file)))))
 
 (defn new!
@@ -888,7 +913,7 @@
                        (warn "Secrets file already exists:" secrets-file)
                        (confirm!
                         (str "Overwrite it? (To change values, use `bb secrets edit "
-                             (clojure.core/name environment-name)
+                             (shell-quote (clojure.core/name environment-name))
                              "` instead.)"))))]
     (if-not proceed?
       (do (info "Aborted.") :aborted)
@@ -917,7 +942,7 @@
     (when-not (.exists (io/file secrets-file))
       (fail! (str "No secrets file at " secrets-file "\n"
                   "    Create one with:  bb secrets new "
-                  (clojure.core/name environment-name))
+                  (shell-quote (clojure.core/name environment-name)))
              {:secrets-file secrets-file
               :environment environment-name}))
     (let [target (encrypt-target! env)
@@ -1004,9 +1029,13 @@
     (when-not (.exists (io/file secrets-file))
       (fail! (str "No secrets file at " secrets-file "\n"
                   "    Create one with:  bb secrets new "
-                  (clojure.core/name environment-name) "\n"
+                  (shell-quote (clojure.core/name environment-name)) "\n"
                   "    or:               bb secrets set "
-                  (clojure.core/name environment-name) " " (pr-str key-arg))
+                  (shell-quote (clojure.core/name environment-name)) " "
+                  ;; A string `key-arg` already is the EDN text argv
+                  ;; carried; any other accepted value is printed to get
+                  ;; that text back.
+                  (shell-quote (if (string? key-arg) key-arg (pr-str key-arg))))
              {:secrets-file secrets-file
               :environment environment-name}))
     (let [target (encrypt-target! env)
@@ -1123,7 +1152,7 @@
     (when-not (.exists (io/file secrets-file))
       (fail! (str "No secrets file at " secrets-file "\n"
                   "    Create one with:  bb secrets new "
-                  (clojure.core/name environment-name))
+                  (shell-quote (clojure.core/name environment-name)))
              {:secrets-file secrets-file
               :environment environment-name}))
     (let [target (encrypt-target! env)
@@ -1156,7 +1185,8 @@
     (let [pub (or pubkey (age/public-key key-file))]
       (when-not pub
         (fail! (str "No public key given and no key at " key-file "\n"
-                    "    Generate one with:  bb secrets keygen " environment-label)
+                    "    Generate one with:  bb secrets keygen "
+                    (shell-quote environment-label))
                {:key-file key-file
                 :environment environment-name}))
       (when-not (age/valid-recipient? pub)
@@ -1176,17 +1206,19 @@
                 (warn "Re-encrypt so the new recipient can read existing secrets:")
                 (println
                  (paint :dim
-                        (str "      bb secrets reencrypt " environment-label))))
+                        (str "      bb secrets reencrypt "
+                             (shell-quote environment-label)))))
               (do
                 (info "No ciphertext exists yet. Create the initial store with either:")
                 (println
                  (paint :dim
                         (str "      printf %s \"$VALUE\" | bb secrets set "
-                             environment-label
+                             (shell-quote environment-label)
                              " :secret/key")))
                 (println
                  (paint :dim
-                        (str "      bb secrets new " environment-label)))))
+                        (str "      bb secrets new "
+                             (shell-quote environment-label))))))
             pub))))))
 
 (defn recipients!
@@ -1248,7 +1280,7 @@
               "is unsupported by this version of the library.")
         (println
          (str "    Regenerate it with `bb secrets reencrypt "
-              environment-label
+              (shell-quote environment-label)
               "`, or upgrade the library."))
         {:status :drift})
 
@@ -1260,7 +1292,7 @@
               (str "but this project is " (pr-str expected-app) "."))
         (println
          (str "    It belongs to a different store. Regenerate it with "
-              "`bb secrets reencrypt " environment-label "`."))
+              "`bb secrets reencrypt " (shell-quote environment-label) "`."))
         {:status :drift})
 
       :else
@@ -1290,7 +1322,8 @@
         (oops environment-label
               "— ciphertext changed since the manifest was written"
               (str "(" manifest-path ")."))
-        (println (str "    Regenerate with:  bb secrets reencrypt " environment-label))
+        (println (str "    Regenerate with:  bb secrets reencrypt "
+                      (shell-quote environment-label)))
         :drift))))
 
 (defn- verify-keyed-diff
@@ -1323,7 +1356,7 @@
         (if (or stale-entries? stale-sha?)
           (do
             (println "    Regenerate with:"
-                     (str "bb secrets reencrypt " environment-label))
+                     (str "bb secrets reencrypt " (shell-quote environment-label)))
             :drift)
           (do
             (ok environment-label "— manifest matches" (str "(" manifest ")"))
@@ -1355,7 +1388,8 @@
         (warn environment-label
               "— no manifest at"
               manifest
-              (str "(run `bb secrets edit " environment-label "` to create it)"))
+              (str "(run `bb secrets edit " (shell-quote environment-label)
+                   "` to create it)"))
         :missing)
 
       :else
@@ -1663,6 +1697,9 @@
              (str "(default: " (name default-environment) ")")
              ""))
   (println (paint :dim "\n  An omitted [env] uses the default environment."))
+  (println
+   (paint :dim
+          "  Commands printed as suggestions are POSIX sh, single-quoted per argument."))
   (println (paint :dim "  verify exits 0 (ok) · 1 (drift) · 2 (missing or unverifiable)."))
   (println
    (paint :dim
