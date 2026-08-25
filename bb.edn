@@ -14,12 +14,14 @@
               [com.kirahowe.secrets.aero-test]
               [com.kirahowe.secrets.cli-test]
               [com.kirahowe.secrets.init-test]
-              [com.kirahowe.secrets.release-test])
+              [com.kirahowe.secrets.release-test]
+              [com.kirahowe.secrets.workflow-policy-test])
    :task (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
                                                  'com.kirahowe.secrets.cli-test
                                                  'com.kirahowe.secrets.aero-test
                                                  'com.kirahowe.secrets.init-test
-                                                 'com.kirahowe.secrets.release-test)]
+                                                 'com.kirahowe.secrets.release-test
+                                                 'com.kirahowe.secrets.workflow-policy-test)]
            (System/exit (if (pos? (+ fail error)) 1 0)))}
 
   ;;;; Code quality

@@ -800,6 +800,28 @@ bb secrets help            # demo the CLI against a throwaway tmp/ file
 clojure -T:build install   # build + install the jar to ~/.m2 (needs a JDK)
 ```
 
+### Continuous integration
+
+CI runs the Babashka and JVM suites, builds and inspects the jar, renders the
+book, and deploys it to Pages from `main`. Every executable dependency it runs
+is immutable: each `uses:` is a full commit SHA with the version that commit is
+recorded beside it, and the Babashka container is an `@sha256:` digest whose
+release tag survives only as a comment. A tag or registry reference that moves
+upstream therefore cannot change what a build executes without a reviewed diff
+here — which matters most for the Pages deployment, the only job holding
+`pages: write` and `id-token: write`, gated on `main` and on the protected
+`github-pages` environment. Every other job runs with the workflow's top-level
+`contents: read`.
+
+`com.kirahowe.secrets.workflow-policy`, under `build/`, is what decides that,
+and `bb test` runs it over every `.github/workflows/*.yml` it discovers rather
+than a list of names, so a workflow added later is covered without anyone
+extending the test. It refuses a tag, a branch, a short SHA, a reference form it
+has no pinning rule for, an image without a digest, and a bare SHA carrying no
+version comment — a pin nobody can review is not a pin. Dependabot proposes the
+upgrades weekly, bumping the SHA and rewriting the comment beside it, so staying
+current is a reviewable diff rather than tag drift.
+
 ### The documentation book
 
 Full documentation lives in a [Quarto](https://quarto.org) book under

@@ -115,6 +115,24 @@ All notable changes to this project are documented here. The format follows
 - Source style and behavior-oriented test names are now consistent, and example
   task entrypoints use qualified function calls so static analysis is reliable
   without changing how the examples run.
+- The CI workflow now pins every executable dependency it runs. Each `uses:`
+  reference is a full commit SHA with the version that commit is recorded
+  alongside it, and the Babashka container is a `@sha256:` digest with its
+  release tag kept only as a comment, so an upstream tag or registry reference
+  that moves no longer changes what a build executes — including the Pages
+  deployment, the one job holding `pages: write` and `id-token: write`
+  (CWE-829, CWE-494). No version was upgraded in the process, no trigger or
+  permission was widened, and Pages deployment keeps its main-only condition and
+  its protected `github-pages` environment. A new
+  `com.kirahowe.secrets.workflow-policy` namespace under `build/` decides whether
+  workflow text pins its references, and names which problem each finding is: a
+  mutable reference, a SHA with no version comment to review it against, a
+  reference form the policy has no pinning rule for, or an undigested image. A
+  test runs it over every discovered `.github/workflows/*.yml`, so a workflow
+  added later is covered without anyone extending the test, and Dependabot is
+  enabled for `github-actions` weekly — it bumps a pinned SHA and rewrites the
+  comment beside it, keeping the pins maintainable as reviewable diffs rather
+  than silent tag drift.
 
 ### Fixed
 - The optional `aero` integration's registration and its decrypted-reader cache

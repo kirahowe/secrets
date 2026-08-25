@@ -1,0 +1,15 @@
+# Every action in .github/workflows is pinned to a full commit SHA, which is only
+# maintainable if something proposes the bumps. Dependabot updates a SHA-pinned
+# `uses:` and rewrites the adjacent version comment, so an upgrade arrives as a
+# reviewable diff naming the commit it moves to instead of silently following a
+# tag. Only `github-actions` is enabled: it is the one ecosystem this repository
+# fetches executable code from at build time.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    # Workflows live at .github/workflows, which this ecosystem reads from the
+    # repository root. Left on the default branch deliberately: naming a
+    # target-branch here would also turn off Dependabot's security updates.
+    directory: /
+    schedule:
+      interval: weekly
