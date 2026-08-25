@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P2 | [022 — Explicit injected-identity temp cleanup](022-injected-identity-temp-cleanup.md) | Delete materialized identities through an explicit concurrency-safe lifecycle while retaining mode `0600`. |
 | P2 | [023 — Redact sensitive exception context](023-redact-sensitive-exception-context.md) | Restrict exception and cache context to allowlisted sanitized source and profile metadata. |
 | P2 | [024 — CLI flag extraction boundary](024-cli-flag-extraction-boundary.md) | Extract `--edn` only where it is defined so an operand can never be consumed as a flag. |
 | P2 | [025 — Blank editor variable](025-blank-editor-variable.md) | Treat a set-but-blank editor variable as unset instead of letting it shadow the next source. |
@@ -52,3 +51,4 @@ weaken the release gate:
 | [019 — Safe initializer output](019-safe-initializer-output.md) | Made path/action summaries the default and `--apply` shape, put full bodies behind a warned opt-in, and stopped the plan and status map carrying file contents at all. |
 | [020 — Shell-safe generated commands](020-shell-safe-generated-commands.md) | Routed every dynamic argument in all seventeen emitted snippets through one POSIX single-quoting helper, and gave the `cat` read an option terminator. |
 | [021 — Self-host documentation scripts](021-self-host-documentation-scripts.md) | Removed the unused jQuery includes rather than bundling them, stripped a Google Fonts `@import` hidden in Bootstrap's CSS, and added a hash-based CSP enforced by a build check. |
+| [022 — Explicit injected-identity temp cleanup](022-injected-identity-temp-cleanup.md) | Gave materialized identities a generation-scoped lifecycle with reference-counted leases, so retirement deletes promptly but never while a decryption is reading. |

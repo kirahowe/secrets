@@ -98,6 +98,24 @@ All notable changes to this project are documented here. The format follows
   page with no policy; `bb book:build` and CI's `build-book` job both fail on
   any finding, and a browser confirms rendering, navigation, search, and
   clipboard copy still work under the policy.
+- `secrets/reset-identity-cache!` retires the temp files that
+  `SECRETS_AGE_IDENTITY` and `SECRETS_AGE_IDENTITY_B64` materialize, so a
+  long-running process no longer keeps an injected private key on disk until it
+  exits and an abnormal exit has less to leave behind (CWE-459). It deletes
+  every materialized identity no decryption is using, defers the rest to their
+  last release, and is idempotent; a later read materializes afresh rather than
+  reusing a retired path, and identity files the caller owns
+  (`SECRETS_AGE_IDENTITY_FILE`, an explicit `:identity-file`,
+  `~/.config/<app>/key.txt`) are never touched. Deletion cannot race a running
+  `age`: `load-secrets` holds the identity through `secrets/with-identity` for
+  its whole call — which covers the reader literals and the Aero readers — and
+  the same scope is public for a caller that hands a resolved path to `age`
+  itself. A failed write and a materialization that loses to a retirement both
+  delete the file they created rather than orphaning a key nothing points at,
+  the identity state keeps one generation and its entries in one atom the way
+  the Aero reader cache does, `deleteOnExit` is now only the backstop, and no
+  identity content, digest, or materialized path reaches a message or `ex-data`
+  this lifecycle raises.
 
 ### Changed
 - Publication runs on a classpath of its own, and no longer resolves a

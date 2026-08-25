@@ -518,6 +518,38 @@ an uberjar (the ciphertext is copied to an owner-only temp file so `age` can
 read it), so the file works the same whether it sits on disk or inside the jar.
 `SECRETS_AGE_IDENTITY` decrypts it at startup.
 
+### The temp file `SECRETS_AGE_IDENTITY` writes
+
+`age` reads its identity from a file, so raw and base64 contents are materialized
+to an owner-only (0600) temp file, one per distinct value. That file is this
+library's to remove, and `(secrets/reset-identity-cache!)` removes it: every
+identity materialized from `SECRETS_AGE_IDENTITY` or `SECRETS_AGE_IDENTITY_B64`
+is deleted, a later read materializes afresh instead of reusing a retired path,
+and a second call has nothing to do. Identity files *you* own —
+`SECRETS_AGE_IDENTITY_FILE`, an explicit `:identity-file`,
+`~/.config/<app>/key.txt` — are never touched. It returns
+`{:generation g :deleted n :pending n}`, and no path, digest, or key content.
+
+Deletion waits for the decryption using the file. `load-secrets` holds the
+identity for the whole call — which covers the reader literals and the Aero
+readers, since both load through it — so a reset that lands mid-decryption defers
+to the last release rather than deleting a file `age` is still reading. A path
+you took out of `resolve-identity-file` and use later is outside that lease;
+wrap it in `(secrets/with-identity path (fn [p] …))` when you hand it to `age`
+yourself. No API can hold a lease a caller never opened.
+
+`deleteOnExit` stays registered, but only as the backstop for a process that
+never calls the reset. **An abnormal exit — `SIGKILL`, a container OOM kill, a
+hard crash — can still leave the file on disk** (CWE-459), and no deletion here
+is secure erasure: on a journaling or copy-on-write filesystem the bytes can
+outlive the unlink. So prefer not materializing at all where the platform
+allows it. `SECRETS_AGE_IDENTITY_FILE` pointing at a secret file the platform
+mounts (a Kubernetes `Secret` volume, systemd `LoadCredential`, a Docker/Fly
+secret file) writes no key anywhere and is the better deployment shape wherever
+it exists; failing that, a memory-backed temp directory
+(`-Djava.io.tmpdir=/dev/shm`, a `tmpfs` mount) keeps a materialized identity out
+of persistent storage.
+
 ### GitHub Actions
 
 GitHub's runner images don't ship `age`, so decryption fails until you install
@@ -887,6 +919,8 @@ manifest is reported as `skipped`.
 - `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil when none is set. A variable that is set but empty throws.
 - `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise. The path is *conventional* — it's never checked for existence, so a non-nil result doesn't mean a usable key is actually there.
 - `(identity-available?)` / `(identity-available? app-or-opts)` — true when an identity actually resolves **and** its file exists on disk. The "do I have a key, or should I tell the user to run `keygen`?" check; `app-or-opts` also accepts an opts map's `:identity-file`.
+- `(reset-identity-cache!)` — retire every identity temp file materialized from `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`: delete each one no decryption is using, defer the rest to their last release, and materialize afresh on the next read. Idempotent; never touches an identity file you own. Returns `{:generation g :deleted n :pending n}`.
+- `(with-identity path f)` — call `(f path)` with `path` held against `reset-identity-cache!` for exactly that call. `load-secrets` already does this for its own decryption; use it when you hand a resolved path to `age` yourself.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
 
@@ -1291,7 +1325,10 @@ you're trading for that simplicity.
 - Sensitive temp files (injected identities, plaintext during `edit`) are
   created owner-only (0600) atomically on POSIX filesystems. On non-POSIX
   filesystems (e.g. Windows) the permissions are applied best-effort after
-  creation — the library targets POSIX systems.
+  creation — the library targets POSIX systems. An injected identity is deleted
+  by `reset-identity-cache!` rather than only at JVM exit; see [the temp file
+  `SECRETS_AGE_IDENTITY` writes](#the-temp-file-secrets_age_identity-writes) for
+  what an abnormal exit still leaves behind.
 - **Decrypted plaintext files are published 0600, never written in place.**
   `decrypt-to-file!` writes into an owner-only sibling staging file and then
   atomically renames it over the destination, so the result does not depend on

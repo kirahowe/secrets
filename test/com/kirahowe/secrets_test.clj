@@ -44,6 +44,17 @@
      (.delete (io/file plain))
      enc)))
 
+(defn- permission-names
+  "POSIX permissions of `path` itself, as names (`\"OWNER_READ\"` …). Names read
+  better in a failure message than enum values, and they are what a reader
+  checking an octal mode against these tests wants to see."
+  [path]
+  (set (map str (java.nio.file.Files/getPosixFilePermissions
+                 (.toPath (io/file path))
+                 (into-array java.nio.file.LinkOption [])))))
+
+(def ^:private owner-only-names #{"OWNER_READ" "OWNER_WRITE"})
+
 (deftest expand-home-test
   (is (= (str (System/getProperty "user.home") "/.config/x")
          (secrets/expand-home "~/.config/x")))
@@ -489,11 +500,11 @@
 (deftest identity-materialization-cache-test
   (testing "concurrent identical contents share a digest-keyed delayed materialization"
     (let [contents (slurp *key*)
-          cache (atom {})
+          state (atom {:generation 0 :entries {} :retired {}})
           write-call-count (atom 0)
           real-write @#'secrets/write-identity!
           paths (with-redefs-fn
-                  {#'secrets/identity-temp cache
+                  {#'secrets/identity-state state
                    #'secrets/write-identity!
                    (fn [value]
                      (swap! write-call-count inc)
@@ -508,19 +519,206 @@
                                      contents)))
                                 (range 16))]
                       (deliver start true)
-                      (mapv deref futures))))]
+                      (mapv deref futures))))
+          entries (:entries @state)]
       (try
         (is (= 1 (count (set paths))))
         (is (= 1 @write-call-count))
-        (is (= 1 (count @cache)))
-        (is (every? string? (vals @cache))
-            "realized delays are replaced so the cache retains only paths")
-        (is (= #{(first paths)} (set (vals @cache))))
-        (is (not-any? #(= contents %) (keys @cache))
+        (is (= 1 (count entries)))
+        (is (every? map? (vals entries))
+            "realized delays are replaced so the state retains only paths")
+        (is (= #{(first paths)} (set (map :path (vals entries)))))
+        (is (= [0] (mapv :users (vals entries)))
+            "a lease-less materialization leaves no active user behind")
+        (is (not-any? #(= contents %) (keys entries))
             "cache keys do not retain raw identity contents")
         (is (= contents (slurp (first paths))))
         (finally
           (run! #(.delete (io/file %)) (set paths)))))))
+
+;;;; Injected identity lifecycle
+
+(def ^:private identity-sentinel
+  "A recognisable stand-in for identity contents, so a diagnostics test can grep
+  every rendered message and ex-data for it. Also invalid base64, which is one of
+  the failure paths under test."
+  "AGE-SECRET-KEY-1SENTINELMUSTNEVERAPPEARINDIAGNOSTICS")
+
+(defn- materialize!
+  "Materialize identity `contents`, the step `identity-from-env` performs for
+  `SECRETS_AGE_IDENTITY`. Env vars cannot be set in-process, so the lifecycle
+  tests drive it directly."
+  [contents]
+  (@#'secrets/materialize-identity! contents))
+
+(defn- with-fresh-identities
+  "Run `f` against a private, empty identity state, then retire whatever it left.
+  The real state is process-wide, so two lifecycle tests sharing it would see
+  each other's files. Temp files are still created by the real
+  `owner-only-temp-file!`, so the 0600 guarantee under test is the real one."
+  [f]
+  (with-redefs-fn {#'secrets/identity-state
+                   (atom {:generation 0 :entries {} :retired {}})}
+    (fn []
+      (try
+        (f)
+        (finally
+          (secrets/reset-identity-cache!))))))
+
+(defn- with-unwritable-temp-files
+  "Run `(f created)` with every owner-only temp file created and then stripped of
+  permissions, so the real `write-identity!` fails *after* its file exists —
+  the case that leaves an orphan if nothing deletes it. `created` is an atom
+  collecting those files, including one whose path no caller ever received."
+  [f]
+  (let [real secrets/owner-only-temp-file!
+        created (atom [])]
+    (with-redefs-fn {#'secrets/owner-only-temp-file!
+                     (fn [prefix suffix]
+                       (let [file (real prefix suffix)]
+                         (swap! created conj file)
+                         (java.nio.file.Files/setPosixFilePermissions
+                          (.toPath file) #{})
+                         file))}
+      (fn [] (f created)))))
+
+(deftest retirement-deletes-materialized-identities-test
+  (with-fresh-identities
+    (fn []
+      (let [contents (slurp *key*)
+            enc (encrypt-edn! {:k "v"})
+            path (materialize! contents)]
+        (testing "an injected identity is a real 0600 file that decrypts"
+          (is (.exists (io/file path)))
+          (is (= owner-only-names (permission-names path)))
+          (is (= {:k "v"} (secrets/load-secrets enc path)))
+          (is (.exists (io/file path))
+              "a completed load leaves the key on disk — deleteOnExit was the only cleanup"))
+        (testing "retirement deletes it now rather than at JVM exit"
+          (is (= {:deleted 1 :pending 0}
+                 (select-keys (secrets/reset-identity-cache!) [:deleted :pending])))
+          (is (not (.exists (io/file path)))))
+        (testing "a later resolution materializes a different file"
+          (let [fresh (materialize! contents)]
+            (is (not= path fresh) "a retired path is never handed out again")
+            (is (.exists (io/file fresh)))
+            (is (= contents (slurp fresh)))))))))
+
+(deftest retirement-is-idempotent-test
+  (with-fresh-identities
+    (fn []
+      (let [path (materialize! (slurp *key*))
+            first-reset (secrets/reset-identity-cache!)
+            second-reset (secrets/reset-identity-cache!)]
+        (is (= 1 (:deleted first-reset)))
+        (is (= {:deleted 0 :pending 0} (select-keys second-reset [:deleted :pending]))
+            "the second call reports nothing to do")
+        (is (= (inc (:generation first-reset)) (:generation second-reset))
+            "and still moves the lifecycle on")
+        (is (not (.exists (io/file path))))))))
+
+(deftest deletion-waits-for-an-active-user-test
+  (with-fresh-identities
+    (fn []
+      (let [path (materialize! (slurp *key*))
+            entered (promise)
+            release (promise)
+            held (future (secrets/with-identity
+                           path
+                           (fn [leased]
+                             (deliver entered leased)
+                             (deref release 10000 :timed-out))))]
+        (is (= path (deref entered 10000 nil)) "the lease is open")
+        (is (= {:deleted 0 :pending 1}
+               (select-keys (secrets/reset-identity-cache!) [:deleted :pending])))
+        (is (.exists (io/file path))
+            "a retirement does not delete a file a decryption is still reading")
+        (deliver release :done)
+        (is (= :done (deref held 10000 :timed-out)))
+        (is (not (.exists (io/file path))) "the last release deletes it")))))
+
+(deftest new-use-after-retirement-materializes-afresh-test
+  (with-fresh-identities
+    (fn []
+      (let [contents (slurp *key*)
+            enc (encrypt-edn! {:k "v"})
+            retired (materialize! contents)
+            entered (promise)
+            release (promise)
+            held (future (secrets/with-identity
+                           retired
+                           (fn [_]
+                             (deliver entered true)
+                             (deref release 10000 :timed-out))))]
+        (is (true? (deref entered 10000 nil)))
+        (secrets/reset-identity-cache!)
+        (is (.exists (io/file retired)) "the retired file is still held")
+        (let [fresh (materialize! contents)]
+          (is (not= retired fresh)
+              "a read beginning after retirement never receives the retired path")
+          (is (= {:k "v"} (secrets/load-secrets enc fresh)))
+          (deliver release :done)
+          (is (= :done (deref held 10000 :timed-out)))
+          (is (not (.exists (io/file retired))) "the retired file goes on its last release")
+          (is (.exists (io/file fresh)) "and the fresh one is untouched"))))))
+
+(deftest failed-materialization-leaves-no-orphan-test
+  (with-fresh-identities
+    (fn []
+      (with-unwritable-temp-files
+        (fn [created]
+          (let [e (is (thrown-with-msg?
+                       clojure.lang.ExceptionInfo
+                       #"Could not write the injected age identity"
+                       (materialize! (slurp *key*))))]
+            (is (= :identity-not-materialized (:reason (ex-data e))))
+            (is (= 1 (count @created)) "the write did create a file")
+            (is (not-any? #(.exists ^java.io.File %) @created)
+                "and materialization deleted the file it could not fill")
+            (is (empty? (:entries @@#'secrets/identity-state))
+                "no entry survives to hand a failed path to a later caller")))))))
+
+(deftest identity-diagnostics-carry-no-secret-test
+  (with-fresh-identities
+    (fn []
+      (let [digest (@#'secrets/identity-digest identity-sentinel)
+            leaks (fn [e]
+                    (let [rendered (str (pr-str e) (pr-str (ex-data e)) (ex-message e))]
+                      (filterv #(str/includes? rendered %)
+                               [identity-sentinel digest "age-identity-"])))]
+        (testing "a failed materialization names neither contents, digest, nor path"
+          (with-unwritable-temp-files
+            (fn [_]
+              (let [e (try (materialize! identity-sentinel)
+                           (catch clojure.lang.ExceptionInfo e e))]
+                (is (= [] (leaks e)))))))
+        (testing "a materialized identity that is gone is not named either"
+          (with-redefs-fn
+            {#'secrets/identity-env (fn [k]
+                                      (when (= k "SECRETS_AGE_IDENTITY") identity-sentinel))
+             #'secrets/write-identity! (fn [_] (str *dir* "/age-identity-vanished.txt"))}
+            (fn []
+              (let [e (try (secrets/load-secrets (encrypt-edn! {:k "v"}) nil)
+                           (catch clojure.lang.ExceptionInfo e e))]
+                (is (= :no-identity (:reason (ex-data e))))
+                (is (= [] (leaks e)))))))
+        (testing "invalid base64 names the variable, never the value"
+          (let [e (try (@#'secrets/decode-b64-identity identity-sentinel)
+                       (catch clojure.lang.ExceptionInfo e e))]
+            (is (= "SECRETS_AGE_IDENTITY_B64" (:env (ex-data e))))
+            (is (= [] (leaks e)))))))))
+
+(deftest permissions-survive-the-lifecycle-test
+  (with-fresh-identities
+    (fn []
+      (let [contents (slurp *key*)
+            before (materialize! contents)]
+        (is (= owner-only-names (permission-names before)))
+        (secrets/reset-identity-cache!)
+        (let [after (materialize! contents)]
+          (is (not= before after))
+          (is (= owner-only-names (permission-names after))
+              "a file materialized after a retirement is owner-only too"))))))
 
 (deftest identity-resolution-nil-without-app-test
   (testing "no env vars + no app ⇒ resolution returns nil (no silent default)"
@@ -686,17 +884,6 @@
                                    (java.nio.file.Files/readAllBytes (.toPath out)))))))
 
 ;;;; Plaintext file output
-
-(defn- permission-names
-  "POSIX permissions of `path` itself, as names (`\"OWNER_READ\"` …). Names read
-  better in a failure message than enum values, and they are what a reader
-  checking an octal mode against these tests wants to see."
-  [path]
-  (set (map str (java.nio.file.Files/getPosixFilePermissions
-                 (.toPath (io/file path))
-                 (into-array java.nio.file.LinkOption [])))))
-
-(def ^:private owner-only-names #{"OWNER_READ" "OWNER_WRITE"})
 
 (defn- symlink!
   "Create the symbolic link `link` pointing at `target`. Babashka does not
