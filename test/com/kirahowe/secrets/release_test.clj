@@ -313,13 +313,13 @@
 
 ;;;; The publisher boundary
 
-;;; `deploy` lives in build.clj, whose `-T:build` alias supplies
-;;; clojure.tools.build; it is therefore not loadable from the test classpath.
-;;; What `deploy` decides is `verified-artifact!` — the receipt it reads, the
-;;; checks it runs, and the `:jar` and `:pom` it hands on — and that is what is
-;;; covered here. Not covered: the four lines in build.clj that pass
-;;; `(:jar receipt)` and `(:pom receipt)` to deps-deploy, exercised instead by a
-;;; stubbed publisher against a disposable clone.
+;;; The publisher lives in `com.kirahowe.secrets.publish`, whose `-M:deploy`
+;;; alias supplies maven-resolver; it is therefore not loadable from the test
+;;; classpath. What it decides before uploading is `verified-artifact!` — the
+;;; receipt it reads, the checks it runs, and the `:jar` and `:pom` it hands on
+;;; — and that is what is covered here. The upload itself is covered by
+;;; `com.kirahowe.secrets.publish-policy-test`, which runs the real publisher
+;;; against a local recorder.
 
 (deftest the-publisher-is-handed-the-inspected-artifact-test
   (let [dir (repo!)

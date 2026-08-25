@@ -949,7 +949,7 @@ The same flow by hand, when a release has to be cut locally:
 ```sh
 clojure -T:build release   # guarded build, writes target/release.edn
 bash .github/scripts/inspect-jar.sh target/secrets-0.1.0.jar
-clojure -T:build deploy    # uploads exactly the files named in the receipt
+clojure -M:deploy          # uploads exactly the files named in the receipt
 ```
 
 `release` refuses a working tree with modified *or untracked* files, a `HEAD`
@@ -962,12 +962,39 @@ the `<scm><tag>` it was built from — a release that claims no provenance is
 refused — and `target/release.edn` records the jar, the pom that ships beside
 it, the commit, and the jar's SHA-256.
 
-`deploy` builds nothing. It re-reads that receipt, re-checks the version, tag,
-commit, and embedded metadata, recomputes the digest, confirms the pom it is
-about to publish is byte-identical to the one inside that jar, and hands the
-publisher exactly those two files. A jar or pom changed after inspection, a
+`clojure -M:deploy` builds nothing. It re-reads that receipt, re-checks the
+version, tag, commit, and embedded metadata, recomputes the digest, confirms the
+pom it is about to publish is byte-identical to the one inside that jar, and
+uploads exactly those two files. A jar or pom changed after inspection, a
 missing receipt, or a `HEAD` that has moved off the tag each fail before any
-credential is used.
+credential is used, and so does a `CLOJARS_USERNAME` or `CLOJARS_PASSWORD` that
+is missing *or* set but blank — in CI a misnamed secret expands to the empty
+string, which means a broken release environment, not an anonymous upload.
+
+The upload is a separate alias rather than a build task because it is the only
+step that holds a credential. `:deploy` *replaces* `:deps` and `:paths` instead
+of extending them, so the JVM holding the Clojars token carries
+`com.kirahowe.secrets.publish`, the release guards beside it, and Maven's own
+deploy code — 25 jars, no `tools.build`, no library source, no test
+dependencies. Clojars is a plain Maven repository over HTTPS, so the upload goes
+through `maven-resolver` directly and resolves no wagon and none of the S3, AWS,
+logging, or serialization branches a wagon-based publisher brings with it. Every
+dependency on that classpath has a recorded dependency path and disposition in
+[doc/release-dependency-review.md](doc/release-dependency-review.md), and three
+tests fail the suite if the resolved graph drifts from it. A deploy prints three
+SLF4J "NOP logger" lines to stderr: no logging binding is on that classpath, by
+choice.
+
+The Clojars **deploy token** is the only credential a release needs. Scope it to
+deployment of `com.kirahowe/secrets` and nothing else, inject it into the deploy
+step's environment alone — never job-wide, so checkout, build, and inspection
+cannot read it — and rotate it in Clojars, and in the `release` environment's
+secrets, if it is ever exposed or if the machine that held it is in doubt. The
+publisher never prints either credential: publication output is the coordinate,
+version, tag, jar path, SHA-256, and repository URL. Passing a repository URL as
+an argument, or setting `SECRETS_DEPLOY_REPOSITORY_URL`, uploads somewhere other
+than Clojars; that exists for the local dry-run test, and every such run is
+labelled an override rather than a publication in the output.
 
 `clojure -T:build jar` is a development build from the live working tree: it
 makes no provenance claim (its pom carries no `<scm><tag>`) and is not

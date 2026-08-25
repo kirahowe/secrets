@@ -22,10 +22,23 @@
                       org.scicloj/clay {:mvn/version "2.0.16"}}}
 
   ;;; `-T` replaces :paths, so "." must stay for build.clj itself to resolve.
-  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}
-                 slipset/deps-deploy {:mvn/version "0.2.2"}}
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
           :paths ["." "build"]
           :ns-default build}
+
+  ;;; The only credential-bearing step. :replace-deps/:replace-paths rather than
+  ;;; :extra-*, which is the entire point of the alias: the JVM that holds the
+  ;;; Clojars token loads com.kirahowe.secrets.publish, the release guards beside
+  ;;; it, and Maven's own deploy code — no tools.build, no "src", no test
+  ;;; dependencies. maven-resolver publishes over HTTP, which is all Clojars is,
+  ;;; so no wagon and none of its S3/AWS/logging branches are resolved at all;
+  ;;; see doc/release-dependency-review.md for the reviewed set.
+  :deploy {:replace-deps
+           {org.clojure/clojure {:mvn/version "1.12.4"}
+            org.apache.maven.resolver/maven-resolver-supplier {:mvn/version "1.9.22"}
+            org.apache.maven.resolver/maven-resolver-transport-http {:mvn/version "1.9.22"}}
+           :replace-paths ["build"]
+           :main-opts ["-m" "com.kirahowe.secrets.publish"]}
 
   :format {:replace-deps {dev.weavejester/cljfmt {:mvn/version "0.16.5"}}
            :main-opts ["-m" "cljfmt.main"]}

@@ -1,14 +1,18 @@
 ;;; Tasks for developing, building, and publishing the library itself.
 ;;; (Consumers wire `com.kirahowe.secrets.cli` into their *own* bb.edn — see the
-;;; README.) The build/install/deploy tasks shell out to `clojure -T:build …`,
-;;; which needs a JDK on the PATH. The test task also needs Java because this
-;;; bb.edn resolves Maven dependencies before Babashka can load them.
+;;; README.) The build/install/release tasks shell out to `clojure -T:build …`
+;;; and deploy to `clojure -M:deploy`, all of which need a JDK on the PATH.
+;;; The test task also needs Java because this bb.edn resolves Maven
+;;; dependencies before Babashka can load them.
 {:paths ["src" "test" "build"]
  :deps {aero/aero {:mvn/version "1.1.6"}}
 
  :tasks
  {test
   {:doc "Run the test suite under babashka"
+   ;; com.kirahowe.secrets.publish-policy-test is deliberately absent:
+   ;; babashka cannot resolve com.sun.net.httpserver.HttpServer, which its
+   ;; local upload recorder needs. `clojure -M:test` runs it.
    :requires ([clojure.test :as t]
               [com.kirahowe.secrets-test]
               [com.kirahowe.secrets.aero-test]
@@ -64,7 +68,10 @@
 
   deploy
   {:doc "Publish the receipted release artifact to Clojars (run `bb release` first)"
-   :task (clojure "-T:build deploy")}
+   ;;; Not `-T:build`: the upload is the only step holding a credential, so it
+   ;;; runs on :deploy's own replaced classpath — the publisher, the release
+   ;;; guards, and Maven's deploy code, with no build tooling on it.
+   :task (clojure "-M:deploy")}
 
   secrets
   {:doc "Demo of the management CLI against a throwaway tmp/ secrets file"

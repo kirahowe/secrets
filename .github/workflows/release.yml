@@ -77,11 +77,14 @@ jobs:
           if-no-files-found: error
 
       # The only step that can see the Clojars credentials: nothing before it
-      # has them in its environment. `deploy` builds nothing — it re-verifies
+      # has them in its environment. `clojure -M:deploy` builds nothing and
+      # replaces the classpath rather than extending it, so the JVM holding the
+      # token carries the publisher, the release guards, and Maven's deploy code
+      # and nothing else — no build tooling, no library source. It re-verifies
       # target/release.edn against the tag and the jar's digest, then uploads
-      # that same file.
+      # that same file. See doc/release-dependency-review.md.
       - name: Publish the receipted artifact to Clojars
         env:
           CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
           CLOJARS_PASSWORD: ${{ secrets.CLOJARS_PASSWORD }}
-        run: clojure -T:build deploy
+        run: clojure -M:deploy

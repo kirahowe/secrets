@@ -45,6 +45,31 @@ All notable changes to this project are documented here. The format follows
   arbitrary file past it is ordinary.
 
 ### Changed
+- Publication runs on a classpath of its own, and no longer resolves a
+  deployment library at all. `clojure -M:deploy` (`bb deploy`) replaces
+  `clojure -T:build deploy`: a new `:deploy` alias whose `:replace-deps` and
+  `:replace-paths` leave the JVM holding the Clojars token carrying the new
+  `com.kirahowe.secrets.publish`, the release guards beside it, and Maven's own
+  deploy code — 25 jars, down from the 108 the build alias resolved, with no
+  `tools.build`, no library source, and no test dependency on it. Clojars is a
+  plain Maven repository over HTTPS, so the upload goes through `maven-resolver`
+  directly rather than through `slipset/deps-deploy`, whose graph dragged in a
+  legacy S3 wagon and with it the AWS SDK, Logback 1.0.12, Jackson, Ion, and
+  Joda-Time — seven packages matching 25 OSV advisories for code Clojars
+  publication can never reach (and which neither an exclusion nor a version bump
+  removes). The publisher re-runs every release guard on the credential-bearing
+  side before it uploads a byte, refuses a `CLOJARS_USERNAME` or
+  `CLOJARS_PASSWORD` that is missing *or* set but blank, exits non-zero on any
+  failure, keeps the resolver's local repository under `target/` instead of
+  `~/.m2`, and prints the coordinate, version, tag, jar, digest, and repository
+  but never a credential. `doc/release-dependency-review.md` records the
+  dependency path, applicability, and disposition of everything on that
+  classpath — as a review, not as a claim that any advisory match was reachable
+  — and new tests fail the suite when the resolved graph drifts from it, when an
+  unused transport branch returns, or when the build tooling reappears beside
+  the token. A fixture release is published to a local HTTP recorder to prove
+  the upload is the receipted bytes, authenticated, and silent about its
+  credentials.
 - Publishing is now a guarded, receipted, two-step flow. `clojure -T:build
   release` (`bb release`) refuses a working tree holding modified or untracked
   files, a `HEAD` that is not exactly the tag naming the declared version — a
@@ -55,7 +80,7 @@ All notable changes to this project are documented here. The format follows
   `<scm><tag>` the pom claims it was built from against the version — a release
   that records no tag claims no provenance and is refused — and records the jar,
   the pom that is published beside it, the commit, and the jar's SHA-256 in
-  `target/release.edn`. `clojure -T:build deploy` no longer builds anything: it
+  `target/release.edn`. The deploy step no longer builds anything: it
   re-reads that receipt, re-verifies the version, tag, commit, embedded
   metadata, and digest, confirms the pom it is about to upload is byte-identical
   to the one inside that jar — the pom, not the jar, is what defines the

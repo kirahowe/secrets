@@ -1,16 +1,17 @@
 (ns build
-  "Build, install, and publish the library.
+  "Build and install the library, and cut the artifact a release publishes.
 
     clojure -T:build jar       ; development build of target/secrets-<version>.jar
     clojure -T:build install   ; jar + install to ~/.m2 (resolves :mvn/version locally)
     clojure -T:build release   ; guarded build from the release tag + a receipt
-    clojure -T:build deploy    ; upload the receipted artifact to Clojars
 
   `jar` builds from the live working tree and is a development artifact only.
   Publishing goes through `release`, which builds from a snapshot of the release
-  tag and records the resulting bytes, and then `deploy`, which uploads exactly
-  those bytes (needs CLOJARS_USERNAME/PASSWORD). The guards live in
-  `com.kirahowe.secrets.release`, under `build/`, where they are tested.
+  tag and records the resulting bytes, and then `clojure -M:deploy`, which
+  uploads exactly those bytes. The upload is deliberately not a task here: it is
+  the only step holding a credential, so it runs from `:deploy`'s own replaced
+  classpath — this namespace, and tools.build with it, is not on it. The guards
+  live in `com.kirahowe.secrets.release`, under `build/`, where they are tested.
 
   Consumers depend on the published coordinate:  com.kirahowe/secrets {:mvn/version \"…\"}."
   (:require [clojure.java.io :as io]
@@ -103,7 +104,7 @@
   from live files, which can change after the guards pass — its embedded metadata
   and tag are checked against the version, and the jar, the pom that ships beside
   it, the commit, and the jar's SHA-256 are recorded in `target/release.edn` for
-  `deploy` to re-verify. Inspect the printed digest before uploading."
+  `clojure -M:deploy` to re-verify. Inspect the printed digest before uploading."
   [_]
   (release/clean-tree!)
   (let [{:keys [tag commit]} (release/exact-tag!)]
@@ -122,22 +123,3 @@
         receipt)
       (finally
         (release/release-source-cleanup!)))))
-
-(defn deploy
-  "Uploads the receipted release artifact to Clojars without rebuilding it.
-
-  Reads `target/release.edn`, re-verifies that the jar it names still matches the
-  release tag, the authoritative version, and the digest recorded when it was
-  built, that its metadata still names that tag, and that the pom it will publish
-  is byte-identical to the one inside that jar — then hands the publisher exactly
-  those two files. Missing receipt, changed bytes, or a moved `HEAD` all fail
-  before any credential is used; run `clojure -T:build release` first."
-  [_]
-  (let [{:keys [jar pom sha256 tag]} (release/verified-artifact!)]
-    ;; requiring-resolve keeps the publisher (and its transitive dependencies)
-    ;; off the classpath of every task that is not an upload.
-    ((requiring-resolve 'deps-deploy.deps-deploy/deploy)
-     {:installer :remote
-      :artifact jar
-      :pom-file pom})
-    (println "Deployed" release/lib tag "to Clojars from" jar "with SHA-256" sha256)))
