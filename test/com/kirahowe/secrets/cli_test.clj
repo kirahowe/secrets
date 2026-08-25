@@ -529,7 +529,38 @@
         (is (= 1 exit) "a v1 manifest fails verification")
         (is (= :drift (:dev results)) "and is never reported as :ok")))))
 
+(deftest wrong-app-manifest-is-rejected-test
+  ;; The wrong-app half of the authenticity contract. `:app` is the one field a
+  ;; manifest records about *which store* it describes, so a manifest belonging
+  ;; to another project must be refused rather than diffed as a shape. It
+  ;; matters most in team mode, where there are no :vhashes to disagree: a
+  ;; foreign structure-only manifest with a refreshed :ciphertext-sha would
+  ;; otherwise verify clean.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          manifest-path (str *dir* "/secrets.edn.manifest")]
+      (encrypt-edn! {:a 1})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [committed (edn/read-string (slurp manifest-path))]
+        (is (= "cli-test" (:app committed)) "the CLI records the app it wrote for")
+        (testing "a manifest naming another app is drift, not a shape to diff"
+          (spit manifest-path (pr-str (assoc committed :app "someone-elses-app")))
+          (let [{:keys [results exit]} (verify config "dev")]
+            (is (= 1 exit))
+            (is (= :drift (:dev results)))))
+        (testing "so is a manifest that records no app at all"
+          (spit manifest-path (pr-str (dissoc committed :app)))
+          (is (= :drift (:dev (:results (verify config "dev"))))))
+        (testing "and the honest manifest still verifies"
+          (spit manifest-path (pr-str committed))
+          (is (= 0 (:exit (verify config "dev")))))))))
+
 (deftest public-recipient-forgery-fails-verification-test
+  ;; The single-key half of the README's authenticity contract and threat
+  ;; model: a public-recipient holder who replaces the ciphertext cannot
+  ;; recompute a :vhash, so a keyed `verify` reports the forgery.
+  ;;
   ;; The two values here collided under the v1 encoding, so this exact forgery
   ;; — ciphertext replaced using only the public recipient, :ciphertext-sha
   ;; refreshed, every committed :vhash left alone — passed full verification
@@ -559,6 +590,63 @@
         (is (= :drift (get-in result [:results :dev])))
         (is (str/includes? out "value or type changed")
             "and names the forged entry as stale")))))
+
+;; The team half of the same contract, and a *documented boundary* rather than
+;; a bug anyone forgot to fix. Multi-recipient mode has no shared private key,
+;; so `manifest-hmac-key` is nil and team manifests carry no :vhash at all.
+;; A holder of one listed public recipient can therefore encrypt a chosen
+;; payload, regenerate the structure-only manifest from it with no key
+;; whatsoever, refresh :ciphertext-sha, and pass full verification. Sender
+;; authenticity is the repository's job here, not `verify`'s. This test exists
+;; so the limitation cannot change silently and so the README's claim is
+;; falsifiable: if it starts failing, the tool gained a property the contract
+;; says it does not have, and the contract is what needs updating.
+(deftest team-mode-manifest-is-not-a-value-integrity-signal-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [recipients (str *dir* "/recipients.txt")
+          ciphertext (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")
+          sha256 (cli-private 'sha256)
+          config (cli/normalize-config (test-config {:recipients-file recipients}))
+          recipient (age/public-key *key*)
+          forged-value {:db/url "postgres://attacker.example/app"}
+          forged-file (str *dir* "/forged.edn")
+          body #(remove (fn [line] (str/includes? line ":ciphertext-sha"))
+                        (str/split-lines %))]
+      (spit recipients (str recipient "\n"))
+      (encrypt-edn! {:db/url "postgres://prod.internal/app"})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [committed (edn/read-string (slurp manifest-path))
+            honest-manifest (slurp manifest-path)
+            honest-ciphertext (file-bytes ciphertext)]
+        (is (not-any? #(contains? % :vhash) (vals (:keys committed)))
+            "a team manifest is structure-only: there is no :vhash to forge")
+        (is (age/valid-recipient? recipient)
+            "the committed public recipient is the attacker's only key material")
+        (spit forged-file (pr-str forged-value))
+        (age/encrypt-file! {:recipients [recipient]} forged-file ciphertext)
+        (.delete (io/file forged-file))
+        (spit manifest-path
+              (manifest/render {:app "cli-test" :ciphertext-sha (sha256 ciphertext)}
+                               (manifest/entries forged-value nil)))
+        (testing "the app will now load the attacker's configuration"
+          (is (= forged-value (edn/read-string (age/decrypt *key* ciphertext)))))
+        (testing "and a same-shape forgery leaves the manifest body untouched"
+          (is (= (body honest-manifest) (body (slurp manifest-path)))
+              "only :ciphertext-sha moves, so the diff reads as a re-encryption"))
+        (testing "so full verification passes — the known boundary"
+          (let [{:keys [result out]} (capture-verify config "dev")]
+            (is (= 0 (:exit result))
+                "expected: nothing in a team manifest binds a value to its shape")
+            (is (= :ok (get-in result [:results :dev]))
+                "verify reports agreement, which is all it ever claimed")
+            (is (str/includes? out "manifest matches"))))
+        (testing "but the forgery had to rewrite committed artifacts"
+          (is (not= honest-ciphertext (file-bytes ciphertext))
+              "the ciphertext is tracked, so replacing it is a repository change")
+          (is (not= honest-manifest (slurp manifest-path))
+              "and so is refreshing :ciphertext-sha — the reviewable boundary"))))))
 
 (deftest verify-missing-is-exit-2-and-repl-safe-test
   (let [config (cli/normalize-config (test-config))

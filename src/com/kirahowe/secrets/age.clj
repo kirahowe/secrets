@@ -10,7 +10,11 @@
   `age` is a small, audited, modern file-encryption tool. A keypair is an
   identity file (the private key, `AGE-SECRET-KEY-1…`) plus a recipient (the
   public key, `age1…`). Encrypting to your own identity (`age -e -i key.txt`)
-  gives a single-key workflow: the same file both encrypts and decrypts."
+  gives a single-key workflow: the same file both encrypts and decrypts.
+
+  age encrypts *to* a recipient and does not sign. A recipient is shareable by
+  design and authorizes *encryption*, not authorship, so nothing here — and
+  nothing built on it — can establish who produced a ciphertext."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]))
@@ -280,6 +284,10 @@
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
   byte array (binary-safe — age encrypts arbitrary files, not just text).
   Throws an ex-info (with the captured stderr) on failure.
+
+  Success establishes that the ciphertext is intact and that `identity-file`
+  matches one of its recipients. It does not identify who encrypted it: age
+  does not sign, so this is payload integrity, never sender authenticity.
 
   `opts` may carry `{:limits {:max-plaintext-bytes n}}`, defaulting to
   `default-max-plaintext-bytes`. The bound is enforced while `age` is writing:

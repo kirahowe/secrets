@@ -76,15 +76,39 @@
 ;; manifests still show adds, removals, and type changes; a rotated string
 ;; without a shape change does not show.
 
-;; ## No signatures
+;; ## No signatures: the repository is the boundary
 
-;; age encrypts to recipients; it does not sign. Anyone holding only the
-;; public keys can produce a file that decrypts cleanly, so the integrity of
-;; your secrets rests on repository controls such as review, branch protection,
-;; and commit access.
-;; `verify` detects drift between manifest and ciphertext; it does not
-;; authenticate who wrote either. Treat the repository as part of the security
-;; boundary.
+;; age encrypts to recipients; it does not sign. Four properties are easy to
+;; run together, so this chapter keeps them apart.
+
+;; Confidentiality is age's. Only a private identity matching one of the file's
+;; recipients decrypts it. Ciphertext integrity is age's too: a modified,
+;; truncated, or spliced ciphertext fails to decrypt rather than yielding
+;; altered plaintext. That is integrity of the payload against corruption and
+;; splicing, and it establishes that the bytes came from *someone* holding a
+;; recipient — not which someone.
+
+;; Sender authenticity is nobody's. A public recipient is meant to be shared
+;; and committed; it permits encryption and is not a signing key. Anyone
+;; holding one can author a file that decrypts cleanly, so a successful
+;; decryption proves readability, never authorship.
+
+;; Repository trust is yours. This project deliberately accepts the reviewed
+;; repository and the deployment channel as the sender-authenticity boundary,
+;; rather than provisioning a second, separately trusted signing key and
+;; carrying a signature beside every ciphertext. Accepting a boundary means
+;; holding it: reviewed and protected refs, immutable artifact transfer from
+;; that commit to the running process, and least-privilege write access to
+;; whatever serves the ciphertext.
+
+;; `verify` reports drift between a manifest and its ciphertext; it does not
+;; authenticate who wrote either. In single-key mode the `:vhash`es make a
+;; forged value fail a keyed run, because whoever holds only a public recipient
+;; cannot key the HMAC. In team mode there are no `:vhash`es, so a forgery that
+;; keeps the same shape passes verification and is visible only as a change to
+;; committed files. The README's authenticity contract and threat model states
+;; this in full, including who may hold a public recipient and who may replace
+;; a deployed artifact.
 
 ;; ## Operational dependencies
 

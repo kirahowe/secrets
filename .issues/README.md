@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P2 | [017 — Sender-authenticity contract](017-sender-authenticity-contract.md) | Explicitly enforce either a protected deployment-channel boundary or separately keyed sender signatures. |
 | P2 | [019 — Safe initializer output](019-safe-initializer-output.md) | Keep credentials out of default initializer output while preserving useful path/action summaries. |
 | P2 | [020 — Shell-safe generated commands](020-shell-safe-generated-commands.md) | Quote every dynamic POSIX argument safely or stop emitting executable shell snippets. |
 | P2 | [021 — Self-host documentation scripts](021-self-host-documentation-scripts.md) | Serve reviewed documentation assets locally and reject unsafe external executable dependencies. |
@@ -52,3 +51,4 @@ weaken the release gate:
 | [013 — Scope CI identities to consuming steps](013-scope-ci-identities.md) | Moved the documented identity onto the step that consumes it, gated and pinned the keyed jobs, and extended the workflow policy to catch a widely scoped credential in docs and workflows alike. |
 | [016 — Bound source and plaintext sizes](016-bound-source-and-plaintext-sizes.md) | Bounded source, plaintext, and EDN depth through a runtime `:limits` map, enforced while bytes stream — decryption moved to `ProcessBuilder` because `sh` cannot bound its own output. |
 | [018 — Reduce release dependency exposure](018-reduce-release-dependency-exposure.md) | Replaced deps-deploy with a maven-resolver publisher on its own replaced classpath, taking the credential-bearing graph from 108 jars to 25 with no S3, AWS, or logging branch left. |
+| [017 — Sender-authenticity contract](017-sender-authenticity-contract.md) | Accepted the protected channel explicitly rather than adding a second key infrastructure, pinned the single-key/team asymmetry with tests, and closed the wrong-app gap the audit found. |

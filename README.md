@@ -1001,6 +1001,166 @@ makes no provenance claim (its pom carries no `<scm><tag>`) and is not
 publishable. `clojure -T:build install` installs that same development jar into
 `~/.m2`.
 
+## Authenticity contract and threat model
+
+age encrypts *to* recipients; it does not sign. This project accepts that
+deliberately: **the reviewed repository and the deployment channel are the
+sender-authenticity boundary.** The alternative — a detached signature over
+every ciphertext — needs a second key that is separately provisioned,
+distributed, rotated, and trusted, a signing step in every write path, and a
+sidecar artifact to carry the signature. That is an entire second key
+infrastructure, which is the thing "no GPG keyrings, no KMS, no vault to run"
+exists to avoid. The channel is therefore the chosen model, and this section
+states it in full rather than leaving it implied by a caveat.
+
+### Four properties, kept apart
+
+- **Confidentiality — age provides it.** Only a holder of a private identity
+  matching one of the file's recipients can decrypt `secrets.edn.age`. A reader
+  with the repository and no identity learns the manifest's shape (key names,
+  types, collection sizes) and nothing else.
+- **Ciphertext integrity — age provides it.** age is authenticated encryption:
+  a modified, truncated, or spliced ciphertext fails to decrypt rather than
+  yielding altered plaintext. That is integrity *of the payload against
+  corruption and splicing*. It establishes that the bytes are intact and were
+  produced by *someone* holding a recipient; it is not evidence of *who*
+  produced them.
+- **Sender authenticity — age does not provide it, and neither does this
+  library.** A public recipient (`age1…`) is meant to be shared and committed;
+  it permits *encryption* and is not a signing key. Anyone holding one can
+  author a ciphertext that decrypts cleanly for every recipient. A successful
+  decryption proves *readability*, never *authorship*.
+- **Repository trust — you provide it.** This is a requirement on the operator,
+  not a property of the tool. The values a process loads are exactly as
+  trustworthy as the commit that carried the ciphertext and the channel that
+  delivered it, and no more.
+
+### Threat model
+
+- **Who may hold a public recipient: anyone.** `recipients.txt` is committed in
+  the clear and `bb secrets show-key` prints public keys precisely so they can
+  be shared. Treat every public recipient as known to every reader of the
+  repository — for a public repository, to everyone. This is by design: an
+  unpublished recipient is not a control, and this project does not offer it as
+  one.
+- **Who may replace a deployed artifact: whoever can write the repository or
+  the deployment channel.** That is anyone who can land a commit on the ref a
+  deploy builds from, anyone who can write the image, bundle, or bucket the
+  ciphertext travels in, and anyone who can write the filesystem the running
+  process reads it from.
+- **Trusted computing base:** the reviewers and ref protection of the
+  repository, the CI/CD identity that builds and ships the artifact, the
+  transfer between the reviewed commit and the running process, and the host
+  that decrypts. Compromise any one of them and the loaded configuration is
+  attacker-chosen. Hold all of them and it is what was reviewed.
+
+### What an attacker with a public recipient and write access can do
+
+The attacker here holds a public recipient (freely available) and can replace
+the ciphertext the application reads. In *both* modes they can author a payload
+that decrypts cleanly — that is the property age does not offer. The modes
+differ in whether the committed manifest exposes it, and the difference is the
+substance of this section.
+
+- **Single-key mode — the manifest exposes a changed value.** Manifest entries
+  carry a `:vhash`, an HMAC keyed by material derived from the *private*
+  identity. The attacker cannot recompute one, so a forged ciphertext plus a
+  refreshed `:ciphertext-sha` fails a full `bb secrets verify`: the entry is
+  reported as changed. `public-recipient-forgery-fails-verification-test` pins
+  this. It is still drift detection that happens to catch a forgery, not
+  authentication — it works only because the attacker lacks a key, and only a
+  *keyed* `verify` run sees it.
+- **Multi-recipient (team) mode — the manifest exposes nothing.** A team has no
+  shared private key, so there is no HMAC key and team manifests are
+  structure-only. The attacker can encrypt a chosen payload to the committed
+  recipient list, regenerate the manifest from it (the generator is pure and
+  needs no key), and refresh `:ciphertext-sha`. If the payload keeps the same
+  key paths and types, the regenerated manifest is byte-identical apart from
+  that one hash, and a full `verify` run by a legitimate teammate passes.
+  `team-mode-manifest-is-not-a-value-integrity-signal-test` pins this as a
+  known, documented boundary; if it ever starts failing, this section is what
+  needs updating.
+
+Neither case is a defect in age, and neither is a check the manifest was ever
+meant to be: the manifest is a review aid, not an authorization decision. What
+both cases share is that the forgery *must modify committed artifacts* — the
+ciphertext and the manifest are tracked files — which is what makes it
+reviewable, and is why the boundary is placed on the repository.
+
+### What the model requires of a deployment
+
+Accepting the channel is only honest if the channel is actually held. Three
+requirements, in the order they bite:
+
+1. **Reviewed, protected refs.** The artifact is only as trustworthy as the
+   commit that carried it, so require review and protect the branches and tags
+   a deploy builds from. An unreviewed push to that ref is an unreviewed change
+   to production configuration.
+2. **Immutable artifact transfer.** Nothing between the reviewed commit and the
+   running process may be able to substitute the ciphertext: build from the
+   protected ref, address every intermediate artifact and dependency by digest
+   rather than by a movable tag, and check the bytes you ship are the bytes you
+   inspected.
+3. **Least-privilege writes.** Whatever serves the ciphertext — repository,
+   registry, bucket, mounted volume — grants write access to as few principals
+   and as few build steps as the deployment can function with, since each one
+   is a party that can choose your configuration.
+
+This repository holds itself to that, and the controls are worth copying:
+
+- **Releases are gated on an environment, not on a ref alone.** A workflow has
+  no trustworthy view of tag protection, so the protected `release`
+  environment — its required reviewers and its tag restriction — decides
+  whether the job runs at all, and it holds the only copy of the Clojars
+  credentials. The build takes the pushed `v*` tag rather than the working
+  tree, and only the final deploy step has the credential in its environment;
+  checkout, build, and inspection never do. `clojure -M:deploy` re-checks the
+  receipt and uploads exactly the inspected bytes (see
+  [Releasing](#releasing)).
+- **CI executes nothing mutable.** Every `uses:` is a full commit SHA and the
+  Babashka container is an `@sha256:` digest, and
+  `com.kirahowe.secrets.workflow-policy` fails `bb test` on any workflow that
+  drifts from that — a tag moving upstream cannot change what a build runs
+  without a reviewed diff (see [Continuous
+  integration](#continuous-integration)).
+- **Privilege is step- and job-scoped.** The only job holding `pages: write`
+  and `id-token: write` is the Pages deployment, gated on `main` and the
+  protected `github-pages` environment; every other job runs with the
+  workflow's top-level `contents: read`. The keyed `verify` recipe this project
+  ships does the same for an age identity: `SECRETS_AGE_IDENTITY` is declared
+  on the one step that runs `verify`, and the job gates on the pull request
+  coming from the repository rather than a fork, so no third-party action ever
+  shares an environment with the key (see [Verifying in
+  CI](#verifying-in-ci)).
+
+### Failure behaviour
+
+There is no signature in this model, so "missing", "invalid", or "replayed"
+*authorization evidence* mostly has nothing to refer to — stated here rather
+than left looking like an unimplemented check. What does exist is `verify`'s
+drift reporting, and it fails closed:
+
+- **Missing evidence** — no ciphertext, no manifest, or a manifest with no
+  `:ciphertext-sha` and no identity to fall back on: `verify` exits 2. It never
+  reports a pass it could not establish.
+- **Invalid evidence** — a manifest that is not EDN, or whose `:version` is
+  anything but 2 (including a legacy v1 manifest): drift, exit 1, never diffed
+  as a shape.
+- **Replay** — no signature and no nonce, so a replayed ciphertext is visible
+  only where it disagrees with the committed manifest (`:ciphertext-sha`, plus
+  the `:vhash`es in single-key mode). Rolling the ciphertext *and* its manifest
+  back to an earlier committed pair is a repository change, and the repository
+  is the boundary.
+- **Wrong app** — the manifest records `:app`, and `verify` refuses a manifest
+  whose `:app` is not this project's, or that records none, as drift rather than
+  diffing it as a shape. This matters most in team mode: with no `:vhash`es to
+  disagree, a foreign structure-only manifest with a refreshed
+  `:ciphertext-sha` would otherwise verify clean.
+- **Wrong environment** — environments are separate files at separately
+  configured paths, so a "wrong environment" is a misconfigured path, which
+  `bb secrets doctor` reports per environment. No ciphertext is
+  cryptographically bound to an environment name.
+
 ## Trade-offs and limitations
 
 This is the "encrypted secrets in git" model (like SOPS, git-crypt, sealed-
@@ -1024,6 +1184,9 @@ you're trading for that simplicity.
   detect manifest/ciphertext *drift*, not a forged commit. (A keyless `verify`
   run checks freshness only, via `:ciphertext-sha`; the full value-level check
   still needs a key.)
+  The full statement of what age does and does not give, the threat model, and
+  what the accepted channel requires of a deployment are in [Authenticity
+  contract and threat model](#authenticity-contract-and-threat-model).
 - **`age` is a runtime dependency.** Decryption shells out, so every environment
   that decrypts — dev, CI, the production container — needs the `age` binary on
   PATH, not just the build. (The one exception: a keyless `bb secrets verify`
@@ -1040,6 +1203,9 @@ you're trading for that simplicity.
   shared secret to key the HMAC; multi-recipient setups have no single shared
   key, so their manifests are structure-only (add / remove / retype still show;
   a rotated string does not).
+  In team mode the manifest is therefore not a value-integrity signal at all —
+  see [Authenticity contract and threat
+  model](#authenticity-contract-and-threat-model).
 - **Where it fits.** A solo developer or small team shipping a handful of apps
   with no secrets infrastructure. If you need dynamic secrets, centralized
   audit, fine-grained IAM, or automatic rotation, a dedicated secrets manager

@@ -1219,9 +1219,21 @@
         recipients))))
 
 (defn- read-supported-manifest
-  [environment-label manifest-path]
+  "The committed manifest at `manifest-path`, or a `:status` when it cannot be
+  compared at all.
+
+  Two gates, both of which reject rather than diff. The `:version` gate keeps a
+  v1 hash from ever being read as a v2 one. The `:app` gate is the wrong-app
+  half of the authenticity contract: `:app` is the one field the manifest
+  records about *which store it describes*, and without checking it a manifest
+  written for another app whose key paths happen to agree is diffed as a shape.
+  Single-key mode would usually still catch that on a `:vhash` derived from
+  different key material, but a team manifest carries no `:vhash` at all, so a
+  refreshed `:ciphertext-sha` would otherwise verify clean."
+  [environment-label expected-app manifest-path]
   (let [parsed (parse-edn (slurp (io/file (str manifest-path))))
-        version (get-in parsed [:value :version])]
+        version (get-in parsed [:value :version])
+        app (get-in parsed [:value :app])]
     (cond
       (not (:ok? parsed))
       (do
@@ -1238,6 +1250,17 @@
          (str "    Regenerate it with `bb secrets reencrypt "
               environment-label
               "`, or upgrade the library."))
+        {:status :drift})
+
+      (not= expected-app app)
+      (do
+        (oops environment-label
+              "— manifest describes app"
+              (pr-str app)
+              (str "but this project is " (pr-str expected-app) "."))
+        (println
+         (str "    It belongs to a different store. Regenerate it with "
+              "`bb secrets reencrypt " environment-label "`."))
         {:status :drift})
 
       :else
@@ -1258,8 +1281,8 @@
       (= ciphertext-sha (sha256 secrets-file))
       (do
         (ok environment-label
-            "— ciphertext matches the manifest"
-            "(freshness verified without a key; values not checked).")
+            "— ciphertext agrees with the manifest"
+            "(freshness only: no key, so values are not checked).")
         :ok-keyless)
 
       :else
@@ -1310,8 +1333,11 @@
   "Verify one environment's committed manifest against its encrypted secrets.
   Prints a human-readable result and returns :ok, :ok-keyless, :drift, or
   :missing. Without an identity, falls back to comparing the manifest's
-  recorded :ciphertext-sha against the actual ciphertext (freshness only)."
-  [{:keys [secrets-file manifest identity-file] environment-name :name :as env}]
+  recorded :ciphertext-sha against the actual ciphertext (freshness only).
+
+  This establishes *agreement* between the two committed artifacts — drift
+  detection — and never who authored either of them; see [[verify!]]."
+  [{:keys [app secrets-file manifest identity-file] environment-name :name :as env}]
   (let [environment-label (clojure.core/name environment-name)]
     (cond
       (not (string? manifest))
@@ -1334,7 +1360,7 @@
 
       :else
       (let [{:keys [committed status]}
-            (read-supported-manifest environment-label manifest)]
+            (read-supported-manifest environment-label app manifest)]
         (if status
           status
           (if-not (.exists (io/file identity-file))
@@ -1349,7 +1375,15 @@
   :ok-keyless, :drift, or :missing. The exit code is 1 on drift, 2 on a
   missing artifact or an unverifiable legacy manifest, and 0 otherwise.
   Keyless verification compares the ciphertext hash and does not require age;
-  full verification decrypts and compares manifest entries."
+  full verification decrypts and compares manifest entries.
+
+  A pass means the ciphertext and the manifest agree, not that either is
+  authentic: age does not sign, so no run of this can identify who wrote them.
+  In single-key mode the `:vhash`es do make a changed value fail a keyed run,
+  because they are keyed by the private identity; team manifests carry no
+  `:vhash`, so a same-shape value change there is invisible to `verify` by
+  design. Sender authenticity rests on the repository and deployment channel —
+  see the README's authenticity contract and threat model."
   [config env-arg]
   (let [envs (if env-arg
                [(resolve-env config env-arg)]

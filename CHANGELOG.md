@@ -43,6 +43,38 @@ All notable changes to this project are documented here. The format follows
   to `bb secrets encrypt` for an arbitrary file, carries its own 1 GiB bound
   instead of the store's 8 MiB: a store past that is hostile or broken, an
   arbitrary file past it is ordinary.
+- An explicit **authenticity contract and threat model** in the README, plus
+  regression coverage that pins it. This documents and tests the boundary that
+  was already there; it adds no signing, no key material, and no new check.
+  The contract separates the four properties that are easy to run together —
+  confidentiality and ciphertext integrity (age provides both), sender
+  authenticity (age provides none, and a shareable public recipient is an
+  encryption key, not a signing key), and repository trust (a requirement on
+  the operator) — then names who may hold a public recipient (anyone: they are
+  committed), who may replace a deployed artifact (whoever can write the
+  repository or the deployment channel), the resulting trusted computing base,
+  and what accepting that channel demands of a deployment: reviewed and
+  protected refs, immutable artifact transfer, least-privilege writes. This
+  repository's own protected-tag release, digest-pinned CI, and step-scoped
+  identities are cited as the worked example. It also states plainly where
+  `verify` stops: a pass means the ciphertext and manifest *agree*, never that
+  either is authentic.
+  `team-mode-manifest-is-not-a-value-integrity-signal-test` makes the sharpest
+  case falsifiable: a team manifest carries no `:vhash`, so a public-recipient
+  holder can replace the ciphertext with a chosen payload, regenerate the
+  structure-only manifest with no key at all, and pass full verification —
+  while necessarily rewriting two committed files, which is what makes it
+  reviewable. Docstrings on `com.kirahowe.secrets`, `…secrets.age`,
+  `…secrets.manifest`, and `verify!`/`verify-one` now say the same thing where
+  the code is read, and the keyless `verify` line reports "ciphertext agrees
+  with the manifest" rather than "freshness verified".
+- `verify` now refuses a manifest whose `:app` is not the configured one, or
+  that records none, as drift rather than diffing it as a shape. Auditing the
+  contract turned up that `:app` was written into every manifest and read back
+  by nothing, so a manifest belonging to another project whose key paths
+  happened to agree was compared as a shape. It matters most in team mode,
+  where there are no `:vhash`es to disagree: a foreign structure-only manifest
+  with a refreshed `:ciphertext-sha` verified clean.
 
 ### Changed
 - Publication runs on a classpath of its own, and no longer resolves a

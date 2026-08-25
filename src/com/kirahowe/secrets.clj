@@ -6,6 +6,12 @@
   identity (private key) and read into a plain Clojure map. The plaintext is
   never written to disk and never committed.
 
+  A successful decryption proves the ciphertext was readable with your
+  identity, not who wrote it: age encrypts to recipients and does not sign. The
+  loaded map is therefore only as trustworthy as the commit and deployment
+  channel that delivered the ciphertext — see the README's authenticity
+  contract and threat model.
+
   Two ways to consume secrets:
 
   • As an Integrant/component value — call `load-secrets` to get the map and
