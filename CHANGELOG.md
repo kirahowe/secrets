@@ -461,6 +461,19 @@ All notable changes to this project are documented here. The format follows
   resolved internally is no longer passed back in as an explicit
   `:identity-file`, which is how a materialized path reached the Aero readers'
   diagnostics.
+- A set-but-blank `VISUAL` or `EDITOR` no longer counts as an editor. The empty
+  string is truthy, so `VISUAL=""` shadowed a correctly set `EDITOR` and the
+  `vim` default, and the shell command word became the decrypted plaintext temp
+  file — `edit` asked the shell to execute the secrets file. It failed closed:
+  that file is owner-only and not executable, so the shell exited 126 and the
+  store was left unchanged, but the operator saw only "Editor exited with an
+  error" with nothing pointing at the variable. Blank and whitespace-only values
+  now fall through to the next source, which is safe here — unlike a blank
+  identity variable, which still throws, a fallback editor cannot silently
+  produce a wrong-but-plausible result. Values carrying arguments
+  (`EDITOR="code --wait"`) are unaffected, the path is still a separate
+  positional argument, and the failure message now names the editor command so a
+  genuine editor failure is attributable.
 
 ## [0.1.0] - 2026-08-21
 

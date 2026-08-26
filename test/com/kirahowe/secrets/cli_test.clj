@@ -11,7 +11,7 @@
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
-            [clojure.test :refer [deftest is testing use-fixtures]]
+            [clojure.test :refer [are deftest is testing use-fixtures]]
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
@@ -771,6 +771,90 @@
           #(run-editor! relative-plaintext))
         (is (= (.getAbsolutePath (io/file relative-plaintext))
                (slurp capture)))))))
+
+;;;; Editor resolution
+
+(deftest editor-resolution-table-test
+  (let [editor-value (cli-private 'editor-value)]
+    (are [visual editor expected] (= expected (editor-value visual editor))
+      "" "nano" "nano"
+      "   " "nano" "nano"
+      "\t\n" "nano" "nano"
+      "" "" "vim"
+      "  " "\t" "vim"
+      nil nil "vim"
+      "" nil "vim"
+      nil "" "vim"
+      "code --wait" nil "code --wait"
+      "  " "emacsclient -t" "emacsclient -t"
+      "vi" "nano" "vi")))
+
+(defn- shell-command-word
+  "The word `/bin/sh` would execute for the argv `run-editor!` builds. `set --`
+  re-splits the command string exactly as `sh -c` does, with `path` arriving as
+  `$1` the way the real invocation passes it, so a command string that expands
+  to nothing but `$1` reports the path — which is the defect."
+  [argv]
+  (let [[_sh _c command _name path] argv]
+    (:out (shell/sh "sh" "-c" (str "set -- " command "; printf '%s' \"$1\"")
+                    "editor" path))))
+
+(deftest blank-editor-never-makes-the-plaintext-the-command-word-test
+  (let [editor-value (cli-private 'editor-value)
+        editor-argv (cli-private 'editor-argv)
+        plaintext (str *dir* "/plain.edn")]
+    (testing "the probe reproduces the defect, so the assertions below are not vacuous"
+      (is (= plaintext (shell-command-word (editor-argv "" plaintext)))
+          "a blank editor really does make the plaintext the command word"))
+    (doseq [[visual editor] [["" ""] ["   " "\t"] ["" nil] [nil "  "] ["" "  "]]]
+      (testing (pr-str [visual editor])
+        (let [argv (editor-argv (editor-value visual editor) plaintext)]
+          (is (= "vim" (shell-command-word argv))
+              "the fallback editor is the command word, never the plaintext")
+          (is (= plaintext (peek argv))
+              "and the plaintext is still the positional argument"))))))
+
+(deftest editor-with-arguments-still-receives-the-path-positionally-test
+  (let [run-editor! (cli-private 'run-editor!)
+        script (io/file *dir* "recording-editor.sh")
+        capture (io/file *dir* "editor-argv.txt")
+        plaintext (str *dir* "/plain.edn")]
+    (spit plaintext "plaintext")
+    (spit script (str "#!/bin/sh\nout=\"$1\"\nshift\n"
+                      "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$out\"\n"))
+    (is (.setExecutable script true true) "the fixture editor must be executable")
+    (with-redefs-fn {(cli-private 'editor)
+                     (constantly (str (.getAbsolutePath script)
+                                      " "
+                                      (.getAbsolutePath capture)
+                                      " --wait"))}
+      #(run-editor! plaintext))
+    (is (= ["--wait" plaintext] (str/split-lines (slurp capture)))
+        "the editor keeps its own arguments and the path stays a separate one")))
+
+(deftest edit-leaves-the-store-untouched-when-the-editor-fails-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")
+          failing (io/file *dir* "failing-editor.sh")]
+      (spit failing "#!/bin/sh\nexit 3\n")
+      (is (.setExecutable failing true true) "the fixture editor must be executable")
+      (encrypt-edn! {:valid true})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [command (.getAbsolutePath failing)
+            ciphertext-before (file-bytes encrypted)
+            manifest-before (slurp manifest-path)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             (re-pattern (str "Editor exited with an error.*"
+                              (java.util.regex.Pattern/quote command)))
+             (with-out-str
+               (with-redefs-fn {(cli-private 'editor) (constantly command)}
+                 #(cli/edit! config "dev")))))
+        (is (= ciphertext-before (file-bytes encrypted)))
+        (is (= manifest-before (slurp manifest-path)))))))
 
 (deftest secure-delete-option-boundary-test
   (let [secure-delete! (cli-private 'secure-delete!)

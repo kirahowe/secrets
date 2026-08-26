@@ -439,23 +439,60 @@
 
 ;;;; Utilities
 
-(defn- editor [] (or (System/getenv "VISUAL") (System/getenv "EDITOR") "vim"))
+(defn- editor-value
+  "The editor command to run, from the `VISUAL` value `visual` and the `EDITOR`
+  value `editor`, falling back to `vim`. A variable that is set but blank counts
+  as unset and falls through to the next source, so an empty `VISUAL` cannot
+  shadow a working `EDITOR` or the default. Takes the values rather than reading
+  them, so the rule is testable without setting process environment.
+
+  Only leading and trailing blankness disqualifies a value: internal whitespace
+  is meaningful, and `\"code --wait\"` or `\"emacsclient -t\"` comes back intact,
+  arguments and all. Whitespace-only is rejected alongside empty because the
+  shell drops both identically, which would leave the file being edited as the
+  command word of [[editor-argv]].
+
+  This is deliberately the opposite of `identity-env-value`, which throws on a
+  set-but-blank identity variable. There every outcome is wrong but plausible:
+  the blank value resolves to an empty key file, and falling through reaches the
+  developer's local key while the deployment that variable was meant to
+  configure stays broken. A blank editor variable has no such failure mode — the
+  operator either watches the fallback editor open or gets a failure that leaves
+  the store untouched, so falling through is safe here."
+  [visual editor]
+  (or (first (remove str/blank? [visual editor])) "vim"))
+
+(defn- editor
+  "`editor-value` applied to the live environment."
+  []
+  (editor-value (getenv "VISUAL") (getenv "EDITOR")))
+
+(defn- editor-argv
+  "The argv that runs editor command `command` on `path` through the shell.
+  `path` is passed positionally rather than interpolated, so the shell treats it
+  as data and it can never become part of the command."
+  [command path]
+  ["sh" "-c" (str command " \"$1\"") "editor" path])
 
 (defn- run-editor!
-  "Open `$EDITOR` on `path`, inheriting the terminal. The editor value goes
-  through the shell because it may carry arguments (\"code --wait\",
+  "Open `$VISUAL`/`$EDITOR` on `path`, inheriting the terminal. The editor value
+  goes through the shell because it may carry arguments (\"code --wait\",
   \"emacsclient -t\"); the path is passed as a positional argument, not
   interpolated. An arbitrary editor would read a dash-leading path as its own
   option and `--` is not portable across editors, so `path` is made absolute
-  before it reaches the editor. Throws if the editor exits non-zero."
+  before it reaches the editor. Throws if the editor exits non-zero, naming the
+  editor command — a misconfigured one is otherwise indistinguishable from an
+  editor that genuinely failed. The command is configuration, not a secret; the
+  plaintext path stays out of the message."
   [path]
-  (let [path (.getAbsolutePath (io/file (str path)))
-        argv ["sh" "-c" (str (editor) " \"$1\"") "editor" path]
-        proc (-> (ProcessBuilder. (into-array String argv))
+  (let [command (editor)
+        path (.getAbsolutePath (io/file (str path)))
+        proc (-> (ProcessBuilder. (into-array String (editor-argv command path)))
                  (.inheritIO)
                  (.start))]
     (when-not (zero? (.waitFor proc))
-      (fail! "Editor exited with an error; leaving secrets unchanged."))))
+      (fail! (str "Editor exited with an error; leaving secrets unchanged."
+                  " Editor: " command)))))
 
 (defn- secure-delete!
   "Best-effort secure delete of a plaintext temp file. `rm`/`shred` receive

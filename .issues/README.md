@@ -20,9 +20,8 @@ weaken the release gate:
 
 ## Open
 
-| Priority | Issue | Outcome |
-| --- | --- | --- |
-| P2 | [025 — Blank editor variable](025-blank-editor-variable.md) | Treat a set-but-blank editor variable as unset instead of letting it shadow the next source. |
+None. Every issue in this backlog is resolved; the alpha release gate is
+satisfied. Each entry below links to its own decision and verification history.
 
 ## Completed
 
@@ -52,3 +51,4 @@ weaken the release gate:
 | [022 — Explicit injected-identity temp cleanup](022-injected-identity-temp-cleanup.md) | Gave materialized identities a generation-scoped lifecycle with reference-counted leases, so retirement deletes promptly but never while a decryption is reading. |
 | [023 — Redact sensitive exception context](023-redact-sensitive-exception-context.md) | Replaced rendered sources and whole option maps with an allowlisted type-aware descriptor, and closed three routes by which a materialized identity path reached a diagnostic. |
 | [024 — CLI flag extraction boundary](024-cli-flag-extraction-boundary.md) | Scoped `--edn` extraction to the one command that defines it and added a `--` operand terminator, closing the last place a filename influenced argument parsing. |
+| [025 — Blank editor variable](025-blank-editor-variable.md) | Treated a set-but-blank editor variable as unset so it cannot shadow the next source and make the plaintext file the shell's command word. |

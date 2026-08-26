@@ -193,6 +193,12 @@ bb secrets new dev       # opens $EDITOR with the template; fill in, save, encry
 self-documenting. Saving writes `secrets.edn.age` (ciphertext) and
 `secrets.edn.manifest` (its value-free shape) — commit both.
 
+`new` and `edit` open `$VISUAL`, then `$EDITOR`, then `vim`. A variable that is
+set but blank counts as unset and falls through to the next source, so an empty
+`VISUAL` can't shadow a working `EDITOR`. The value may carry arguments
+(`EDITOR="code --wait"`, `EDITOR="emacsclient -t"`); the file is passed to it as
+a separate positional argument, never interpolated into the command.
+
 Day to day:
 
 ```sh
