@@ -1721,13 +1721,35 @@
    ["decrypt" "[env] <file>" "Decrypt a <file>.age to stdout"]
    ["help" "" "Show this help"]])
 
+(defn- split-operands
+  "Split `args` at the first `--` operand terminator into `[options operands]`,
+  consuming the terminator itself. Everything in `operands` is positional data
+  however it is spelled, which is how an operand that looks like an option — a
+  file named `--edn` — is named on the command line. Same boundary every `age`
+  invocation gets; a second `--` is data, not another terminator."
+  [args]
+  (let [[options operands] (split-with #(not= "--" %) args)]
+    [(vec options) (vec (rest operands))]))
+
+(defn- without-terminator
+  "`args` with the `--` operand terminator consumed and nothing else touched —
+  what a command that defines no flag of its own needs."
+  [args]
+  (let [[options operands] (split-operands args)]
+    (into options operands)))
+
 (defn- extract-flag
-  "Pull a boolean `flag` out of `args`, returning [present? remaining-args].
-  Parsed out before positional dispatch (only `run!` calls this) so a flag can
-  appear anywhere among the args without shifting the optional [env]."
+  "Pull a boolean `flag` out of `args`, returning `[present? remaining-args]`.
+  Called only for the command that defines `flag`, so no other command's
+  operand can be consumed as a flag it does not accept. Within that command the
+  flag still leaves the sequence before positional dispatch reads it: `set` is
+  `[env] <key> [--edn]`, and `(second args)` deciding whether the first
+  argument is the environment or the key is what the extraction protects. A
+  flag is only recognized before the operand terminator."
   [flag args]
-  [(boolean (some #{flag} args))
-   (doall (remove #{flag} args))])
+  (let [[options operands] (split-operands args)]
+    [(boolean (some #{flag} options))
+     (into (vec (remove #{flag} options)) operands)]))
 
 (defn- print-help [{:keys [environments default-environment]}]
   (println (paint :bold "Manage encrypted secrets (age).") "\n")
@@ -1740,6 +1762,9 @@
              (str "(default: " (name default-environment) ")")
              ""))
   (println (paint :dim "\n  An omitted [env] uses the default environment."))
+  (println
+   (paint :dim
+          "  -- ends the options: everything after it is a filename or key, even --edn."))
   (println
    (paint :dim
           "  Commands printed as suggestions are POSIX sh, single-quoted per argument."))
@@ -1774,12 +1799,18 @@
       ;; structured exit 2. Every existing command retains the original
       ;; normalize-before-dispatch behavior and failure exit.
       (if (= "doctor" command)
-        (let [{:keys [exit]} (doctor! config (first more))]
+        (let [{:keys [exit]} (doctor! config (first (without-terminator more)))]
           (when (pos? exit) (System/exit exit)))
         (let [config (normalize-config config)
-              ;; --edn only means anything to `set`, but pulling it out here
-              ;; keeps [env] positional and optional either way.
-              [edn? more] (extract-flag "--edn" more)]
+              ;; `--edn` is `set`'s flag and no other command's, so only `set`'s
+              ;; arguments are searched for it — otherwise a file named `--edn`
+              ;; is stripped before positional dispatch and `encrypt`/`decrypt`
+              ;; run against a shifted operand. The original global extraction
+              ;; was protecting `set`'s optional positional [env] from the flag;
+              ;; that reason is real, so it now applies to `set` alone.
+              [edn? more] (if (= "set" command)
+                            (extract-flag "--edn" more)
+                            [false (without-terminator more)])]
           (case command
             "keygen" (keygen! config (first more))
             "new" (new! config (first more))

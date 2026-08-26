@@ -281,6 +281,24 @@ All notable changes to this project are documented here. The format follows
   than silent tag drift.
 
 ### Fixed
+- The CLI no longer lets a filename change how it parses its own arguments.
+  `--edn` was removed from every command's arguments before positional
+  dispatch, so a file named `--edn` was stripped and `encrypt`/`decrypt` ran
+  against a missing or shifted operand (CWE-88): `bb secrets encrypt --edn`
+  reported `No such file: ` and `bb secrets encrypt dev --edn` reported
+  `No such file: dev`. It failed closed — the existence guard rejected the
+  shifted operand before `age` was invoked, so no wrong file was read or
+  written and no ciphertext or plaintext was produced — which makes this a
+  parsing-correctness fix, not a disclosure fix. `--edn` is now extracted only
+  for `set`, the one command that defines it, and only after dispatch has
+  selected it; every other command reads a `--edn` operand as the filename or
+  key it is. Extraction still happens before `set`'s own positional
+  `[env]`/`<key>` decision, which is what the global extraction was really
+  protecting. Additionally `--` now ends the options for every command and is
+  consumed rather than passed on, so `bb secrets encrypt dev -- --edn` names the
+  file for the same reason age invocations take a terminator. `[env]` remains
+  positional and optional everywhere, and an omitted `[env]` still selects the
+  default environment.
 - The CI examples in the production chapter and the README no longer grant a
   private age identity to a whole job. `SECRETS_AGE_IDENTITY` is declared on the
   `bb secrets verify` step alone, so checkout, the `age` install, and the

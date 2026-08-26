@@ -1376,6 +1376,12 @@ you're trading for that simplicity.
   that starts with a dash is passed as `./-name` — age reads a bare `-` from
   standard input even behind a terminator, so the prefix is the part that keeps
   a filename a filename.
+- **A filename cannot change how the CLI parses its own arguments either.**
+  `--edn` is `set`'s flag, so only `set`'s arguments are searched for it; every
+  other command reads a `--edn` operand as the filename or key it is. `--` ends
+  the options for every command and is consumed rather than passed on, so
+  `bb secrets encrypt dev -- --edn` encrypts the file. `[env]` stays positional
+  and optional throughout.
 
 ## License
 

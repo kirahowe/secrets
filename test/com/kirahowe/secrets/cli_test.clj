@@ -838,6 +838,184 @@
                     ["shred" "-u" "--" absolute]]
                    @calls))))))))
 
+;;;; CLI flag extraction boundary
+
+;;; The same defect as the age boundary above, one layer out: the CLI's own
+;;; parser used to strip `--edn` from every command's arguments, so a file
+;;; named `--edn` was removed before positional dispatch. `--edn` is `set`'s
+;;; flag alone now, and `--` ends the options for every command.
+
+(defn- captured-stdout-bytes
+  "The exact bytes `f` writes to `System/out`, where `decrypt` streams
+  plaintext. `with-out-str` cannot see those: it rebinds `*out*` only."
+  [f]
+  (let [captured (java.io.ByteArrayOutputStream.)
+        original System/out]
+    (with-open [replacement (java.io.PrintStream. captured)]
+      (System/setOut replacement)
+      (try
+        (with-out-str (f))
+        (finally
+          (System/setOut original))))
+    (.toByteArray captured)))
+
+(defn- dispatched
+  "The arguments `run!` hands the command named by `args`, with every command
+  implementation replaced by a recorder. The real dispatch path — the same
+  `case`, the same flag and terminator handling — with only the leaves stubbed,
+  so how an operand was interpreted is observable without the command touching
+  the filesystem and without a failure exiting the test runner."
+  [config args]
+  (let [seen (atom nil)
+        record (fn [_config & more] (reset! seen (vec more)) {:exit 0})]
+    (with-redefs [cli/keygen! record
+                  cli/new! record
+                  cli/edit! record
+                  cli/set-secret! record
+                  cli/remove-secret! record
+                  cli/verify! record
+                  cli/show-key! record
+                  cli/add-recipient! record
+                  cli/recipients! record
+                  cli/reencrypt! record
+                  cli/encrypt! record
+                  cli/decrypt! record
+                  cli/doctor! record]
+      (with-out-str (cli/run! config args)))
+    @seen))
+
+(deftest a-file-named-like-a-flag-round-trips-test
+  ;; The acceptance criterion, through `run!` rather than the command fns: what
+  ;; the defect broke is dispatch, so dispatch is what has to run. Safe here
+  ;; only because every step is expected to succeed — a failure would exit the
+  ;; test runner, which is exactly what the pre-fix `No such file: ` does.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (with-cwd-entry "--edn"
+      (fn [entry]
+        (with-cwd-entry "--edn.age"
+          (fn [_]
+            (let [config (test-config)
+                  payload "a file whose name is spelled like a flag"]
+              (spit entry payload)
+              (doseq [[label env-args] [["environment given explicitly" ["dev"]]
+                                        ["environment omitted" []]]]
+                (testing label
+                  (with-out-str
+                    (cli/run! config (into ["encrypt"] (conj env-args "--edn"))))
+                  (is (.exists (io/file "--edn.age"))
+                      "the operand named the file, not a flag")
+                  (is (= payload
+                         (String. (captured-stdout-bytes
+                                   #(cli/run! config (into ["decrypt"]
+                                                           (conj env-args "--edn.age"))))
+                                  "UTF-8"))
+                      "the recovered bytes are the original"))))))))))
+
+(deftest operand-terminator-addresses-a-flag-named-file-test
+  ;; `--` for the CLI's own parser, for the reason 006 gave age one: an operand
+  ;; that looks like an option needs a way to say it is not one. The ciphertext
+  ;; is `--edn.age` because that is what `encrypt` writes; it is dash-leading
+  ;; too, so `decrypt` past the terminator is the interesting half.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (with-cwd-entry "--edn"
+      (fn [entry]
+        (with-cwd-entry "--edn.age"
+          (fn [_]
+            (let [config (test-config)
+                  payload "addressed from past the terminator"]
+              (spit entry payload)
+              (testing "encrypt dev -- --edn encrypts the file"
+                (with-out-str (cli/run! config ["encrypt" "dev" "--" "--edn"]))
+                (is (.exists (io/file "--edn.age")))
+                (is (not (.exists (io/file "--.age")))
+                    "the terminator was consumed, not taken as the file"))
+              (testing "decrypt dev -- --edn.age recovers the bytes"
+                (is (= payload
+                       (String. (captured-stdout-bytes
+                                 #(cli/run! config ["decrypt" "dev" "--" "--edn.age"]))
+                                "UTF-8")))))))))))
+
+(deftest set-edn-still-works-everywhere-it-did-test
+  ;; Every position the dispatch accepts the flag in today: before or after an
+  ;; explicit [env], and with [env] omitted. A real EDN value each time, since
+  ;; a dropped flag stores the same text as a string and would still "work".
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (test-config)
+          encrypted (str *dir* "/secrets.edn.age")
+          stored (fn [k] (k (edn/read-string (age/decrypt *key* encrypted))))]
+      (doseq [[k args] [[:flag-only-arg ["set" "--edn" ":flag-only-arg"]]
+                        [:flag-after-key ["set" ":flag-after-key" "--edn"]]
+                        [:flag-before-env ["set" "--edn" "dev" ":flag-before-env"]]
+                        [:flag-between ["set" "dev" "--edn" ":flag-between"]]
+                        [:flag-after-key-and-env ["set" "dev" ":flag-after-key-and-env" "--edn"]]]]
+        (testing (str/join " " args)
+          (with-out-str (with-in-str "{:port 5432}" (cli/run! config args)))
+          (is (= {:port 5432} (stored k))
+              "the value was parsed as EDN, not stored as its text")))
+      (testing "the terminator leaves set's own positional arguments alone"
+        (with-out-str (with-in-str "plain" (cli/run! config ["set" "dev" "--" ":past-terminator"])))
+        (is (= "plain" (stored :past-terminator)))))))
+
+(deftest other-commands-do-not-consume-a-flag-they-do-not-define-test
+  (let [config (test-config)]
+    (doseq [[args expected note]
+            [;; The two cases the issue confirmed.
+             [["encrypt" "--edn"] [nil "--edn"] "a lone flag-shaped operand is the file"]
+             [["encrypt" "dev" "--edn"] ["dev" "--edn"] "[env] stays positional before it"]
+             [["decrypt" "--edn"] [nil "--edn"] "the same for decrypt"]
+             [["decrypt" "dev" "--edn"] ["dev" "--edn"] "the same for decrypt"]
+             [["rm" "--edn"] [nil "--edn"] "rm reads it as the key"]
+             [["rm" "dev" "--edn"] ["dev" "--edn"] "rm reads it as the key"]
+             [["add-recipient" "--edn"] ["--edn" nil] "add-recipient reads it as [env]"]
+             [["add-recipient" "dev" "--edn"] ["dev" "--edn"] "add-recipient reads it as [key]"]
+             [["keygen" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
+             [["new" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
+             [["edit" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
+             [["verify" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
+             [["show-key" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
+             [["recipients" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
+             [["reencrypt" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
+             [["doctor" "--edn"] ["--edn"] "doctor dispatches before normalization"]
+             ;; [env] positional and optional, unchanged.
+             [["keygen"] [nil] "an omitted [env] is still nil at the boundary"]
+             [["keygen" "dev"] ["dev"] "an explicit [env] is still positional"]
+             [["encrypt" "note.txt"] [nil "note.txt"] "an ordinary lone operand is the file"]
+             [["encrypt" "dev" "note.txt"] ["dev" "note.txt"] "an ordinary [env] <file>"]
+             ;; The terminator is consumed by every command, not passed on.
+             [["encrypt" "--" "--edn"] [nil "--edn"] "terminated, with [env] omitted"]
+             [["encrypt" "dev" "--" "--edn"] ["dev" "--edn"] "terminated, [env] given"]
+             [["keygen" "--" "dev"] ["dev"] "terminated single-argument command"]]]
+      (testing (str (str/join " " args) " — " note)
+        (is (= expected (dispatched config args)))))))
+
+(deftest default-environment-still-resolves-without-env-test
+  ;; What the original global extraction was protecting: [env] is positional
+  ;; and optional, and omitting it selects the default. Proved by effect rather
+  ;; than by the dispatched argument — the same command with and without the
+  ;; environment name has to agree.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (test-config)
+          plaintext (str *dir* "/default-env.txt")]
+      (testing "recipients resolves the default environment by name"
+        (let [omitted (with-out-str (cli/run! config ["recipients"]))]
+          (is (= (with-out-str (cli/run! config ["recipients" "dev"])) omitted))
+          (is (str/includes? omitted "dev"))))
+      (testing "set writes the default environment's store"
+        (with-out-str (with-in-str "v" (cli/run! config ["set" ":default-env"])))
+        (let [store (str *dir* "/secrets.edn.age")]
+          (is (= "v" (:default-env (edn/read-string (age/decrypt *key* store)))))))
+      (testing "verify reports the same result either way"
+        (is (= (with-out-str (cli/run! config ["verify" "dev"]))
+               (with-out-str (cli/run! config ["verify"])))))
+      (testing "encrypt uses the default environment's recipients"
+        (spit plaintext "default env payload")
+        (with-out-str (cli/run! config ["encrypt" plaintext]))
+        (is (.exists (io/file (str plaintext ".age"))))))))
+
 ;;;; Generated shell commands
 
 ;;; The CLI prints copy/paste commands and never runs them, so the defect

@@ -22,7 +22,6 @@ weaken the release gate:
 
 | Priority | Issue | Outcome |
 | --- | --- | --- |
-| P2 | [024 — CLI flag extraction boundary](024-cli-flag-extraction-boundary.md) | Extract `--edn` only where it is defined so an operand can never be consumed as a flag. |
 | P2 | [025 — Blank editor variable](025-blank-editor-variable.md) | Treat a set-but-blank editor variable as unset instead of letting it shadow the next source. |
 
 ## Completed
@@ -52,3 +51,4 @@ weaken the release gate:
 | [021 — Self-host documentation scripts](021-self-host-documentation-scripts.md) | Removed the unused jQuery includes rather than bundling them, stripped a Google Fonts `@import` hidden in Bootstrap's CSS, and added a hash-based CSP enforced by a build check. |
 | [022 — Explicit injected-identity temp cleanup](022-injected-identity-temp-cleanup.md) | Gave materialized identities a generation-scoped lifecycle with reference-counted leases, so retirement deletes promptly but never while a decryption is reading. |
 | [023 — Redact sensitive exception context](023-redact-sensitive-exception-context.md) | Replaced rendered sources and whole option maps with an allowlisted type-aware descriptor, and closed three routes by which a materialized identity path reached a diagnostic. |
+| [024 — CLI flag extraction boundary](024-cli-flag-extraction-boundary.md) | Scoped `--edn` extraction to the one command that defines it and added a `--` operand terminator, closing the last place a filename influenced argument parsing. |

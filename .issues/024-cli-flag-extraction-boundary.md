@@ -1,6 +1,6 @@
 # 024 — CLI flag extraction boundary
 
-Status: `open`
+Status: `resolved`
 Priority: P2
 Review classification: Low
 
@@ -48,20 +48,65 @@ file. Either way `[env]` stays positional and optional.
 
 ## Acceptance criteria
 
-- [ ] A file named `--edn` round-trips through `encrypt` and `decrypt` with the
+- [x] A file named `--edn` round-trips through `encrypt` and `decrypt` with the
       environment given explicitly and with it omitted.
-- [ ] `--edn` is no longer removed from the arguments of any command that does
+- [x] `--edn` is no longer removed from the arguments of any command that does
       not define it, and no command's operand can be consumed as a flag it
       does not accept.
-- [ ] `set --edn` keeps working in every argument position it accepts today,
+- [x] `set --edn` keeps working in every argument position it accepts today,
       including with `[env]` omitted.
-- [ ] Every other command's argument interpretation is unchanged: `[env]` stays
+- [x] Every other command's argument interpretation is unchanged: `[env]` stays
       positional and optional and an omitted `[env]` still selects the default
       environment.
-- [ ] A regression test drives the real dispatch path for the `--edn`-named
+- [x] A regression test drives the real dispatch path for the `--edn`-named
       file and for `set`, and fails against the current extraction behavior.
-- [ ] Any cwd-relative fixture is removed in a `finally` and covered by a
+- [x] Any cwd-relative fixture is removed in a `finally` and covered by a
       `.gitignore` safety-net entry, as in 006.
+
+## Resolution
+
+Both routes the issue offered, because they close different halves. `--edn` is
+extracted only for `set`, the command that defines it, and `split-operands` stops
+flag recognition at a `--` terminator, consuming it rather than passing it on.
+Every other command now receives its arguments untouched apart from the
+terminator, and `doctor` takes the same no-flag path so the grammar is uniform.
+
+The interesting part is *why* the original extracted early, because that reason
+is real and had to be preserved rather than deleted. `set` is
+`[env] <key> [--edn]` with an optional `[env]`, and the dispatch decides which of
+the two the first argument is with `(second more)`. With `--edn` still in the
+sequence, `set --edn :n` makes `(second more)` truthy, so `--edn` would be read
+as the environment and `:n` as the key. The flag genuinely must leave the
+sequence before that arity decision — but only for `set`, so that is now the only
+place it happens, with the reasoning recorded at the binding and in
+`extract-flag`'s docstring.
+
+A second `--` after the terminator is data, so a file named `--` is addressable
+too.
+
+Regression tests: `a-file-named-like-a-flag-round-trips-test` (real `age`, real
+`cli/run!`, a cwd file named exactly `--edn`, environment given and omitted,
+recovered bytes compared), `operand-terminator-addresses-a-flag-named-file-test`
+(including an assertion that no `--.age` was produced, proving the terminator was
+consumed rather than taken as the file), `set-edn-still-works-everywhere-it-did-test`
+(all five positions the dispatch accepts, enumerated from the dispatch rather than
+guessed, plus `set dev -- :past-terminator`),
+`other-commands-do-not-consume-a-flag-they-do-not-define-test` (a 23-row table
+asserting the exact arguments dispatch hands each command, including the two
+cases the issue confirmed), and
+`default-environment-still-resolves-without-env-test`.
+
+Verified independently against the real binary: a file named `--edn` encrypts and
+decrypts through `bb secrets` both as `encrypt dev -- --edn` and as bare
+`encrypt --edn` with the environment omitted, recovering identical bytes. The
+cwd-relative fixtures are cleaned in a `finally` and `.gitignore` gained `/--edn`
+and `/--edn.age`, extending 006's safety net; its comment now covers the CLI's own
+flags as well as age's options.
+
+This was a parsing-correctness fix, not a disclosure fix — the defect failed
+closed, rejecting the shifted operand at the existence guard before `age` ran.
+It was the last place in the codebase where a filename influenced argument
+parsing.
 
 ## Non-goals
 
