@@ -1,6 +1,6 @@
 # 034 — Publish security reporting path
 
-Status: `open`
+Status: `resolved`
 Priority: P2
 Review classification: Low release hygiene
 
@@ -40,28 +40,65 @@ proof-of-concept payloads, or unpatched exploit instructions in public issues.
 
 ## Acceptance criteria
 
-- [ ] A root or GitHub-recognized `.github/SECURITY.md` is present and linked
+- [x] A root or GitHub-recognized `.github/SECURITY.md` is present and linked
       from the repository's main documentation or contribution path.
-- [ ] The policy identifies exactly which released alpha versions/branches are
+- [x] The policy identifies exactly which released alpha versions/branches are
       supported and how support changes when a new alpha is published.
-- [ ] It provides at least one working private channel controlled by the
+- [x] It provides at least one working private channel controlled by the
       maintainer, such as GitHub private vulnerability reporting or a dedicated
       security address, with a safe fallback if the primary channel is
       unavailable.
-- [ ] It tells reporters what non-secret reproduction, impact, affected-version,
+- [x] It tells reporters what non-secret reproduction, impact, affected-version,
       and contact information helps triage while warning them not to include
       real credentials or user data.
-- [ ] It states acknowledgement, triage/status-update, and remediation/disclosure
+- [x] It states acknowledgement, triage/status-update, and remediation/disclosure
       expectations using realistic target windows rather than an unsupported
       guarantee.
-- [ ] It defines coordinated disclosure: private validation, fix and supported
+- [x] It defines coordinated disclosure: private validation, fix and supported
       release preparation, advisory/CVE handling where appropriate, reporter
       credit preferences, and public disclosure only after coordination or the
       documented deadline/escalation path.
-- [ ] Public issue templates or nearby reporting guidance direct suspected
+- [x] Public issue templates or nearby reporting guidance direct suspected
       vulnerabilities to the private path without revealing report details.
-- [ ] The channel and rendered links are checked from an unauthenticated
+- [x] The channel and rendered links are checked from an unauthenticated
       repository view without sending a real vulnerability report.
+
+## Resolution
+
+Added a root [`SECURITY.md`](../SECURITY.md), which GitHub recognizes as the
+repository security policy. It names `v0.1.0` as the only supported alpha,
+states that `main` and every other version or branch are unsupported, and makes
+the newest alpha the sole supported release as soon as it is published.
+
+The private route is `contact@kirahowe.com`, linked with a `mailto:` URL and
+grounded in the contact address the maintainer already publishes on the
+[`kirahowe` GitHub profile](https://github.com/kirahowe), rather than an invented
+security mailbox or an assumed GitHub repository setting. If that address is
+unavailable, the policy permits only a content-free public request for an
+alternate private route; it forbids naming the component, impact, or any report
+detail there.
+
+The policy asks for affected versions, sanitized configuration, impact,
+synthetic reproduction steps, prerequisites, mitigations, a follow-up address,
+and credit preference. It forbids real identities, credentials, decrypted
+secrets, production URLs with tokens, user data, and unsanitized proof of
+concepts. Good-faith targets are 3 business days for acknowledgement, 7 business
+days for initial triage, and a private update every 14 calendar days, explicitly
+not guarantees. Remediation timing remains severity- and release-dependent.
+
+Coordinated disclosure covers private synthetic-data validation, a supported
+fix release when feasible, advisory and CVE handling where appropriate,
+reporter-chosen credit or anonymity, and sanitization before publication. Its
+default deadline is 90 calendar days from the initial private report, with
+changes only by reporter agreement and a documented status-request, 7-day, and
+content-free public-contact escalation path when the maintainer is unresponsive.
+
+The root README links the policy beside its operational security notes and tells
+reporters not to use public issues. The GitHub issue chooser also links
+`https://github.com/kirahowe/secrets/security/policy` with the same warning.
+An unauthenticated Chromium check loaded the public repository and maintainer
+profile and resolved the rendered profile contact to
+`mailto:contact@kirahowe.com`; no message or vulnerability report was sent.
 
 ## Non-goals
 

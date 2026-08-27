@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/kirahowe/secrets/security/policy
+    about: Follow the private reporting instructions; never put vulnerability details in a public issue.

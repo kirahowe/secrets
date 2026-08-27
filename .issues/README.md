@@ -1,9 +1,9 @@
 # Dogfooding and alpha security backlog
 
 These issues came from dogfooding the examples and alpha security reviews, most
-recently completed on 2026-08-27. Priorities are relative execution order; each
-open issue is independently ready to pick up in a clean session. Completed items
-remain linked as decision and verification history.
+recently completed on 2026-08-27. All alpha backlog items are resolved.
+Completed items remain linked as classification, decision, and verification
+history.
 
 ## Security review classification
 
@@ -12,32 +12,19 @@ High project finding was established. Issue 027 concerns an upstream advisory
 rated High, but vulnerable-method reachability in the publisher was not
 established, so the repository finding remains Conditional Medium.
 
-- **Unconditional alpha release gate:** 026–029 must be resolved before alpha.
-  This gate is unconditional even where exploitability depends on reachability
-  or attacker influence.
-- **Conditional source-contract issue:** 030 blocks the alpha contract if
-  attacker-influenced remote sources remain supported.
-- **Low hardening and release hygiene:** 031–034.
+- **Historical unconditional alpha release gate:** 026–029 had to be resolved
+  before alpha. This gate was unconditional even where exploitability depended
+  on reachability or attacker influence.
+- **Historical conditional source-contract issue:** 030 blocked the alpha
+  contract while attacker-influenced remote sources remained supported.
+- **Historical low hardening and release hygiene:** 031–034.
 - Completed classifications and their resolution evidence remain recorded under
-  001–025 below.
+  001–034 below.
 
 ## Open
 
-The alpha release gate is **not satisfied** because issues 026–029 remain open.
-Issue 030 additionally requires a source-contract decision; 031–034 remain open
-hardening and release-hygiene work.
-
-| Issue | Priority | Review classification | Alpha gate |
-| --- | --- | --- | --- |
-| [026 — Restrict release repository](026-restrict-release-repository.md) | P0 | Confirmed Medium / alpha release blocker | Unconditional blocker |
-| [027 — Patch deploy dependency vulnerability](027-patch-deploy-dependency-vulnerability.md) | P0 | Conditional Medium / alpha release blocker | Unconditional blocker; upstream advisory is High, deploy reachability unestablished |
-| [028 — Redact EDN parse failures](028-redact-edn-parse-failures.md) | P0 | Confirmed Medium / alpha release blocker | Unconditional blocker |
-| [029 — Bound CLI inputs and EDN depth](029-bound-cli-inputs-and-edn-depth.md) | P1 | Conditional Medium / alpha release blocker | Unconditional blocker |
-| [030 — Constrain remote source access](030-constrain-remote-source-access.md) | P1 | Conditional Medium | Contract blocker if attacker-influenced remote sources remain supported |
-| [031 — Verify identity cleanup](031-verify-identity-cleanup.md) | P2 | Low | Hardening |
-| [032 — Enforce strict base64 identity input](032-enforce-strict-base64-identity-input.md) | P2 | Low | Hardening |
-| [033 — Audit build dependency advisories](033-audit-build-dependency-advisories.md) | P2 | Low release hygiene | Release hygiene |
-| [034 — Publish security reporting path](034-security-reporting-path.md) | P2 | Low release hygiene | Release hygiene |
+There are no open alpha backlog items. The unconditional gate and conditional
+source-contract decision are satisfied.
 
 ## Completed
 
@@ -68,3 +55,12 @@ hardening and release-hygiene work.
 | [023 — Redact sensitive exception context](023-redact-sensitive-exception-context.md) | Replaced rendered sources and whole option maps with an allowlisted type-aware descriptor, and closed three routes by which a materialized identity path reached a diagnostic. |
 | [024 — CLI flag extraction boundary](024-cli-flag-extraction-boundary.md) | Scoped `--edn` extraction to the one command that defines it and added a `--` operand terminator, closing the last place a filename influenced argument parsing. |
 | [025 — Blank editor variable](025-blank-editor-variable.md) | Treated a set-but-blank editor variable as unset so it cannot shadow the next source and make the plaintext file the shell's command word. |
+| [026 — Restrict release repository](026-restrict-release-repository.md) | Fixed production publication to the exact `https://repo.clojars.org` origin and rejected every retired override before credentials or network access. |
+| [027 — Patch deploy dependency vulnerability](027-patch-deploy-dependency-vulnerability.md) | Fixed Plexus Utils at 3.6.2 on the unchanged exact 25-jar deploy graph and enforced that reviewed coordinate set. |
+| [028 — Redact EDN parse failures](028-redact-edn-parse-failures.md) | Unified runtime, CLI, manifest, and initializer EDN parsing behind content-free reasons and allowlisted numeric metadata. |
+| [029 — Bound CLI inputs and EDN depth](029-bound-cli-inputs-and-edn-depth.md) | Bounded CLI plaintext, stdin, manifest, and recipient reads, pre-scanned EDN depth, and streamed arbitrary decrypt output. |
+| [030 — Constrain remote source access](030-constrain-remote-source-access.md) | Made runtime loading local-only and rejected remote, nested, handler-controlled, and otherwise disallowed sources before transport. |
+| [031 — Verify identity cleanup](031-verify-identity-cleanup.md) | Made materialized-identity deletion outcomes accurate and path-free, retaining failed cleanup for safe retry across resets and leases. |
+| [032 — Enforce strict base64 identity input](032-enforce-strict-base64-identity-input.md) | Required canonical standard base64 after removing only documented ASCII whitespace, before any identity materialization. |
+| [033 — Audit build dependency advisories](033-audit-build-dependency-advisories.md) | Patched affected tooling-only graphs and added one reproducible exact-coordinate advisory gate across every project alias. |
+| [034 — Publish security reporting path](034-security-reporting-path.md) | Published a GitHub-recognized security policy with a private reporting route, supported-version scope, and coordinated-disclosure process. |

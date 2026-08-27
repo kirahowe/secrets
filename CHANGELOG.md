@@ -21,13 +21,12 @@ All notable changes to this project are documented here. The format follows
   default".
 - Runtime loading takes a `:limits` map — `secrets/default-limits`, overridable
   through the opts of `load-secrets`, `reader-literals`, and `merge-readers` —
-  bounding the ciphertext copied from a URL or InputStream
-  (`:max-source-bytes`, 16 MiB), the plaintext `age` may produce
+  bounding ciphertext read from accepted local files or local classpath-jar
+  resources (`:max-source-bytes`, 16 MiB), the plaintext `age` may produce
   (`:max-plaintext-bytes`, 8 MiB), and the nesting depth of the decrypted EDN
   (`:max-edn-depth`, 100). Each bound is enforced while the bytes move rather
-  than after they are all allocated: sources are counted chunk by chunk as they
-  are copied, so a misleading, absent, or chunked `Content-Length` cannot raise
-  or lower the effective bound, and decryption now streams through
+  than after they are all allocated: classpath-jar resources are counted chunk
+  by chunk as they are copied, and decryption now streams through
   `ProcessBuilder` instead of `clojure.java.shell/sh`, which materializes the
   whole plaintext before any caller can look at its size. Passing a bound kills
   the `age` process, drops the partial plaintext, deletes the partial temp copy
@@ -46,6 +45,36 @@ All notable changes to this project are documented here. The format follows
   to `bb secrets encrypt` for an arbitrary file, carries its own 1 GiB bound
   instead of the store's 8 MiB: a store past that is hostile or broken, an
   arbitrary file past it is ordinary.
+- Runtime secret loading is now explicitly local-only. `load-secrets` accepts
+  filesystem paths/Files/Paths, local `file:` locators, and `jar:file:`
+  classpath resources; reader `:file`/`:resource` configuration reaches the same
+  boundary, while CLI artifact configuration accepts filesystem paths only.
+  HTTP(S), every other nonlocal scheme, remote or nested `jar:` sources,
+  arbitrary `io/input-stream` dispatch, and malformed local locators fail with
+  content-free `:disallowed-source` diagnostics before DNS, connection,
+  redirect, or response reads. Local locator URLs are reconstructed as files or
+  opened directly with `JarFile`, so a caller-supplied URL handler cannot turn
+  an allowed-looking scheme into network access. This clean local/remote
+  contract deliberately exposes no HTTP operation and therefore has no network
+  timeout or redirect-policy settings to misconfigure.
+- A root [security policy](SECURITY.md) naming the sole supported alpha, the
+  maintainer-controlled private email route and safe fallback, sanitized triage
+  inputs, realistic response targets, and the coordinated disclosure deadline.
+  The README and GitHub issue chooser direct suspected vulnerabilities there
+  without asking reporters to put sensitive details in a public issue.
+- A reproducible dependency-advisory gate resolves the default classpath and
+  every alias (`:test`, `:book`, `:build`, `:deploy`, `:audit`, `:format`, and
+  `:lint`) to exact Maven coordinates, retains every tools.deps dependency path,
+  and scans each set with checksum-pinned OSV-Scanner 2.5.1. Any package match
+  fails CI; the release workflow separately scans the replaced `:deploy` graph
+  before its only credential-bearing step. Clay, Ring, Jackson, Jetty, and
+  tools.build moved to reviewed fixed lines; transitive overrides remain local
+  to `:book` and `:lint`, and the audit implementation dependency is confined to
+  `:audit` and `:test`. Tooling therefore enters neither the Clojure-only
+  library basis and published jar nor the credential-bearing deploy classpath.
+  The owner-visible review records the prior raw package matches, affected surfaces,
+  repository-input analysis, fixed versions, dispositions, and review dates
+  without claiming advisory-specific reachability or exploitation.
 - An explicit **authenticity contract and threat model** in the README, plus
   regression coverage that pins it. This documents and tests the boundary that
   was already there; it adds no signing, no key material, and no new check.
@@ -104,21 +133,24 @@ All notable changes to this project are documented here. The format follows
 - `secrets/reset-identity-cache!` retires the temp files that
   `SECRETS_AGE_IDENTITY` and `SECRETS_AGE_IDENTITY_B64` materialize, so a
   long-running process no longer keeps an injected private key on disk until it
-  exits and an abnormal exit has less to leave behind (CWE-459). It deletes
-  every materialized identity no decryption is using, defers the rest to their
-  last release, and is idempotent; a later read materializes afresh rather than
-  reusing a retired path, and identity files the caller owns
+  exits and an abnormal exit has less to leave behind (CWE-459). It checks
+  deletion of every materialized identity no decryption is using, defers the
+  rest to their last release, and is idempotent; a later read materializes
+  afresh rather than reusing a retired path, and identity files the caller owns
   (`SECRETS_AGE_IDENTITY_FILE`, an explicit `:identity-file`,
-  `~/.config/<app>/key.txt`) are never touched. Deletion cannot race a running
-  `age`: `load-secrets` holds the identity through `secrets/with-identity` for
-  its whole call — which covers the reader literals and the Aero readers — and
-  the same scope is public for a caller that hands a resolved path to `age`
-  itself. A failed write and a materialization that loses to a retirement both
-  delete the file they created rather than orphaning a key nothing points at,
-  the identity state keeps one generation and its entries in one atom the way
-  the Aero reader cache does, `deleteOnExit` is now only the backstop, and no
-  identity content, digest, or materialized path reaches a message or `ex-data`
-  this lifecycle raises.
+  `~/.config/<app>/key.txt`) are never touched. Its path-free result separates
+  successful `:deleted`, already `:absent`, retained `:failed`, and newly
+  `:pending` counts. A failed deletion remains tracked for the next reset
+  instead of fabricating success or losing the retry.
+  Deletion cannot race a running `age`: `load-secrets` holds the identity
+  through `secrets/with-identity` for its whole call — which covers the reader
+  literals and the Aero readers — and the same scope is public for a caller
+  that hands a resolved path to `age` itself. A failed write and a
+  materialization that loses to a retirement use the same checked retry
+  lifecycle rather than orphaning a key nothing points at, the identity state
+  keeps one generation and its entries in one atom the way the Aero reader
+  cache does, `deleteOnExit` is now only the backstop, and no identity content,
+  digest, or materialized path reaches a cleanup result, message, or `ex-data`.
 
 ### Changed
 - Publication runs on a classpath of its own, and no longer resolves a
@@ -284,6 +316,29 @@ All notable changes to this project are documented here. The format follows
   than silent tag drift.
 
 ### Fixed
+- Production publication is fixed to the exact `https://repo.clojars.org`
+  origin. The production entry point rejects every command-line argument and
+  every nonblank value of the retired `SECRETS_DEPLOY_REPOSITORY_URL` override
+  before reading Clojars credentials or starting network I/O; local recorder
+  tests inject their target only below that entry point.
+- The exact 25-jar credential-bearing deploy graph now resolves
+  `org.codehaus.plexus/plexus-utils` 3.6.2 instead of the advisory-affected
+  3.5.1, without adding a coordinate or moving to the Plexus 4.x line.
+- Malformed EDN failures are content-free across runtime loading, CLI
+  plaintext, stdin `--edn`, manifests, and initializer templates. One shared
+  parser boundary retains only a stable allowlisted reason and safe numeric
+  depth or location metadata, never the parser message, source fragment, or
+  cause.
+- CLI editor/plaintext files, stdin, manifests, and read-only recipient paths
+  are bounded while read, and every CLI EDN route runs the same linear depth
+  pre-scan as the runtime before recursive parsing. Arbitrary binary decrypt
+  output is streamed to stdout in fixed-size chunks under its command-specific
+  bound instead of being accumulated in one process-sized byte array.
+- `SECRETS_AGE_IDENTITY_B64` now accepts only canonical standard base64 after
+  removing the documented ASCII space, horizontal tab, carriage return, and
+  line feed characters. Omitted padding, nonzero padding bits, punctuation,
+  Unicode whitespace, and other noncanonical forms fail without retaining the
+  input or decoder exception and before an identity file is materialized.
 - The CLI no longer lets a filename change how it parses its own arguments.
   `--edn` was removed from every command's arguments before positional
   dispatch, so a file named `--edn` was stripped and `encrypt`/`decrypt` ran

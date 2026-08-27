@@ -446,17 +446,42 @@ An Integrant `init-key` is two lines:
   (secrets/load-secrets (io/resource resource) {:app "myapp"}))
 ```
 
+### Source provenance: local only
+
+Runtime source loading performs no remote network operation. `load-secrets`
+accepts filesystem path strings, `File`/`Path` values, local `file:` locators,
+and `jar:file:` classpath resources such as the URL returned by `io/resource`
+inside an uberjar. `reader-literals` and `merge-readers` resolve `:file` as a
+filesystem path and `:resource` on the classpath, then pass the result through
+that same boundary. `bb secrets` configuration is stricter still: every
+artifact location is a filesystem path string, not a URL.
+
+HTTP(S), other nonlocal schemes, remote or multiply nested `jar:` locators,
+`file:` locators with an authority, malformed local locators, InputStreams, and
+arbitrary `clojure.java.io/input-stream` values are rejected with
+`:reason :disallowed-source`. Rejection happens from the locator alone, before
+DNS resolution, connection setup, redirects, or response reads. Allowed URL
+objects are reconstructed as a local file or opened directly with `JarFile`, so
+a caller-provided URL handler cannot turn an allowed-looking locator into
+network access.
+
+There is deliberately no HTTP loading option and therefore no connect/read
+timeout or redirect policy to configure. Fetch a remote ciphertext in an
+explicit, policy-aware application step, then pass the resulting trusted local
+path here; that fetcher, not this local loader, owns scheme, DNS/address, port,
+redirect-hop, and finite timeout policy.
+
 ### Resource limits
 
 Every runtime entry point — `load-secrets`, `reader-literals`, `merge-readers`
 — takes an optional `:limits` map in its opts, merged over
 `secrets/default-limits`:
 
-| limit                  | default | bounds                                                 |
-| ---------------------- | ------- | ------------------------------------------------------ |
-| `:max-source-bytes`    | 16 MiB  | ciphertext bytes read from a URL, InputStream, or file  |
-| `:max-plaintext-bytes` | 8 MiB   | plaintext bytes `age` may produce                      |
-| `:max-edn-depth`       | 100     | collection nesting depth of the decrypted EDN          |
+| limit                  | default | bounds                                                   |
+| ---------------------- | ------- | -------------------------------------------------------- |
+| `:max-source-bytes`    | 16 MiB  | ciphertext bytes in a local file or classpath-jar entry  |
+| `:max-plaintext-bytes` | 8 MiB   | plaintext bytes `age` may produce                        |
+| `:max-edn-depth`       | 100     | collection nesting depth of the decrypted EDN            |
 
 ```clojure
 (secrets/load-secrets (io/resource "secrets.edn.age")
@@ -464,15 +489,15 @@ Every runtime entry point — `load-secrets`, `reader-literals`, `merge-readers`
 ```
 
 The defaults sit far above every example in this README — a real store is
-kilobytes — so ordinary use never meets them. They exist because a source you do
-not fully control (a URL, an InputStream, a ciphertext someone else can replace)
-is otherwise an unbounded write to your disk and heap (CWE-400).
+kilobytes — so ordinary use never meets them. They exist because a ciphertext
+someone else can replace is otherwise an unbounded write to disk or heap
+(CWE-400).
 
-Each bound is enforced *while* the bytes move, not after they have all been
-allocated. A source is counted chunk by chunk as it is copied, so a
-`Content-Length` that lies in either direction — or is absent, or chunked —
-changes nothing: only bytes actually read decide, and the copy is abandoned
-before the first byte past the bound is written. Plaintext is captured from
+Bounds are enforced before or *while* bytes move, not after they have all been
+allocated. An existing filesystem source is length-checked before `age` starts;
+a classpath-jar entry is counted chunk by chunk while it is copied, without
+trusting its declared size, and the copy is abandoned before the first byte past
+the bound is written. Plaintext is captured from
 `age`'s stdout the same way, which is why decryption runs through
 `ProcessBuilder` rather than `clojure.java.shell/sh`: `sh` materializes the
 complete output before any caller can look at its size. Passing a bound kills
@@ -511,7 +536,15 @@ the local default path):
 | ------------------- | --------------------------------------------------------------------- |
 | `SECRETS_AGE_IDENTITY_FILE` | a path to the key file                                                |
 | `SECRETS_AGE_IDENTITY`      | the key file *contents*, used verbatim (never decoded) — materialized to an owner-only (0600) temp file |
-| `SECRETS_AGE_IDENTITY_B64`  | base64 of the key file contents (newline-tolerant), for secret stores that mangle multi-line values; invalid base64 throws — no silent fallback |
+| `SECRETS_AGE_IDENTITY_B64`  | canonical base64 of the key file contents; documented ASCII wrapping is allowed, and every other malformed input throws |
+
+For `SECRETS_AGE_IDENTITY_B64`, wrapping may contain only ASCII space (`U+0020`),
+horizontal tab (`U+0009`), carriage return (`U+000D`), and line feed (`U+000A`);
+those four characters are removed anywhere in single- or multi-line environment
+values before decoding. Unicode whitespace, punctuation, omitted or malformed
+padding, nonzero padding bits, and every other noncanonical encoding throw
+without materializing an identity or echoing the input. There is no raw-content
+fallback.
 
 A variable that is **set but empty** throws, naming itself, rather than being
 treated as absent. CI runners expand a missing or misnamed secret to the empty
@@ -544,13 +577,15 @@ read it), so the file works the same whether it sits on disk or inside the jar.
 
 `age` reads its identity from a file, so raw and base64 contents are materialized
 to an owner-only (0600) temp file, one per distinct value. That file is this
-library's to remove, and `(secrets/reset-identity-cache!)` removes it: every
-identity materialized from `SECRETS_AGE_IDENTITY` or `SECRETS_AGE_IDENTITY_B64`
-is deleted, a later read materializes afresh instead of reusing a retired path,
-and a second call has nothing to do. Identity files *you* own —
-`SECRETS_AGE_IDENTITY_FILE`, an explicit `:identity-file`,
+library's to remove. `(secrets/reset-identity-cache!)` checks deletion of every
+identity materialized from `SECRETS_AGE_IDENTITY` or
+`SECRETS_AGE_IDENTITY_B64`; a failed deletion remains tracked for the next reset,
+and a later read materializes afresh instead of reusing a retired path. Identity
+files *you* own — `SECRETS_AGE_IDENTITY_FILE`, an explicit `:identity-file`,
 `~/.config/<app>/key.txt` — are never touched. It returns
-`{:generation g :deleted n :pending n}`, and no path, digest, or key content.
+`{:generation g :deleted n :absent n :failed n :pending n}`: successful
+deletions, already-absent paths, retained failures, and newly deferred leases,
+with no path, digest, or key content.
 
 Deletion waits for the decryption using the file. `load-secrets` holds the
 identity for the whole call — which covers the reader literals and the Aero
@@ -937,15 +972,14 @@ manifest is reported as `skipped`.
 
 These exceptions are meant to be safe to hand to an error reporter, so their
 context is an allowlist rather than a rendering. Every failure about a secrets
-source carries `:source`: a locator's scheme, host, port, and path with
-**userinfo, query, and fragment dropped** — a signed URL keeps its credential
-in the query and `https://user:pass@host/…` keeps one in the userinfo; or a
-File's or path string's path, which is yours already; or, for an InputStream, a
-Reader, or any other value, its class name alone. Nothing calls `str` or
-`pr-str` on an object you passed in, because a `toString` you wrote is exactly
-how a credential-bearing object leaks. A *path* can carry a token too, so
-keeping it is a judgement rather than a safe default: a diagnostic that cannot
-name the failing resource is not one, and that residual risk is real, not zero.
+source carries `:source`: a local or rejected locator's scheme, host, port, and
+path with **userinfo, query, and fragment dropped**; a File, Path, or path
+string's path, which is yours already; or, for any rejected object, its class
+name alone. Nothing calls `str` or `pr-str` on an arbitrary object you passed
+in, because a `toString` you wrote is exactly how a credential-bearing object
+leaks. A *path* can carry a token too, so keeping it is a judgement rather than
+a safe default: a diagnostic that cannot name the failing resource is not one,
+and that residual risk is real, not zero.
 
 An identity path is named only when you supplied it. A path materialized from
 `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64` appears in no message, no
@@ -955,25 +989,25 @@ therefore leave the identity path out unless the call passes
 `{:identity-nameable? true}`; a wrong key still says so, with the captured
 stderr and its hint.
 
-A transport failure's own message travels only with a path source, where it can
-name nothing the failure does not already name. For a URL or a custom object,
-`clojure.java.io` builds that message out of the value it was handed, so the
-failure keeps the exception's *class* instead of its message and does not attach
-it as a cause — printing an exception prints its causes' messages too. Aero
-failures name the `:profile` and the opts map's *key names*, never a value: an
+An I/O failure's own message travels only with a filesystem path source, where
+it can name nothing the failure does not already name. A local locator failure
+keeps the exception's class instead of its message and does not attach it as a
+cause — printing an exception prints its causes' messages too. A rejected
+source has no I/O cause because policy runs before opening. Aero failures name
+the `:profile` and the opts map's *key names*, never a value: an
 opts map can hold a resolver, a database password, or a whole configuration. A
 bound that trips carries the byte count and the limit, never content.
 
 ## API
 
 `com.kirahowe.secrets`
-- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is a path, File, or URL/resource (including a `jar:` URL inside an uberjar); the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`. Every failure throws `ex-info` with a `:reason` — `:no-identity` (no identity resolves, or the resolved file doesn't exist) or `:no-file` (the source is nil, names a path that doesn't exist, or cannot be opened) — the same vocabulary `#secret/req` uses, so a consumer can branch on it whichever way it reached the store. Every failure about the source also carries `:source`, allowlisted metadata naming which source failed and never the source value — see *What a failure carries*.
+- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is local-only: a filesystem path string, File, Path, local `file:` locator, or `jar:file:` classpath resource; the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`. Every failure throws `ex-info` with a `:reason`: `:no-identity`, `:no-file`, or `:disallowed-source` for anything outside the provenance contract. No HTTP operation exists and no DNS, connection, redirect, or response read occurs for a rejected locator. Every failure about the source also carries `:source`, allowlisted metadata naming which source failed and never the source value — see *What a failure carries*.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
 - `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
 - `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil when none is set. A variable that is set but empty throws.
 - `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise. The path is *conventional* — it's never checked for existence, so a non-nil result doesn't mean a usable key is actually there.
 - `(identity-available?)` / `(identity-available? app-or-opts)` — true when an identity actually resolves **and** its file exists on disk. The "do I have a key, or should I tell the user to run `keygen`?" check; `app-or-opts` also accepts an opts map's `:identity-file`.
-- `(reset-identity-cache!)` — retire every identity temp file materialized from `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`: delete each one no decryption is using, defer the rest to their last release, and materialize afresh on the next read. Idempotent; never touches an identity file you own. Returns `{:generation g :deleted n :pending n}`.
+- `(reset-identity-cache!)` — retire every identity temp file materialized from `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`: check deletion of each one no decryption is using, defer the rest to their last release, retain failures for retry, and materialize afresh on the next read. Idempotent; never touches an identity file you own. Returns path-free `{:generation g :deleted n :absent n :failed n :pending n}` outcome counts.
 - `(with-identity path f)` — call `(f path)` with `path` held against `reset-identity-cache!` for exactly that call. `load-secrets` already does this for its own decryption; use it when you hand a resolved path to `age` yourself.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
@@ -1137,10 +1171,13 @@ step's environment alone — never job-wide, so checkout, build, and inspection
 cannot read it — and rotate it in Clojars, and in the `release` environment's
 secrets, if it is ever exposed or if the machine that held it is in doubt. The
 publisher never prints either credential: publication output is the coordinate,
-version, tag, jar path, SHA-256, and repository URL. Passing a repository URL as
-an argument, or setting `SECRETS_DEPLOY_REPOSITORY_URL`, uploads somewhere other
-than Clojars; that exists for the local dry-run test, and every such run is
-labelled an override rather than a publication in the output.
+version, tag, jar path, SHA-256, and the fixed
+`https://repo.clojars.org` repository URL. The production entry point accepts no
+repository override: every argument and every nonblank value of the retired
+`SECRETS_DEPLOY_REPOSITORY_URL` input is rejected before credentials are read or
+network I/O can begin. The authenticated local-recorder test calls the
+lower-level `deploy!` seam directly with its HTTP URL and fixture credentials;
+those test-only values cannot change production target selection.
 
 `clojure -T:build jar` is a development build from the live working tree: it
 makes no provenance claim (its pom carries no `<scm><tag>`) and is not
@@ -1358,6 +1395,11 @@ you're trading for that simplicity.
   (Vault, a cloud KMS / secret manager) earns its extra complexity.
 
 ## Security notes
+
+Report a suspected vulnerability through the private route in the
+[security policy](SECURITY.md), not a public issue. Never put sensitive report
+details, real secrets or user data, proof-of-concept payloads, or unpatched
+exploit instructions in a public issue.
 
 - Never commit decrypted plaintext — only `*.edn.age` (encrypted),
   `*.edn.manifest` (value-free shape), `*.edn.example` (templates), and
