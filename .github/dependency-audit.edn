@@ -1,0 +1,191 @@
+{:scanner
+ {:version "2.5.1"
+  :base-url "https://github.com/google/osv-scanner/releases/download/v2.5.1/"
+  :assets
+  {"darwin-amd64"
+   {:file "osv-scanner_darwin_amd64"
+    :sha256 "9f89beb6c3d784893cb1cae0a3d56c529bfe91075418c2f9440c45b79654198b"}
+   "darwin-arm64"
+   {:file "osv-scanner_darwin_arm64"
+    :sha256 "75c44d6332f892a1e56286f4105a98ed751ae28d215ca0a8b65cc00d84103054"}
+   "linux-amd64"
+   {:file "osv-scanner_linux_amd64"
+    :sha256 "f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be"}
+   "linux-arm64"
+   {:file "osv-scanner_linux_arm64"
+    :sha256 "3d0f5aa5a6baa8eb32bcef247388e149ef6030a6634ccae6fa0d62681fb27a6d"}
+   "windows-amd64"
+   {:file "osv-scanner_windows_amd64.exe"
+    :sha256 "25e42f5ef6711fd8c0fb45390972205891dd44c6bd02ac93f0f63e8e98d9bfb6"}
+   "windows-arm64"
+   {:file "osv-scanner_windows_arm64.exe"
+    :sha256 "33feb0b210a3e5ea7b338c719defc899f8833d990cdd297bcad4ff1a2586ec8b"}}}
+
+ :graphs
+ [{:name "default" :aliases []}
+  {:name "test" :aliases [:test]}
+  {:name "book" :aliases [:book]}
+  {:name "build" :aliases [:build]}
+  {:name "deploy" :aliases [:deploy]}
+  {:name "audit" :aliases [:audit]}
+  {:name "format" :aliases [:format]}
+  {:name "lint" :aliases [:lint]}]
+
+ ;; These are dispositions of the package matches that prompted the audit. They
+ ;; are historical review records, not scanner ignores: the current audit has no
+ ;; allowlist and fails on every OSV match.
+ :reviews
+ [{:graph :book
+   :coordinate [com.fasterxml.jackson.core/jackson-core "2.18.2"]
+   :dependency-path
+   [org.scicloj/clay metosin/muuntaja metosin/jsonista
+    com.fasterxml.jackson.core/jackson-core]
+   :advisories ["GHSA-72hv-8253-57qq" "GHSA-r7wm-3cxj-wff9"]
+   :surface "JSON async number parsing used by the renderer's JSON stack"
+   :repository-input "Clay evaluates and renders repository-controlled chapters; advisory-specific async parsing was not demonstrated"
+   :fixed-version "2.18.9"
+   :disposition :override
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :book
+   :coordinate [com.fasterxml.jackson.core/jackson-databind "2.18.2"]
+   :dependency-path
+   [org.scicloj/clay metosin/muuntaja metosin/jsonista
+    com.fasterxml.jackson.core/jackson-databind]
+   :advisories
+   ["GHSA-3pjw-73gf-8qr5" "GHSA-5gvw-p9qm-jgwh"
+    "GHSA-5jmj-h7xm-6q6v" "GHSA-hgj6-7826-r7m5"
+    "GHSA-j3rv-43j4-c7qm" "GHSA-mhm7-754m-9p8w"
+    "GHSA-rmj7-2vxq-3g9f"]
+   :surface "Jackson databinding reached through Clay's Muuntaja/Jsonista stack"
+   :repository-input "Repository-controlled chapters reach Clay, but use of the advisory-specific polymorphic, view, record, or socket-address paths was not demonstrated"
+   :fixed-version "2.18.9"
+   :disposition :override
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :book
+   :coordinate [org.apache.commons/commons-fileupload2-core "2.0.0-M2"]
+   :dependency-path
+   [org.scicloj/clay ring/ring ring/ring-core
+    org.apache.commons/commons-fileupload2-core]
+   :advisories ["GHSA-vv7r-c36w-3prj"]
+   :surface "Multipart header parsing in Ring's development server stack"
+   :repository-input "The release book task renders files and does not accept multipart requests; reachable attacker-controlled multipart input was not demonstrated"
+   :fixed-version "2.0.0-M4"
+   :disposition :upgrade-ring
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :book
+   :coordinate [org.eclipse.jetty/jetty-server "12.0.18"]
+   :dependency-path
+   [org.scicloj/clay ring/ring ring/ring-jetty-adapter
+    org.eclipse.jetty/jetty-server]
+   :advisories
+   ["GHSA-7p3p-8qv8-m2vh" "GHSA-f4v5-65jj-pcr2"
+    "GHSA-xxh7-fcf3-rj7f"]
+   :surface "Jetty server request handling available to Clay's development server"
+   :repository-input "CI invokes Clay's non-server book render; no attacker-controlled HTTP request path was demonstrated"
+   :fixed-version "12.1.10"
+   :disposition :upgrade-ring-and-override
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :book
+   :coordinate [org.eclipse.jetty/jetty-http "12.0.18"]
+   :dependency-path
+   [org.scicloj/clay ring/ring ring/ring-jetty-adapter
+    org.eclipse.jetty/jetty-server org.eclipse.jetty/jetty-http]
+   :advisories ["GHSA-355h-qmc2-wpwf" "GHSA-wjpw-4j6x-6rwh"]
+   :surface "Jetty HTTP parsing available to Clay's development server"
+   :repository-input "CI performs an offline render rather than serving untrusted HTTP; advisory-specific URI/request parsing was not demonstrated"
+   :fixed-version "12.1.10"
+   :disposition :upgrade-ring-and-override
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :book
+   :coordinate [org.eclipse.jetty/jetty-util "12.0.18"]
+   :dependency-path
+   [org.scicloj/clay ring/ring ring/ring-jetty-adapter
+    org.eclipse.jetty/jetty-server org.eclipse.jetty/jetty-http
+    org.eclipse.jetty/jetty-util]
+   :advisories ["GHSA-w7x5-g22v-xqhr"]
+   :surface "Jetty path handling available to Clay's development server"
+   :repository-input "Repository paths are rendered, but the advisory-specific HTTP path-parameter traversal was not demonstrated"
+   :fixed-version "12.1.10"
+   :disposition :upgrade-ring-and-override
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :book
+   :coordinate [org.eclipse.jetty/jetty-security "12.0.18"]
+   :dependency-path
+   [org.scicloj/clay ring/ring ring/ring-jetty-adapter
+    org.eclipse.jetty.ee9/jetty-ee9-servlet
+    org.eclipse.jetty.ee9/jetty-ee9-nested
+    org.eclipse.jetty/jetty-security]
+   :advisories ["GHSA-2fvj-hgj9-j2gr"]
+   :surface "Jetty digest authentication available to Clay's development server"
+   :repository-input "The CI book render does not configure digest authentication; reachable credentials or attacker-controlled authentication input were not demonstrated"
+   :fixed-version "12.1.10"
+   :disposition :upgrade-ring-and-override
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :book
+   :coordinate [org.eclipse.jetty.ee9/jetty-ee9-security "12.1.8"]
+   :dependency-path
+   [org.scicloj/clay ring/ring ring/ring-jetty-adapter
+    org.eclipse.jetty.ee9/jetty-ee9-servlet
+    org.eclipse.jetty.ee9/jetty-ee9-security]
+   :advisories ["GHSA-2fvj-hgj9-j2gr"]
+   :surface "EE9 digest-authentication integration in Clay's development server stack"
+   :repository-input "The CI book render does not start Jetty or configure digest authentication; advisory-specific authentication input was not demonstrated"
+   :fixed-version "12.1.10"
+   :disposition :override-ee9-security
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :lint
+   :coordinate [com.fasterxml.jackson.core/jackson-core "2.17.0"]
+   :dependency-path
+   [clj-kondo/clj-kondo cheshire/cheshire
+    com.fasterxml.jackson.core/jackson-core]
+   :advisories ["GHSA-72hv-8253-57qq" "GHSA-r7wm-3cxj-wff9"]
+   :surface "Jackson async number parsing present in clj-kondo's Cheshire JSON stack"
+   :repository-input "Lint consumes repository-controlled Clojure source and configuration; use of Jackson's advisory-specific async parser with attacker-controlled numeric chunks was not demonstrated"
+   :fixed-version "2.18.8"
+   :disposition :override-jackson-line-to-2.18.9
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :build
+   :coordinate [org.codehaus.plexus/plexus-utils "3.4.1"]
+   :dependency-path
+   [io.github.clojure/tools.build org.clojure/tools.deps
+    org.apache.maven/maven-core org.apache.maven/maven-settings-builder
+    org.codehaus.plexus/plexus-sec-dispatcher
+    org.codehaus.plexus/plexus-utils]
+   :advisories ["GHSA-6fmv-xxpf-w3cw"]
+   :surface "Archive extraction helper present in Maven build tooling"
+   :repository-input "tools.build reads repository sources and dependency metadata, but no call to Plexus Expand.extractFile or attacker-controlled archive extraction was demonstrated"
+   :fixed-version "3.6.1"
+   :disposition :upgrade-tools-build
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}
+
+  {:graph :build
+   :coordinate [org.eclipse.jetty/jetty-http "9.4.58.v20250814"]
+   :dependency-path
+   [io.github.clojure/tools.build org.clojure/tools.deps
+    com.cognitect/http-client org.eclipse.jetty/jetty-http]
+   :advisories ["GHSA-355h-qmc2-wpwf" "GHSA-qh8g-58pp-2wxh"]
+   :surface "HTTP parsing in the dependency resolver's legacy HTTP client"
+   :repository-input "Build resolution consumes repository dependency metadata, but no attacker-controlled inbound Jetty request parsing was demonstrated"
+   :fixed-version "9.4.60"
+   :disposition :upgrade-tools-build-remove-client
+   :reachability :not-demonstrated
+   :review-date "2026-08-27"}]}

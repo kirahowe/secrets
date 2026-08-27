@@ -76,6 +76,13 @@ jobs:
             target/jar-pom.properties
           if-no-files-found: error
 
+      # This resolves :deploy's replace-deps/replace-paths exactly as the next
+      # step will, using the checksum-pinned scanner and no advisory ignores.
+      # It receives no Clojars environment and is the final hard gate before the
+      # one step that can read publication credentials.
+      - name: Audit the credential-bearing deploy graph
+        run: clojure -M:audit deploy
+
       # The only step that can see the Clojars credentials: nothing before it
       # has them in its environment. `clojure -M:deploy` builds nothing and
       # replaces the classpath rather than extending it, so the JVM holding the

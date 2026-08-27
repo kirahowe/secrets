@@ -17,17 +17,19 @@
       clojure -T:build release   # writes target/release.edn
       CLOJARS_USERNAME=… CLOJARS_PASSWORD=… clojure -M:deploy
 
-  A repository URL given as an argument, or in `SECRETS_DEPLOY_REPOSITORY_URL`,
-  overrides [[clojars-url]] so the dry-run test can point an upload at a local
-  server. Any other repository is reported as an override and never as a
-  publication.
+  The production entry point has one fixed target: the exact HTTPS Clojars
+  repository [[clojars-url]]. It rejects every argument and the former
+  repository environment override before reading credentials or inspecting an
+  artifact. Tests exercise other repositories only through [[deploy!]], below
+  production target selection.
 
   Unlike `com.kirahowe.secrets.release`, this namespace needs maven-resolver on
   the classpath: it is JVM-only and does not load under babashka."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.release :as release])
-  (:import [org.apache.maven.repository.internal MavenRepositorySystemUtils]
+  (:import [java.net URI URISyntaxException]
+           [org.apache.maven.repository.internal MavenRepositorySystemUtils]
            [org.eclipse.aether RepositorySystem]
            [org.eclipse.aether.artifact Artifact DefaultArtifact]
            [org.eclipse.aether.deployment DeployRequest]
@@ -42,20 +44,46 @@
   "The repository a release is actually published to."
   "https://repo.clojars.org")
 
-(def repository-url-env
-  "The environment variable that overrides [[clojars-url]].
-
-  Exists for the local dry run, which needs a real upload against a repository
-  that is not Clojars. An overridden upload is reported as an override, so a
-  fixture run cannot be read as a publication."
+(def ^:private repository-url-env
+  "The retired repository override variable, rejected if it is nonblank."
   "SECRETS_DEPLOY_REPOSITORY_URL")
 
-(defn repository-url
-  "The repository to upload to: `arg`, else [[repository-url-env]], else Clojars."
-  [arg]
-  (or (not-empty (str/trim (or arg "")))
-      (not-empty (str/trim (or (System/getenv repository-url-env) "")))
-      clojars-url))
+(defn- target-description
+  "A secret-safe description of repository `target`.
+
+  It identifies the origin and which URI components are present without
+  echoing userinfo, paths, queries, fragments, or malformed input."
+  [target]
+  (if (str/blank? target)
+    "<blank>"
+    (try
+      (let [uri (URI. target)]
+        (str "scheme=" (pr-str (or (.getScheme uri) "<none>"))
+             ", host=" (pr-str (or (.getHost uri) "<none>"))
+             ", port=" (if (neg? (.getPort uri)) "<default>" (.getPort uri))
+             ", userinfo=" (if (.getRawUserInfo uri) "<present>" "<absent>")
+             ", path=" (if (seq (.getRawPath uri)) "<present>" "<absent>")
+             ", query=" (if (.getRawQuery uri) "<present>" "<absent>")
+             ", fragment=" (if (.getRawFragment uri) "<present>" "<absent>")))
+      (catch URISyntaxException _
+        (str "<malformed target, " (count target) " characters>")))))
+
+(defn- rejected-repository!
+  "Rejects `target` selected through `source` without retaining its raw value."
+  [source target]
+  (throw (ex-info
+          (str "Repository target from " source " is rejected; publication is fixed at "
+               clojars-url ". Rejected target: " (target-description target) ".")
+          {:reason ::repository-override :source source})))
+
+(defn- production-repository-url!
+  "Returns [[clojars-url]], rejecting every former target-selection input."
+  [args]
+  (when (seq args)
+    (rejected-repository! "the command line" (first args)))
+  (when-let [target (not-empty (str/trim (or (System/getenv repository-url-env) "")))]
+    (rejected-repository! repository-url-env target))
+  clojars-url)
 
 ;;;; Credentials
 
@@ -126,7 +154,7 @@
   [{:keys [jar pom]} url credentials]
   (let [system (.get (RepositorySystemSupplier.))
         ^Artifact artifact (-> (DefaultArtifact. (namespace release/lib) (name release/lib)
-                                                "" "jar" release/version)
+                                                 "" "jar" release/version)
                                (.setFile (io/file jar)))
         request (-> (DeployRequest.)
                     (.setRepository (remote-repository url credentials))
@@ -138,17 +166,12 @@
 ;;;; The entry point
 
 (defn- report!
-  "Prints what was uploaded and where. Never prints a credential."
-  [{:keys [jar tag sha256]} url]
-  (let [clojars? (= url clojars-url)]
-    (when-not clojars?
-      (println "*** OVERRIDE: the repository was overridden by an argument or"
-               (str repository-url-env ",") "so this is NOT a publication of"
-               (str release/lib) "***"))
-    (println (if clojars? "Published" "Uploaded") (str release/lib) release/version "from" tag)
-    (println "  jar       " jar)
-    (println "  sha-256   " sha256)
-    (println "  repository" url)))
+  "Prints what was published. Never prints a credential."
+  [{:keys [jar tag sha256]}]
+  (println "Published" (str release/lib) release/version "from" tag)
+  (println "  jar       " jar)
+  (println "  sha-256   " sha256)
+  (println "  repository" clojars-url))
 
 (defn- failed!
   "Reports `e` on stderr and exits non-zero, so a failed upload cannot read as a
@@ -163,10 +186,11 @@
   "Publishes the receipted release artifact; see the namespace docstring."
   [& args]
   (try
-    (let [credentials (credentials-from-env)
-          url (repository-url (first args))
+    (let [url (production-repository-url! args)
+          credentials (credentials-from-env)
           receipt (release/verified-artifact!)]
-      (report! receipt (deploy! receipt url credentials))
+      (deploy! receipt url credentials)
+      (report! receipt)
       (shutdown-agents)
       (System/exit 0))
     (catch Exception e

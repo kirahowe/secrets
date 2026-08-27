@@ -1,6 +1,6 @@
 # 026 — Restrict release repository
 
-Status: `open`
+Status: `resolved`
 Priority: P0
 Review classification: Confirmed Medium / alpha release blocker
 
@@ -51,20 +51,44 @@ test-only inputs cannot change production target selection.
 
 ## Acceptance criteria
 
-- [ ] The production entry point has no CLI or environment repository override
+- [x] The production entry point has no CLI or environment repository override
       and accepts only the exact `https://repo.clojars.org` origin.
-- [ ] Any non-HTTPS, non-Clojars, userinfo-bearing, port-changing, path-changing,
+- [x] Any non-HTTPS, non-Clojars, userinfo-bearing, port-changing, path-changing,
       query-bearing, fragment-bearing, or lookalike target is rejected before
       credentials are attached or network I/O starts.
-- [ ] Local publication tests inject an HTTP recorder URL and fixture
+- [x] Local publication tests inject an HTTP recorder URL and fixture
       credentials below `-main`, without changing process environment to steer
       the production target.
-- [ ] A focused policy test proves production invocation cannot send a request
+- [x] A focused policy test proves production invocation cannot send a request
       to an argument- or environment-selected recorder.
-- [ ] Failure output names the rejected target safely and never prints either
+- [x] Failure output names the rejected target safely and never prints either
       credential.
-- [ ] Release documentation and dependency review no longer describe a
+- [x] Release documentation and dependency review no longer describe a
       production repository override.
+
+## Resolution
+
+Production target selection is now closed: `-main` calls
+`production-repository-url!` before it reads either credential or verifies the
+artifact. That function rejects every command-line argument and every nonblank
+value of the retired `SECRETS_DEPLOY_REPOSITORY_URL` input, then returns the
+literal `https://repo.clojars.org`. The rejected-target diagnostic reports the
+source, scheme, host, port, and only the presence of sensitive URI components;
+it never retains or echoes userinfo, path, query, fragment, malformed input, or
+either publication credential.
+
+The authenticated recorder coverage now starts a JVM on the isolated deploy
+classpath and calls `deploy!` directly with its local URL and fixture credential
+map. Those test-only values never enter `-main`. Separate production subprocess
+coverage supplies the recorder once as an argument and once through the retired
+environment variable, requires both invocations to fail, and requires the
+recorder to remain empty. A table covers HTTP, another host, userinfo, changed
+port and path, query, fragment, lookalike, and even an explicit fixed-origin
+argument, proving that no target-selection interface remains.
+
+The publisher namespace documentation, release guide, and dependency review now
+describe the exact fixed origin and the lower-level recorder seam rather than a
+production override.
 
 ## Non-goals
 
@@ -88,3 +112,4 @@ existing authenticated dry run still uploads the receipted fixture bytes.
 - [release workflow](../.github/workflows/release.yml)
 - [deploy alias](../deps.edn)
 - [release dependency review](../doc/release-dependency-review.md)
+- [release guide](../README.md)

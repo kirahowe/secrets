@@ -5,21 +5,22 @@ code on its classpath is reviewed rather than inherited. This is that review:
 every dependency `clojure -M:deploy` resolves, the path that puts it there, and
 what was decided about it.
 
-Reviewed: 2026-08-25, for `com.kirahowe/secrets` 0.1.0.
-Produced by `clojure -Spath -M:deploy` and `clojure -Stree -M:deploy` (Clojure
-CLI 1.12.5.1664) against [`deps.edn`](../deps.edn)'s `:deploy` alias. Both
-commands are reproducible from a checkout and are what the policy tests in
-`test/com/kirahowe/secrets/publish_policy_test.clj` run.
+Reviewed: 2026-08-27, for `com.kirahowe/secrets` 0.1.0.
+Reproduce the exact graph with `clojure -Spath -M:deploy` and
+`clojure -Stree -M:deploy` (Clojure CLI 1.12.5.1664) against
+[`deps.edn`](../deps.edn)'s `:deploy` alias. The policy tests in
+`test/com/kirahowe/secrets/publish_policy_test.clj` run both commands, and the
+advisory gate described below scans the same resolved coordinates.
 
 ## What this document is, and is not
 
-It records dependency path, applicability, and disposition. It does **not**
-assert that any advisory match against the previous graph was reachable or
-exploitable — that was never established, and establishing it is not what
-removing an unused transport requires. Equally, nothing below is a claim that
-the reviewed set is advisory-free: it is a claim that each entry is on the
-credential-bearing classpath for a stated reason, and that the entries carrying
-the matches are gone because the code they served was never used.
+It records dependency path, applicability, and disposition. An OSV package
+match proves that an affected version is present; it does **not** by itself
+prove that the advisory-specific method and attacker-controlled input are
+reachable. The review therefore removes every known match while preserving the
+distinction between exposure and demonstrated exploitation. The automated scan
+has no advisory ignore list: a future match fails and requires another reviewed
+upgrade or removal.
 
 ## What changed
 
@@ -52,9 +53,47 @@ The `:deploy` alias uses `:replace-deps` and `:replace-paths`, so the JVM
 holding the token also has no `tools.build`, no library source, and no test
 dependency on it.
 
+The production entry point always deploys to the exact
+`https://repo.clojars.org` origin. Repository arguments and the retired
+`SECRETS_DEPLOY_REPOSITORY_URL` input are rejected before credentials are read,
+an authenticated repository is constructed, or network I/O can begin. The local
+HTTP recorder is injected only through the lower-level `deploy!` test seam with
+fixture credentials; it is not a production repository override.
+
+### Plexus Utils advisory disposition
+
+The previous graph selected `org.codehaus.plexus/plexus-utils` 3.5.1 through
+`maven-model`, `maven-artifact`, `maven-repository-metadata`, and
+`maven-resolver-provider`. OSV records that version as affected by
+[GHSA-6fmv-xxpf-w3cw](https://osv.dev/vulnerability/GHSA-6fmv-xxpf-w3cw) /
+CVE-2025-67030 and fixes the 3.x line at 3.6.1. The affected surface is unsafe
+path handling in `org.codehaus.plexus.util.Expand.extractFile` during archive
+extraction.
+
+Maven Central publishes both fixed 3.6.1 and 3.6.2. The upstream 3.6.2 release
+states that it changes build metadata only and contains no library-code change
+from 3.6.1; its published pom has no runtime dependencies. The `:deploy` alias
+therefore overrides the transitive coordinate with 3.6.2: the latest reviewed
+3.x maintenance release, without taking the compatibility risk of a 4.x major
+upgrade. Dependency mediation replaces the already-present 3.5.1 coordinate
+rather than adding another jar, so the credential-bearing graph remains 25 jars
+and gains no transport, logging binding, injection container, build tool,
+library source, or test dependency.
+
+Reachability remains **not demonstrated**. The publisher constructs a
+`RepositorySystemSupplier` and `DeployRequest`, then asks Maven Resolver to
+deploy the receipted jar and pom. Neither the publisher nor its release guards
+call `Expand`, `extractFile`, or any archive-extraction API, and the deploy input
+is the locally built, digest-verified artifact rather than an attacker-selected
+archive to extract. That does not excuse the package match; it explains why the
+record is a conditional dependency exposure, not a claim of demonstrated
+arbitrary-code execution.
+
 ## The reviewed set
 
-Two direct dependencies, plus Clojure. Everything else arrives beneath them.
+Two direct deploy dependencies, plus Clojure. Everything else arrives beneath
+them; the Plexus Utils override mediates an existing transitive coordinate, not
+another jar.
 
 | Dependency | Dependency path | Applicability | Disposition |
 | --- | --- | --- | --- |
@@ -79,14 +118,15 @@ Two direct dependencies, plus Clojure. Everything else arrives beneath them.
 | `org.apache.maven/maven-artifact` 3.9.8 | model-builder | Version and coordinate handling. | Keep. |
 | `org.apache.maven/maven-builder-support` 3.9.8 | model-builder | Problem collection for the model builder. | Keep. |
 | `org.apache.maven/maven-repository-metadata` 3.9.8 | resolver-provider | The `maven-metadata.xml` model the deploy writes. | Keep. |
-| `org.codehaus.plexus/plexus-utils` 3.5.1 | maven-model, maven-artifact, maven-repository-metadata, resolver-provider | XML reading and writing for those models. | Keep. |
+| `org.codehaus.plexus/plexus-utils` 3.6.2 | override of 3.5.1 requested by maven-model, maven-artifact, maven-repository-metadata, resolver-provider | XML reading and writing for Maven's models. The archive-extraction helper carrying GHSA-6fmv-xxpf-w3cw is present, but this deploy path has no demonstrated call or attacker-controlled archive input. | Keep the reviewed fixed 3.x version; 3.5.1 is rejected by the exact-version policy. |
 | `org.codehaus.plexus/plexus-interpolation` 1.27 | model-builder | Property interpolation in the model builder. | Keep. |
 | `org.slf4j/slf4j-api` 1.7.36 | resolver and transport, throughout | Logging facade. No binding is on the classpath, so it is a no-op. | Keep, unbound. |
 | `org.slf4j/jcl-over-slf4j` 1.7.36 | transport-http | Routes HttpClient's commons-logging calls into that facade, which is why `commons-logging` itself is absent. | Keep. |
 
 `javax.inject` and `org.eclipse.sisu.inject` appear in `clojure -Stree` output
-marked `:excluded`, and `maven-resolver-{api,spi,util,impl}` 1.9.20 appear marked
-`:older-version`. Neither reaches a classpath, so neither is reviewed here.
+marked `:excluded`, and `maven-resolver-{api,spi,util,impl}` 1.9.20 appears
+marked `:older-version`. Plexus Utils 3.5.1 is rejected by the alias override.
+None reaches a classpath, so none is an entry in the reviewed resolved set.
 
 ## Expected output, not defects
 
@@ -112,16 +152,33 @@ in a subprocess and fails when the resolved graph drifts from this document:
   `s3`, `aws`, `logback`, `ion-java`, `jackson`, `joda-time`, or
   `commons-logging` is on the classpath, named individually so a failure says
   which branch returned.
-- `release-classpath-matches-the-reviewed-set-test` — the resolved coordinates
-  and the allow-list in that test are equal in both directions: an unreviewed
-  addition fails, and so does an allow-list entry that is no longer resolved, so
-  the list cannot rot.
+- `release-classpath-matches-the-reviewed-set-test` — each resolved coordinate
+  and exact version must equal the reviewed map. The two set differences retain
+  bidirectional enforcement: an unreviewed addition fails, and so does an entry
+  that is no longer resolved.
+- `release-classpath-uses-fixed-plexus-utils-test` — the classpath contains the
+  reviewed 3.6.2 jar and not affected 3.5.1.
 - `deploy-alias-excludes-the-build-tooling-test` — `tools.build` and the
   library's own `src` are absent, so the credential-bearing step cannot load
   them.
-- `dry-run-publication-uploads-the-receipted-bytes-test` and
-  `publish-refuses-before-it-uploads-anything-test` — a real upload of a fixture
-  artifact to a local recorder, and the refusals that precede one.
+- `lower-level-deploy-uploads-the-receipted-bytes-test` and
+  `publish-refuses-before-it-uploads-anything-test` — a real upload of a
+  receipted fixture through the lower-level seam, plus the artifact refusals
+  that precede one.
+- `production-repository-target-is-fixed-test` and
+  `production-rejects-disallowed-repository-targets-test` — argument- and
+  environment-selected repositories fail before a local recorder sees a
+  request, and disallowed URI shapes are rejected without disclosing fixture
+  credentials.
+
+The release workflow then runs `clojure -M:audit deploy` as the final hard gate
+before the only step receiving Clojars credentials. The isolated audit runner
+resolves the same `:deploy` alias, writes its exact coordinates and dependency
+tree under `target/dependency-audit/deploy/`, and invokes OSV Scanner 2.5.1.
+`.github/dependency-audit.edn` pins the scanner download by platform SHA-256 and
+defines no advisory ignores, so any package match exits nonzero before
+publication. The coordinate, tree, scanner input, and result files remain
+available as the reproducible disposition record.
 
 Changing the `:deploy` alias therefore fails the suite until this document is
 updated to match.

@@ -1,6 +1,6 @@
 # 033 — Audit build dependency advisories
 
-Status: `open`
+Status: `resolved`
 Priority: P2
 Review classification: Low release hygiene
 
@@ -85,22 +85,83 @@ disposition for every match.
 
 ## Acceptance criteria
 
-- [ ] The exact `:book` graph no longer resolves affected Jackson 2.18.2,
+- [x] The exact `:book` graph no longer resolves affected Jackson 2.18.2,
       Commons FileUpload 2.0.0-M2, or Jetty 12.0.18 coordinates.
-- [ ] The exact `:build` graph no longer resolves Plexus Utils 3.4.1 or affected
+- [x] The exact `:build` graph no longer resolves Plexus Utils 3.4.1 or affected
       Jetty 9 coordinates.
-- [ ] Clay/tools.build upgrades or overrides preserve deterministic jar
+- [x] Clay/tools.build upgrades or overrides preserve deterministic jar
       production, book rendering, site-policy enforcement, and the existing
       separation from runtime/library dependencies.
-- [ ] Reproducible advisory scanning covers the default graph and every alias,
+- [x] Reproducible advisory scanning covers the default graph and every alias,
       including `:test`, `:book`, `:build`, `:deploy`, `:format`, and `:lint`.
-- [ ] Scan records retain exact coordinates and dependency paths and distinguish
+- [x] Scan records retain exact coordinates and dependency paths and distinguish
       raw package matches from demonstrated reachability/exploitability.
-- [ ] Each retained match has an owner-visible disposition with advisory,
+- [x] Each retained match has an owner-visible disposition with advisory,
       affected surface, repository-controlled input analysis, fixed version,
       and review date.
-- [ ] Policy confirms build/book dependencies remain absent from the published
+- [x] Policy confirms build/book dependencies remain absent from the published
       library jar and credential-bearing deploy classpath.
+
+## Resolution
+
+The dependency changes are local to the three affected tooling aliases. `:book`
+upgrades Clay 2.0.16 to 2.0.21 and, because that release still selects the older
+components, overrides only the renderer graph to Ring 1.15.5, the Jackson 2.18.9
+line, and Jetty server/security plus EE9 security 12.1.10. The resulting
+affected coordinates are Jackson core/databind 2.18.9, Commons FileUpload
+2.0.0-M5, and Jetty server/http/util/security and EE9 security 12.1.10.
+`:build` upgrades tools.build 0.10.13 to 0.10.14; its newer tools.deps/Maven
+graph selects Plexus Utils 3.6.1 and removes the Cognitect HTTP client branch
+that supplied Jetty 9. `:lint` keeps the pinned clj-kondo release but overrides
+Cheshire's Jackson core, CBOR, and Smile modules together from 2.17.0 to 2.18.9;
+current clj-kondo releases still select Cheshire 5.13.0 and that Jackson line.
+The JVM `:test` graph explicitly includes data.json 2.5.1 to load the audit
+policy implementation. None of these changes touches top-level runtime `:deps`
+or `:paths`.
+
+There is one advisory system rather than a deploy-only check beside a second
+build check. [`.github/dependency-audit.edn`](../.github/dependency-audit.edn)
+pins OSV-Scanner 2.5.1 by release URL and per-platform SHA-256, names the default
+graph and every project alias (including the isolated `:audit` runner itself),
+and carries the review records for every original advisory plus the follow-up
+matches exposed by the first complete all-alias run. In particular, the record
+now includes `jetty-ee9-security` 12.1.8 through Clay/Ring and Jackson Core
+2.17.0 through clj-kondo/Cheshire, with their exact paths. Each record retains
+the matched coordinate and dependency path, affected surface,
+repository-controlled input analysis, fixed version, upgrade/override
+disposition, `:not-demonstrated` reachability, and review date. These are
+historical dispositions, not ignores: the scanner invocation has no allowlist
+or ignore configuration and fails for every current OSV package match.
+
+`com.kirahowe.secrets.dependency-audit` resolves each graph independently with
+the pinned Clojure CLI's `-X:deps list` and `tree` programs. For every graph it
+writes `coordinates.edn` (the selected coordinate and every root-to-package
+path), `tree.edn`, the exact OSV custom-lockfile input, and OSV's JSON result
+under `target/dependency-audit/<graph>/`. A non-Maven coordinate is a refusal,
+not a silent omission; one graph's failure is retained while the remaining
+graphs are attempted, and the process fails after all selected graphs finish.
+The `:audit` alias uses replaced dependencies and the `build/` path; its JSON
+dependency is also explicit in `:test` so policy tests load on the JVM. Neither
+the runner nor JSON dependency enters the runtime, book, build, deploy, or
+published-library graph.
+
+CI's `dependency-advisory-audit` job runs `clojure -M:audit`, uploads the exact
+records even on failure, and is a prerequisite of the main-only Pages deploy.
+The release workflow runs the same implementation as
+`clojure -M:audit deploy`, selecting only `:deploy`'s
+`replace-deps`/`replace-paths`, as the final hard gate immediately before the
+only step receiving Clojars credentials. Thus the credential-bearing graph is
+scanned before every publication without giving the scanner those credentials.
+
+The existing build and book contracts are unchanged: `clojure -T:build jar`
+still builds only `src`, the jar inspection compares every non-metadata entry
+with the source tree, and `bb book:build` still renders then invokes the site
+policy before its Pages artifact can upload. New policy tests require audit
+configuration to equal the live alias set, validate scanner pins and complete
+review fields, refuse unscannable coordinate kinds, preserve exact dependency
+paths in OSV input, pin the fixed EE9 and coherent lint Jackson overrides, prove
+the default library basis remains Clojure-only, prove the deploy replacement
+excludes every build/book dependency, and enforce both workflow gates.
 
 ## Non-goals
 
@@ -111,10 +172,23 @@ disposition for every match.
 
 ## Verification
 
-Resolve every alias to an exact coordinate set and run the same pinned advisory
-scanner over each set. Review and record every match, then exercise the existing
-jar build/inspection and book render/site policy to prove upgraded graphs retain
-their outputs and privilege separation.
+- `clojure -M:audit` — resolve and scan the default graph and every alias,
+  retaining exact coordinate/path and JSON result artifacts.
+- `clojure -M:audit deploy` — exercise the release workflow's selective,
+  pre-credential hard gate.
+- `clojure -M:test` — run the dependency audit policy and existing publication,
+  workflow, release, site-policy, and library tests.
+- `clojure -T:build jar` followed by
+  `bash .github/scripts/inspect-jar.sh target/secrets-*.jar` — prove tooling did
+  not enter the published artifact.
+- `bb book:build` followed by `bb book:policy` — prove the upgraded renderer
+  still produces and enforces the Pages artifact.
+
+The integrated alpha gate `clojure -M:audit` completed successfully on
+2026-08-27. It scanned all eight configured graphs with no OSV package match:
+default 3, `:test` 27, `:book` 106, `:build` 59, `:deploy` 25, `:audit` 4,
+`:format` 9, and `:lint` 28 exact Maven coordinates. The retained artifacts
+carry the exact coordinate and dependency paths for each set.
 
 ## Dependencies / related files
 
@@ -123,3 +197,7 @@ their outputs and privilege separation.
 - [CI build and Pages workflow](../.github/workflows/ci.yml)
 - [build implementation](../build.clj)
 - [site policy](../build/com/kirahowe/secrets/site_policy.clj)
+- [audit configuration](../.github/dependency-audit.edn)
+- [release pre-publication gate](../.github/workflows/release.yml)
+- [dependency audit implementation](../build/com/kirahowe/secrets/dependency_audit.clj)
+- [dependency audit policy tests](../test/com/kirahowe/secrets/dependency_audit_test.clj)

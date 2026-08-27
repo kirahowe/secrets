@@ -54,15 +54,14 @@
   (println "SKIP" (str *ns*) "-" reason)
   (is true reason))
 
-(defn- run-clojure
-  "Runs `args` under `clojure` in `dir` with `env` added to the environment.
+(defn- run-process
+  "Runs `command` under `dir` with `env` added to the environment.
 
   Returns `{:exit :out :err}`, or throws once [[command-timeout-ms]] has passed.
   Both streams are drained while the process runs, so a chatty resolver cannot
   fill a pipe and deadlock."
-  [dir env args]
-  (let [command (into ["clojure"] args)
-        builder (doto (ProcessBuilder. ^java.util.List command)
+  [dir env command]
+  (let [builder (doto (ProcessBuilder. ^java.util.List command)
                   (.directory (io/file dir)))
         _ (.putAll (.environment builder) env)
         process (.start builder)
@@ -75,41 +74,45 @@
                       {:command command :dir (str dir)})))
     {:exit (.exitValue process) :out @out :err @err}))
 
+(defn- run-clojure
+  "Runs `args` through the Clojure CLI under `dir` with `env` additions."
+  [dir env args]
+  (run-process dir env (into ["clojure"] args)))
+
 ;;;; The reviewed classpath
 
 (def ^:private reviewed-dependencies
-  "Every dependency `clojure -M:deploy` may resolve, by coordinate.
+  "Every dependency `clojure -M:deploy` may resolve, by coordinate and version.
 
-  This is the list `doc/release-dependency-review.md` records a disposition for:
-  Maven's own deploy code path and the HTTP transport it publishes through. An
-  addition nothing has reviewed fails the check below, and so does an entry that
-  is no longer resolved, so the list cannot rot into a claim about a graph that
-  has moved on."
-  '#{commons-codec/commons-codec
-     org.apache.httpcomponents/httpclient
-     org.apache.httpcomponents/httpcore
-     org.apache.maven.resolver/maven-resolver-api
-     org.apache.maven.resolver/maven-resolver-connector-basic
-     org.apache.maven.resolver/maven-resolver-impl
-     org.apache.maven.resolver/maven-resolver-named-locks
-     org.apache.maven.resolver/maven-resolver-spi
-     org.apache.maven.resolver/maven-resolver-supplier
-     org.apache.maven.resolver/maven-resolver-transport-file
-     org.apache.maven.resolver/maven-resolver-transport-http
-     org.apache.maven.resolver/maven-resolver-util
-     org.apache.maven/maven-artifact
-     org.apache.maven/maven-builder-support
-     org.apache.maven/maven-model
-     org.apache.maven/maven-model-builder
-     org.apache.maven/maven-repository-metadata
-     org.apache.maven/maven-resolver-provider
-     org.clojure/clojure
-     org.clojure/core.specs.alpha
-     org.clojure/spec.alpha
-     org.codehaus.plexus/plexus-interpolation
-     org.codehaus.plexus/plexus-utils
-     org.slf4j/jcl-over-slf4j
-     org.slf4j/slf4j-api})
+  This is the exact set `doc/release-dependency-review.md` records a disposition
+  for: Maven's own deploy code path and the HTTP transport it publishes through.
+  An addition nothing has reviewed fails the check below, as does a stale entry
+  or a version change, so the list cannot describe a graph that has moved on."
+  '{commons-codec/commons-codec "1.17.1"
+    org.apache.httpcomponents/httpclient "4.5.14"
+    org.apache.httpcomponents/httpcore "4.4.16"
+    org.apache.maven.resolver/maven-resolver-api "1.9.22"
+    org.apache.maven.resolver/maven-resolver-connector-basic "1.9.22"
+    org.apache.maven.resolver/maven-resolver-impl "1.9.22"
+    org.apache.maven.resolver/maven-resolver-named-locks "1.9.22"
+    org.apache.maven.resolver/maven-resolver-spi "1.9.22"
+    org.apache.maven.resolver/maven-resolver-supplier "1.9.22"
+    org.apache.maven.resolver/maven-resolver-transport-file "1.9.22"
+    org.apache.maven.resolver/maven-resolver-transport-http "1.9.22"
+    org.apache.maven.resolver/maven-resolver-util "1.9.22"
+    org.apache.maven/maven-artifact "3.9.8"
+    org.apache.maven/maven-builder-support "3.9.8"
+    org.apache.maven/maven-model "3.9.8"
+    org.apache.maven/maven-model-builder "3.9.8"
+    org.apache.maven/maven-repository-metadata "3.9.8"
+    org.apache.maven/maven-resolver-provider "3.9.8"
+    org.clojure/clojure "1.12.4"
+    org.clojure/core.specs.alpha "0.4.74"
+    org.clojure/spec.alpha "0.5.238"
+    org.codehaus.plexus/plexus-interpolation "1.27"
+    org.codehaus.plexus/plexus-utils "3.6.2"
+    org.slf4j/jcl-over-slf4j "1.7.36"
+    org.slf4j/slf4j-api "1.7.36"})
 
 (def ^:private forbidden-fragments
   "Artifact-name fragments the old publisher's graph carried and this one must
@@ -140,20 +143,20 @@
           (throw (ex-info (str "clojure -Stree -M:deploy failed: " err) {:exit exit})))
         out))))
 
-(defn- tree-coordinates
-  "The coordinates `clojure -Stree` output `s` says were used.
+(defn- tree-dependencies
+  "The coordinate-to-version map `clojure -Stree` output `s` says was used.
 
   A line is `<coordinate> <version>` at the top level and `. <coordinate>
   <version>` below it; `X` marks a candidate the resolver rejected, which is on
   no classpath and reviewed nowhere."
   [s]
-  (into #{}
+  (into {}
         (keep (fn [line]
-                (let [[marker coordinate] (str/split (str/trim line) #"\s+")]
+                (let [[marker coordinate version] (str/split (str/trim line) #"\s+")]
                   (cond
                     (= "X" marker) nil
-                    (= "." marker) (symbol coordinate)
-                    :else (symbol marker)))))
+                    (= "." marker) [(symbol coordinate) version]
+                    :else [(symbol marker) coordinate]))))
         (remove str/blank? (str/split-lines s))))
 
 (defn- jar-names
@@ -174,19 +177,35 @@
 
 (deftest release-classpath-matches-the-reviewed-set-test
   (if-let [tree @deploy-tree]
-    (let [resolved (tree-coordinates tree)
+    (let [resolved (tree-dependencies tree)
+          resolved-coordinates (set (keys resolved))
+          reviewed-coordinates (set (keys reviewed-dependencies))
           classpath @deploy-classpath]
       (testing "every resolved coordinate has a reviewed disposition"
-        (is (empty? (set/difference resolved reviewed-dependencies))
+        (is (empty? (set/difference resolved-coordinates reviewed-coordinates))
             (str "unreviewed additions to the credential-bearing classpath: "
-                 (pr-str (sort (set/difference resolved reviewed-dependencies))))))
+                 (pr-str (sort (set/difference resolved-coordinates
+                                               reviewed-coordinates))))))
       (testing "the allow-list has nothing left in it that is no longer resolved"
-        (is (empty? (set/difference reviewed-dependencies resolved))
+        (is (empty? (set/difference reviewed-coordinates resolved-coordinates))
             (str "reviewed entries that are no longer on the classpath: "
-                 (pr-str (sort (set/difference reviewed-dependencies resolved))))))
+                 (pr-str (sort (set/difference reviewed-coordinates
+                                               resolved-coordinates))))))
+      (testing "every reviewed coordinate resolves its reviewed exact version"
+        (is (= reviewed-dependencies resolved)
+            (str "reviewed dependency versions differ from the resolved graph: "
+                 (pr-str resolved))))
       (testing "one jar per reviewed coordinate, and the publisher's own path"
         (is (= (count reviewed-dependencies) (count (jar-names classpath))))
         (is (some #{"build"} classpath))))
+    (skipped "no `clojure` CLI on the PATH to resolve the deploy classpath")))
+
+(deftest release-classpath-uses-fixed-plexus-utils-test
+  (if-let [classpath @deploy-classpath]
+    (let [jars (jar-names classpath)]
+      (testing "the reviewed fixed Plexus Utils replaces the advisory match"
+        (is (contains? jars "plexus-utils-3.6.2.jar"))
+        (is (not (contains? jars "plexus-utils-3.5.1.jar")))))
     (skipped "no `clojure` CLI on the PATH to resolve the deploy classpath")))
 
 (deftest deploy-alias-excludes-the-build-tooling-test
@@ -322,14 +341,31 @@
 
 (def ^:private fixture-password "not-a-real-token-a41f9c")
 
-(defn- publish!
-  "Runs the publisher in `dir` against `url` with fixture credentials."
+(defn- deploy-fixture!
+  "Calls the lower-level deploy seam in `dir` against `url`.
+
+  The fixture target and credentials are values in this test-only expression;
+  neither can participate in the production entry point's target selection."
   [dir url]
+  (let [credentials {:username fixture-username :password fixture-password}
+        form (str "(do (require '[com.kirahowe.secrets.publish :as publish]"
+                  " '[com.kirahowe.secrets.release :as release])"
+                  " (let [receipt (release/verified-artifact!)]"
+                  " (publish/deploy! receipt " (pr-str url) " " (pr-str credentials) ")"
+                  " (println \"Uploaded receipted fixture\" (:sha256 receipt))))")
+        java (str (io/file (System/getProperty "java.home") "bin" "java"))
+        classpath (str/join java.io.File/pathSeparator @deploy-classpath)]
+    (run-process dir {} [java "-cp" classpath "clojure.main" "-e" form])))
+
+(defn- invoke-publisher!
+  "Runs the production entry point in `dir`, with fixed fixture credentials."
+  [dir env args]
   (run-clojure dir
-               {"CLOJARS_USERNAME" fixture-username
-                "CLOJARS_PASSWORD" fixture-password
-                "SECRETS_DEPLOY_REPOSITORY_URL" url}
-               ["-M:deploy"]))
+               (merge {"CLOJARS_USERNAME" fixture-username
+                       "CLOJARS_PASSWORD" fixture-password
+                       "SECRETS_DEPLOY_REPOSITORY_URL" ""}
+                      env)
+               (into ["-M:deploy"] args)))
 
 (defn- expected-uploads
   "Every path a complete deploy of the fixture writes under `prefix`.
@@ -346,7 +382,7 @@
                suffix ["" ".sha1" ".md5"]]
            (str base suffix)))))
 
-(deftest dry-run-publication-uploads-the-receipted-bytes-test
+(deftest lower-level-deploy-uploads-the-receipted-bytes-test
   (if-not (clojure-cli?)
     (skipped "no `clojure` CLI on the PATH to run the publisher")
     (let [dir (temp-dir!)
@@ -355,10 +391,10 @@
       (try
         (let [{:keys [jar]} (fixture-release! dir)
               url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/repository")
-              {:keys [exit out err]} (publish! dir url)
+              {:keys [exit out err]} (deploy-fixture! dir url)
               recorded @requests]
-          (testing "the upload succeeded against the override repository"
-            (is (zero? exit) (str "publisher failed: " err)))
+          (testing "the lower-level seam uploads to the fixture repository"
+            (is (zero? exit) (str "fixture deploy failed: " err)))
           (testing "exactly the artifacts, checksums, and metadata of one deploy"
             (is (= (expected-uploads "/repository")
                    (set (map :path (filter #(= "PUT" (:method %)) recorded))))))
@@ -369,14 +405,66 @@
             (let [uploaded (some #(when (str/ends-with? (:path %) ".jar") (:body %)) recorded)]
               (is (Arrays/equals ^bytes (Files/readAllBytes (.toPath (io/file jar)))
                                  ^bytes uploaded))))
-          (testing "the credentials appear in no output, and the run reads as a dry run"
+          (testing "fixture credentials appear in no output"
             (is (not (str/includes? (str out err) fixture-password)))
             (is (not (str/includes? (str out err) fixture-username)))
-            (is (str/includes? out "OVERRIDE"))
-            (is (str/includes? out "NOT a publication"))
+            (is (str/includes? out "Uploaded receipted fixture"))
             (is (str/includes? out (:sha256 (release/read-receipt! {:dir dir}))))))
         (finally
           (.stop server 0)
+          (delete-tree! dir))))))
+
+(deftest production-repository-target-is-fixed-test
+  (if-not (clojure-cli?)
+    (skipped "no `clojure` CLI on the PATH to run the publisher")
+    (let [dir (temp-dir!)
+          requests (atom [])
+          server (recorder! requests)]
+      (try
+        (fixture-release! dir)
+        (let [url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/repository")
+              invocations [["the command line" (invoke-publisher! dir {} [url])]
+                           ["SECRETS_DEPLOY_REPOSITORY_URL"
+                            (invoke-publisher! dir {"SECRETS_DEPLOY_REPOSITORY_URL" url} [])]]]
+          (doseq [[source {:keys [exit out err]}] invocations]
+            (testing (str source " cannot select a recorder")
+              (is (= 1 exit))
+              (is (str/includes? err (str "Repository target from " source " is rejected")))
+              (is (str/includes? err "host=\"127.0.0.1\""))
+              (is (not (str/includes? (str out err) "/repository")))
+              (is (not (str/includes? (str out err) fixture-password)))
+              (is (not (str/includes? (str out err) fixture-username)))))
+          (testing "target rejection happens before any request"
+            (is (empty? @requests))))
+        (finally
+          (.stop server 0)
+          (delete-tree! dir))))))
+
+(deftest production-rejects-disallowed-repository-targets-test
+  (if-not (clojure-cli?)
+    (skipped "no `clojure` CLI on the PATH to run the publisher")
+    (let [dir (temp-dir!)
+          targets [["an explicit fixed origin" "https://repo.clojars.org"]
+                   ["plaintext HTTP" "http://repo.clojars.org"]
+                   ["another host" "https://example.invalid"]
+                   ["userinfo" (str "https://" fixture-username ":" fixture-password
+                                    "@repo.clojars.org")]
+                   ["a changed port" "https://repo.clojars.org:8443"]
+                   ["a changed path" "https://repo.clojars.org/repository"]
+                   ["a query" (str "https://repo.clojars.org?token=" fixture-password)]
+                   ["a fragment" (str "https://repo.clojars.org#" fixture-password)]
+                   ["a lookalike" "https://repo.clojars.org.example"]]]
+      (try
+        (fixture-release! dir)
+        (doseq [[kind target] targets
+                :let [{:keys [exit out err]} (invoke-publisher! dir {} [target])]]
+          (testing (str kind " is not a production target input")
+            (is (= 1 exit))
+            (is (str/includes? err "Repository target from the command line is rejected"))
+            (is (str/includes? err "Rejected target:"))
+            (is (not (str/includes? (str out err) fixture-password)))
+            (is (not (str/includes? (str out err) fixture-username)))))
+        (finally
           (delete-tree! dir))))))
 
 (deftest publish-refuses-before-it-uploads-anything-test
@@ -388,10 +476,7 @@
       (try
         (let [{:keys [jar]} (fixture-release! dir)
               url (str "http://127.0.0.1:" (.getPort (.getAddress server)) "/repository")
-              blank (run-clojure dir {"CLOJARS_USERNAME" fixture-username
-                                      "CLOJARS_PASSWORD" ""
-                                      "SECRETS_DEPLOY_REPOSITORY_URL" url}
-                                 ["-M:deploy"])]
+              blank (invoke-publisher! dir {"CLOJARS_PASSWORD" ""} [])]
           (testing "a set-but-blank credential is a broken release, not an anonymous upload"
             (is (= 1 (:exit blank)))
             (is (str/includes? (:err blank) "CLOJARS_PASSWORD is set but empty")))
@@ -399,12 +484,12 @@
             (let [content (Files/readAllBytes (.toPath (io/file jar)))]
               (aset-byte content 0 (unchecked-byte (bit-xor (aget content 0) 1)))
               (io/copy content (io/file jar)))
-            (let [{:keys [exit err]} (publish! dir url)]
+            (let [{:keys [exit err]} (deploy-fixture! dir url)]
               (is (= 1 exit))
               (is (str/includes? err "changed after it was inspected"))))
           (testing "no receipt means nothing to publish"
             (.delete (release/receipt-path {:dir dir}))
-            (let [{:keys [exit err]} (publish! dir url)]
+            (let [{:keys [exit err]} (deploy-fixture! dir url)]
               (is (= 1 exit))
               (is (str/includes? err "No release receipt at"))))
           (testing "not one request reached the repository"

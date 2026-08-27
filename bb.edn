@@ -10,9 +10,11 @@
  :tasks
  {test
   {:doc "Run the test suite under babashka"
-   ;; com.kirahowe.secrets.publish-policy-test is deliberately absent:
-   ;; babashka cannot resolve com.sun.net.httpserver.HttpServer, which its
-   ;; local upload recorder needs. `clojure -M:test` runs it.
+   ;; JVM-only policy tests are deliberately absent. Publish-policy needs
+   ;; com.sun.net.httpserver.HttpServer; dependency-audit-test loads the JVM
+   ;; runner and its test-only org.clojure/data.json dependency.
+   ;; `clojure -M:test` runs both without adding tooling to this Babashka
+   ;; classpath.
    :requires ([clojure.test :as t]
               [com.kirahowe.secrets-test]
               [com.kirahowe.secrets.aero-test]
@@ -31,6 +33,10 @@
            (System/exit (if (pos? (+ fail error)) 1 0)))}
 
   ;;;; Code quality
+
+  audit
+  {:doc "Resolve and scan every dependency graph with pinned OSV-Scanner"
+   :task (apply clojure "-M:audit" *command-line-args*)}
 
   format
   {:doc "Format Clojure source with cljfmt"

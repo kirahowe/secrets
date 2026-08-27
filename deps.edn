@@ -12,17 +12,28 @@
  {:test {:extra-paths ["test" "build"]
          :extra-deps {aero/aero {:mvn/version "1.1.6"}
                       lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                      org.clojure/data.json {:mvn/version "2.5.1"}
                       rewrite-clj/rewrite-clj {:mvn/version "1.2.55"}}
          :main-opts ["-m" "kaocha.runner"]}
 
-  ;;; The documentation book: Clay renders the literate chapters under
-  ;;; book/chapters into a Quarto book (see clay.edn and the book:* bb tasks).
+  ;;; Clay's newest release still selects older Ring/Jackson components. Keep
+  ;;; the overrides here, inside :book, so the renderer gets reviewed fixed
+  ;;; lines without adding build-only dependencies to the library graph.
   :book {:extra-paths ["book/chapters"]
          :extra-deps {aero/aero {:mvn/version "1.1.6"}
-                      org.scicloj/clay {:mvn/version "2.0.16"}}}
+                      org.scicloj/clay {:mvn/version "2.0.21"}}
+         :override-deps
+         {com.fasterxml.jackson.core/jackson-annotations {:mvn/version "2.18.9"}
+          com.fasterxml.jackson.core/jackson-core {:mvn/version "2.18.9"}
+          com.fasterxml.jackson.core/jackson-databind {:mvn/version "2.18.9"}
+          com.fasterxml.jackson.datatype/jackson-datatype-jsr310 {:mvn/version "2.18.9"}
+          org.eclipse.jetty.ee9/jetty-ee9-security {:mvn/version "12.1.10"}
+          org.eclipse.jetty/jetty-security {:mvn/version "12.1.10"}
+          org.eclipse.jetty/jetty-server {:mvn/version "12.1.10"}
+          ring/ring {:mvn/version "1.15.5"}}}
 
   ;;; `-T` replaces :paths, so "." must stay for build.clj itself to resolve.
-  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.13"}}
+  :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.14"}}
           :paths ["." "build"]
           :ns-default build}
 
@@ -31,17 +42,35 @@
   ;;; Clojars token loads com.kirahowe.secrets.publish, the release guards beside
   ;;; it, and Maven's own deploy code — no tools.build, no "src", no test
   ;;; dependencies. maven-resolver publishes over HTTP, which is all Clojars is,
-  ;;; so no wagon and none of its S3/AWS/logging branches are resolved at all;
-  ;;; see doc/release-dependency-review.md for the reviewed set.
+  ;;; so no wagon and none of its S3/AWS/logging branches are resolved at all.
+  ;;; Plexus Utils is an explicit same-graph override: Maven 3.9.8 requests the
+  ;;; affected 3.5.1, while fixed 3.6.2 has no runtime dependencies and adds no
+  ;;; coordinate; see doc/release-dependency-review.md for the reviewed set.
   :deploy {:replace-deps
            {org.clojure/clojure {:mvn/version "1.12.4"}
             org.apache.maven.resolver/maven-resolver-supplier {:mvn/version "1.9.22"}
             org.apache.maven.resolver/maven-resolver-transport-http {:mvn/version "1.9.22"}}
+           :override-deps
+           {org.codehaus.plexus/plexus-utils {:mvn/version "3.6.2"}}
            :replace-paths ["build"]
            :main-opts ["-m" "com.kirahowe.secrets.publish"]}
+
+  ;;; Isolated audit runner. It resolves every real alias from deps.edn and
+  ;;; writes exact coordinates and dependency paths before invoking the pinned
+  ;;; scanner; none of its implementation dependencies enter an audited graph.
+  :audit {:replace-deps {org.clojure/clojure {:mvn/version "1.12.4"}
+                         org.clojure/data.json {:mvn/version "2.5.1"}}
+          :replace-paths ["build"]
+          :main-opts ["-m" "com.kirahowe.secrets.dependency-audit"]}
 
   :format {:replace-deps {dev.weavejester/cljfmt {:mvn/version "0.16.5"}}
            :main-opts ["-m" "cljfmt.main"]}
 
+  ;;; Current clj-kondo releases still carry Cheshire's Jackson 2.17 line.
+  ;;; Move that internally coherent core/dataformat set together inside :lint.
   :lint {:replace-deps {clj-kondo/clj-kondo {:mvn/version "2026.05.25"}}
+         :override-deps
+         {com.fasterxml.jackson.core/jackson-core {:mvn/version "2.18.9"}
+          com.fasterxml.jackson.dataformat/jackson-dataformat-cbor {:mvn/version "2.18.9"}
+          com.fasterxml.jackson.dataformat/jackson-dataformat-smile {:mvn/version "2.18.9"}}
          :main-opts ["-m" "clj-kondo.main"]}}}
