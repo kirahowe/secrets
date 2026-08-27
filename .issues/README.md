@@ -1,27 +1,43 @@
 # Dogfooding and alpha security backlog
 
-These issues came from dogfooding the examples and the alpha security review
-on 2026-08-23. Priorities are relative ordering for the next pass; each open
-issue is independently ready to pick up in a clean session. Completed items
+These issues came from dogfooding the examples and alpha security reviews, most
+recently completed on 2026-08-27. Priorities are relative execution order; each
+open issue is independently ready to pick up in a clean session. Completed items
 remain linked as decision and verification history.
 
 ## Security review classification
 
 Under the review's trusted-repository/private-identity model, no Critical or
-High findings were identified. Priorities are execution order only and do not
-weaken the release gate:
+High project finding was established. Issue 027 concerns an upstream advisory
+rated High, but vulnerable-method reachability in the publisher was not
+established, so the repository finding remains Conditional Medium.
 
-- **Confirmed Medium / alpha release blockers:** 007–015. Every one of these
-  issues must be resolved before alpha, regardless of whether its priority is
-  P0 or P1.
-- **Conditional Medium:** 016–018.
-- **Low:** 019–025, of which 024–025 came from the security review of the 006
-  fix rather than the original audit.
+- **Unconditional alpha release gate:** 026–029 must be resolved before alpha.
+  This gate is unconditional even where exploitability depends on reachability
+  or attacker influence.
+- **Conditional source-contract issue:** 030 blocks the alpha contract if
+  attacker-influenced remote sources remain supported.
+- **Low hardening and release hygiene:** 031–034.
+- Completed classifications and their resolution evidence remain recorded under
+  001–025 below.
 
 ## Open
 
-None. Every issue in this backlog is resolved; the alpha release gate is
-satisfied. Each entry below links to its own decision and verification history.
+The alpha release gate is **not satisfied** because issues 026–029 remain open.
+Issue 030 additionally requires a source-contract decision; 031–034 remain open
+hardening and release-hygiene work.
+
+| Issue | Priority | Review classification | Alpha gate |
+| --- | --- | --- | --- |
+| [026 — Restrict release repository](026-restrict-release-repository.md) | P0 | Confirmed Medium / alpha release blocker | Unconditional blocker |
+| [027 — Patch deploy dependency vulnerability](027-patch-deploy-dependency-vulnerability.md) | P0 | Conditional Medium / alpha release blocker | Unconditional blocker; upstream advisory is High, deploy reachability unestablished |
+| [028 — Redact EDN parse failures](028-redact-edn-parse-failures.md) | P0 | Confirmed Medium / alpha release blocker | Unconditional blocker |
+| [029 — Bound CLI inputs and EDN depth](029-bound-cli-inputs-and-edn-depth.md) | P1 | Conditional Medium / alpha release blocker | Unconditional blocker |
+| [030 — Constrain remote source access](030-constrain-remote-source-access.md) | P1 | Conditional Medium | Contract blocker if attacker-influenced remote sources remain supported |
+| [031 — Verify identity cleanup](031-verify-identity-cleanup.md) | P2 | Low | Hardening |
+| [032 — Enforce strict base64 identity input](032-enforce-strict-base64-identity-input.md) | P2 | Low | Hardening |
+| [033 — Audit build dependency advisories](033-audit-build-dependency-advisories.md) | P2 | Low release hygiene | Release hygiene |
+| [034 — Publish security reporting path](034-security-reporting-path.md) | P2 | Low release hygiene | Release hygiene |
 
 ## Completed
 
