@@ -9,7 +9,10 @@
             [clojure.test :refer [are deftest is testing use-fixtures]]
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
-            [com.kirahowe.secrets.manifest :as manifest]))
+            [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.manifest :as manifest]
+            [com.kirahowe.secrets.safe-edn :as safe-edn]
+            [com.kirahowe.secrets.source :as source]))
 
 (def ^:dynamic ^:private *dir* nil)
 (def ^:dynamic ^:private *key* nil)
@@ -500,7 +503,7 @@
 (deftest identity-materialization-cache-test
   (testing "concurrent identical contents share a digest-keyed delayed materialization"
     (let [contents (slurp *key*)
-          state (atom {:generation 0 :entries {} :retired {}})
+          state (atom {:generation 0 :entries {} :retired {} :cleanup #{}})
           write-call-count (atom 0)
           real-write @#'secrets/write-identity!
           paths (with-redefs-fn
@@ -558,7 +561,7 @@
   `owner-only-temp-file!`, so the 0600 guarantee under test is the real one."
   [f]
   (with-redefs-fn {#'secrets/identity-state
-                   (atom {:generation 0 :entries {} :retired {}})}
+                   (atom {:generation 0 :entries {} :retired {} :cleanup #{}})}
     (fn []
       (try
         (f)
@@ -571,9 +574,9 @@
   the case that leaves an orphan if nothing deletes it. `created` is an atom
   collecting those files, including one whose path no caller ever received."
   [f]
-  (let [real secrets/owner-only-temp-file!
+  (let [real fs/owner-only-temp-file!
         created (atom [])]
-    (with-redefs-fn {#'secrets/owner-only-temp-file!
+    (with-redefs-fn {#'fs/owner-only-temp-file!
                      (fn [prefix suffix]
                        (let [file (real prefix suffix)]
                          (swap! created conj file)
@@ -615,6 +618,63 @@
             "the second call reports nothing to do")
         (is (= (inc (:generation first-reset)) (:generation second-reset))
             "and still moves the lifecycle on")
+        (is (not (.exists (io/file path))))))))
+
+(deftest cleanup-failure-is-truthful-and-retryable-test
+  (with-fresh-identities
+    (fn []
+      (let [path (materialize! identity-sentinel)
+            digest (@#'secrets/identity-digest identity-sentinel)
+            failed (with-redefs-fn
+                     {#'secrets/try-delete-identity-file! (constantly false)}
+                     secrets/reset-identity-cache!)
+            rendered (pr-str failed)]
+        (is (= {:deleted 0 :absent 0 :failed 1 :pending 0}
+               (select-keys failed [:deleted :absent :failed :pending]))
+            "an existing file rejected by the filesystem is not counted as deleted")
+        (is (.exists (io/file path)))
+        (is (= #{path} (:cleanup @@#'secrets/identity-state))
+            "the failed path remains tracked for deterministic retry")
+        (is (not-any? #(str/includes? rendered %)
+                      [path digest identity-sentinel "age-identity-"])
+            "the cleanup result exposes counts, not credential material or paths")
+        (is (= {:deleted 1 :absent 0 :failed 0 :pending 0}
+               (select-keys (secrets/reset-identity-cache!)
+                            [:deleted :absent :failed :pending]))
+            "a later reset retries and confirms deletion")
+        (is (not (.exists (io/file path))))
+        (is (empty? (:cleanup @@#'secrets/identity-state)))))))
+
+(deftest cleanup-reports-an-already-absent-file-test
+  (with-fresh-identities
+    (fn []
+      (let [path (materialize! (slurp *key*))]
+        (is (.delete (io/file path)) "the fixture removes the tracked file first")
+        (is (= {:deleted 0 :absent 1 :failed 0 :pending 0}
+               (select-keys (secrets/reset-identity-cache!)
+                            [:deleted :absent :failed :pending])))
+        (is (empty? (:cleanup @@#'secrets/identity-state))
+            "confirmed absence completes cleanup rather than scheduling a retry")))))
+
+(deftest deferred-cleanup-failure-is-retryable-test
+  (with-fresh-identities
+    (fn []
+      (let [path (materialize! (slurp *key*))]
+        (is (true? (@#'secrets/acquire-identity! path)))
+        (is (= {:deleted 0 :absent 0 :failed 0 :pending 1}
+               (select-keys (secrets/reset-identity-cache!)
+                            [:deleted :absent :failed :pending])))
+        (is (.exists (io/file path))
+            "reset does not attempt deletion while the lease is active")
+        (with-redefs-fn
+          {#'secrets/try-delete-identity-file! (constantly false)}
+          (fn [] (@#'secrets/release-identity! path)))
+        (is (.exists (io/file path)))
+        (is (= #{path} (:cleanup @@#'secrets/identity-state))
+            "a failed last-release deletion follows the same retry contract")
+        (is (= {:deleted 1 :absent 0 :failed 0 :pending 0}
+               (select-keys (secrets/reset-identity-cache!)
+                            [:deleted :absent :failed :pending])))
         (is (not (.exists (io/file path))))))))
 
 (deftest deletion-waits-for-an-active-user-test
@@ -706,6 +766,7 @@
           (let [e (try (@#'secrets/decode-b64-identity identity-sentinel)
                        (catch clojure.lang.ExceptionInfo e e))]
             (is (= "SECRETS_AGE_IDENTITY_B64" (:env (ex-data e))))
+            (is (nil? (ex-cause e)))
             (is (= [] (leaks e)))))))))
 
 (deftest permissions-survive-the-lifecycle-test
@@ -757,14 +818,76 @@
 (deftest b64-identity-decode-test
   (let [decode @#'secrets/decode-b64-identity
         raw "AGE-SECRET-KEY-1EXAMPLE\n"
-        b64 (.encodeToString (java.util.Base64/getMimeEncoder)
-                             (.getBytes raw "UTF-8"))]
-    (is (= raw (decode b64)) "valid base64 round-trips")
-    (is (= raw (decode (str "  " b64 "\n"))) "surrounding whitespace is tolerated")
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"base64"
-         (decode "!!! not base64 !!!"))
-        "invalid base64 throws instead of silently falling back")))
+        b64 (.encodeToString (java.util.Base64/getEncoder)
+                             (.getBytes raw "UTF-8"))
+        whitespace [["space" " "]
+                    ["horizontal tab" "\t"]
+                    ["carriage return" "\r"]
+                    ["line feed" "\n"]]
+        invalid [["junk at the beginning" "%QUJD"]
+                 ["junk in the middle" "QU%JD"]
+                 ["junk at the end" "QUJD%%%"]
+                 ["other punctuation" "QUJ!D"]
+                 ["Unicode nonbreaking space" "QU\u00A0JD"]
+                 ["Unicode em space" "QU\u2003JD"]
+                 ["padding at the beginning" "=QUJD"]
+                 ["padding in the middle" "QU=JD"]
+                 ["short padding" "Zg="]
+                 ["excess padding" "Zg==="]
+                 ["one-character length" "A"]
+                 ["five-character length" "ABCDE"]
+                 ["omitted double padding" "Zg"]
+                 ["omitted single padding" "Zm8"]
+                 ["nonzero padding bits" "Zh=="]]]
+    (testing "canonical unwrapped base64 round-trips"
+      (is (= raw (decode b64)))
+      (is (= "\uFFFF" (decode "77+/"))
+          "the standard alphabet's + and / boundaries remain valid"))
+    (testing "only documented ASCII transport whitespace is removed"
+      (doseq [[label s] whitespace
+              [position wrapped] [["beginning" (str s b64)]
+                                  ["middle" (str (subs b64 0 2) s (subs b64 2))]
+                                  ["end" (str b64 s)]]]
+        (is (= raw (decode wrapped)) (str label " at the " position)))
+      (is (= raw (decode (str "\t" (subs b64 0 8) "\r\n"
+                              (subs b64 8) " ")))
+          "mixed wrapping and multiline transport round-trips"))
+    (testing "junk, Unicode whitespace, malformed padding, and ambiguous encodings fail"
+      (doseq [[label value] invalid]
+        (let [e (try (decode value)
+                     nil
+                     (catch clojure.lang.ExceptionInfo e e))]
+          (is (some? e) label)
+          (when e
+            (is (= {:env "SECRETS_AGE_IDENTITY_B64"} (ex-data e)) label)
+            (is (re-find #"SECRETS_AGE_IDENTITY_B64.*base64-encoded"
+                         (ex-message e))
+                label)
+            (is (nil? (ex-cause e)) label)))))))
+
+(deftest b64-identity-input-boundary-test
+  (let [invalid "QUJD%%%identity-token-sentinel"
+        materializations (atom 0)]
+    (with-redefs-fn
+      {#'secrets/identity-env
+       (fn [k]
+         (when (= k "SECRETS_AGE_IDENTITY_B64") invalid))
+       #'secrets/materialize-identity!
+       (fn [_]
+         (swap! materializations inc)
+         "unreachable")}
+      (fn []
+        (let [e (try (secrets/identity-from-env)
+                     nil
+                     (catch clojure.lang.ExceptionInfo e e))
+              rendered (str (pr-str e) (pr-str (ex-data e)) (ex-message e))]
+          (is (= {:env "SECRETS_AGE_IDENTITY_B64"} (ex-data e)))
+          (is (re-find #"base64-encoded age key file contents" (ex-message e)))
+          (is (str/includes? (ex-message e) "SECRETS_AGE_IDENTITY"))
+          (is (nil? (ex-cause e)))
+          (is (not (str/includes? rendered invalid)))
+          (is (zero? @materializations)
+              "invalid input is rejected before identity materialization"))))))
 
 (deftest load-secrets-opts-map-test
   (let [enc (encrypt-edn! {:k "v"})]
@@ -812,18 +935,60 @@
     (let [enc (encrypt-edn! {:k "v"})]
       (is (= {:k "v"} (secrets/load-secrets enc *key*))))))
 
-(deftest jar-resource-loading-test
-  (testing "load-secrets reads an encrypted entry through a jar: URL"
-    (let [enc (encrypt-edn! {:from :jar})
-          jar (str *dir* "/app.jar")]
-      (with-open [zos (java.util.zip.ZipOutputStream. (io/output-stream jar))]
-        (.putNextEntry zos (java.util.zip.ZipEntry. "secrets.edn.age"))
-        (io/copy (io/file enc) zos)
-        (.closeEntry zos))
-      (let [url (str "jar:file:" jar "!/secrets.edn.age")]
-        (is (= {:from :jar} (secrets/load-secrets (java.net.URL. url) *key*)))
-        (is (= {:from :jar} (secrets/load-secrets url *key*))
-            "a String source may be a URL; io/input-stream tries the URL first")))))
+(defn- jar-source!
+  "Write `encrypted` as `entry` in a local jar and return its `jar:file:` URI."
+  [encrypted jar-name entry]
+  (let [jar (io/file *dir* jar-name)]
+    (with-open [zos (java.util.zip.ZipOutputStream. (io/output-stream jar))]
+      (.putNextEntry zos (java.util.zip.ZipEntry. entry))
+      (io/copy (io/file encrypted) zos)
+      (.closeEntry zos))
+    (java.net.URI. (str "jar:" (.toURI jar) "!/" entry))))
+
+(def ^:private ^:dynamic *guarded-url-spec* nil)
+(def ^:private ^:dynamic *guarded-url-invocations* nil)
+
+(defn- guarded-url
+  "Build a JVM-only URL whose handler records every method policy must avoid.
+
+  The fixed form is read at runtime so Babashka never resolves the JVM-only
+  `URLStreamHandler` class while analyzing this test namespace."
+  [spec invoked]
+  (binding [*ns* (the-ns 'com.kirahowe.secrets-test)
+            *guarded-url-spec* spec
+            *guarded-url-invocations* invoked]
+    (eval
+     (read-string
+      "(java.net.URL.
+        nil *guarded-url-spec*
+        (proxy [java.net.URLStreamHandler] []
+          (openConnection [_]
+            (swap! *guarded-url-invocations* inc)
+            (throw (AssertionError. \"A caller-provided URL handler was opened.\")))
+          (toExternalForm [url]
+            (swap! *guarded-url-invocations* inc)
+            (proxy-super toExternalForm url))))"))))
+
+(deftest local-source-loading-test
+  (let [enc (encrypt-edn! {:from :local})
+        file (io/file enc)
+        file-uri (.toURI file)
+        jar-uri (jar-source! enc "app.jar" "secrets.edn.age")]
+    (testing "filesystem paths and local file locators remain accepted"
+      (doseq [source [enc file (.toPath file) (str file-uri) file-uri (.toURL file-uri)]]
+        (is (= {:from :local} (secrets/load-secrets source *key*)))))
+    (testing "local classpath jar resources remain accepted"
+      (doseq [source [(str jar-uri) jar-uri (.toURL jar-uri)]]
+        (is (= {:from :local} (secrets/load-secrets source *key*)))))
+    (testing "an allowed-looking caller URL cannot substitute its own I/O handler"
+      (if (System/getProperty "babashka.version")
+        (is true "JVM-only hostile URLStreamHandler coverage")
+        (doseq [spec [(str file-uri) (str jar-uri)]]
+          (let [invoked (atom 0)]
+            (is (= {:from :local}
+                   (secrets/load-secrets (guarded-url spec invoked) *key*)))
+            (is (zero? @invoked)
+                "classification avoids handler rendering and I/O dispatch")))))))
 
 ;;;; Multi-recipient encryption
 
@@ -1043,43 +1208,54 @@
 ;;;; Resource limits
 
 (defn- temp-source-copies
-  "The ciphertext temp copies `source->file` may have left behind, by name."
+  "The ciphertext temp copies `source/acquire!` may have left behind, by name."
   []
   (set (filterv #(re-matches #"^secrets-.*\.age$" %)
                 (seq (.list (io/file (System/getProperty "java.io.tmpdir")))))))
 
 (defn- acquire-source
-  "Run the private `source->file` against `limit`, running any cleanup, and
-  return `[:ok byte-count]`, the failure `:reason`, or `:io` for a transport
-  failure. The private seam is used deliberately: these boundaries are about
-  bytes, not about identities or EDN."
+  "Run `source/acquire!` against `limit`, running any cleanup, and return
+  `[:ok byte-count]` or the failure `:reason`. The owning namespace's public
+  seam is used deliberately: these boundaries are about bytes, not identities
+  or EDN."
   [source limit]
   (try
-    (let [[f cleanup!] (#'secrets/source->file source
-                                               (#'secrets/source-descriptor source)
-                                               limit)]
+    (let [[f cleanup!] (source/acquire! source (source/descriptor source) limit)]
       (try [:ok (.length f)] (finally (cleanup!))))
-    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))
-    (catch java.io.IOException _ :io)))
+    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
 
-(defn- serve-once!
-  "Serve one raw HTTP response on an ephemeral port and return its URL string.
-  `headers` is written verbatim, so a `Content-Length` can be made to lie in
-  either direction or be left out entirely."
-  [headers ^bytes body]
-  (let [server (java.net.ServerSocket. 0)]
-    (future
-      (try
-        (with-open [sock (.accept server)]
-          (let [out (.getOutputStream sock)
-                request (io/reader (.getInputStream sock))]
-            (loop [] (when (seq (str (.readLine request))) (recur)))
-            (.write out (.getBytes (str "HTTP/1.1 200 OK\r\n" headers "\r\n") "UTF-8"))
-            (.write out body)
-            (.flush out)))
-        (finally
-          (.close server))))
-    (str "http://127.0.0.1:" (.getLocalPort server) "/secrets.edn.age")))
+(defn- source-policy-failure
+  "Return the policy exception for `source`, asserting the load did not proceed."
+  [source]
+  (let [e (try
+            (secrets/load-secrets source *key*)
+            nil
+            (catch clojure.lang.ExceptionInfo e e))]
+    (is (some? e) "the source must be rejected")
+    e))
+
+(defn- tracked-http-source!
+  "Start a loopback endpoint, returning its URL, request signal, and cleanup."
+  [response]
+  (let [server (java.net.ServerSocket. 0)
+        requested (promise)
+        worker (future
+                 (try
+                   (with-open [socket (.accept server)]
+                     (deliver requested true)
+                     (if response
+                       (let [out (.getOutputStream socket)]
+                         (.write out (.getBytes ^String response "UTF-8"))
+                         (.flush out))
+                       (Thread/sleep 5000)))
+                   (catch java.net.SocketException _)
+                   (finally
+                     (.close server))))]
+    {:url (str "http://127.0.0.1:" (.getLocalPort server) "/store.age")
+     :requested requested
+     :cleanup! (fn []
+                 (.close server)
+                 (future-cancel worker))}))
 
 (defn- encrypt-sized!
   "Encrypt a store whose EDN plaintext is exactly `n` bytes and return the
@@ -1096,50 +1272,63 @@
 (deftest source-size-boundary-test
   (let [enc (encrypt-edn! {:k "v"})
         size (.length (io/file enc))
+        jar-uri (jar-source! enc "bounded.jar" "store.age")
         before (temp-source-copies)]
     (testing "a path used in place is checked without being copied"
       (is (= [:ok size] (acquire-source enc size)) "exactly at the limit is accepted")
       (is (= :source-too-large (acquire-source enc (dec size))) "one byte over is refused"))
-    (testing "a copied InputStream source is counted as it is copied"
-      (is (= [:ok size] (acquire-source (io/input-stream enc) size)))
-      (is (= :source-too-large (acquire-source (io/input-stream enc) (dec size)))))
+    (testing "a classpath jar entry is counted while it is copied"
+      (is (= [:ok size] (acquire-source jar-uri size)))
+      (is (= :source-too-large (acquire-source jar-uri (dec size)))))
     (testing "load-secrets reports the bound it refused, and no source content"
-      (is (= {:k "v"} (secrets/load-secrets enc {:identity-file *key*
-                                                 :limits {:max-source-bytes size}})))
-      (let [e (try (secrets/load-secrets enc {:identity-file *key*
-                                              :limits {:max-source-bytes (dec size)}})
+      (is (= {:k "v"} (secrets/load-secrets jar-uri {:identity-file *key*
+                                                     :limits {:max-source-bytes size}})))
+      (let [e (try (secrets/load-secrets jar-uri {:identity-file *key*
+                                                  :limits {:max-source-bytes (dec size)}})
                    (catch clojure.lang.ExceptionInfo e e))]
         (is (= :source-too-large (:reason (ex-data e))))
         (is (= (dec size) (:limit (ex-data e))))
         (is (= size (:bytes (ex-data e))))))
     (is (= before (temp-source-copies))
-        "no partial ciphertext copy survives a refused source")))
+        "no completed or partial ciphertext copy survives cleanup")))
 
-(deftest misleading-and-unknown-content-length-test
-  (let [body (byte-array 10000 (byte 65))]
-    (testing "a Content-Length that lies low does not raise the effective bound"
-      (is (= :source-too-large (acquire-source (serve-once! "Content-Length: 4\r\n" body) 5000))
-          "10000 bytes really arrive, so a declared 4 does not let them through"))
-    (testing "a Content-Length that lies high does not lower it either"
-      (is (not= :source-too-large
-                (acquire-source (serve-once! "Content-Length: 1000000\r\n" body) 20000))
-          "the declared million is never consulted; only bytes read decide")
-      (is (= :source-too-large
-             (acquire-source (serve-once! "Content-Length: 1000000\r\n" body) 100))))
-    (testing "no declared length at all is decided exactly the same way"
-      (is (= [:ok 10000] (acquire-source (serve-once! "Connection: close\r\n" body) 10000)))
-      (is (= :source-too-large
-             (acquire-source (serve-once! "Connection: close\r\n" body) 9999))))))
-
-(deftest unbounded-stream-is-refused-test
-  ;; /dev/zero opened as a stream is genuinely endless. Passing the *path* would
-  ;; take the used-in-place branch and measure a zero-length file instead.
-  (testing "an endless source is abandoned at the bound, not read to an end it has not"
-    (let [copy (future (acquire-source (io/input-stream (io/file "/dev/zero")) 65536))
-          outcome (deref copy 30000 ::never-stopped)]
-      (future-cancel copy)
-      (is (= :source-too-large outcome)
-          "::never-stopped would mean the copy ran on past the bound"))))
+(deftest remote-source-policy-test
+  (testing "nonlocal and malformed nested locators are rejected by shape"
+    (doseq [source ["ftp://example.com/store.age"
+                    "gopher://example.com/store.age"
+                    "jar:http://example.com/app.jar!/store.age"
+                    "jar:jar:file:/tmp/app.jar!/nested.jar!/store.age"
+                    "file://127.0.0.1/share/store.age"
+                    (java.io.ByteArrayInputStream. (byte-array 0))]]
+      (let [e (source-policy-failure source)]
+        (is (= :disallowed-source (:reason (ex-data e)))))))
+  (testing "loopback, private, redirects, and pre-byte stalls are rejected by URL shape"
+    (doseq [[label spec]
+            [["loopback target" "http://127.0.0.1:8080/store.age"]
+             ["private target" "https://10.0.0.1/store.age"]
+             ["redirect hop" "http://127.0.0.1:8080/redirect-to-private"]
+             ["connection stall" "http://192.0.2.1:81/connect-stall"]
+             ["read stall before the first byte" "http://127.0.0.1:8080/read-stall"]]]
+      (testing label
+        (let [e (source-policy-failure (java.net.URL. spec))]
+          (is (= :disallowed-source (:reason (ex-data e))))))))
+  (testing "controlled direct, redirect, and read-stall endpoints receive no request"
+    (doseq [[label response]
+            [["direct response" "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]
+             ["redirect hop" "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.1/\r\n\r\n"]
+             ["read stall before first byte" nil]]]
+      (testing label
+        (let [{:keys [url requested cleanup!]} (tracked-http-source! response)
+              attempt (future (source-policy-failure url))]
+          (try
+            (let [result (deref attempt 1000 ::timed-out)]
+              (is (not= ::timed-out result) "local-only rejection does not wait on transport")
+              (when (instance? clojure.lang.ExceptionInfo result)
+                (is (= :disallowed-source (:reason (ex-data result)))))
+              (is (not (realized? requested)) "the endpoint accepted no connection"))
+            (finally
+              (cleanup!)
+              (future-cancel attempt))))))))
 
 (deftest plaintext-size-boundary-test
   (let [limit 4096
@@ -1199,7 +1388,7 @@
         "and no partial staging plaintext survives — the bound trips before one exists")))
 
 (deftest edn-depth-scan-test
-  (let [depth #(#'secrets/edn-max-depth %)
+  (let [depth #(#'safe-edn/max-depth %)
         read-edn #(#'secrets/read-secrets-edn % secrets/default-limits)
         nested (fn [n] (str (apply str (repeat n \[)) (apply str (repeat n \]))))]
     (testing "only delimiters that are structure count as depth"
@@ -1231,6 +1420,54 @@
     (testing "balance is the parser's business, not the scanner's"
       (is (= 1 (depth "{:a 1")))
       (is (thrown? Exception (read-edn "{:a 1"))))))
+
+(deftest edn-parse-failures-are-content-free-test
+  (let [sentinel "123SENTINELSECRET"
+        rendered (fn [e]
+                   (str/join
+                    "\n"
+                    (for [link (take-while some? (iterate ex-cause e))
+                          part [(pr-str link)
+                                (str (ex-message link))
+                                (pr-str (ex-data link))]]
+                      part)))]
+    (testing "stable reasons distinguish each content-free failure class"
+      (are [reason s] (= reason (:reason (safe-edn/parse s)))
+        :edn-empty ""
+        :edn-empty "  ; comment only"
+        :edn-extra-values "{:one 1} {:two 2}"
+        :edn-malformed sentinel
+        :edn-malformed "{:unfinished"))
+    (testing "only numeric parser location metadata is retained"
+      (with-redefs [edn/read (fn [& _]
+                               (throw
+                                (ex-info (str "Invalid number: " sentinel)
+                                         {:line 7
+                                          :column 11
+                                          :token sentinel
+                                          :source-fragment sentinel})))]
+        (is (= {:ok? false
+                :reason :edn-malformed
+                :line 7
+                :column 11}
+               (safe-edn/parse sentinel)))))
+    (testing "the runtime exception chain drops parser messages, data, and causes"
+      (let [plain (str *dir* "/malformed-secret.edn")
+            encrypted (str *dir* "/malformed-secret.edn.age")]
+        (spit plain sentinel)
+        (age/encrypt-file! *key* plain encrypted)
+        (.delete (io/file plain))
+        (let [e (try
+                  (secrets/load-secrets encrypted *key*)
+                  nil
+                  (catch Exception e e))
+              diagnostic (rendered e)]
+          (is (some? e) "the malformed decrypted store must fail")
+          (is (= :edn-malformed (:reason (ex-data e))))
+          (is (nil? (ex-cause e)) "no parser-derived exception is retained")
+          (is (not (str/includes? diagnostic sentinel)))
+          (is (not (str/includes? diagnostic "Invalid number")))
+          (is (str/includes? (ex-message e) "malformed EDN syntax")))))))
 
 (deftest ordinary-trusted-resources-are-unaffected-test
   (testing "the defaults let a documented store through with no :limits at all"
@@ -1297,14 +1534,6 @@
                   part [(pr-str link) (str (ex-message link)) (pr-str (ex-data link))]]
               part)))
 
-(defn- closed-port
-  "A TCP port with nothing listening: bound to learn its number, then closed."
-  []
-  (let [server (java.net.ServerSocket. 0)
-        port (.getLocalPort server)]
-    (.close server)
-    port))
-
 (defn- sentinel-url
   "A URL reaching `port` whose userinfo, query, and fragment each carry a
   sentinel — the shape of a signed URL with an embedded password."
@@ -1312,13 +1541,6 @@
   (str "http://user:" (:userinfo source-sentinels) "@127.0.0.1:" port "/store.age"
        "?X-Amz-Signature=" (:query source-sentinels)
        "#" (:fragment source-sentinels)))
-
-(defn- serve-sentinel-url!
-  "Serve `path`'s bytes once, and return the sentinel-bearing URL reaching them."
-  [path]
-  (let [served (serve-once! "Connection: close\r\n"
-                            (java.nio.file.Files/readAllBytes (.toPath (io/file path))))]
-    (sentinel-url (.getPort (java.net.URL. served)))))
 
 (defn- load-failure
   "The exception `load-secrets` throws for `source` under `opts`, asserting that
@@ -1334,7 +1556,7 @@
     e))
 
 (deftest source-descriptors-drop-credentials-test
-  (let [describe #(#'secrets/source-descriptor %)
+  (let [describe source/descriptor
         signed (str "https://user:" (:userinfo source-sentinels)
                     "@example.com:8443/store.age")]
     (testing "a locator keeps scheme, host, port, and path, and nothing else"
@@ -1374,23 +1596,16 @@
         (is (= [] (leaked (pr-str (describe source)))))))))
 
 (deftest source-failures-carry-no-sentinel-test
-  (let [wrong-key (str *dir* "/wrong-key.txt")
-        _ (age/keygen! wrong-key)
-        enc (encrypt-edn! {:nested {:deep {:deeper "v"}}})
-        chain (fn [source opts]
-                (rendered-chain (load-failure source (merge {:identity-file *key*} opts))))]
-    (testing "a source that cannot be opened at all"
-      (is (= [] (leaked (chain (sentinel-url (closed-port)) nil)))))
-    (testing "a source past :max-source-bytes"
-      (is (= [] (leaked (chain (serve-sentinel-url! enc)
-                               {:limits {:max-source-bytes 1}})))))
-    (testing "a decryption that fails because the key is wrong"
-      (is (= [] (leaked (chain (serve-sentinel-url! enc) {:identity-file wrong-key})))))
-    (testing "a plaintext nested past :max-edn-depth"
-      (is (= [] (leaked (chain (serve-sentinel-url! enc)
-                               {:limits {:max-edn-depth 1}})))))
+  (let [chain (fn [source]
+                (rendered-chain
+                 (load-failure source {:identity-file *key*})))]
+    (testing "policy failures retain no sensitive locator field"
+      (doseq [source [(sentinel-url 8443)
+                      (str "https://example.com/s.age?sig=" (:query source-sentinels))
+                      (str "https://example.com/s.age#" (:fragment source-sentinels))]]
+        (is (= [] (leaked (chain source))))))
     (testing "a source object whose toString is the credential"
-      (is (= [] (leaked (chain (StringBuilder. (:to-string source-sentinels)) nil)))))))
+      (is (= [] (leaked (chain (StringBuilder. (:to-string source-sentinels)))))))))
 
 (deftest materialized-identity-never-appears-in-diagnostics-test
   (let [wrong-key (str *dir* "/wrong-key.txt")
@@ -1433,45 +1648,44 @@
   (let [wrong-key (str *dir* "/wrong-key.txt")
         _ (age/keygen! wrong-key)
         enc (encrypt-edn! {:nested {:deep {:deeper "v"}}})
-        port (closed-port)
-        served (fn [] {:kind :url :scheme "http" :host "127.0.0.1" :path "/store.age"})
+        jar-uri (jar-source! enc "diagnostics.jar" "store.age")
+        descriptor (source/descriptor jar-uri)
         failure (fn [source opts]
                   (load-failure source (merge {:identity-file *key*} opts)))]
-    (testing "an unopenable locator names the resource and which transport failed"
-      (let [e (failure (sentinel-url port) nil)
+    (testing "a disallowed locator explains the local-only policy"
+      (let [e (failure (sentinel-url 8443) nil)
             data (ex-data e)]
-        (is (= :no-file (:reason data)))
-        (is (= (assoc (served) :port port) (:source data)))
-        (is (str/includes? (ex-message e) (str "http://127.0.0.1:" port "/store.age")))
-        (is (re-find #"java\.net\.\w*Exception" (ex-message e))
-            "the transport is named even though its own message is withheld")))
-    (testing "an oversized source names the bound it refused and the source kind"
-      (let [url (serve-sentinel-url! enc)
-            e (failure url {:limits {:max-source-bytes 1}})
+        (is (= :disallowed-source (:reason data)))
+        (is (= {:kind :url :scheme "http" :host "127.0.0.1"
+                :port 8443 :path "/store.age"}
+               (:source data)))
+        (is (str/includes? (ex-message e) "local-only"))))
+    (testing "an oversized local resource names the bound and safe descriptor"
+      (let [e (failure jar-uri {:limits {:max-source-bytes 1}})
             data (ex-data e)]
         (is (= :source-too-large (:reason data)))
         (is (= 1 (:limit data)))
         (is (pos? (:bytes data)))
-        (is (= (served) (dissoc (:source data) :port)))
+        (is (= descriptor (:source data)))
         (is (str/includes? (ex-message e) ":max-source-bytes"))))
-    (testing "a wrong key still says so, and still says which source it was reading"
-      (let [e (failure (serve-sentinel-url! enc) {:identity-file wrong-key})
+    (testing "a wrong key still says so and names the local resource"
+      (let [e (failure jar-uri {:identity-file wrong-key})
             data (ex-data e)]
         (is (= "age decryption failed" (ex-message e)))
         (is (str/includes? (:hint data) "Wrong key"))
         (is (seq (:error data)) "the captured stderr is still there")
-        (is (= (served) (dissoc (:source data) :port)))))
-    (testing "an EDN plaintext past its depth bound keeps its reason and its source"
-      (let [e (failure (serve-sentinel-url! enc) {:limits {:max-edn-depth 1}})
+        (is (= descriptor (:source data)))))
+    (testing "an EDN plaintext past its depth bound keeps its reason and source"
+      (let [e (failure jar-uri {:limits {:max-edn-depth 1}})
             data (ex-data e)]
         (is (= :edn-too-deep (:reason data)))
         (is (= 1 (:limit data)))
-        (is (= (served) (dissoc (:source data) :port)))
+        (is (= descriptor (:source data)))
         (is (str/includes? (ex-message e) ":max-edn-depth"))))
-    (testing "an unopenable object says its class, never its toString"
+    (testing "a rejected object says its class, never its toString"
       (let [e (failure (StringBuilder. (:to-string source-sentinels)) nil)
             data (ex-data e)]
-        (is (= :no-file (:reason data)))
+        (is (= :disallowed-source (:reason data)))
         (is (= {:kind :object :class "java.lang.StringBuilder"} (:source data)))
         (is (str/includes? (ex-message e) "an instance of java.lang.StringBuilder"))))))
 

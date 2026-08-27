@@ -420,14 +420,22 @@
   (testing "invalid existing templates"
     (let [template (io/file *dir* "secrets/secrets.edn.example")]
       (.mkdirs (.getParentFile template))
-      (spit template "not an edn map")
+      (spit template "not-an-edn-map")
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"must contain an EDN map"
                             (init/proposed-changes {:root *dir* :app "reader"})))
-      (spit template "{")
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"not valid EDN"
-                            (init/proposed-changes {:root *dir* :app "reader"})))))
+      (let [sentinel "123SENTINELSECRET"
+            _ (spit template sentinel)
+            e (try
+                (init/proposed-changes {:root *dir* :app "reader"})
+                nil
+                (catch Exception e e))
+            rendered (pr-str [(ex-message e) (ex-data e) (ex-cause e)])]
+        (is (some? e))
+        (is (re-find #"not valid EDN" (ex-message e)))
+        (is (= :edn-malformed (:reason (ex-data e))))
+        (is (nil? (ex-cause e)))
+        (is (not (str/includes? rendered sentinel))))))
   (testing "symlinked ancestors"
     (let [link (.toPath (io/file *dir* "secrets"))]
       (delete-tree! link)

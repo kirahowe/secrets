@@ -29,9 +29,9 @@
     2. $SECRETS_AGE_IDENTITY      — the raw key file *contents*, used verbatim and
        materialized to a 0600 temp file. Lets a deploy inject the key as one
        secret/env var.
-    3. $SECRETS_AGE_IDENTITY_B64  — base64-encoded key file contents (newline-tolerant),
-       for secret stores that mangle multi-line values. Invalid base64 throws —
-       there is no silent fallback.
+    3. $SECRETS_AGE_IDENTITY_B64  — canonical base64-encoded key file contents.
+       ASCII space, horizontal tab, carriage return, and line feed are permitted
+       for wrapping; every other nonalphabet character or malformed encoding throws.
     4. ~/.config/<app>/key.txt — the local developer default, used only when an
        app name is known (an `:app` option or app argument).
   When none of these yields an identity, resolution returns nil and loading
@@ -40,10 +40,12 @@
   The temp files that sources 2 and 3 materialize are this library's to clean
   up: `reset-identity-cache!` deletes them, waiting for any decryption still
   holding one, and `.deleteOnExit` is only the backstop."
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
+  (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [com.kirahowe.secrets.age :as age]))
+            [com.kirahowe.secrets.age :as age]
+            [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.safe-edn :as safe-edn]
+            [com.kirahowe.secrets.source :as source]))
 
 (def ^:private not-found ::not-found)
 
@@ -60,35 +62,15 @@
       (str (user-home) (subs s 1))
       s)))
 
-;;;; Owner-only temp files
-
-(defn owner-only-temp-file!
-  "Create a delete-on-exit temp file that is owner-only (0600) from the moment
-  it exists — atomically via NIO POSIX attributes, so there is no window with
-  default-umask permissions. Falls back to create-then-chmod on filesystems
-  without POSIX permissions. Returns a java.io.File. Used for every file this
-  library materializes that may hold sensitive bytes (identities, plaintext)."
-  [prefix suffix]
-  (doto (try
-          (.toFile
-           (java.nio.file.Files/createTempFile
-            prefix suffix
-            (into-array java.nio.file.attribute.FileAttribute
-                        [(java.nio.file.attribute.PosixFilePermissions/asFileAttribute
-                          #{java.nio.file.attribute.PosixFilePermission/OWNER_READ
-                            java.nio.file.attribute.PosixFilePermission/OWNER_WRITE})])))
-          (catch UnsupportedOperationException _
-            (doto (java.io.File/createTempFile prefix suffix)
-              (.setReadable false false) (.setReadable true true)
-              (.setWritable false false) (.setWritable true true))))
-    (.deleteOnExit)))
-
 ;;;; Identity resolution
 
 ;;; `identity-state` holds every injected identity this library materialized and
 ;;; the generation they belong to:
 ;;;
-;;;     {:generation 0 :entries {digest entry} :retired {path users}}
+;;;     {:generation 0
+;;;      :entries {digest entry}
+;;;      :retired {path users}
+;;;      :cleanup #{path}}
 ;;;
 ;;; An `:entries` entry is a `delay` while its file is being written and
 ;;; `{:path … :users n}` once the file exists, where `:users` counts the leases
@@ -97,37 +79,85 @@
 ;;; belong to it have to move together, and replacing `:entries` wholesale is
 ;;; the single mechanism that retires them.
 ;;;
-;;; `:retired` is not a second mechanism — it is only where an entry waits for a
-;;; lease that outlived its generation. It is keyed by path because a temp path
-;;; is unique to one materialization, so it names the file a lease is holding
-;;; without depending on a digest a newer generation may have re-materialized.
+;;; `:retired` is where an entry waits for a lease that outlived its generation.
+;;; `:cleanup` retains unleased paths until checked deletion confirms the file is
+;;; absent. Both are keyed by path because a temp path is unique to one
+;;; materialization, so neither depends on a digest a newer generation may have
+;;; re-materialized.
 ;;;
 ;;; `:generation` gives a lifecycle an identity that tests and diagnostics can
 ;;; name. It is deliberately not part of any key.
 
 (defonce ^:private identity-state
-  (atom {:generation 0 :entries {} :retired {}}))
+  (atom {:generation 0 :entries {} :retired {} :cleanup #{}}))
+
+(defn- try-delete-identity-file!
+  "Attempt to delete `file`. Kept as the narrow filesystem seam for tests."
+  [file]
+  (.delete file))
 
 (defn- delete-identity-file!
-  "Delete a materialized identity file, tolerating one that is already gone.
-  Prompt deletion is the lifecycle here; `.deleteOnExit` is only the backstop."
+  "Return `:deleted`, `:absent`, or `:failed` after checked deletion of `path`."
   [path]
-  (.delete (io/file path)))
+  (let [file (io/file path)]
+    (try
+      (cond
+        (not (.exists file)) :absent
+        (try-delete-identity-file! file) :deleted
+        (.exists file) :failed
+        :else :absent)
+      (catch SecurityException _
+        :failed))))
+
+(defn- track-cleanup
+  "Retain `path` in `state` until checked deletion confirms it absent."
+  [state path]
+  (update state :cleanup (fnil conj #{}) path))
+
+(defn- forget-cleanup
+  "Forget `path` after checked deletion confirms it absent."
+  [state path]
+  (update state :cleanup (fnil disj #{}) path))
+
+(defn- cleanup-identity-file!
+  "Delete tracked `path`, retaining it when deletion fails."
+  [path]
+  (let [outcome (delete-identity-file! path)]
+    (when (not= :failed outcome)
+      (swap! identity-state forget-cleanup path))
+    outcome))
+
+(def ^:private identity-b64-whitespace-re
+  "ASCII whitespace permitted in base64 identity transport: space, horizontal
+  tab, carriage return, and line feed."
+  #"[ \t\r\n]")
+
+(defn- invalid-b64-identity
+  "Return the content-free error for invalid base64 identity input."
+  []
+  (ex-info (str "SECRETS_AGE_IDENTITY_B64 is not valid base64. Set it to the"
+                " base64-encoded age key file contents, or use"
+                " SECRETS_AGE_IDENTITY (raw contents) / SECRETS_AGE_IDENTITY_FILE"
+                " (a path) instead.")
+           {:env "SECRETS_AGE_IDENTITY_B64"}))
 
 (defn- decode-b64-identity
-  "Decode an $SECRETS_AGE_IDENTITY_B64 value (base64 of the key file contents,
-  newline-tolerant) to the raw identity text. Throws on invalid base64 —
-  never falls back to using the value verbatim."
+  "Decode canonical base64 identity contents to raw identity text.
+
+  ASCII space, horizontal tab, carriage return, and line feed are removed for
+  environment transport. Every other nonalphabet character, noncanonical
+  encoding, malformed length, or padding error throws without retaining the
+  input or a decoder cause."
   [contents]
-  (try
-    (String. (.decode (java.util.Base64/getMimeDecoder) (str/trim contents)) "UTF-8")
-    (catch IllegalArgumentException e
-      (throw (ex-info (str "SECRETS_AGE_IDENTITY_B64 is not valid base64. Set it to the"
-                           " base64-encoded age key file contents, or use"
-                           " SECRETS_AGE_IDENTITY (raw contents) / SECRETS_AGE_IDENTITY_FILE"
-                           " (a path) instead.")
-                      {:env "SECRETS_AGE_IDENTITY_B64"}
-                      e)))))
+  (let [normalized (str/replace contents identity-b64-whitespace-re "")
+        decoded (try
+                  (.decode (java.util.Base64/getDecoder) normalized)
+                  (catch IllegalArgumentException _
+                    (throw (invalid-b64-identity))))]
+    (when-not (= normalized
+                 (.encodeToString (java.util.Base64/getEncoder) decoded))
+      (throw (invalid-b64-identity)))
+    (String. decoded "UTF-8")))
 
 (defn- identity-digest
   "Return a stable SHA-256 cache key without retaining the raw identity contents."
@@ -145,12 +175,14 @@
   reported by exception class only, with no cause attached — the underlying
   IOException names the temp file, and a diagnostic must not."
   [contents]
-  (let [file (owner-only-temp-file! "age-identity-" ".txt")]
+  (let [file (fs/owner-only-temp-file! "age-identity-" ".txt")]
     (try
       (spit file contents)
       (.getAbsolutePath file)
       (catch Exception e
-        (.delete file)
+        (let [path (.getAbsolutePath file)]
+          (swap! identity-state track-cleanup path)
+          (cleanup-identity-file! path))
         (throw (ex-info (str "Could not write the injected age identity to a temp file ("
                              (.getName (class e)) "). Check the temp directory is writable.")
                         {:reason :identity-not-materialized}))))))
@@ -205,7 +237,8 @@
             promoted (swap! identity-state promote-identity digest entry path)]
         (if (= path (get-in promoted [:entries digest :path]))
           path
-          (do (delete-identity-file! path)
+          (do (swap! identity-state track-cleanup path)
+              (cleanup-identity-file! path)
               (recur contents)))))))
 
 ;;;; Identity leases and retirement
@@ -237,25 +270,26 @@
     (some? (live-digest (:entries before) path))))
 
 (defn- release-user
-  "Drop one active user of `path`, forgetting a retired entry whose last user is
-  leaving."
+  "Drop one active user of `path`, moving a retired path whose last user leaves
+  into checked cleanup."
   [{:keys [entries retired] :as state} path]
   (if (contains? retired path)
     (if (= 1 (get retired path))
-      (update state :retired dissoc path)
+      (-> state
+          (update :retired dissoc path)
+          (track-cleanup path))
       (update-in state [:retired path] dec))
     (if-let [digest (live-digest entries path)]
       (update-in state [:entries digest :users] dec)
       state)))
 
 (defn- release-identity!
-  "Release one active user of the identity at `path`, deleting the file when a
-  [[reset-identity-cache!]] retired it while this user held it and this was the
-  last one. That deferred deletion happens here, not at JVM exit."
+  "Release one active user of the identity at `path`, checking deferred deletion
+  when the last user leaves and retaining a failed path for the next reset."
   [path]
   (let [[before] (swap-vals! identity-state release-user path)]
     (when (= 1 (get (:retired before) path))
-      (delete-identity-file! path))
+      (cleanup-identity-file! path))
     nil))
 
 (defn with-identity
@@ -281,48 +315,58 @@
       (finally
         (when held? (release-identity! path))))))
 
+(defn- retire-entry
+  "Move materialized `entry` to active retirement or checked cleanup."
+  [state _ entry]
+  (if (map? entry)
+    (if (pos? (:users entry))
+      (assoc-in state [:retired (:path entry)] (:users entry))
+      (track-cleanup state (:path entry)))
+    state))
+
 (defn- retire-identities
-  "Move `state` to a new generation: a materialized entry with an active user
-  waits in `:retired` for its last release, and everything else is dropped —
-  including a delay still writing, whose materialization then deletes the orphan
-  no entry points at any more."
-  [{:keys [generation entries retired]}]
-  {:generation (inc generation)
-   :entries {}
-   :retired (into retired
-                  (keep (fn [[_ entry]]
-                          (when (and (map? entry) (pos? (:users entry)))
-                            [(:path entry) (:users entry)])))
-                  entries)})
+  "Move `state` to a new generation, retaining every materialized path until its
+  active leases finish and checked deletion confirms it absent."
+  [{:keys [generation entries retired cleanup]}]
+  (reduce-kv retire-entry
+             {:generation (inc generation)
+              :entries {}
+              :retired retired
+              :cleanup (or cleanup #{})}
+             entries))
+
+(defn- cleanup-identities!
+  "Clean `paths` and return truthful outcome counts without exposing paths."
+  [paths]
+  (reduce (fn [counts path]
+            (update counts (cleanup-identity-file! path) inc))
+          {:deleted 0 :absent 0 :failed 0}
+          paths))
 
 (defn reset-identity-cache!
   "Retire every temp identity file this library materialized from
-  `SECRETS_AGE_IDENTITY` or `SECRETS_AGE_IDENTITY_B64`: delete each one no
-  decryption is using, and leave the rest to the last [[with-identity]] release
+  `SECRETS_AGE_IDENTITY` or `SECRETS_AGE_IDENTITY_B64`: check deletion of each one
+  no decryption is using, and leave the rest to the last [[with-identity]] release
   holding them. Identity files the caller owns — `SECRETS_AGE_IDENTITY_FILE`,
   an explicit `:identity-file`, `~/.config/<app>/key.txt` — are never touched.
 
   This is the primary lifecycle for an injected identity, so a long-running
   process can stop keeping a private key on disk without exiting.
   `.deleteOnExit` stays only as the backstop for a process that never reaches
-  here, and an abnormal exit can still leave the file behind. Idempotent: a
-  second call has nothing to retire and deletes nothing. A resolution after this
-  call materializes a fresh file rather than reusing a retired path.
+  here, and an abnormal exit can still leave the file behind. A resolution after
+  this call materializes a fresh file rather than reusing a retired path.
 
-  Returns `{:generation g :deleted n :pending n}` — the new generation, how many
-  files this call deleted, and how many it retired into a decryption still in
-  flight. No path, digest, or identity content is returned."
+  Returns `{:generation g :deleted n :absent n :failed n :pending n}`. `:deleted`
+  counts successful delete operations, `:absent` counts tracked paths already
+  gone, `:failed` counts existing paths still retained for a later retry, and
+  `:pending` counts newly retired paths still leased. No path, digest, or identity
+  content is returned."
   []
   (let [[before after] (swap-vals! identity-state retire-identities)
-        unused (into []
-                     (keep (fn [[_ entry]]
-                             (when (and (map? entry) (zero? (:users entry)))
-                               (:path entry))))
-                     (:entries before))]
-    (run! delete-identity-file! unused)
-    {:generation (:generation after)
-     :deleted (count unused)
-     :pending (- (count (:retired after)) (count (:retired before)))}))
+        outcomes (cleanup-identities! (:cleanup after))]
+    (assoc outcomes
+           :generation (:generation after)
+           :pending (- (count (:retired after)) (count (:retired before))))))
 
 (def ^:private identity-env-help
   "What each identity variable should contain, for the set-but-empty error."
@@ -372,8 +416,10 @@
   checked in order:
     $SECRETS_AGE_IDENTITY_FILE — a path to the key file, returned as-is.
     $SECRETS_AGE_IDENTITY      — the raw key file contents, used verbatim.
-    $SECRETS_AGE_IDENTITY_B64  — base64-encoded key file contents (invalid base64 throws).
-  A blank value throws. Raw or decoded contents are materialized into owner-only
+    $SECRETS_AGE_IDENTITY_B64  — canonical base64-encoded key file contents;
+      ASCII space, horizontal tab, carriage return, and line feed are ignored.
+  Every other nonalphabet character or malformed encoding throws. A blank value
+  throws. Raw or decoded contents are materialized into owner-only
   temp files, one per distinct value per lifecycle; `reset-identity-cache!`
   deletes them, and a path returned here is outside every [[with-identity]]
   lease until you wrap it in one."
@@ -427,8 +473,8 @@
   exhausting the process (CWE-400), and each is checked *during* the work rather
   than after it:
 
-    :max-source-bytes     ciphertext bytes read from a URL, InputStream, or
-                          file, counted while copying (16 MiB).
+    :max-source-bytes     ciphertext bytes read from a local file or classpath
+                          jar resource (16 MiB).
     :max-plaintext-bytes  plaintext bytes `age` may produce before the
                           subprocess is killed (8 MiB).
     :max-edn-depth        collection nesting depth the decrypted EDN may reach,
@@ -439,7 +485,7 @@
   defaults sit far above every documented example — a real store is kilobytes."
   {:max-source-bytes 16777216
    :max-plaintext-bytes age/default-max-plaintext-bytes
-   :max-edn-depth 100})
+   :max-edn-depth safe-edn/default-max-depth})
 
 (defn- resolve-limits
   "Merge a supplied `:limits` map over `default-limits`. Rejects anything a
@@ -463,175 +509,7 @@
                       {:limits limits :limit limit :value value :reason :invalid-limits}))))
   (merge default-limits limits))
 
-;;;; Source descriptors
-
-;;; A secrets source can itself be a credential: a signed URL keeps its
-;;; signature in the query, `https://user:pass@host/store.age` keeps a password
-;;; in the userinfo, and a caller's own object can render anything at all from
-;;; `toString`. So no failure carries a source value — it carries a descriptor
-;;; built by allowlist, and every message about a source is written from that
-;;; descriptor rather than from the source.
-
-(def ^:private max-locator-schemes
-  "How many nested locator schemes a descriptor unwraps — `jar:file:` is two —
-  before it keeps only the schemes it has seen. A source string can spell
-  `a:b:c:…` to any depth, and describing one is bounded work."
-  4)
-
-(def ^:private uri-scheme
-  "A leading URI scheme, per RFC 3986. A source string carrying one is a
-  locator whose remainder may hold a credential, never a path to keep as-is."
-  #"^([A-Za-z][A-Za-z0-9+.\-]*):")
-
-(defn- parse-uri
-  "`s` as a `java.net.URI`, or nil when it does not parse. The
-  `URISyntaxException` is dropped rather than reported: its message quotes the
-  whole string it rejected."
-  [s]
-  (try
-    (java.net.URI. s)
-    (catch Exception _ nil)))
-
-(defn- locator-parts
-  "The scheme chain of the locator string `s` and its innermost parsed URI, as
-  `[schemes uri]`.
-
-  An opaque URI wraps another locator (`jar:file:/app.jar!/store.age`), and each
-  wrapper contributes only its scheme. Unwrapping stops at a part that is not
-  opaque, does not parse, or carries no scheme, and at `max-locator-schemes`
-  either way."
-  [s]
-  (loop [s s schemes []]
-    (let [scheme (second (re-find uri-scheme s))
-          uri (when scheme (parse-uri s))
-          schemes (cond-> schemes scheme (conj scheme))]
-      (if (and uri (.isOpaque uri) (< (count schemes) max-locator-schemes))
-        (recur (.getSchemeSpecificPart uri) schemes)
-        [schemes uri]))))
-
-(defn- locator-descriptor
-  "Allowlisted metadata for the locator string `s`: its scheme chain, host,
-  port, and path, and nothing else. Userinfo, query, and fragment are dropped —
-  a signed URL keeps its credential in the query and an embedded password in its
-  userinfo — and a locator whose remainder cannot be taken apart keeps only its
-  scheme.
-
-  A *path* can carry a token too (`/t/abc123/store.age`), so keeping it is a
-  judgement rather than a safe default: without it a diagnostic cannot say which
-  resource failed. That residual risk is real, not zero."
-  [s]
-  (let [[schemes uri] (locator-parts s)
-        host (some-> uri .getHost not-empty)
-        path (some-> uri .getPath not-empty)
-        port (or (some-> uri .getPort) -1)]
-    (cond-> {:kind :url :scheme (str/join ":" schemes)}
-      host (assoc :host host)
-      (pos? port) (assoc :port port)
-      path (assoc :path path))))
-
-(defn- source-descriptor
-  "Allowlisted metadata naming which secrets source a failure is about, safe to
-  attach to an exception or render into a message.
-
-  It is built kind by kind, never by rendering the value:
-
-  - A URL, URI, or scheme-carrying string keeps what [[locator-descriptor]]
-    keeps — scheme, host, port, path — with userinfo, query, and fragment gone.
-  - A File or a path string keeps its path. That path is the caller's own, and
-    naming it is most of a diagnostic's value.
-  - Anything else — an InputStream, a Reader, a caller's own type — keeps only
-    its class name. Nothing here calls `str` or `pr-str` on the value: a custom
-    `toString` is exactly how a credential-bearing object leaks.
-
-  `nil` describes nothing, so a nil source carries no descriptor at all."
-  [source]
-  (cond
-    (nil? source) nil
-    (instance? java.io.File source) {:kind :file :path (str source)}
-    (string? source) (if (re-find uri-scheme source)
-                       (locator-descriptor source)
-                       {:kind :file :path source})
-    (or (instance? java.net.URL source)
-        (instance? java.net.URI source)) (locator-descriptor (str source))
-    :else {:kind :object :class (.getName (class source))}))
-
-(defn- source-description
-  "A one-line rendering of a source `descriptor` for a message. It can say no
-  more than the descriptor kept: an object contributes its class name, never its
-  `toString`."
-  [{:keys [kind path scheme host port] class-name :class}]
-  (if (= :url kind)
-    (str scheme ":" (when host (str "//" host)) (when port (str ":" port)) path)
-    (or path (str "an instance of " class-name))))
-
 ;;;; Loading
-
-(def ^:private source-chunk-bytes
-  "Sources are copied in fixed 64 KiB chunks so the running total is checked
-  before every further read rather than after the source is exhausted."
-  65536)
-
-(defn- source-too-large!
-  "Throw the source size failure, naming only the source descriptor, the byte
-  count, and the limit — never any source content."
-  [descriptor read-bytes limit]
-  (throw (ex-info (str "The secrets source is larger than the configured :max-source-bytes"
-                       " limit of " limit " bytes.")
-                  {:source descriptor
-                   :bytes read-bytes
-                   :limit limit
-                   :reason :source-too-large})))
-
-(defn- copy-source!
-  "Copy `in` to `out` in fixed chunks, refusing to write more than `limit`
-  bytes.
-
-  A chunk that would push the total past `limit` is never written, so nothing
-  beyond the bound reaches the filesystem and an endless stream is abandoned at
-  the bound instead of being read to an end it does not have. Counting while
-  copying is what makes a declared length irrelevant: a `Content-Length` that
-  lies in either direction, or no length at all, changes nothing here."
-  [descriptor ^java.io.InputStream in ^java.io.OutputStream out limit]
-  (let [chunk (byte-array source-chunk-bytes)]
-    (loop [total 0]
-      (let [n (.read in chunk 0 source-chunk-bytes)]
-        (when-not (neg? n)
-          (let [total (+ total n)]
-            (when (> total limit)
-              (source-too-large! descriptor total limit))
-            (.write out chunk 0 n)
-            (recur total)))))))
-
-(defn- source->file
-  "Coerce a secrets `source`, described by `descriptor`, to a [file cleanup!]
-  pair, refusing a source larger than `limit` bytes. Path strings and Files
-  naming an existing file are used in place (no cleanup), so their length is
-  checked directly. Anything else that `io/input-stream` can open — any URL
-  (including a jar: resource URL from inside an uberjar), an InputStream, … — is
-  copied to a 0600 temp file so `age` can read it, counting bytes as it goes and
-  deleting the partial copy at once if the bound is passed; cleanup deletes that
-  copy."
-  [source descriptor limit]
-  (let [f (when (or (instance? java.io.File source) (string? source))
-            (io/file source))]
-    (if (and f (.exists f))
-      (do
-        (when (> (.length f) limit)
-          (source-too-large! descriptor (.length f) limit))
-        [f (fn [])])
-      (let [tmp (owner-only-temp-file! "secrets-" ".age")]
-        (try
-          (with-open [in (io/input-stream source)
-                      out (io/output-stream tmp)]
-            (copy-source! descriptor in out limit))
-          (catch Exception e
-            (.delete tmp)
-            (throw e)))
-        [tmp #(.delete tmp)]))))
-
-(def ^:private no-store-hint
-  "One-line remediation appended to \"no secrets file\" errors."
-  "Create it with `bb secrets new`.")
 
 (defn- load-identity
   "The identity for one `load-secrets` call as `[path materialized?]`. An
@@ -661,115 +539,40 @@
                         descriptor (assoc :source descriptor)
                         nameable (assoc :identity nameable)))))))
 
-(defn- unreadable-source!
-  "Throw the `:no-file` failure for a source `io/input-stream` could not read.
+(defn- edn-location-message
+  [{:keys [line column]}]
+  (cond
+    (and line column) (str " at line " line ", column " column)
+    line (str " at line " line)
+    column (str " at column " column)
+    :else ""))
 
-  A source that is a path is named, and the transport failure's own message and
-  the exception itself travel with it: that message can only name the path,
-  which the failure names anyway. For every other kind both are dropped —
-  `io/input-stream` builds its message out of the value it was given, a URL in
-  full or `pr-str` of a caller's object, and printing an exception prints its
-  causes' messages too — so the failure carries the exception's class instead,
-  which says which transport failed without quoting what it was handed."
-  [descriptor e]
-  (let [path (when (= :file (:kind descriptor)) (:path descriptor))]
-    (throw
-     (if path
-       (ex-info (if (.exists (io/file path))
-                  (str "Could not read secrets source " path ": " (.getMessage e))
-                  (str "Secrets file not found: " path ". " no-store-hint))
-                {:source descriptor :reason :no-file}
-                e)
-       (ex-info (str "Could not read secrets source " (source-description descriptor)
-                     " (" (.getName (class e)) "). The failure's own message is withheld:"
-                     " it is built from the source itself, userinfo and query included.")
-                {:source descriptor :reason :no-file})))))
+(defn- edn-failure-data
+  [failure]
+  (select-keys failure [:reason :line :column :depth :limit]))
 
-(defn- acquire-source!
-  "Acquire a file and cleanup function for `source`, described by `descriptor`,
-  under `limits`, translating read failures."
-  [source descriptor limits]
-  (when (nil? source)
-    (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
-                         " (io/resource \"secrets.edn.age\") found nothing on the classpath"
-                         " — check the encrypted file is present as a classpath resource. "
-                         no-store-hint)
-                    {:reason :no-file})))
-  ;; Opening decides whether a source is readable. A String may name a path or
-  ;; a URL, so checking for a missing path first would reject jar:file: URLs.
-  ;; IllegalArgumentException is what `io/input-stream` raises for a source it
-  ;; cannot open at all — a Reader, a caller's own type — and it reaches a
-  ;; caller for the same reason an IOException does.
-  (try
-    (source->file source descriptor (:max-source-bytes limits))
-    (catch java.io.IOException e (unreadable-source! descriptor e))
-    (catch IllegalArgumentException e (unreadable-source! descriptor e))))
+(defn- edn-failure-message
+  [{:keys [reason depth limit] :as failure}]
+  (case reason
+    :edn-empty "The decrypted secrets are empty; expected exactly one EDN value."
+    :edn-extra-values (str "The decrypted secrets contain more than one EDN value;"
+                           " expected exactly one.")
+    :edn-too-deep (str "The decrypted secrets nest " depth " collections deep, past the"
+                       " configured :max-edn-depth limit of " limit ".")
+    :edn-malformed (str "The decrypted secrets contain malformed EDN syntax"
+                        (edn-location-message failure) ".")))
 
-(defn- skip-string
-  "Return the index just past the EDN string literal whose opening quote sits at
-  `i` - 1, so a `\\` escape cannot hide the closing quote."
-  [^String s i]
-  (let [n (.length s)]
-    (loop [i i]
-      (cond
-        (>= i n) n
-        (= \\ (.charAt s i)) (recur (+ i 2))
-        (= \" (.charAt s i)) (inc i)
-        :else (recur (inc i))))))
-
-(defn- skip-comment
-  "Return the index of the newline ending the `;` comment that starts at `i`, or
-  the end of `s`."
-  [^String s i]
-  (let [n (.length s)]
-    (loop [i i]
-      (if (or (>= i n) (= \newline (.charAt s i)))
-        i
-        (recur (inc i))))))
-
-(defn- edn-max-depth
-  "Return the deepest collection nesting the EDN text `s` reaches, scanning it
-  once without parsing it.
-
-  Only delimiters that are structure count: string literals (including their
-  `\\` escapes), character literals such as `\\[`, and `;` comments are skipped,
-  so a delimiter inside any of them is text rather than depth. `#{` needs no
-  special case — its `{` is the opener. Surplus closing delimiters clamp at
-  zero: balance is `clojure.edn`'s job, not this scanner's."
-  [^String s]
-  (let [n (.length s)]
-    (loop [i 0 depth 0 deepest 0]
-      (if (>= i n)
-        deepest
-        (case (.charAt s i)
-          \" (recur (skip-string s (inc i)) depth deepest)
-          \\ (recur (+ i 2) depth deepest)
-          \; (recur (skip-comment s (inc i)) depth deepest)
-          (\( \[ \{) (recur (inc i) (inc depth) (max deepest (inc depth)))
-          (\) \] \}) (recur (inc i) (max 0 (dec depth)) deepest)
-          (recur (inc i) depth deepest))))))
+(def ^:private edn-failure-reasons
+  #{:edn-empty :edn-extra-values :edn-too-deep :edn-malformed})
 
 (defn- read-secrets-edn
-  "Parse decrypted `plaintext` as EDN under `limits`.
-
-  The whole parse policy is two bounds and one deliberate absence. EDN has no
-  aliasing, reference, or expansion mechanism, so a parsed graph's size is
-  linear in its plaintext's byte count: `:max-plaintext-bytes`, enforced while
-  `age` is still writing, already bounds the graph. What a byte bound does not
-  bound is parser *recursion*: a few hundred kilobytes of `[[[[…` overflows the
-  stack, and `StackOverflowError` is an `Error` no caller should be relying on a
-  `catch` for, so `:max-edn-depth` is checked by one linear scan
-  ([[edn-max-depth]]) before the parser sees the text. And `clojure.edn` with no
-  custom readers evaluates nothing at all — unlike `read`, it cannot construct
-  arbitrary classes or run code, so no input, of any size, buys execution."
+  "Parse decrypted `plaintext` under the shared, content-free EDN policy."
   [plaintext limits]
-  (let [limit (:max-edn-depth limits)
-        depth (edn-max-depth plaintext)]
-    (when (> depth limit)
-      (throw (ex-info (str "The decrypted secrets nest " depth " collections deep, past the"
-                           " configured :max-edn-depth limit of " limit ".")
-                      {:depth depth :limit limit :reason :edn-too-deep})))
-    (edn/read-string plaintext)))
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext limits)]
+    (if ok?
+      value
+      (throw (ex-info (edn-failure-message parsed)
+                      (edn-failure-data parsed))))))
 
 (defn- decrypt-and-read!
   "Decrypt and read `file` under `opts` — `:limits`, the `:source` descriptor,
@@ -778,9 +581,8 @@
 
   A failure below here knows the file `age` was handed, which for a copied
   source is a temp file the caller never named, so it is re-thrown with the
-  source descriptor added and the original as its cause. Message, `:reason`, and
-  every other key are carried through unchanged: this adds the context the layer
-  below could not have, it does not restate the failure."
+  source descriptor added. Content-free EDN failures deliberately drop their
+  intermediate exception; other failures retain their cause."
   [identity file {:keys [limits source materialized-identity?]} cleanup!]
   (try
     (read-secrets-edn (age/decrypt identity (.getAbsolutePath ^java.io.File file)
@@ -788,7 +590,10 @@
                                     :identity-nameable? (not materialized-identity?)})
                       limits)
     (catch clojure.lang.ExceptionInfo e
-      (throw (ex-info (ex-message e) (assoc (ex-data e) :source source) e)))
+      (let [data (assoc (ex-data e) :source source)]
+        (throw (if (contains? edn-failure-reasons (:reason data))
+                 (ex-info (ex-message e) data)
+                 (ex-info (ex-message e) data e)))))
     (finally
       (cleanup!))))
 
@@ -801,11 +606,12 @@
   materialized it from an injected key, and every diagnostic below here turns on
   that difference."
   [source [identity materialized?] limits]
-  (let [descriptor (source-descriptor source)]
+  (let [descriptor (source/descriptor source)]
     (with-identity identity
       (fn [path]
         (validate-load-identity! descriptor path materialized?)
-        (let [[file cleanup!] (acquire-source! source descriptor limits)]
+        (let [[file cleanup!] (source/acquire! source descriptor
+                                               (:max-source-bytes limits))]
           (decrypt-and-read! path file
                              {:limits limits
                               :source descriptor
@@ -815,32 +621,35 @@
 (defn load-secrets
   "Decrypt an age-encrypted EDN source and return its value.
 
-  `source` may be a path string, File, URL, classpath resource URL, or another
-  value accepted by `clojure.java.io/input-stream`. `identity-or-opts` is an
-  identity path or an options map:
+  `source` is local-only: a filesystem path string, File, Path, local `file:`
+  URL/URI/string, or a `jar:file:` classpath resource URL/URI/string.
+  HTTP(S), every other scheme, remote or nested jar sources, malformed local
+  locators, and arbitrary values accepted by `clojure.java.io/input-stream` are
+  rejected with `:disallowed-source` before DNS, connection, redirect, or
+  response reads. This API performs no remote operation, so it has no network
+  timeout contract. `identity-or-opts` is an identity path or an options map:
     :identity-file  explicit identity path (wins over :app and the env vars)
     :app            app name for the default ~/.config/<app>/key.txt
     :limits         resource bounds merged over `default-limits`
   Without an explicit identity or app, only the SECRETS_AGE_IDENTITY*
   environment variables are used.
 
-  Missing inputs throw ex-info with a :reason:
-    :no-identity  no identity resolves, or the resolved file does not exist.
-    :no-file      `source` is nil (almost always because
-                  `(io/resource \"secrets.edn.age\")` found nothing on the
-                  classpath), a path/File is absent, or reading the source
-                  raises an IOException.
+  Missing or invalid inputs throw ex-info with a :reason:
+    :no-identity        no identity resolves, or the resolved file does not exist.
+    :no-file            `source` is nil, an allowed local file is absent, or an
+                        allowed local source cannot be read.
+    :disallowed-source  `source` is outside the local-only provenance contract.
   An input past one of the `:limits` throws with `:source-too-large`,
   `:plaintext-too-large`, or `:edn-too-deep`, and `:invalid-limits` rejects a
   `:limits` map that is malformed rather than reading it as the defaults.
-  Limits are resolved first, then the identity, then the source. The plaintext
-  is read with `clojure.edn`, not `eval`.
+  Limits are resolved first, then the identity, then source policy and opening.
+  The plaintext is read with `clojure.edn`, not `eval`.
 
   Every failure about a source carries `:source`, allowlisted metadata naming
   which source failed — a locator's scheme, host, port, and path, a file's path,
-  or an object's class — and never the source value, whose userinfo, query, or
-  `toString` can be a credential. An identity path is named only when the caller
-  supplied it.
+  or a rejected object's class — and never the source value, whose userinfo,
+  query, or `toString` can be a credential. An identity path is named only when
+  the caller supplied it.
 
   The identity is held with [[with-identity]] for the whole call, so a
   `reset-identity-cache!` cannot delete an injected identity while `age` is

@@ -1,6 +1,6 @@
 # 029 — Bound CLI inputs and EDN depth
 
-Status: `open`
+Status: `resolved`
 Priority: P1
 Review classification: Conditional Medium / alpha release blocker
 
@@ -56,20 +56,20 @@ stdout instead of materializing the entire maximum-sized result on the heap.
 
 ## Acceptance criteria
 
-- [ ] Plaintext/editor files and stdin are bounded while being read, with limits
+- [x] Plaintext/editor files and stdin are bounded while being read, with limits
       enforced before a full oversized value is retained.
-- [ ] Manifest reads and read-only recipient listing/doctor reads have explicit
+- [x] Manifest reads and read-only recipient listing/doctor reads have explicit
       byte and entry limits consistent with encryption's recipient policy.
-- [ ] Every CLI EDN path applies the same maximum-depth scanner and safe parse
+- [x] Every CLI EDN path applies the same maximum-depth scanner and safe parse
       diagnostics as the runtime before recursive parsing begins.
-- [ ] Oversized and over-depth inputs fail with stable content-free reasons and
+- [x] Oversized and over-depth inputs fail with stable content-free reasons and
       configured/observed bounds, without echoing input content.
-- [ ] A 200,000-opener EDN input fails normally before `clojure.edn` is called
+- [x] A 200,000-opener EDN input fails normally before `clojure.edn` is called
       and never raises `StackOverflowError`.
-- [ ] Arbitrary-file decryption streams binary plaintext to stdout under a
+- [x] Arbitrary-file decryption streams binary plaintext to stdout under a
       deliberate bound and does not allocate a byte array sized to the whole
       output.
-- [ ] Boundary coverage includes exact-limit and one-byte/one-level-over cases
+- [x] Boundary coverage includes exact-limit and one-byte/one-level-over cases
       for plaintext, stdin, manifests, recipient diagnostics, and streamed
       decrypt output.
 
@@ -96,3 +96,42 @@ incrementally under the configured cap.
 - [age process streaming](../src/com/kirahowe/secrets/age.clj)
 - [CLI tests](../test/com/kirahowe/secrets/cli_test.clj)
 - [runtime tests](../test/com/kirahowe/secrets_test.clj)
+
+## Resolution
+
+CLI limits now inherit the runtime's plaintext-byte and EDN-depth policy and add
+explicit manifest byte/entry limits alongside the existing recipient
+byte/entry/line limits. Fixed-size bounded readers cover templates, edited
+plaintext, stdin, manifests, and every recipient command. Overflow stops after
+a bounded chunk (one byte beyond the remaining allowance for byte streams) and
+reports only a stable reason, the configured limit, and the observed byte or
+entry count.
+
+Runtime and CLI EDN routes now use the same safe `secrets/parse-edn` boundary.
+It scans depth before invoking `clojure.edn`, distinguishes empty, extra-value,
+over-depth, and malformed input, and keeps only allowlisted numeric location or
+depth metadata. Editor plaintext, stdin `--edn`, key paths, decrypted stores,
+verification manifests, and doctor manifests all use that policy.
+
+`age/decrypt-to-stream!` copies binary plaintext from the age process to the
+caller's output stream in fixed-size chunks, enforces the plaintext cap while
+age is producing output, and kills the subprocess at the first byte beyond the
+bound. The arbitrary CLI decrypt command writes through this API directly to
+stdout; its 1 GiB command policy no longer implies a 1 GiB contiguous byte
+array.
+
+Focused coverage exercises exact and immediately-over plaintext files, stdin,
+manifest bytes and entries, read-only recipient bytes and entries (including
+doctor's content-free bounded state), EDN depth, the 200,000-opener scan, and
+binary streamed decrypt output larger than the copy buffer.
+
+Suggested focused verification (not run as part of this issue assignment):
+
+```sh
+clojure -M:test --focus com.kirahowe.secrets-test/edn-depth-scan-test
+clojure -M:test --focus com.kirahowe.secrets-cli-test/cli-depth-bomb-is-rejected-before-recursive-parse-test
+clojure -M:test --focus com.kirahowe.secrets-cli-test/decrypt-to-stream-boundaries-test
+clojure -M:test --focus com.kirahowe.secrets-cli-test/read-only-recipient-boundaries-test
+clojure -M:test --focus com.kirahowe.secrets-cli-test/plaintext-file-and-stdin-byte-boundaries-test
+clojure -M:test --focus com.kirahowe.secrets-cli-test/manifest-byte-and-entry-boundaries-test
+```

@@ -1,6 +1,6 @@
 # 031 — Verify identity cleanup
 
-Status: `open`
+Status: `resolved`
 Priority: P2
 Review classification: Low
 
@@ -41,21 +41,21 @@ contents.
 
 ## Acceptance criteria
 
-- [ ] Cleanup distinguishes confirmed deletion, already absent, and failed
+- [x] Cleanup distinguishes confirmed deletion, already absent, and failed
       deletion of an existing materialized identity.
-- [ ] `:deleted` counts only paths confirmed absent as a result of cleanup; any
+- [x] `:deleted` counts only paths confirmed absent as a result of cleanup; any
       separate already-absent/failed counts are named truthfully.
-- [ ] A failed path remains eligible for retry, or the API returns/throws a
+- [x] A failed path remains eligible for retry, or the API returns/throws a
       structured failure carrying enough safe state for deterministic recovery.
-- [ ] Deferred last-lease cleanup follows the same checked contract as an
+- [x] Deferred last-lease cleanup follows the same checked contract as an
       immediate reset.
-- [ ] Cleanup diagnostics never include identity contents, digests, or other
+- [x] Cleanup diagnostics never include identity contents, digests, or other
       credential material and preserve the existing materialized-path redaction
       policy.
-- [ ] Focused coverage forces deletion failure and proves the file remains
+- [x] Focused coverage forces deletion failure and proves the file remains
       tracked or the failure is surfaced, a subsequent retry can remove it, and
       no success count was fabricated.
-- [ ] Concurrent reset/release behavior remains race-safe and never deletes an
+- [x] Concurrent reset/release behavior remains race-safe and never deletes an
       identity while a lease is active.
 
 ## Non-goals
@@ -77,3 +77,44 @@ removed. Re-run the active-lease scenario to confirm deletion remains deferred.
 
 - [identity lifecycle](../src/com/kirahowe/secrets.clj)
 - [identity lifecycle tests](../test/com/kirahowe/secrets_test.clj)
+
+## Resolution
+
+`identity-state` now has a `:cleanup` set in addition to live `:entries` and
+leased `:retired` paths. Retirement atomically moves every unleased materialized
+path into that set before filesystem work begins. A path leaves the set only
+after checked deletion reports `:deleted` or confirms it is already `:absent`;
+`:failed` paths remain there for the next `reset-identity-cache!`. This ordering
+also prevents concurrent reset/release interleavings from losing a retry or
+deleting a path whose lease is still active.
+
+`reset-identity-cache!` returns path-free
+`{:generation g :deleted n :absent n :failed n :pending n}` results. `:deleted`
+counts only successful delete operations, `:absent` names paths already gone,
+and `:failed` names existing files retained for retry. The deletion classifier
+catches `SecurityException` and returns only an outcome keyword, so no
+filesystem exception can disclose a materialized path. Identity contents and
+digests remain absent from both state transitions and public diagnostics.
+
+The last release of a retired lease now moves its path into `:cleanup` before
+attempting deletion, then uses the same checked classifier as immediate reset.
+Failed write cleanup and the concurrent materialization/retirement orphan path
+also enter the same retry set before deletion, closing the two other unchecked
+uses of the old boolean deletion helper.
+
+Focused tests use the narrow `try-delete-identity-file!` filesystem seam to make
+deletion return false while the real temp file remains. They prove the reset
+reports `:failed 1` and `:deleted 0`, keeps the path tracked without rendering
+the path, digest, or sentinel contents, and deletes it on the next reset. Separate
+timing-independent cases cover an already-absent file and a failed deferred
+last-lease deletion; the existing coordinated active-lease test continues to
+cover the reset/release race boundary.
+
+Suggested focused verification (not run as part of this issue assignment):
+
+```sh
+clojure -M:test --focus com.kirahowe.secrets-test/cleanup-failure-is-truthful-and-retryable-test
+clojure -M:test --focus com.kirahowe.secrets-test/cleanup-reports-an-already-absent-file-test
+clojure -M:test --focus com.kirahowe.secrets-test/deferred-cleanup-failure-is-retryable-test
+clojure -M:test --focus com.kirahowe.secrets-test/deletion-waits-for-an-active-user-test
+```

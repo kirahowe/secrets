@@ -84,6 +84,31 @@
       (reset! result (cli/verify! config env-arg)))
     {:result @result :out (str out) :err (str err)}))
 
+(defn- throwable-diagnostic
+  [e]
+  (when e
+    {:printed (pr-str e)
+     :message (ex-message e)
+     :data (ex-data e)
+     :cause (throwable-diagnostic (ex-cause e))}))
+
+(defn- capture-failure
+  [f]
+  (let [failure (atom nil)
+        out (java.io.StringWriter.)
+        err (java.io.StringWriter.)]
+    (binding [*out* out *err* err]
+      (try
+        (f)
+        (catch Exception e
+          (reset! failure (throwable-diagnostic e)))))
+    {:failure @failure :out (str out) :err (str err)}))
+
+(defn- assert-redacted!
+  [sentinel diagnostic]
+  (is (not (str/includes? (pr-str diagnostic) sentinel))
+      "messages, data, causes, stdout, and stderr omit the malformed source"))
+
 (defn- file-bytes [path]
   (vec (java.nio.file.Files/readAllBytes (.toPath (io/file path)))))
 
@@ -377,6 +402,93 @@
           "invalid editor contents never create ciphertext")
       (is (not (.exists (io/file manifest)))
           "invalid editor contents never create a manifest"))))
+
+(deftest safe-edn-failure-rendering-test
+  (let [render (cli-private 'edn-failure-message)]
+    (is (= "malformed EDN syntax at line 7, column 11"
+           (render {:reason :edn-malformed :line 7 :column 11})))
+    (is (= "expected one EDN value, found empty input"
+           (render {:reason :edn-empty})))
+    (is (= "expected one EDN value, found another"
+           (render {:reason :edn-extra-values})))
+    (is (= (str "EDN nesting depth 101 exceeds the configured "
+                ":max-edn-depth of 100")
+           (render {:reason :edn-too-deep :depth 101 :limit 100})))))
+
+(deftest cli-depth-bomb-is-rejected-before-recursive-parse-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [bomb (apply str (repeat 200000 \[))
+          config (cli/normalize-config (test-config))
+          e (try
+              (with-out-str
+                (with-in-str bomb
+                  (cli/set-secret! config "dev" ":bomb" true)))
+              (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :edn-too-deep (:reason (ex-data e))))
+      (is (= 100 (:limit (ex-data e))))
+      (is (= 200000 (:depth (ex-data e))))
+      (is (not (.exists (io/file (str *dir* "/secrets.edn.age"))))))))
+
+(deftest secret-bearing-edn-failures-are-redacted-across-cli-routes-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [sentinel "123SENTINELSECRET"
+          malformed sentinel
+          config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")]
+      (testing "editor plaintext"
+        (let [captured
+              (with-redefs-fn
+                {(cli-private 'run-editor!) (fn [path] (spit path malformed))}
+                (fn [] (capture-failure (fn [] (cli/new! config "dev")))))]
+          (is (= :edn-malformed (get-in captured [:failure :data :reason])))
+          (is (nil? (get-in captured [:failure :cause])))
+          (assert-redacted! sentinel captured)))
+      (testing "stdin --edn"
+        (let [captured
+              (capture-failure
+               (fn []
+                 (with-in-str malformed
+                   (cli/set-secret! config "dev" ":secret/value" true))))]
+          (is (= :edn-malformed (get-in captured [:failure :data :reason])))
+          (is (nil? (get-in captured [:failure :cause])))
+          (assert-redacted! sentinel captured)))
+      (testing "malformed key EDN"
+        (let [captured
+              (capture-failure
+               (fn []
+                 (with-in-str "unused"
+                   (cli/set-secret! config "dev" malformed false))))]
+          (is (= :edn-malformed (get-in captured [:failure :data :reason])))
+          (assert-redacted! sentinel captured)))
+      (testing "an existing decrypted store"
+        (let [plain (str *dir* "/malformed.edn")]
+          (spit plain malformed)
+          (age/encrypt-file! *key* plain encrypted)
+          (.delete (io/file plain)))
+        (let [captured
+              (capture-failure
+               (fn []
+                 (with-in-str "replacement"
+                   (cli/set-secret! config "dev" ":secret/value" false))))]
+          (is (= :edn-malformed (get-in captured [:failure :data :reason])))
+          (is (nil? (get-in captured [:failure :cause])))
+          (assert-redacted! sentinel captured)))
+      (testing "manifest verification"
+        (spit manifest-path malformed)
+        (let [{:keys [result err] :as captured} (capture-verify config "dev")]
+          (is (= :drift (get-in result [:results :dev])))
+          (is (str/includes? err "malformed EDN syntax"))
+          (assert-redacted! sentinel captured)))
+      (testing "doctor manifest diagnostics"
+        (let [doctor-config (complete-doctor-config)]
+          (spit manifest-path malformed)
+          (let [{:keys [result] :as captured}
+                (doctor-under doctor-config nil {})]
+            (is (= :invalid (get-in result [:verify :state])))
+            (assert-redacted! sentinel captured)))))))
 
 (deftest edit-rejects-invalid-edn-without-replacing-valid-files-test
   (if (age-env-set?)
@@ -707,6 +819,34 @@
               (System/setOut orig))))
         (is (= (alength payload) (.size baos))
             "a file larger than the store bound still round-trips")))))
+
+(deftest decrypt-to-stream-boundaries-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [plain (str *dir* "/stream.bin")
+          encrypted (str plain ".age")
+          payload (byte-array (map unchecked-byte (take 20001 (cycle (range 256)))))]
+      (with-open [out (io/output-stream plain)]
+        (.write out payload))
+      (age/encrypt-file! *key* plain encrypted)
+      (testing "binary output larger than the copy buffer streams exactly at its limit"
+        (let [out (java.io.ByteArrayOutputStream.)]
+          (is (identical? out
+                          (age/decrypt-to-stream!
+                           *key* encrypted out
+                           {:limits {:max-plaintext-bytes (alength payload)}})))
+          (is (java.util.Arrays/equals payload (.toByteArray out)))))
+      (testing "the first byte over the limit is rejected without being written"
+        (let [out (java.io.ByteArrayOutputStream.)
+              limit (dec (alength payload))
+              e (try
+                  (age/decrypt-to-stream!
+                   *key* encrypted out {:limits {:max-plaintext-bytes limit}})
+                  (catch clojure.lang.ExceptionInfo e e))]
+          (is (= :plaintext-too-large (:reason (ex-data e))))
+          (is (= limit (:limit (ex-data e))))
+          (is (= (inc limit) (:bytes (ex-data e))))
+          (is (<= (.size out) limit)))))))
 
 ;;;; Command-line option boundary
 
@@ -1774,6 +1914,44 @@
         (is (= "s.manifest" (:manifest e)))
         (is (= "s.example" (:template e)))))))
 
+(deftest artifact-locators-are-rejected-test
+  (let [config (fn [overrides]
+                 {:app "x"
+                  :environments
+                  {:dev (merge {:secrets-file "s.age"} overrides)}})]
+    (testing "every configured artifact location is a filesystem path, never a URL"
+      (doseq [[field value]
+              [[:secrets-file "https://127.0.0.1/store.age"]
+               [:key-file "file:/tmp/key.txt"]
+               [:template "jar:file:/tmp/app.jar!/template.edn"]
+               [:manifest "ftp://example.com/store.manifest"]
+               [:recipients-file "http://10.0.0.1/recipients.txt"]]]
+        (let [e (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                      #"filesystem path"
+                                      (cli/normalize-config
+                                       (config {field value}))))]
+          (is (= field (:field (ex-data e)))))))
+    (testing "credential-bearing locators survive only as allowlisted metadata"
+      (let [sentinel "URI-CREDENTIAL-SENTINEL"
+            locator (str "HTTPS://user:" sentinel "@127.0.0.1/store.age?sig=" sentinel)
+            e (try
+                (cli/normalize-config (config {:secrets-file locator}))
+                nil
+                (catch clojure.lang.ExceptionInfo e e))
+            rendered (str (pr-str e) (ex-message e) (pr-str (ex-data e)))]
+        (is (= {:environment :dev
+                :field :secrets-file
+                :reason :disallowed-source-location
+                :scheme "https"}
+               (select-keys (ex-data e) [:environment :field :reason :scheme])))
+        (is (not (str/includes? rendered sentinel)))
+        (is (not (contains? (ex-data e) :path)))))
+    (testing "a Windows drive path is not mistaken for a one-letter scheme"
+      (is (= "C:\\secrets\\store.age"
+             (get-in (cli/normalize-config
+                      (config {:secrets-file "C:\\secrets\\store.age"}))
+                     [:environments :dev :secrets-file]))))))
+
 ;;;; Recipient snapshotting
 
 (defn- recorded-sh-argvs
@@ -1854,7 +2032,7 @@
                  ["a file larger than :max-recipients-bytes"
                   {:max-recipients-bytes 16}
                   (fake-recipient 24 "q")
-                  #":max-recipients-bytes of 16"]]]
+                  #":max-recipients-bytes limit of 16"]]]
           (testing label
             (spit recipients (str contents "\n"))
             (is (thrown-with-msg? clojure.lang.ExceptionInfo pattern
@@ -1902,14 +2080,151 @@
         (is (= [] (remove #{["age" "--version"]} (age-argvs argvs)))
             "nothing was encrypted, decrypted, or handed to age at all")))))
 
+(deftest read-only-recipient-boundaries-test
+  (let [recipients-file (str *dir* "/read-only-recipients.txt")
+        first-recipient (fake-recipient 24 "q")
+        second-recipient (fake-recipient 24 "r")
+        exact-content (str first-recipient "\n")
+        config-for (fn [limits]
+                     (cli/normalize-config
+                      (assoc (test-config {:recipients-file recipients-file})
+                             :limits limits)))]
+    (testing "listing accepts the exact byte and entry limits"
+      (spit recipients-file exact-content)
+      (let [config (config-for {:max-recipients 1
+                                :max-recipients-bytes (count exact-content)})
+            listed (atom nil)]
+        (with-out-str (reset! listed (cli/recipients! config "dev")))
+        (is (= [first-recipient] @listed))))
+    (testing "listing rejects the first byte over without retaining its content"
+      (let [sentinel "#"
+            config (config-for {:max-recipients-bytes (count exact-content)})]
+        (spit recipients-file (str exact-content sentinel))
+        (let [e (try
+                  (with-out-str (cli/recipients! config "dev"))
+                  (catch clojure.lang.ExceptionInfo e e))
+              rendered (str (ex-message e) (pr-str (ex-data e)))]
+          (is (= :input-too-large (:reason (ex-data e))))
+          (is (= (count exact-content) (:configured (ex-data e))))
+          (is (= (inc (count exact-content)) (:observed (ex-data e))))
+          (is (not (str/includes? rendered sentinel))))))
+    (testing "listing rejects one entry over and doctor reports only bounds"
+      (spit recipients-file (str first-recipient "\n" second-recipient "\n"))
+      (let [config (config-for {:max-recipients 1})
+            e (try
+                (with-out-str (cli/recipients! config "dev"))
+                (catch clojure.lang.ExceptionInfo e e))
+            doctor (:result
+                    (doctor-under config "dev"
+                                  {:identity-path *key* :version "age test-version"}))
+            state (get-in doctor [:encryption :recipients])]
+        (is (= :too-many-recipients (:reason (ex-data e))))
+        (is (= 2 (:observed (ex-data e))))
+        (is (= :bounded (:state state)))
+        (is (= :too-many-recipients (:reason state)))
+        (is (not (contains? state :recipients)))))))
+
+(deftest plaintext-file-and-stdin-byte-boundaries-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [plaintext-file (str *dir* "/bounded-plain.edn")
+          exact-plaintext (str "{:a 1}" (apply str (repeat 26 " ")))
+          limit (count exact-plaintext)
+          config (cli/normalize-config
+                  (assoc (test-config {:manifest false})
+                         :limits {:max-plaintext-bytes limit}))
+          env (get-in config [:environments :dev])
+          write-secrets! (cli-private 'write-secrets!)
+          ciphertext (:secrets-file env)]
+      (testing "an editor plaintext at the exact byte limit is accepted"
+        (spit plaintext-file exact-plaintext)
+        (write-secrets! env {:identity-file *key*} plaintext-file)
+        (is (= {:a 1} (edn/read-string (age/decrypt *key* ciphertext)))))
+      (testing "the first byte over is rejected before parsing or encryption"
+        (let [sentinel "~"
+              before (file-bytes ciphertext)]
+          (spit plaintext-file (str exact-plaintext sentinel))
+          (let [e (try
+                    (write-secrets! env {:identity-file *key*} plaintext-file)
+                    (catch clojure.lang.ExceptionInfo e e))
+                rendered (str (ex-message e) (pr-str (ex-data e)))]
+            (is (= :input-too-large (:reason (ex-data e))))
+            (is (= (inc limit) (:observed (ex-data e))))
+            (is (not (str/includes? rendered sentinel)))
+            (is (= before (file-bytes ciphertext))))))
+      (testing "stdin accepts exact UTF-8 bytes and rejects one byte over"
+        (let [stdin-limit 64
+              exact-stdin (str "42" (apply str (repeat (- stdin-limit 2) " ")))
+              stdin-config (cli/normalize-config
+                            (assoc (test-config {:manifest false})
+                                   :limits {:max-plaintext-bytes stdin-limit}))]
+          (with-out-str
+            (with-in-str exact-stdin
+              (cli/set-secret! stdin-config "dev" ":n" true)))
+          (is (= 42 (:n (edn/read-string (age/decrypt *key* ciphertext)))))
+          (let [e (try
+                    (with-out-str
+                      (with-in-str (str exact-stdin " ")
+                        (cli/set-secret! stdin-config "dev" ":n" true)))
+                    (catch clojure.lang.ExceptionInfo e e))]
+            (is (= :input-too-large (:reason (ex-data e))))
+            (is (= stdin-limit (:configured (ex-data e))))
+            (is (= (inc stdin-limit) (:observed (ex-data e))))))))))
+
+(deftest manifest-byte-and-entry-boundaries-test
+  (let [manifest-file (str *dir* "/bounded.manifest")
+        read-supported (cli-private 'read-supported-manifest)
+        value {:version 2
+               :app "cli-test"
+               :keys {[:a] {:type :string}
+                      [:b] {:type :integer}}}
+        exact-content (pr-str value)
+        base-limits (get-in (cli/normalize-config (test-config))
+                            [:environments :dev :limits])]
+    (testing "exact manifest byte and entry limits are accepted"
+      (spit manifest-file exact-content)
+      (let [limits (assoc base-limits
+                          :max-manifest-bytes (count exact-content)
+                          :max-manifest-entries 2)]
+        (is (= value
+               (:committed
+                (read-supported "dev" "cli-test" manifest-file limits))))))
+    (testing "the first byte over is rejected with content-free bounds"
+      (spit manifest-file (str exact-content " "))
+      (let [e (try
+                (read-supported
+                 "dev" "cli-test" manifest-file
+                 (assoc base-limits :max-manifest-bytes (count exact-content)))
+                (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :input-too-large (:reason (ex-data e))))
+        (is (= (inc (count exact-content)) (:observed (ex-data e))))))
+    (testing "one manifest entry over is rejected after the bounded safe parse"
+      (spit manifest-file exact-content)
+      (let [e (try
+                (read-supported
+                 "dev" "cli-test" manifest-file
+                 (assoc base-limits
+                        :max-manifest-bytes (count exact-content)
+                        :max-manifest-entries 1))
+                (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :too-many-manifest-entries (:reason (ex-data e))))
+        (is (= 2 (:observed (ex-data e))))))))
+
 (deftest invalid-limits-config-fails-closed-test
   (testing "resolved limits land on every normalized environment"
-    (is (= {:max-recipients 256 :max-recipient-chars 1024 :max-recipients-bytes 262144}
+    (is (= (merge (select-keys secrets/default-limits
+                               [:max-plaintext-bytes :max-edn-depth])
+                  {:max-recipients 256
+                   :max-recipient-chars 1024
+                   :max-recipients-bytes 262144
+                   :max-manifest-bytes 1048576
+                   :max-manifest-entries 10000})
            (get-in (cli/normalize-config (test-config)) [:environments :dev :limits]))))
   (testing "a supplied limit overrides only itself"
-    (is (= {:max-recipients 4 :max-recipient-chars 1024 :max-recipients-bytes 262144}
-           (get-in (cli/normalize-config (assoc (test-config) :limits {:max-recipients 4}))
-                   [:environments :dev :limits]))))
+    (is (= 4
+           (get-in (cli/normalize-config
+                    (assoc (test-config) :limits {:max-recipients 4}))
+                   [:environments :dev :limits :max-recipients]))))
   (testing "a value that is not a positive integer is rejected"
     (doseq [value [0 -1 2.5 "8" nil]]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"

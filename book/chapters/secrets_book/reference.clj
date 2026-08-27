@@ -7,6 +7,7 @@
             [com.kirahowe.secrets.aero :as secrets-aero]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
+            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.manifest :as manifest]
             [scicloj.kindly.v4.kind :as kind]))
 
@@ -39,8 +40,14 @@
              #'secrets/identity-from-env
              #'secrets/resolve-identity-file
              #'secrets/identity-available?
-             #'secrets/expand-home
-             #'secrets/owner-only-temp-file!)
+             #'secrets/expand-home)
+
+;; ## com.kirahowe.secrets.fs
+
+;; Owner-only temporary-file creation for callers that must materialize
+;; sensitive bytes without a default-permission window.
+
+(doc-section #'fs/owner-only-temp-file!)
 
 ;; ## com.kirahowe.secrets.aero
 

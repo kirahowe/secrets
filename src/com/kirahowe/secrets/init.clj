@@ -1,10 +1,10 @@
 (ns com.kirahowe.secrets.init
   "Standalone, one-shot project bootstrapper for `bb secrets`."
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
+  (:require [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [com.kirahowe.secrets.cli :as cli]
+            [com.kirahowe.secrets.safe-edn :as safe-edn]
             [rewrite-clj.node :as node]
             [rewrite-clj.zip :as z])
   (:import [java.nio ByteBuffer]
@@ -366,18 +366,16 @@
       (= layout :disposable) (assoc ".gitignore" "/.local/secrets/\n"))))
 
 (defn- existing-template! [file path]
-  (try
-    (let [value (edn/read-string (slurp file))]
-      (when-not (map? value)
-        (throw (ex-info "Existing secrets template must contain an EDN map"
-                        {:path path})))
-      value)
-    (catch clojure.lang.ExceptionInfo e
-      (throw e))
-    (catch Exception e
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse (slurp file))]
+    (when-not ok?
       (throw (ex-info "Existing secrets template is not valid EDN"
-                      {:path path :cause (.getMessage e)}
-                      e)))))
+                      (merge {:path path}
+                             (select-keys parsed
+                                          [:reason :line :column :depth :limit])))))
+    (when-not (map? value)
+      (throw (ex-info "Existing secrets template must contain an EDN map"
+                      {:path path})))
+    value))
 
 (def ^:private write-actions #{:create :merge})
 

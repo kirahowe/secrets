@@ -1,6 +1,6 @@
 # 032 — Enforce strict base64 identity input
 
-Status: `open`
+Status: `resolved`
 Priority: P2
 Review classification: Low
 
@@ -39,18 +39,43 @@ length must fail through the existing content-free invalid-base64 contract.
 
 ## Acceptance criteria
 
-- [ ] The accepted whitespace set is explicit and limited to documented ASCII
+- [x] The accepted whitespace set is explicit and limited to documented ASCII
       whitespace needed for single- or multi-line environment values.
-- [ ] Only that whitespace is removed before decoding; Unicode whitespace and
+- [x] Only that whitespace is removed before decoding; Unicode whitespace and
       all other nonalphabet characters are rejected.
-- [ ] Decoding uses `Base64/getDecoder` or an equivalently strict decoder after
+- [x] Decoding uses `Base64/getDecoder` or an equivalently strict decoder after
       normalization, not the MIME decoder.
-- [ ] `QUJD%%%`, punctuation inserted inside otherwise valid input, malformed
+- [x] `QUJD%%%`, punctuation inserted inside otherwise valid input, malformed
       padding, and invalid lengths all fail closed.
-- [ ] Valid unwrapped and documented whitespace-wrapped/multiline base64 still
+- [x] Valid unwrapped and documented whitespace-wrapped/multiline base64 still
       decode byte-for-byte.
-- [ ] Failure messages and `ex-data` name the environment variable and remedy
+- [x] Failure messages and `ex-data` name the environment variable and remedy
       without echoing any credential input or retaining a token-bearing cause.
+
+## Resolution
+
+`decode-b64-identity` now removes exactly ASCII space, horizontal tab, carriage
+return, and line feed, then decodes with `Base64/getDecoder`. It re-encodes the
+decoded bytes with the standard encoder and requires exact equality with the
+normalized input. That canonicality check closes strict-decoder ambiguities such
+as omitted padding and nonzero padding bits in addition to the decoder's
+rejection of punctuation, misplaced padding, and malformed lengths.
+
+All invalid-input branches construct the existing content-free remediation
+error without attaching the decoder exception as a cause. The error names only
+`SECRETS_AGE_IDENTITY_B64` in `ex-data`; `env-identity` still invokes decoding
+before `materialize-identity!`, so rejected input cannot reach a credential temp
+file.
+
+`b64-identity-decode-test` now covers the standard alphabet's `+` and `/`
+boundaries, every accepted whitespace byte at the beginning, middle, and end,
+mixed multiline wrapping, punctuation in each position, Unicode whitespace,
+padding variants, invalid lengths, omitted padding, and noncanonical padding
+bits. `b64-identity-input-boundary-test` exercises the public environment entry
+path and proves invalid input is rejected before materialization while rendered
+diagnostics retain neither the token nor a cause. The runtime namespace and
+production documentation state the exact accepted transport characters and
+canonical encoding requirement.
 
 ## Non-goals
 
