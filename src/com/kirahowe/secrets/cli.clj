@@ -1741,22 +1741,44 @@
 
 ;;;; Dispatch
 
-(def ^:private commands
-  [["keygen" "[env]" "Generate an age key for an environment"]
-   ["new" "[env]" "Create a new encrypted secrets file (opens your editor)"]
-   ["edit" "[env]" "Edit an existing secrets file (decrypt → edit → re-encrypt)"]
-   ["set" "[env] <key> [--edn]"
-    "Set a key's value from stdin (creates the file if missing)"]
-   ["rm" "[env] <key>" "Remove a key (fails if the key or file is absent)"]
-   ["verify" "[env]" "Check the committed manifest matches the secrets"]
-   ["doctor" "[env]" "Safely diagnose configuration and verification capability"]
-   ["show-key" "[env]" "Print public key(s) for sharing"]
-   ["add-recipient" "[env] [key]" "Add a public key to the env's recipients file"]
-   ["recipients" "[env]" "List configured recipient public keys"]
-   ["reencrypt" "[env]" "Re-encrypt to current recipients (after a change)"]
-   ["encrypt" "[env] <file>" "Encrypt an arbitrary file to <file>.age"]
-   ["decrypt" "[env] <file>" "Decrypt a <file>.age to stdout"]
-   ["help" "" "Show this help"]])
+(def ^:private command-specs
+  [{:name "keygen" :usage "[env]" :description "Generate an age key for an environment"
+    :min-positionals 0 :max-positionals 1}
+   {:name "new" :usage "[env]"
+    :description "Create a new encrypted secrets file (opens your editor)"
+    :min-positionals 0 :max-positionals 1}
+   {:name "edit" :usage "[env]"
+    :description "Edit an existing secrets file (decrypt → edit → re-encrypt)"
+    :min-positionals 0 :max-positionals 1}
+   {:name "set" :usage "[env] <key> [--edn]"
+    :description "Set a key from stdin; --edn parses the value as EDN instead of a string"
+    :min-positionals 1 :max-positionals 2}
+   {:name "rm" :usage "[env] <key>"
+    :description "Remove a key (fails if the key or file is absent)"
+    :min-positionals 1 :max-positionals 2}
+   {:name "verify" :usage "[env]"
+    :description "Check the committed manifest matches the secrets"
+    :min-positionals 0 :max-positionals 1}
+   {:name "doctor" :usage "[env]"
+    :description "Safely diagnose configuration and verification capability"
+    :min-positionals 0 :max-positionals 1}
+   {:name "show-key" :usage "[env]" :description "Print public key(s) for sharing"
+    :min-positionals 0 :max-positionals 1}
+   {:name "add-recipient" :usage "[env] [key]"
+    :description "Add a public key to the env's recipients file"
+    :min-positionals 0 :max-positionals 2}
+   {:name "recipients" :usage "[env]" :description "List configured recipient public keys"
+    :min-positionals 0 :max-positionals 1}
+   {:name "reencrypt" :usage "[env]"
+    :description "Re-encrypt to current recipients (after a change)"
+    :min-positionals 0 :max-positionals 1}
+   {:name "encrypt" :usage "[env] <file>"
+    :description "Encrypt an arbitrary file to <file>.age"
+    :min-positionals 1 :max-positionals 2}
+   {:name "decrypt" :usage "[env] <file>" :description "Decrypt a <file>.age to stdout"
+    :min-positionals 1 :max-positionals 2}
+   {:name "help" :usage "[command]" :description "Show global or command-specific help"
+    :min-positionals 0 :max-positionals 1}])
 
 (defn- split-operands
   "Split `args` at the first `--` operand terminator into `[options operands]`,
@@ -1788,11 +1810,22 @@
     [(boolean (some #{flag} options))
      (into (vec (remove #{flag} options)) operands)]))
 
-(defn- print-help [{:keys [environments default-environment]}]
+(def ^:private help-flags #{"--help" "-h"})
+
+(defn- command-spec [command]
+  (some #(when (= command (:name %)) %) command-specs))
+
+(defn- usage-line [{command :name :keys [usage]}]
+  (str "Usage: bb secrets " command (when (seq usage) (str " " usage))))
+
+(defn- print-global-help! [{:keys [environments default-environment]}]
   (println (paint :bold "Manage encrypted secrets (age).") "\n")
   (println "Usage: bb secrets <command> [args]\n")
-  (doseq [[cmd args doc] commands]
-    (println (format "  %-14s %-14s %s" cmd args doc)))
+  (doseq [{command :name :keys [usage description]} command-specs]
+    (println (format "  %-14s %-23s %s" command usage description)))
+  (println)
+  (println "Global help: bb secrets -h (or: bb secrets --help)")
+  (println "Command help: bb secrets help <command> (or: bb secrets <command> --help)")
   (println)
   (println "Environments:" (str/join ", " (map name (keys environments)))
            (if default-environment
@@ -1801,7 +1834,7 @@
   (println (paint :dim "\n  An omitted [env] uses the default environment."))
   (println
    (paint :dim
-          "  -- ends the options: everything after it is a filename or key, even --edn."))
+          "  -- ends the options: everything after it is an operand, even -h, --help, or --edn."))
   (println
    (paint :dim
           "  Commands printed as suggestions are POSIX sh, single-quoted per argument."))
@@ -1809,6 +1842,25 @@
   (println
    (paint :dim
           "  doctor exits 0 (healthy) · 1 (warning/action needed) · 2 (invalid configuration).")))
+
+(defn- print-command-help! [{:keys [description] :as spec}]
+  (println (usage-line spec))
+  (println)
+  (println description))
+
+(defn- validate-positionals! [{command :name
+                               :keys [min-positionals max-positionals]
+                               :as spec}
+                              positionals]
+  (let [n (count positionals)]
+    (cond
+      (< n min-positionals)
+      (fail! (str "Missing positional argument for " command ".")
+             {:command command :hint (usage-line spec)})
+
+      (> n max-positionals)
+      (fail! (str "Too many positional arguments for " command ".")
+             {:command command :hint (usage-line spec)}))))
 
 (defn- print-error!
   "Print an ex-info the way `run!` reports failures: the message via `oops`,
@@ -1823,60 +1875,78 @@
             line (str/split-lines (str/trim-newline (str v)))]
       (println "   " line))))
 
+(defn- help-requested? [args]
+  (let [[options _] (split-operands args)]
+    (boolean (some help-flags options))))
+
+(defn- command-positionals [command args]
+  (if (= "set" command)
+    (extract-flag "--edn" args)
+    [false (without-terminator args)]))
+
+(defn- print-help-invocation! [config positionals]
+  (if-let [target (first positionals)]
+    (if-let [spec (command-spec (str/lower-case target))]
+      (print-command-help! spec)
+      (fail! (str "Unknown command: " target)
+             {:command target :hint (usage-line (command-spec "help"))}))
+    (print-global-help! config)))
+
+(defn- execute-command! [config command positionals edn?]
+  (if (= "doctor" command)
+    (let [{:keys [exit]} (doctor! config (first positionals))]
+      (when (pos? exit) (System/exit exit)))
+    (let [config (normalize-config config)]
+      (case command
+        "keygen" (keygen! config (first positionals))
+        "new" (new! config (first positionals))
+        "edit" (edit! config (first positionals))
+        "set" (if (second positionals)
+                (set-secret! config (first positionals) (second positionals) edn?)
+                (set-secret! config nil (first positionals) edn?))
+        "rm" (if (second positionals)
+               (remove-secret! config (first positionals) (second positionals))
+               (remove-secret! config nil (first positionals)))
+        "verify" (let [{:keys [exit]} (verify! config (first positionals))]
+                   (when (pos? exit) (System/exit exit)))
+        "show-key" (show-key! config (first positionals))
+        "add-recipient" (add-recipient! config (first positionals) (second positionals))
+        "recipients" (recipients! config (first positionals))
+        "reencrypt" (reencrypt! config (first positionals))
+        "encrypt" (if (second positionals)
+                    (encrypt! config (first positionals) (second positionals))
+                    (encrypt! config nil (first positionals)))
+        "decrypt" (if (second positionals)
+                    (decrypt! config (first positionals) (second positionals))
+                    (decrypt! config nil (first positionals)))))))
+
+(defn- dispatch! [config args]
+  (let [[cmd & more] args
+        command (some-> cmd str/lower-case)]
+    (cond
+      (or (nil? command) (help-flags command))
+      (print-global-help! config)
+
+      :else
+      (if-let [spec (command-spec command)]
+        (if (help-requested? more)
+          (print-command-help! spec)
+          (let [[edn? positionals] (command-positionals command more)]
+            (validate-positionals! spec positionals)
+            (if (= "help" command)
+              (print-help-invocation! config positionals)
+              (execute-command! config command positionals edn?))))
+        (let [config (normalize-config config)]
+          (print-global-help! config)
+          (fail! (str "Unknown command: " cmd) {:command cmd}))))))
+
 (defn run!
-  "Entry point. Dispatch `args` (typically *command-line-args*) against `config`.
-  This is the only function in the namespace that exits the process. It prints
-  ex-info details and exits with :secrets/exit (default 1); `verify` and
-  `doctor` supply their own exit codes."
+  "Public entry point for dispatching `args` against `config`.
+  Reports ex-info details and exits with :secrets/exit (default 1); commands
+  with documented status codes may exit directly."
   [config args]
   (try
-    (let [[cmd & more] args
-          command (some-> cmd str/lower-case)]
-      ;; doctor owns normalization so configuration failures become a safe,
-      ;; structured exit 2. Every existing command retains the original
-      ;; normalize-before-dispatch behavior and failure exit.
-      (if (= "doctor" command)
-        (let [{:keys [exit]} (doctor! config (first (without-terminator more)))]
-          (when (pos? exit) (System/exit exit)))
-        (let [config (normalize-config config)
-              ;; `--edn` is `set`'s flag and no other command's, so only `set`'s
-              ;; arguments are searched for it — otherwise a file named `--edn`
-              ;; is stripped before positional dispatch and `encrypt`/`decrypt`
-              ;; run against a shifted operand. The original global extraction
-              ;; was protecting `set`'s optional positional [env] from the flag;
-              ;; that reason is real, so it now applies to `set` alone.
-              [edn? more] (if (= "set" command)
-                            (extract-flag "--edn" more)
-                            [false (without-terminator more)])]
-          (case command
-            "keygen" (keygen! config (first more))
-            "new" (new! config (first more))
-            "edit" (edit! config (first more))
-            ;; set/rm take [env] <key>; with one arg it is the key, and the
-            ;; default environment applies — same convention as encrypt/decrypt.
-            "set" (if (second more)
-                    (set-secret! config (first more) (second more) edn?)
-                    (set-secret! config nil (first more) edn?))
-            "rm" (if (second more)
-                   (remove-secret! config (first more) (second more))
-                   (remove-secret! config nil (first more)))
-            "verify" (let [{:keys [exit]} (verify! config (first more))]
-                       (when (pos? exit) (System/exit exit)))
-            "show-key" (show-key! config (first more))
-            "add-recipient" (add-recipient! config (first more) (second more))
-            "recipients" (recipients! config (first more))
-            "reencrypt" (reencrypt! config (first more))
-            ;; encrypt/decrypt take [env] <file>; with one arg it is the file,
-            ;; and the default environment applies.
-            "encrypt" (if (second more)
-                        (encrypt! config (first more) (second more))
-                        (encrypt! config nil (first more)))
-            "decrypt" (if (second more)
-                        (decrypt! config (first more) (second more))
-                        (decrypt! config nil (first more)))
-            ("help" nil) (print-help config)
-            (do (print-help config)
-                (fail! (str "Unknown command: " cmd) {:command cmd}))))))
+    (dispatch! config args)
     (catch clojure.lang.ExceptionInfo e
       (print-error! e)
       (System/exit (:secrets/exit (ex-data e) 1)))))

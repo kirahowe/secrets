@@ -22,7 +22,7 @@
     :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}})
 
 (defn parse-args
-  "Parse initializer options, including standalone `--help`."
+  "Parse initializer options, including standalone `-h` and `--help`."
   [args]
   (loop [xs args
          opts {:env "dev" :layout :tracked}]
@@ -56,7 +56,7 @@
         "--keygen" (recur (next xs) (assoc opts :keygen? true))
         "--apply" (recur (next xs) (assoc opts :apply? true))
         "--show-contents" (recur (next xs) (assoc opts :show-contents? true))
-        "--help" (assoc opts :help? true)
+        ("-h" "--help") (assoc opts :help? true)
         (throw (ex-info (str "Unknown option: " x) {:argument x})))
       (do
         (when-not (and (string? (:app opts)) (not (str/blank? (:app opts))))
@@ -776,12 +776,8 @@
 
 (defn- print-trust! [{:keys [trusted? message]}]
   (if trusted?
-    (println (str " Race safety: verified through the "
-                  (str/join " and " required-attribute-views)
-                  " file attributes that every directory from / down to this project is"
-                  " owned by you or root, is not other-writable unless sticky, and is not"
-                  " group-writable unless sticky or its group is just its owner."))
-    (println (str " Race safety: not established, so applying would be refused. "
+    (println " Project path is trusted for safe writes.")
+    (println (str " Project path is not trusted; --apply will be refused. "
                   message))))
 
 (defn- output-mode
@@ -842,9 +838,38 @@
       :cancel
       (assoc result :status :cancelled)
 
-      (assoc result :status :preview))))
+      (do
+        (when (seq (:changes proposal))
+          (if (:trusted? trust)
+            (println "No files changed. Rerun with --apply to apply this plan.")
+            (println (str "No files changed. Fix the project-path trust problem above, "
+                          "then preview again."))))
+        (assoc result :status :preview)))))
 
 ;;;; Entry Point
+
+(def ^:private help-text
+  (str "Secrets project initializer\n\n"
+       "Usage:\n"
+       "  -m com.kirahowe.secrets.init --app NAME [options]\n\n"
+       "Options:\n"
+       "  --app NAME                 Application name (required)\n"
+       "  --env NAME                 Environment name (default: dev)\n"
+       "  --layout tracked|disposable\n"
+       "                             Artifact layout (default: tracked)\n"
+       "  --team                     Create a public recipients file\n"
+       "  --keygen                   Generate an identity after applying\n"
+       "  --apply                    Apply the previewed changes\n"
+       "  --show-contents            Print complete file contents in the preview\n"
+       "  -h, --help                 Show this help"))
+
+(defn- print-init-help! []
+  (println help-text))
+
+(defn- print-init-error! [e]
+  (binding [*out* *err*]
+    (println "secrets init:" (ex-message e))
+    (println "Run with --help for usage and options.")))
 
 (defn -main
   "Run the secrets initializer from command-line arguments."
@@ -852,12 +877,8 @@
   (try
     (let [opts (parse-args args)]
       (if (:help? opts)
-        (println
-         (str "Usage: bb -Sdeps '<coordinate>' -m com.kirahowe.secrets.init --app NAME "
-              "[--env dev] [--layout tracked|disposable] [--team] [--keygen] [--apply] "
-              "[--show-contents]"))
+        (print-init-help!)
         (init! opts)))
     (catch clojure.lang.ExceptionInfo e
-      (binding [*out* *err*]
-        (println "secrets init:" (ex-message e)))
+      (print-init-error! e)
       (System/exit 1))))

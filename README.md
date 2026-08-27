@@ -84,6 +84,9 @@ absolute `src` path):
 bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
 ```
 
+Use the same launcher with `-h` or `--help` to see the initializer's readable
+usage and option list without supplying `--app`.
+
 The initializer proposes a minimal `dev` store, names every file it would
 create, merge, or leave alone, and then offers to apply it, print the
 configuration for manual integration, or cancel. `--keygen` is an explicit
@@ -106,11 +109,13 @@ Existing `bb.edn` comments and unrelated forms are preserved. A conflicting
 dependency or `secrets` task is refused rather than overwritten. Existing valid
 templates and hand-maintained recipients files are also preserved.
 
-For a non-interactive scaffold, `--apply` is the explicit confirmation after
-the preview; it prints paths and actions only. Other layout options are
-described under [Initialization layouts](#initialization-layouts), and what a
-preview does and does not print under [Preview
-output](#initializer-preview-output).
+For a non-interactive scaffold, the first run is preview-only and explicitly
+says that no files changed. When the project path is trusted and changes are
+pending, rerun with `--apply`; an untrusted preview instead explains that apply
+will be refused and does not offer it as a successful next step. Applied runs
+print paths and actions only. Other layout options are described under
+[Initialization layouts](#initialization-layouts), and what a preview does and
+does not print under [Preview output](#initializer-preview-output).
 
 **2. Set the first value through stdin.** This interactive shell form disables
 echo while reading and never places the value in shell history or a process
@@ -206,6 +211,17 @@ bb secrets edit dev      # decrypt → $EDITOR → re-encrypt (no plaintext left
 bb secrets show-key       # print public key(s) to share with teammates
 bb secrets decrypt dev secrets/secrets.edn.age  # plaintext to stdout
 ```
+
+Discover the full command list or one command's exact operands without touching
+the encrypted files:
+
+```sh
+bb secrets --help
+bb secrets help set       # the same command help is available as: bb secrets set -h
+```
+
+`-h` and `--help` are recognized before the `--` operand terminator. After
+`--`, a flag-shaped value remains a filename, key, or environment operand.
 
 Every command takes the environment first (`bb secrets decrypt [env] <file>`);
 omit it to use the default environment. `decrypt` writes to stdout byte-for-byte,
@@ -611,8 +627,9 @@ hold the value for production.
 
 ## Initialization layouts
 
-The initializer requires `--app`, defaults to `--env dev`, and supports these
-explicit layouts:
+The initializer requires `--app`, defaults to `--env dev`, and accepts `-h` or
+`--help` for its launcher-neutral usage and options. It supports these explicit
+layouts:
 
 | Invocation | Template | Ciphertext + manifest | Identity | Recipients |
 | --- | --- | --- | --- | --- |

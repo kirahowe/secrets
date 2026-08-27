@@ -968,6 +968,57 @@
       (with-out-str (cli/run! config args)))
     @seen))
 
+(defn- dispatch-cli! [config args]
+  ((cli-private 'dispatch!) config args))
+
+(deftest help-aliases-and-command-scoping-test
+  (let [config {:deliberately :unnormalizable}
+        unexpected (fn [& _] (throw (ex-info "help touched command execution" {})))]
+    (with-redefs [cli/normalize-config unexpected
+                  cli/keygen! unexpected
+                  cli/set-secret! unexpected]
+      (let [long-help (with-out-str (dispatch-cli! config ["--help"]))
+            short-help (with-out-str (dispatch-cli! config ["-h"]))
+            help-command (with-out-str (dispatch-cli! config ["help"]))]
+        (is (= long-help short-help help-command))
+        (is (str/includes? long-help "Usage: bb secrets <command> [args]"))
+        (is (str/includes? long-help "Global help: bb secrets -h (or: bb secrets --help)"))
+        (is (str/includes? long-help "bb secrets help <command>")))
+      (let [via-help (with-out-str (dispatch-cli! config ["help" "set"]))
+            via-long-flag (with-out-str (dispatch-cli! config ["set" "--help"]))
+            via-short-flag (with-out-str (dispatch-cli! config ["set" "-h"]))]
+        (is (= via-help via-long-flag via-short-flag))
+        (is (str/starts-with? via-help "Usage: bb secrets set [env] <key> [--edn]"))
+        (is (str/includes? via-help "--edn parses the value as EDN")))
+      (let [out (with-out-str (dispatch-cli! config ["help" "keygen"]))]
+        (is (str/starts-with? out "Usage: bb secrets keygen [env]"))
+        (is (str/includes? out "Generate an age key for an environment"))))))
+
+(deftest help-flags-after-the-terminator-remain-operands-test
+  (let [config (test-config)]
+    (is (= ["--help"] (dispatched config ["keygen" "--" "--help"])))
+    (is (= [nil "--help" false]
+           (dispatched config ["set" "--" "--help"])))))
+
+(deftest positional-arity-is-checked-before-command-leaves-test
+  (let [called (atom [])
+        record (fn [& args] (swap! called conj args))
+        failure (fn [args]
+                  (try
+                    (dispatch-cli! (test-config) args)
+                    nil
+                    (catch clojure.lang.ExceptionInfo e e)))]
+    (with-redefs [cli/keygen! record
+                  cli/set-secret! record]
+      (let [surplus (failure ["keygen" "dev" "unexpected"])
+            missing (failure ["set"])]
+        (is (= "Too many positional arguments for keygen." (ex-message surplus)))
+        (is (= "Usage: bb secrets keygen [env]" (:hint (ex-data surplus))))
+        (is (= "Missing positional argument for set." (ex-message missing)))
+        (is (= "Usage: bb secrets set [env] <key> [--edn]" (:hint (ex-data missing))))
+        (is (empty? @called)
+            "arity failures occur before keygen! or set-secret! can perform I/O")))))
+
 (deftest a-file-named-like-a-flag-round-trips-test
   ;; The acceptance criterion, through `run!` rather than the command fns: what
   ;; the defect broke is dispatch, so dispatch is what has to run. Safe here

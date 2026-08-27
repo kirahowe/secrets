@@ -6,6 +6,9 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Discoverable global, per-command, and initializer help (`-h`/`--help`), with
+  command-spec-driven positional arity checks and explicit preview/error next
+  steps instead of ignored extra arguments or ambiguous no-op previews.
 - Development tasks for formatting (`bb format`), non-mutating format checks
   (`bb format:check`), and linting (`bb lint`), enforcing the project's
   100-column Clojure style consistently.

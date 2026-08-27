@@ -117,12 +117,26 @@
       "--app" "--team"
       "--env" "--keygen"
       "--layout" "--apply"))
-  (testing "standalone help"
-    (is (= {:env "dev" :layout :tracked :help? true}
-           (init/parse-args ["--help"]))
-        "help must not demand an app name")
-    (is (str/includes? (with-out-str (init/-main "--help")) "Usage:")
-        "the standalone entry point also accepts --help without --app")))
+  (testing "standalone help aliases"
+    (doseq [flag ["-h" "--help"]]
+      (is (= {:env "dev" :layout :tracked :help? true}
+             (init/parse-args [flag]))
+          "help must not demand an app name")
+      (let [out (with-out-str (init/-main flag))]
+        (is (str/includes? out
+                           "Usage:\n  -m com.kirahowe.secrets.init --app NAME [options]"))
+        (is (str/includes? out "Options:"))
+        (is (str/includes? out "--apply"))
+        (is (not (str/includes? out "<coordinate>"))
+            "help describes initializer arguments without prescribing a launcher")))))
+
+(deftest initializer-failures-print-help-guidance-test
+  (let [err (java.io.StringWriter.)
+        print-init-error! (ns-resolve 'com.kirahowe.secrets.init 'print-init-error!)]
+    (binding [*err* err]
+      (print-init-error! (ex-info "--app <name> is required" {})))
+    (is (str/includes? (str err) "secrets init: --app <name> is required"))
+    (is (str/includes? (str err) "Run with --help for usage and options."))))
 
 (deftest layouts-are-safe-and-normalizable-test
   (let [tracked (init/proposed-config {:app "reader"})
@@ -183,9 +197,13 @@
 
 (deftest noninteractive-preview-and-manual-cancel-do-not-mutate-test
   (testing "non-TTY without --apply is strictly preview-only"
-    (is (= :preview
-           (:status (init/init! {:root *dir* :app "reader" :tty? false}))))
-    (is (not (.exists (io/file *dir* "bb.edn")))))
+    (let [result (atom nil)
+          out (with-out-str
+                (reset! result (init/init! {:root *dir* :app "reader" :tty? false})))]
+      (is (= :preview (:status @result)))
+      (is (not (.exists (io/file *dir* "bb.edn"))))
+      (is (str/includes? out "Project path is trusted for safe writes."))
+      (is (str/includes? out "No files changed. Rerun with --apply to apply this plan."))))
   (testing "manual and cancel do not write or generate a key"
     (let [called (atom false)]
       (with-redefs [cli/keygen! (fn [& _] (reset! called true))]
@@ -556,7 +574,7 @@
            #"cannot report its posix and unix file attributes"
            (binding [*out* out]
              (init/init! {:root *dir* :app "reader" :apply? true :tty? false}))))
-      (is (str/includes? (str out) "would be refused")))
+      (is (str/includes? (str out) "--apply will be refused")))
     (is (not (.exists (io/file *dir* "bb.edn"))))))
 
 (deftest staging-write-refuses-an-existing-entry-test
@@ -613,7 +631,9 @@
         (is (= :preview (:status @result)))
         (is (false? (:trusted? (:trust @result))))
         (is (= :world-writable (:reason (:trust @result))))
-        (is (str/includes? out "would be refused"))
+        (is (str/includes? out "--apply will be refused"))
+        (is (not (str/includes? out "Rerun with --apply"))
+            "an untrusted preview does not imply that applying this plan can succeed")
         (is (str/includes? out "secrets/secrets.edn.example: create")
             "the preview itself still runs")
         (is (not (.exists (io/file project "bb.edn"))))))))
