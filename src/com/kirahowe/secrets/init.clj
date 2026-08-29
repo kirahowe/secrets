@@ -1,6 +1,7 @@
 (ns com.kirahowe.secrets.init
   "Standalone, one-shot project bootstrapper for `bb secrets`."
-  (:require [clojure.java.io :as io]
+  (:require [babashka.cli :as bbcli]
+            [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [com.kirahowe.secrets.cli :as cli]
@@ -21,47 +22,43 @@
    {:git/tag "v0.1.0"
     :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}})
 
+(def ^:private init-spec
+  [[:app {:coerce :string :desc "Application name"}]
+   [:env {:coerce :string :default "dev" :desc "Environment name"}]
+   [:layout {:coerce keyword
+             :default :tracked
+             :validate #{:tracked :disposable}
+             :desc "Artifact layout: tracked or disposable"}]
+   [:team {:coerce :boolean :desc "Create a public recipients file"}]
+   [:keygen {:coerce :boolean :desc "Generate an identity after applying"}]
+   [:apply {:coerce :boolean :desc "Apply the previewed changes"}]
+   [:show-contents {:coerce :boolean :desc "Print complete file contents"}]
+   [:help {:alias :h :coerce :boolean :desc "Show this help"}]])
+
+(def ^:private boolean-option-names
+  {:team :team?
+   :keygen :keygen?
+   :apply :apply?
+   :show-contents :show-contents?
+   :help :help?})
+
 (defn parse-args
   "Parse initializer options, including standalone `-h` and `--help`."
   [args]
-  (loop [xs args
-         opts {:env "dev" :layout :tracked}]
-    (if-let [x (first xs)]
-      (case x
-        "--app"
-        (if-let [v (and (second xs)
-                        (not (str/starts-with? (second xs) "--"))
-                        (second xs))]
-          (recur (nnext xs) (assoc opts :app v))
-          (throw (ex-info "--app needs a name" {})))
-
-        "--env"
-        (if-let [v (and (second xs)
-                        (not (str/starts-with? (second xs) "--"))
-                        (second xs))]
-          (recur (nnext xs) (assoc opts :env v))
-          (throw (ex-info "--env needs a name" {})))
-
-        "--layout"
-        (if-let [v (and (second xs)
-                        (not (str/starts-with? (second xs) "--"))
-                        (second xs))]
-          (let [layout (keyword v)]
-            (when-not (#{:tracked :disposable} layout)
-              (throw (ex-info "--layout must be tracked or disposable" {:layout v})))
-            (recur (nnext xs) (assoc opts :layout layout)))
-          (throw (ex-info "--layout needs a value" {})))
-
-        "--team" (recur (next xs) (assoc opts :team? true))
-        "--keygen" (recur (next xs) (assoc opts :keygen? true))
-        "--apply" (recur (next xs) (assoc opts :apply? true))
-        "--show-contents" (recur (next xs) (assoc opts :show-contents? true))
-        ("-h" "--help") (assoc opts :help? true)
-        (throw (ex-info (str "Unknown option: " x) {:argument x})))
-      (do
-        (when-not (and (string? (:app opts)) (not (str/blank? (:app opts))))
-          (throw (ex-info "--app <name> is required" {})))
-        opts))))
+  (let [parsed (bbcli/parse-opts args {:spec init-spec
+                                       :restrict true
+                                       :restrict-args true
+                                       :no-keyword-opts true})
+        opts (reduce-kv (fn [m option result]
+                          (if (true? (get parsed option))
+                            (assoc m result true)
+                            m))
+                        (apply dissoc parsed (keys boolean-option-names))
+                        boolean-option-names)]
+    (when-not (or (:help? opts)
+                  (and (string? (:app opts)) (not (str/blank? (:app opts)))))
+      (throw (ex-info "--app <name> is required" {})))
+    opts))
 
 (defn proposed-config
   "Build a proposed secrets configuration from initializer options."
@@ -846,23 +843,13 @@
 
 ;;;; Entry Point
 
-(def ^:private help-text
-  (str "Secrets project initializer\n\n"
-       "Usage:\n"
-       "  -m com.kirahowe.secrets.init --app NAME [options]\n\n"
-       "Options:\n"
-       "  --app NAME                 Application name (required)\n"
-       "  --env NAME                 Environment name (default: dev)\n"
-       "  --layout tracked|disposable\n"
-       "                             Artifact layout (default: tracked)\n"
-       "  --team                     Create a public recipients file\n"
-       "  --keygen                   Generate an identity after applying\n"
-       "  --apply                    Apply the previewed changes\n"
-       "  --show-contents            Print complete file contents in the preview\n"
-       "  -h, --help                 Show this help"))
-
 (defn- print-init-help! []
-  (println help-text))
+  (println "Secrets project initializer")
+  (println)
+  (println "Usage: -m com.kirahowe.secrets.init --app NAME [options]")
+  (println)
+  (println "Options:")
+  (println (bbcli/format-opts {:spec init-spec})))
 
 (defn- print-init-error! [e]
   (binding [*out* *err*]

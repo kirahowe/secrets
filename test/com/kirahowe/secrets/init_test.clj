@@ -112,11 +112,15 @@
                           (init/parse-args [])))
     (are [option following]
          (thrown-with-msg? clojure.lang.ExceptionInfo
-                           #"needs"
+                           #"Missing value"
                            (init/parse-args [option following]))
       "--app" "--team"
       "--env" "--keygen"
       "--layout" "--apply"))
+  (testing "positional arguments are rejected"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"Unexpected argument: extra"
+                          (init/parse-args ["--app" "reader" "extra"]))))
   (testing "standalone help aliases"
     (doseq [flag ["-h" "--help"]]
       (is (= {:env "dev" :layout :tracked :help? true}
@@ -124,7 +128,7 @@
           "help must not demand an app name")
       (let [out (with-out-str (init/-main flag))]
         (is (str/includes? out
-                           "Usage:\n  -m com.kirahowe.secrets.init --app NAME [options]"))
+                           "Usage: -m com.kirahowe.secrets.init --app NAME [options]"))
         (is (str/includes? out "Options:"))
         (is (str/includes? out "--apply"))
         (is (not (str/includes? out "<coordinate>"))

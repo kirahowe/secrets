@@ -6,9 +6,10 @@ everything else — structure, defaults, and the encrypted ciphertext itself —
 lives in git, with a committed value-free manifest that makes each change
 reviewable.
 
-- **No additional Clojure libraries.** It uses core Clojure APIs plus the
-  `age` CLI, and once on the classpath it runs the same under JVM Clojure and
-  [babashka](https://babashka.org).
+- **Babashka CLI parsing.** Command-line options and generated usage are powered
+   by [babashka/cli](https://github.com/babashka/cli), which is built into
+   Babashka and included as a JVM dependency for reproducible resolution. The
+   project otherwise uses core Clojure APIs plus the `age` CLI.
 - **A safe project initializer and `bb secrets` task.** Bootstrap with a
   previewed `bb.edn` merge, then use `keygen` · `new` · `edit` · `set` · `rm` ·
   `verify` · `doctor` · `show-key` · `add-recipient` · `recipients` ·
@@ -216,12 +217,15 @@ Discover the full command list or one command's exact operands without touching
 the encrypted files:
 
 ```sh
+bb secrets              # empty arguments show the same global help
 bb secrets --help
 bb secrets help set       # the same command help is available as: bb secrets set -h
 ```
 
-`-h` and `--help` are recognized before the `--` operand terminator. After
-`--`, a flag-shaped value remains a filename, key, or environment operand.
+`-h` and `--help` are recognized anywhere before the `--` operand
+terminator. After `--`, a flag-shaped value remains a filename, key, or
+environment operand. Only `set` recognizes `--edn`, also anywhere before the
+terminator; other commands preserve that spelling as an operand.
 
 Every command takes the environment first (`bb secrets decrypt [env] <file>`);
 omit it to use the default environment. `decrypt` writes to stdout byte-for-byte,

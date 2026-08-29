@@ -1,9 +1,9 @@
 {:paths ["src"]
 
- ;;; Zero runtime dependencies beyond Clojure itself — the library shells out to
- ;;; the `age` CLI and uses only clojure.core/edn/io/shell, so it loads and runs
- ;;; identically under JVM Clojure and babashka.
- :deps {org.clojure/clojure {:mvn/version "1.12.4"}}
+ ;;; Babashka has babashka.cli built in for direct-classpath, Java-free smoke.
+ ;;; This runtime coordinate supplies transitive and JVM Clojure consumers.
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}
+         org.babashka/cli {:mvn/version "0.12.86"}}
 
  :aliases
  ;;; The :test alias adds "build" so the release guards

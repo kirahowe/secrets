@@ -1,6 +1,5 @@
 (ns com.kirahowe.secrets.cli
-  "The `bb secrets` management task: a self-contained, dependency-free command
-  dispatcher a host project wires into a single babashka task.
+  "The `bb secrets` management task, using Babashka CLI for parsing and dispatch.
 
       ;; bb.edn
       {:deps  {com.kirahowe/secrets {:local/root \"../secrets\"}}
@@ -35,8 +34,8 @@
 
   Optional per-environment keys:
     :recipients-file  path to a committed file of age public keys (one per
-                      line). When set, the environment encrypts to *all* of
-                      them, so each teammate can decrypt with their own key.
+                      line). When set, the environment encrypts to all of them,
+                      so each teammate can decrypt with their own key.
                       Absent ⇒ single-key mode (encrypt to own key).
     :manifest false   disable the manifest for this environment.
 
@@ -58,7 +57,8 @@
   :secrets/exit) instead of exiting. `run!` — the CLI entry point — is the
   only fn here that prints error data and calls System/exit."
   (:refer-clojure :exclude [run!])
-  (:require [clojure.java.io :as io]
+  (:require [babashka.cli :as bbcli]
+            [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
@@ -1936,131 +1936,43 @@
 
 ;;;; Dispatch
 
-(def ^:private command-specs
-  [{:name "keygen" :usage "[env]" :description "Generate an age key for an environment"
-    :min-positionals 0 :max-positionals 1}
-   {:name "new" :usage "[env]"
-    :description "Create a new encrypted secrets file (opens your editor)"
-    :min-positionals 0 :max-positionals 1}
-   {:name "edit" :usage "[env]"
-    :description "Edit an existing secrets file (decrypt → edit → re-encrypt)"
-    :min-positionals 0 :max-positionals 1}
-   {:name "set" :usage "[env] <key> [--edn]"
-    :description "Set a key from stdin; --edn parses the value as EDN instead of a string"
-    :min-positionals 1 :max-positionals 2}
-   {:name "rm" :usage "[env] <key>"
-    :description "Remove a key (fails if the key or file is absent)"
-    :min-positionals 1 :max-positionals 2}
-   {:name "verify" :usage "[env]"
-    :description "Check the committed manifest matches the secrets"
-    :min-positionals 0 :max-positionals 1}
-   {:name "doctor" :usage "[env]"
-    :description "Safely diagnose configuration and verification capability"
-    :min-positionals 0 :max-positionals 1}
-   {:name "show-key" :usage "[env]" :description "Print public key(s) for sharing"
-    :min-positionals 0 :max-positionals 1}
-   {:name "add-recipient" :usage "[env] [key]"
-    :description "Add a public key to the env's recipients file"
-    :min-positionals 0 :max-positionals 2}
-   {:name "recipients" :usage "[env]" :description "List configured recipient public keys"
-    :min-positionals 0 :max-positionals 1}
-   {:name "reencrypt" :usage "[env]"
-    :description "Re-encrypt to current recipients (after a change)"
-    :min-positionals 0 :max-positionals 1}
-   {:name "encrypt" :usage "[env] <file>"
-    :description "Encrypt an arbitrary file to <file>.age"
-    :min-positionals 1 :max-positionals 2}
-   {:name "decrypt" :usage "[env] <file>" :description "Decrypt a <file>.age to stdout"
-    :min-positionals 1 :max-positionals 2}
-   {:name "help" :usage "[command]" :description "Show global or command-specific help"
-    :min-positionals 0 :max-positionals 1}])
+(def ^:private completions-command "org.babashka.cli/completions")
+(def ^:private help-options #{"-h" "--help"})
 
-(defn- split-operands
-  "Split `args` at the first `--` operand terminator into `[options operands]`,
-  consuming the terminator itself. Everything in `operands` is positional data
-  however it is spelled, which is how an operand that looks like an option — a
-  file named `--edn` — is named on the command line. Same boundary every `age`
-  invocation gets; a second `--` is data, not another terminator."
+(defn- normalize-argv
+  "Adapt argv to Babashka CLI without changing any operand.
+
+  Babashka CLI treats dash-leading operands as options and does not bind
+  `:args->opts` after `--`. Before the user's first terminator, extract only
+  `-h`/`--help` and `set`'s `--edn`, then replace each operand with its
+  safe decimal index. Command `:exec-fn` closures resolve those indexes back to
+  the exact original strings."
   [args]
-  (let [[options operands] (split-with #(not= "--" %) args)]
-    [(vec options) (vec (rest operands))]))
-
-(defn- without-terminator
-  "`args` with the `--` operand terminator consumed and nothing else touched —
-  what a command that defines no flag of its own needs."
-  [args]
-  (let [[options operands] (split-operands args)]
-    (into options operands)))
-
-(defn- extract-flag
-  "Pull a boolean `flag` out of `args`, returning `[present? remaining-args]`.
-  Called only for the command that defines `flag`, so no other command's
-  operand can be consumed as a flag it does not accept. Within that command the
-  flag still leaves the sequence before positional dispatch reads it: `set` is
-  `[env] <key> [--edn]`, and `(second args)` deciding whether the first
-  argument is the environment or the key is what the extraction protects. A
-  flag is only recognized before the operand terminator."
-  [flag args]
-  (let [[options operands] (split-operands args)]
-    [(boolean (some #{flag} options))
-     (into (vec (remove #{flag} options)) operands)]))
-
-(def ^:private help-flags #{"--help" "-h"})
-
-(defn- command-spec [command]
-  (some #(when (= command (:name %)) %) command-specs))
-
-(defn- usage-line [{command :name :keys [usage]}]
-  (str "Usage: bb secrets " command (when (seq usage) (str " " usage))))
-
-(defn- print-global-help! [{:keys [environments default-environment]}]
-  (println (paint :bold "Manage encrypted secrets (age).") "\n")
-  (println "Usage: bb secrets <command> [args]\n")
-  (doseq [{command :name :keys [usage description]} command-specs]
-    (println (format "  %-14s %-23s %s" command usage description)))
-  (println)
-  (println "Global help: bb secrets -h (or: bb secrets --help)")
-  (println "Command help: bb secrets help <command> (or: bb secrets <command> --help)")
-  (println)
-  (println "Environments:" (str/join ", " (map name (keys environments)))
-           (if default-environment
-             (str "(default: " (name default-environment) ")")
-             ""))
-  (println (paint :dim "\n  An omitted [env] uses the default environment."))
-  (println
-   (paint :dim
-          "  -- ends the options: everything after it is an operand, even -h, --help, or --edn."))
-  (println
-   (paint :dim
-          "  Commands printed as suggestions are POSIX sh, single-quoted per argument."))
-  (println (paint :dim "  verify exits 0 (ok) · 1 (drift) · 2 (missing or unverifiable)."))
-  (println
-   (paint :dim
-          "  doctor exits 0 (healthy) · 1 (warning/action needed) · 2 (invalid configuration).")))
-
-(defn- print-command-help! [{:keys [description] :as spec}]
-  (println (usage-line spec))
-  (println)
-  (println description))
-
-(defn- validate-positionals! [{command :name
-                               :keys [min-positionals max-positionals]
-                               :as spec}
-                              positionals]
-  (let [n (count positionals)]
+  (let [[command & command-args] args]
     (cond
-      (< n min-positionals)
-      (fail! (str "Missing positional argument for " command ".")
-             {:command command :hint (usage-line spec)})
+      (nil? command) {:argv ["--help"] :operands []}
+      (= completions-command command) {:argv args :operands []}
+      (help-options command) {:argv args :operands []}
+      :else
+      (let [command (str/lower-case command)
+            known-options (cond-> help-options
+                            (= "set" command) (conj "--edn"))
+            [before-boundary after-boundary] (split-with #(not= "--" %) command-args)
+            options (filterv known-options before-boundary)
+            operands (into (vec (remove known-options before-boundary))
+                           (next after-boundary))]
+        {:argv (into [command] (concat options (map str (range (count operands)))))
+         :operands operands}))))
 
-      (> n max-positionals)
-      (fail! (str "Too many positional arguments for " command ".")
-             {:command command :hint (usage-line spec)}))))
+(defn- operand [operands token]
+  (when token
+    (nth operands (parse-long token))))
+
+(defn- operand-token? [x]
+  (and (string? x) (re-matches #"\d+" x)))
 
 (defn- print-error!
-  "Print an ex-info the way `run!` reports failures: the message via `oops`,
-  then any :hint / :install / :error (captured stderr) / :docs from the
-  ex-data as indented follow-up lines on stderr."
+  "Print an ex-info the way `run!` reports failures."
   [e]
   (oops (ex-message e))
   (binding [*out* *err*]
@@ -2070,75 +1982,220 @@
             line (str/split-lines (str/trim-newline (str v)))]
       (println "   " line))))
 
-(defn- help-requested? [args]
-  (let [[options _] (split-operands args)]
-    (boolean (some help-flags options))))
+(defn- restore-error-operand [data operands]
+  (cond
+    (and (= :restrict-args (:cause data)) (operand-token? (:value data)))
+    (let [value (operand operands (:value data))]
+      (assoc data :value value :msg (str "Unexpected argument: " value)))
 
-(defn- command-positionals [command args]
-  (if (= "set" command)
-    (extract-flag "--edn" args)
-    [false (without-terminator args)]))
+    (and (= :no-match (:cause data)) (operand-token? (:wrong-input data)))
+    (let [wrong-input (operand operands (:wrong-input data))]
+      (assoc data
+             :wrong-input wrong-input
+             :msg (str "Unknown command: " wrong-input)))
 
-(defn- print-help-invocation! [config positionals]
-  (if-let [target (first positionals)]
-    (if-let [spec (command-spec (str/lower-case target))]
-      (print-command-help! spec)
-      (fail! (str "Unknown command: " target)
-             {:command target :hint (usage-line (command-spec "help"))}))
-    (print-global-help! config)))
+    :else data))
 
-(defn- execute-command! [config command positionals edn?]
-  (if (= "doctor" command)
-    (let [{:keys [exit]} (doctor! config (first positionals))]
-      (when (pos? exit) (System/exit exit)))
-    (let [config (normalize-config config)]
-      (case command
-        "keygen" (keygen! config (first positionals))
-        "new" (new! config (first positionals))
-        "edit" (edit! config (first positionals))
-        "set" (if (second positionals)
-                (set-secret! config (first positionals) (second positionals) edn?)
-                (set-secret! config nil (first positionals) edn?))
-        "rm" (if (second positionals)
-               (remove-secret! config (first positionals) (second positionals))
-               (remove-secret! config nil (first positionals)))
-        "verify" (let [{:keys [exit]} (verify! config (first positionals))]
-                   (when (pos? exit) (System/exit exit)))
-        "show-key" (show-key! config (first positionals))
-        "add-recipient" (add-recipient! config (first positionals) (second positionals))
-        "recipients" (recipients! config (first positionals))
-        "reencrypt" (reencrypt! config (first positionals))
-        "encrypt" (if (second positionals)
-                    (encrypt! config (first positionals) (second positionals))
-                    (encrypt! config nil (first positionals)))
-        "decrypt" (if (second positionals)
-                    (decrypt! config (first positionals) (second positionals))
-                    (decrypt! config nil (first positionals)))))))
+(defn- dispatch-options [operands]
+  {:prog "bb secrets"
+   :help true
+   :restrict true
+   :no-keyword-opts true
+   :error-fn (fn [data]
+               (let [data (restore-error-operand data operands)]
+                 (throw (ex-info (bbcli/format-command-error data)
+                                 (assoc data :secrets/exit 1)))))})
+
+(defn- root-epilog [{:keys [environments default-environment]}]
+  (str "Environments: "
+       (str/join ", " (map name (keys environments)))
+       (when default-environment
+         (str " (default: " (name default-environment) ")"))
+       \newline
+       \newline
+       (str/join
+        \newline
+        ["An omitted [env] uses the default environment."
+         "-- ends the options: everything after it is an operand, even -h, --help, or --edn."
+         "Commands printed as suggestions are POSIX sh, single-quoted per argument."
+         "verify exits 0 (ok), 1 (drift), or 2 (missing or unverifiable)."
+         "doctor exits 0 (healthy), 1 (warning/action needed), or 2 (invalid configuration)."])))
+
+(defn- exit-on-status! [{:keys [exit]}]
+  (when (pos? exit)
+    (System/exit exit)))
+
+(defn- command-table [config operands]
+  [{:cmds []
+    :doc "Manage encrypted secrets (age)."
+    :epilog (root-epilog config)}
+   {:cmds ["keygen"]
+    :doc "Generate an age key for an environment."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to configured environment)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (keygen! (normalize-config config) (operand operands env)))}
+   {:cmds ["new"]
+    :doc "Create a new encrypted secrets file (opens your editor)."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to configured environment)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (new! (normalize-config config) (operand operands env)))}
+   {:cmds ["edit"]
+    :doc "Edit an existing secrets file (decrypt, edit, then re-encrypt)."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to configured environment)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (edit! (normalize-config config) (operand operands env)))}
+   {:cmds ["set"]
+    :doc (str "Set a key from stdin. With one argument it is the key in the default environment; "
+              "with two, the first is the environment and the second is the key.")
+    :args->opts [:env-or-key :key]
+    :require [:env-or-key]
+    :restrict-args true
+    :spec [[:env-or-key {:positional true :coerce :string :desc "Environment or key"}]
+           [:key {:positional true :coerce :string :desc "Key when an environment is supplied"}]
+           [:edn {:coerce :boolean :desc "Parse stdin as EDN instead of a string"}]]
+    :exec-fn (fn [{:keys [env-or-key key edn]}]
+               (if key
+                 (set-secret! (normalize-config config)
+                              (operand operands env-or-key) (operand operands key) (true? edn))
+                 (set-secret! (normalize-config config)
+                              nil (operand operands env-or-key) (true? edn))))}
+   {:cmds ["rm"]
+    :doc (str "Remove a key. With one argument it is the key in the default environment; "
+              "with two, the first is the environment and the second is the key.")
+    :args->opts [:env-or-key :key]
+    :require [:env-or-key]
+    :restrict-args true
+    :spec [[:env-or-key {:positional true :coerce :string :desc "Environment or key"}]
+           [:key {:positional true :coerce :string :desc "Key when an environment is supplied"}]]
+    :exec-fn (fn [{:keys [env-or-key key]}]
+               (if key
+                 (remove-secret! (normalize-config config)
+                                 (operand operands env-or-key) (operand operands key))
+                 (remove-secret! (normalize-config config)
+                                 nil (operand operands env-or-key))))}
+   {:cmds ["verify"]
+    :doc "Check that the committed manifest matches the secrets."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to configured environment)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (exit-on-status! (verify! (normalize-config config) (operand operands env))))}
+   {:cmds ["doctor"]
+    :doc "Safely diagnose configuration and verification capability."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to configured environment)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (exit-on-status! (doctor! config (operand operands env))))}
+   {:cmds ["show-key"]
+    :doc "Print public keys for sharing."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to all sharing environments)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (show-key! (normalize-config config) (operand operands env)))}
+   {:cmds ["add-recipient"]
+    :doc "Add a public key to an environment's recipients file."
+    :args->opts [:env :key]
+    :restrict-args true
+    :spec [[:env {:positional true :coerce :string :desc "Environment"}]
+           [:key {:positional true
+                  :coerce :string
+                  :desc "Public key (read from stdin when omitted)"}]]
+    :exec-fn (fn [{:keys [env key]}]
+               (add-recipient! (normalize-config config)
+                               (operand operands env) (operand operands key)))}
+   {:cmds ["recipients"]
+    :doc "List configured recipient public keys."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to configured environment)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (recipients! (normalize-config config) (operand operands env)))}
+   {:cmds ["reencrypt"]
+    :doc "Re-encrypt to the current recipients after a change."
+    :args->opts [:env]
+    :restrict-args true
+    :spec [[:env {:positional true
+                  :coerce :string
+                  :desc "Environment (defaults to configured environment)"}]]
+    :exec-fn (fn [{:keys [env]}]
+               (reencrypt! (normalize-config config) (operand operands env)))}
+   {:cmds ["encrypt"]
+    :doc (str "Encrypt an arbitrary file to <file>.age. With one argument it is the file in "
+              "the default environment; with two, the first is the environment and "
+              "the second is the file.")
+    :args->opts [:env-or-file :file]
+    :require [:env-or-file]
+    :restrict-args true
+    :spec [[:env-or-file {:positional true :coerce :string :desc "Environment or input file"}]
+           [:file {:positional true
+                   :coerce :string
+                   :desc "Input file when an environment is supplied"}]]
+    :exec-fn (fn [{:keys [env-or-file file]}]
+               (if file
+                 (encrypt! (normalize-config config)
+                           (operand operands env-or-file) (operand operands file))
+                 (encrypt! (normalize-config config)
+                           nil (operand operands env-or-file))))}
+   {:cmds ["decrypt"]
+    :doc (str "Decrypt an age file to stdout. With one argument it is the file in the default "
+              "environment; with two, the first is the environment and the second is the file.")
+    :args->opts [:env-or-file :file]
+    :require [:env-or-file]
+    :restrict-args true
+    :spec [[:env-or-file {:positional true :coerce :string :desc "Environment or encrypted file"}]
+           [:file {:positional true
+                   :coerce :string
+                   :desc "Encrypted file when an environment is supplied"}]]
+    :exec-fn (fn [{:keys [env-or-file file]}]
+               (if file
+                 (decrypt! (normalize-config config)
+                           (operand operands env-or-file) (operand operands file))
+                 (decrypt! (normalize-config config)
+                           nil (operand operands env-or-file))))}
+   {:cmds ["help"]
+    :doc "Show global or command-specific help."
+    :args->opts [:command]
+    :restrict-args true
+    :spec [[:command {:positional true :coerce :string :desc "Command to describe"}]]
+    :exec-fn (fn [{:keys [command]}]
+               (let [target (when command
+                              (str/lower-case (operand operands command)))
+                     argv (cond
+                            (nil? target) ["--help"]
+                            (str/starts-with? target "-") [command]
+                            :else [target "--help"])]
+                 (bbcli/dispatch (command-table config operands)
+                                 argv
+                                 (dispatch-options operands))))}])
 
 (defn- dispatch! [config args]
-  (let [[cmd & more] args
-        command (some-> cmd str/lower-case)]
-    (cond
-      (or (nil? command) (help-flags command))
-      (print-global-help! config)
-
-      :else
-      (if-let [spec (command-spec command)]
-        (if (help-requested? more)
-          (print-command-help! spec)
-          (let [[edn? positionals] (command-positionals command more)]
-            (validate-positionals! spec positionals)
-            (if (= "help" command)
-              (print-help-invocation! config positionals)
-              (execute-command! config command positionals edn?))))
-        (let [config (normalize-config config)]
-          (print-global-help! config)
-          (fail! (str "Unknown command: " cmd) {:command cmd}))))))
+  (let [{:keys [argv operands]} (normalize-argv args)]
+    (bbcli/dispatch (command-table config operands) argv (dispatch-options operands))))
 
 (defn run!
-  "Public entry point for dispatching `args` against `config`.
-  Reports ex-info details and exits with :secrets/exit (default 1); commands
-  with documented status codes may exit directly."
+  "Dispatch `args` against `config`, exiting only at the CLI process boundary."
   [config args]
   (try
     (dispatch! config args)

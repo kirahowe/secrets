@@ -1083,12 +1083,19 @@
           (System/setOut original))))
     (.toByteArray captured)))
 
+(defn- management-invocation [args]
+  (shell/sh "bb" "-cp" "src" "-e"
+            (str "(require '[com.kirahowe.secrets.cli :as cli]) "
+                 "(cli/run! {:deliberately :invalid} " (pr-str args) ")")))
+
+(defn- management-help [args]
+  (let [{:keys [exit out err]} (management-invocation args)]
+    (when-not (zero? exit)
+      (throw (ex-info "Management help subprocess failed" {:args args :error err})))
+    out))
+
 (defn- dispatched
-  "The arguments `run!` hands the command named by `args`, with every command
-  implementation replaced by a recorder. The real dispatch path — the same
-  `case`, the same flag and terminator handling — with only the leaves stubbed,
-  so how an operand was interpreted is observable without the command touching
-  the filesystem and without a failure exiting the test runner."
+  "Record the exact operands a successful `run!` invocation gives its leaf."
   [config args]
   (let [seen (atom nil)
         record (fn [_config & more] (reset! seen (vec more)) {:exit 0})]
@@ -1108,31 +1115,39 @@
       (with-out-str (cli/run! config args)))
     @seen))
 
-(defn- dispatch-cli! [config args]
-  ((cli-private 'dispatch!) config args))
-
 (deftest help-aliases-and-command-scoping-test
-  (let [config {:deliberately :unnormalizable}
-        unexpected (fn [& _] (throw (ex-info "help touched command execution" {})))]
-    (with-redefs [cli/normalize-config unexpected
-                  cli/keygen! unexpected
-                  cli/set-secret! unexpected]
-      (let [long-help (with-out-str (dispatch-cli! config ["--help"]))
-            short-help (with-out-str (dispatch-cli! config ["-h"]))
-            help-command (with-out-str (dispatch-cli! config ["help"]))]
-        (is (= long-help short-help help-command))
-        (is (str/includes? long-help "Usage: bb secrets <command> [args]"))
-        (is (str/includes? long-help "Global help: bb secrets -h (or: bb secrets --help)"))
-        (is (str/includes? long-help "bb secrets help <command>")))
-      (let [via-help (with-out-str (dispatch-cli! config ["help" "set"]))
-            via-long-flag (with-out-str (dispatch-cli! config ["set" "--help"]))
-            via-short-flag (with-out-str (dispatch-cli! config ["set" "-h"]))]
-        (is (= via-help via-long-flag via-short-flag))
-        (is (str/starts-with? via-help "Usage: bb secrets set [env] <key> [--edn]"))
-        (is (str/includes? via-help "--edn parses the value as EDN")))
-      (let [out (with-out-str (dispatch-cli! config ["help" "keygen"]))]
-        (is (str/starts-with? out "Usage: bb secrets keygen [env]"))
-        (is (str/includes? out "Generate an age key for an environment"))))))
+  (let [empty-help (management-help [])
+        long-help (management-help ["--help"])
+        short-help (management-help ["-h"])
+        help-command (management-help ["help"])]
+    (is (= empty-help long-help short-help help-command))
+    (is (str/includes? long-help "Usage: bb secrets [options] <command>"))
+    (is (str/includes? long-help "help           Show global or command-specific help"))
+    (is (str/includes? long-help "Run \"bb secrets <command> --help\"")))
+  (let [via-help (management-help ["help" "SET"])
+        via-long-flag (management-help ["set" "--help"])
+        via-short-flag (management-help ["set" "key" "-h"])]
+    (is (= via-help via-long-flag via-short-flag))
+    (is (str/starts-with? via-help
+                          "Usage: bb secrets set [options] <env-or-key> [<key>]"))
+    (is (str/includes? via-help "Parse stdin as EDN instead of a string")))
+  (let [out (management-help ["help" "keygen"])]
+    (is (str/starts-with? out "Usage: bb secrets keygen [options] [<env>]"))
+    (is (str/includes? out "Generate an age key for an environment"))))
+
+(deftest command-errors-are-rendered-at-the-run-boundary-test
+  (let [missing (management-invocation ["set"])
+        surplus (management-invocation ["keygen" "dev" "extra"])
+        unknown (management-invocation ["wat"])
+        terminated-long-help (management-invocation ["help" "--" "--help"])
+        terminated-short-help (management-invocation ["help" "--" "-h"])]
+    (is (= 1 (:exit missing) (:exit surplus) (:exit unknown)
+           (:exit terminated-long-help) (:exit terminated-short-help)))
+    (is (str/includes? (:err missing) "Required argument: <env-or-key>"))
+    (is (str/includes? (:err surplus) "Unexpected argument: extra"))
+    (is (str/includes? (:err unknown) "Unknown command: wat"))
+    (is (str/includes? (:err terminated-long-help) "Unknown command: --help"))
+    (is (str/includes? (:err terminated-short-help) "Unknown command: -h"))))
 
 (deftest help-flags-after-the-terminator-remain-operands-test
   (let [config (test-config)]
@@ -1140,24 +1155,8 @@
     (is (= [nil "--help" false]
            (dispatched config ["set" "--" "--help"])))))
 
-(deftest positional-arity-is-checked-before-command-leaves-test
-  (let [called (atom [])
-        record (fn [& args] (swap! called conj args))
-        failure (fn [args]
-                  (try
-                    (dispatch-cli! (test-config) args)
-                    nil
-                    (catch clojure.lang.ExceptionInfo e e)))]
-    (with-redefs [cli/keygen! record
-                  cli/set-secret! record]
-      (let [surplus (failure ["keygen" "dev" "unexpected"])
-            missing (failure ["set"])]
-        (is (= "Too many positional arguments for keygen." (ex-message surplus)))
-        (is (= "Usage: bb secrets keygen [env]" (:hint (ex-data surplus))))
-        (is (= "Missing positional argument for set." (ex-message missing)))
-        (is (= "Usage: bb secrets set [env] <key> [--edn]" (:hint (ex-data missing))))
-        (is (empty? @called)
-            "arity failures occur before keygen! or set-secret! can perform I/O")))))
+(deftest command-names-are-case-insensitive-test
+  (is (= ["prod"] (dispatched (test-config) ["KEYGEN" "prod"]))))
 
 (deftest a-file-named-like-a-flag-round-trips-test
   ;; The acceptance criterion, through `run!` rather than the command fns: what

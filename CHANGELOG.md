@@ -6,9 +6,13 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
-- Discoverable global, per-command, and initializer help (`-h`/`--help`), with
-  command-spec-driven positional arity checks and explicit preview/error next
-  steps instead of ignored extra arguments or ambiguous no-op previews.
+- Babashka CLI 0.12.86 now provides declarative initializer option parsing,
+  management-command dispatch, positional validation, and generated help. JVM
+  users resolve it as a runtime dependency while Babashka supplies the same
+  namespace directly.
+- Discoverable global, per-command, and initializer help (`-h`/`--help`),
+  with explicit preview/error next steps instead of ignored extra arguments or
+  ambiguous no-op previews.
 - Development tasks for formatting (`bb format`), non-mutating format checks
   (`bb format:check`), and linting (`bb lint`), enforcing the project's
   100-column Clojure style consistently.

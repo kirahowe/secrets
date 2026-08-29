@@ -140,8 +140,9 @@
                                (keys (get-in deps [:aliases :book :override-deps]))))
         build-libs (set (keys (get-in deps [:aliases :build :deps])))
         tooling-libs (set/union book-libs build-libs)]
-    (testing "the published library basis remains Clojure-only"
-      (is (= #{'org.clojure/clojure} runtime-libs))
+    (testing "the published library basis contains only runtime dependencies"
+      (is (= #{'org.clojure/clojure 'org.babashka/cli} runtime-libs))
+      (is (= "0.12.86" (get-in deps [:deps 'org.babashka/cli :mvn/version])))
       (is (= ["src"] (:paths deps)))
       (is (empty? (set/intersection runtime-libs tooling-libs))))
     (testing "the credential-bearing deploy replacement excludes book/build tooling"
