@@ -533,12 +533,20 @@
         (let [shared (mkdirs! (io/file *dir* "shared"))
               under-shared (mkdirs! (io/file shared "project"))]
           (set-permissions! shared "rwxrwxr-x")
-          (is (= {:reason :shared-group-writable :path (str shared)}
-                 (ancestry-refusal under-shared))
-              "a group that holds more than the owner can rename the directory")
-          ;; No portable API creates a group named after the current user, so the
-          ;; user-private group of Fedora, RHEL, and Debian is stood in for at the
-          ;; one read that decides it.
+          ;; No portable API creates or chgrps to a group with a chosen name, so
+          ;; both directions of this decision are simulated at the one read that
+          ;; makes it. A fresh directory's real group happens to be user-private
+          ;; on some hosts (e.g. GitHub's ubuntu runners, where a checkout's
+          ;; owner and group are both `runner`) and not on others (macOS's
+          ;; `staff`), so leaving this assertion to the real group would pass or
+          ;; fail depending on the platform instead of the code under test.
+          (with-redefs-fn {#'init/posix-group (constantly "secrets-shared-group")}
+            (fn []
+              (is (= {:reason :shared-group-writable :path (str shared)}
+                     (ancestry-refusal under-shared))
+                  "a group that holds more than the owner can rename the directory")))
+          ;; The user-private group of Fedora, RHEL, and Debian is stood in for
+          ;; the same way.
           (with-redefs-fn {#'init/posix-group (constantly (System/getProperty "user.name"))}
             (fn []
               (is (nil? (ancestry-refusal under-shared))

@@ -210,5 +210,7 @@
       (let [found (policy/violations dir)]
         (testing "every rendered page and stylesheet passes the same rules"
           (is (empty? found) (str/join "\n" (map policy/finding-message found)))))
-      (println (str "rendered-book-is-compliant-test: skipped, " dir
-                    " holds no pages. Run `bb book:build` to check the real artifact.")))))
+      (do
+        (is (nil? built) "premise: no rendered book to check yet")
+        (println (str "rendered-book-is-compliant-test: skipped, " dir
+                      " holds no pages. Run `bb book:build` to check the real artifact."))))))
