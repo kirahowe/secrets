@@ -19,6 +19,12 @@ pom_dir="META-INF/maven/com.kirahowe/secrets"
 pom_xml="${pom_dir}/pom.xml"
 pom_props="${pom_dir}/pom.properties"
 
+# Read the runtime dependency version from deps.edn rather than duplicating it
+# here, so the two can't silently drift apart.
+deps_edn_path="$(pwd)/deps.edn"
+babashka_cli_version="$(clojure -M -e "(print (get-in (clojure.edn/read-string (slurp \"${deps_edn_path}\")) [:deps (quote org.babashka/cli) :mvn/version]))")"
+test -n "${babashka_cli_version}"
+
 mkdir -p target
 
 jar tf "${jar_path}" > target/jar-entries.txt
@@ -74,6 +80,6 @@ trap 'rm -rf "${inspect_tmpdir}"' EXIT
 
 (
   cd "${inspect_tmpdir}"
-  clojure -Sdeps "{:paths [\"${jar_path}\"]}" \
+  clojure -Sdeps "{:paths [\"${jar_path}\"] :deps {org.babashka/cli {:mvn/version \"${babashka_cli_version}\"}}}" \
     -e "(require 'com.kirahowe.secrets 'com.kirahowe.secrets.cli 'com.kirahowe.secrets.age 'com.kirahowe.secrets.manifest)"
 )

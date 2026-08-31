@@ -101,10 +101,11 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Clojure CLI
+      - name: Set up Clojure CLI and Babashka
         uses: DeLaGuardo/setup-clojure@4c7a6f613e5089821bb3bb2a33a3ee115578580d # 13.6.1
         with:
           cli: 1.12.5.1664
+          bb: 1.13.219
 
       - name: Install age
         run: |
