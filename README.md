@@ -958,7 +958,7 @@ raw/base64 identity paths, recipient lines, private-key text, or secret values.
 
 The verification fields distinguish a keyless freshness check from full
 verification. Keyless verification is available only when ciphertext exists
-and a readable version-1 manifest contains `:ciphertext-sha`; full verification
+and a readable version-2 manifest contains `:ciphertext-sha`; full verification
 requires `age`, a usable identity, ciphertext, and a manifest. A disabled
 manifest is reported as `skipped`.
 
