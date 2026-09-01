@@ -38,11 +38,11 @@ case $initial_add_output in
   *reencrypt*) exit 1 ;;
 esac
 case $initial_add_output in
-  *"bb secrets set demo"*) ;;
+  *"bb secrets set 'demo'"*) ;;
   *) exit 1 ;;
 esac
 case $initial_add_output in
-  *"bb secrets new demo"*) ;;
+  *"bb secrets new 'demo'"*) ;;
   *) exit 1 ;;
 esac
 test ! -e "$ciphertext"
@@ -66,7 +66,7 @@ age-keygen -o "$bob_key" >/dev/null 2>&1
 bob_public=$(age-keygen -y "$bob_key")
 teammate_add_output=$(bb secrets add-recipient demo "$bob_public" 2>&1)
 case $teammate_add_output in
-  *"bb secrets reencrypt demo"*) ;;
+  *"bb secrets reencrypt 'demo'"*) ;;
   *) exit 1 ;;
 esac
 bb secrets reencrypt demo >/dev/null
