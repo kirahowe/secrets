@@ -7,12 +7,11 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]))
 
-;; In the single-key setup, every teammate shares one private key. Age also
-;; supports multiple recipients: a file can encrypt to many
-;; recipients at once, and any one of the matching private keys decrypts it.
-;; In team mode, every person generates their own key, the list of
-;; public keys is committed to the repo, and teammates do not exchange their
-;; private identities.
+;; Sharing one private key is simple, but it gets awkward as soon as more than
+;; one person needs it. Age can encrypt one file to many public recipients, and
+;; any matching private identity can decrypt it. In team mode every person keeps
+;; their own identity, while the public recipient list is committed to the
+;; repository. Private keys never have to move between teammates.
 
 ;; ## Two people, two keys
 
@@ -68,8 +67,26 @@
 ;; ```
 
 ;; From then on, every `new`, `edit`, and `reencrypt` encrypts to the complete
-;; list. Onboarding a teammate is two commands run by the new person and one
-;; by anyone who already has access:
+;; list.
+
+;; ### Creating the first team store
+
+;; The first owner generates a key, adds their own public recipient, and then
+;; creates the ciphertext:
+
+;; ```sh
+;; bb secrets keygen prod
+;; bb secrets add-recipient prod
+;; bb secrets new prod
+;; ```
+
+;; There is no `reencrypt` step yet because no ciphertext exists. `new` (or the
+;; first `set`) encrypts directly to the recipients already in the file.
+
+;; ### Adding another person
+
+;; Once a store exists, onboarding a teammate is two commands run by the new
+;; person and one by somebody who already has access:
 
 ;; ```sh
 ;; bb secrets keygen prod          # new person, their own machine

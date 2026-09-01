@@ -8,6 +8,7 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.init :as init]
             [com.kirahowe.secrets.manifest :as manifest]
             [scicloj.kindly.v4.kind :as kind]))
 
@@ -26,7 +27,10 @@
            (str/join "  \n"
                      (map #(str "`" (pr-str (cons var-name %)) "`") arglists))
            "\n\n"
-           (str/replace (or doc "") #"(?m)^  " ""))))))
+           (-> (or doc "")
+               (str/replace #"\[\[([^\]]+)\]\]"
+                            (fn [[_ var-name]] (str "`" var-name "`")))
+               (str/replace #"(?m)^  " "")))))))
 
 ;; ## com.kirahowe.secrets
 
@@ -40,7 +44,13 @@
              #'secrets/identity-from-env
              #'secrets/resolve-identity-file
              #'secrets/identity-available?
+             #'secrets/with-identity
+             #'secrets/reset-identity-cache!
              #'secrets/expand-home)
+
+;; `load-secrets` accepts local filesystem sources, local `file:` locators, and
+;; `jar:file:` classpath resources. It deliberately rejects HTTP(S), remote or
+;; nested jars, and arbitrary input-stream values.
 
 ;; ## com.kirahowe.secrets.fs
 
@@ -73,7 +83,8 @@
 ;; back to standard input. Recipient strings passed as `:recipients` are values
 ;; rather than paths, and are used as given.
 
-(doc-section #'age/installed?
+(doc-section #'age/version
+             #'age/installed?
              #'age/ensure-installed!
              #'age/keygen!
              #'age/public-key
@@ -81,6 +92,7 @@
              #'age/encrypt-file!
              #'age/decrypt
              #'age/decrypt-bytes
+             #'age/decrypt-to-stream!
              #'age/decrypt-to-file!
              #'age/default-max-plaintext-bytes)
 
@@ -94,6 +106,19 @@
              #'manifest/hmac-key
              #'manifest/render
              #'manifest/diff)
+
+;; ## com.kirahowe.secrets.init
+
+;; The one-shot Babashka project initializer. `-main` is the command-line entry
+;; point; the other functions are available to tools that want to preview or
+;; apply the same scaffold programmatically.
+
+(doc-section #'init/init!
+             #'init/proposed-config
+             #'init/task-spec
+             #'init/merge-bb-edn
+             #'init/root-trust
+             #'init/filesystem-capability)
 
 ;; ## com.kirahowe.secrets.cli
 
@@ -109,6 +134,7 @@
              #'cli/set-secret!
              #'cli/remove-secret!
              #'cli/verify!
+             #'cli/doctor!
              #'cli/show-key!
              #'cli/add-recipient!
              #'cli/recipients!
@@ -125,6 +151,7 @@
 ;; | `:app` | yes | names the default key path `~/.config/<app>/key.txt`; recorded in the manifest |
 ;; | `:default-environment` | no | environment keyword used when a command omits `[env]` |
 ;; | `:environments` | yes | map of environment keyword to environment config |
+;; | `:limits` | no | positive integer bounds merged over the CLI defaults for every environment |
 
 ;; Per environment:
 
@@ -132,12 +159,28 @@
 ;; |-----|----------|---------|
 ;; | `:secrets-file` | yes | path to the ciphertext; must end in `.age` unless both `:template` and `:manifest` are explicit |
 ;; | `:key-file` | no | durable key path; default `~/.config/<app>/key.txt` |
+;; | `:identity-file` | no | explicit decrypt-side identity; environment variables still win |
 ;; | `:template` | no | seed for `new`; default `<secrets-file>` with `.example` |
 ;; | `:manifest` | no | manifest path, or `false` to disable; default `<secrets-file>` with `.manifest` |
 ;; | `:recipients-file` | no | committed list of age public keys; enables team mode |
 
 ;; Normalization also computes `:identity-file` per environment: the
 ;; `SECRETS_AGE_IDENTITY*` environment variables when set, otherwise `:key-file`.
+
+;; ### Configuration limits
+
+;; | Key | Default | Meaning |
+;; |-----|---------|---------|
+;; | `:max-plaintext-bytes` | 8 MiB | decrypted store size |
+;; | `:max-edn-depth` | 100 | nested EDN collection depth |
+;; | `:max-recipients` | 256 | recipient entries in one file |
+;; | `:max-recipient-chars` | 1,024 | characters in one recipient entry |
+;; | `:max-recipients-bytes` | 256 KiB | total recipients-file size |
+;; | `:max-manifest-bytes` | 1 MiB | manifest file size |
+;; | `:max-manifest-entries` | 10,000 | key entries in one manifest |
+
+;; The separate runtime `secrets/default-limits` also includes
+;; `:max-source-bytes` (16 MiB) for local file and jar-resource loading.
 
 ;; ## Environment variables
 
@@ -157,9 +200,10 @@
 ;; ## Exit codes
 
 ;; `bb secrets verify` exits 0 when every environment checks out (including
-;; keyless freshness passes), 1 on any drift, and 2 when an artifact is missing
-;; or a keyless run cannot check an older manifest with no ciphertext hash.
-;; Other commands exit 0 on success and 1 on failure.
+;; keyless freshness passes), 1 on drift, and 2 when an artifact is missing or a
+;; keyless run cannot check an older manifest with no ciphertext hash. `doctor`
+;; exits 0 when healthy, 1 when action is needed, and 2 for invalid
+;; configuration. Other commands exit 0 on success and 1 on failure.
 
 ;; ## File conventions
 

@@ -27,6 +27,12 @@
 ;; per distinct value because this wrapper passes the identity to `age` as a
 ;; file path.
 
+;; In a long-running process, call `secrets/reset-identity-cache!` after the
+;; configuration has loaded if you do not want that materialized copy to remain
+;; on disk. A copy still in use is deleted when its last decryption finishes;
+;; an explicit or mounted identity file is owned by the caller and is never
+;; touched. A later load materializes the injected value again.
+
 ;; A variable that is **set but empty** throws, naming itself, rather than
 ;; being treated as unset. This matters in CI: the workflow snippet later in
 ;; this chapter maps a repository secret into
@@ -107,8 +113,10 @@
    (java.net.URL. (str "jar:file:" jar "!/secrets.edn.age"))
    key-file))
 
-;; The library detects that the source is not a plain file, streams it out to
-;; an owner-only temp copy, hands that to `age`, and deletes the copy.
+;; The library recognizes the local `jar:file:` source, streams it out to an
+;; owner-only temp copy under the configured 16 MiB source limit, hands that to
+;; `age`, and deletes the copy. Remote and nested jar URLs are refused; runtime
+;; secret loading never performs a network request.
 
 ;; ## Startup wiring
 
@@ -143,8 +151,10 @@
 ;;     contents: read
 ;;   steps:
 ;;     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-;;     - uses: turtlequeue/setup-babashka@d78ec6570aea3b614bc695cafcceb82eb45c2af9 # v1.8.0
-;;       with: {babashka-version: 1.12.208}
+;;     - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+;;       with: {distribution: temurin, java-version: '21'}
+;;     - uses: DeLaGuardo/setup-clojure@4c7a6f613e5089821bb3bb2a33a3ee115578580d # v13.6.1
+;;       with: {bb: 1.13.219}
 ;;     - run: bb secrets verify
 ;; ```
 
@@ -174,9 +184,11 @@
 ;;     contents: read
 ;;   steps:
 ;;     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+;;     - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+;;       with: {distribution: temurin, java-version: '21'}
+;;     - uses: DeLaGuardo/setup-clojure@4c7a6f613e5089821bb3bb2a33a3ee115578580d # v13.6.1
+;;       with: {bb: 1.13.219}
 ;;     - run: sudo apt-get update && sudo apt-get install -y age
-;;     - uses: turtlequeue/setup-babashka@d78ec6570aea3b614bc695cafcceb82eb45c2af9 # v1.8.0
-;;       with: {babashka-version: 1.12.208}
 ;;     - run: bb secrets verify
 ;;       env:
 ;;         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
@@ -223,6 +235,10 @@
 ;;     contents: read
 ;;   steps:
 ;;     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+;;     - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+;;       with: {distribution: temurin, java-version: '21'}
+;;     - uses: DeLaGuardo/setup-clojure@4c7a6f613e5089821bb3bb2a33a3ee115578580d # v13.6.1
+;;       with: {bb: 1.13.219}
 ;;     - name: Install age
 ;;       run: sudo apt-get update && sudo apt-get install -y age
 ;;     - name: Run evaluations

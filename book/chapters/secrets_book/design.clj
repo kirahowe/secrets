@@ -5,15 +5,19 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 
-;; This chapter explains the main design choices and their trade-offs.
+;; There are many perfectly reasonable ways to manage secrets. This library is
+;; opinionated about a few of them, so it is worth being clear about the model
+;; and the trade-offs before getting too attached to it.
 
 ;; ## The problem with environment variables
 
-;; Environment variables are a common starting point, but they have limits.
+;; Environment variables are a perfectly good place to start. The trouble is
+;; that most applications do not stop at three of them.
 
-;; Each integration adds more variables, while the repository may contain no
-;; complete list of what the application needs. The active configuration then
-;; lives in deployment settings rather than beside the code.
+;; Each integration adds a few more variables, while the repository may contain
+;; no complete list of what the application actually needs. Before long the
+;; active configuration lives in a deployment dashboard rather than beside the
+;; code that consumes it.
 
 ;; They are untyped. An env var is a string, so a list of admin emails becomes
 ;; a comma-separated string and a parser you now maintain. Compare the two
@@ -25,9 +29,10 @@
 
 (edn/read-string "#{\"kira@example.com\" \"sam@example.com\"}")
 
-;; The first result is a vector and requires the application to define parsing
-;; rules. The second is a set. EDN also represents nested maps, keywords, and
-;; numbers without application-specific string parsing.
+;; The first result is a vector and still requires the application to decide
+;; what commas, blanks, and whitespace mean. The second is already a set. EDN
+;; also gives us nested maps, keywords, numbers, and booleans without inventing
+;; a tiny string format for each setting.
 
 ;; Git does not record changes made in a deployment dashboard. A platform may
 ;; have its own audit history, but it is separate from the code change that
@@ -47,9 +52,9 @@
 ;; {:database/url "..." :auth/admins #{...}}    a plain Clojure map, in memory
 ;; ```
 
-;; The repository now records additions and removals. Private identities stay
-;; outside git: one shared identity in the basic setup, or one per recipient in
-;; team mode.
+;; The repository now records the encrypted store along with the code that uses
+;; it. Private identities stay outside git: one identity in the basic setup, or
+;; one per person in team mode.
 
 ;; ## Why age
 
@@ -78,7 +83,7 @@
 ;; This library keeps whole-file encryption and adds a
 ;; [manifest](secrets_book.manifest.html) that records structural changes.
 
-;; ## Prior art, and what got borrowed
+;; ## Prior art, and what I borrowed
 
 ;; Rails 5.2 also uses an encrypted credentials file in the repository and a
 ;; master key outside it. Other tools make different choices about granularity

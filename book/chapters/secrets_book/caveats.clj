@@ -3,8 +3,9 @@
 ^:kindly/hide-code
 (ns secrets-book.caveats)
 
-;; This chapter describes what the library protects and what remains the
-;; operator's responsibility.
+;; Encryption is useful, but it does not make the rest of the system disappear.
+;; This chapter draws the boundary around what the library protects and what is
+;; still your responsibility.
 
 ;; ## What the encryption actually protects
 
@@ -85,8 +86,7 @@
 ;; recipients decrypts it. Ciphertext integrity is age's too: a modified,
 ;; truncated, or spliced ciphertext fails to decrypt rather than yielding
 ;; altered plaintext. That is integrity of the payload against corruption and
-;; splicing, and it establishes that the bytes came from *someone* holding a
-;; recipient — not which someone.
+;; splicing. It does not establish who created it.
 
 ;; Sender authenticity is nobody's. A public recipient is meant to be shared
 ;; and committed; it permits encryption and is not a signing key. Anyone
@@ -117,6 +117,13 @@
 ;; The exception is keyless `verify`, which compares hashes and needs neither
 ;; an identity nor the binary.
 
+;; Runtime loading is local-only. It accepts files, local `file:` locators, and
+;; `jar:file:` classpath resources; it never fetches a ciphertext over HTTP.
+;; Ciphertext, plaintext, EDN depth, recipient lists, and manifests are bounded
+;; while they are read. The defaults are intentionally generous for a secrets
+;; map, but an application with an unusually large store may need explicit
+;; `:limits`.
+
 ;; POSIX file permissions are assumed. Writing decrypted plaintext to a file
 ;; now *requires* them: `decrypt-to-file!` stages plaintext in an owner-only
 ;; sibling file and fails closed if that mode cannot be established and
@@ -126,6 +133,11 @@
 ;; files degrade to best effort and the secure-delete path does not exist. The
 ;; library targets POSIX systems; treat Windows as unsupported for anything
 ;; beyond reading — which this makes literal.
+
+;; If you find a vulnerability in the library itself, follow the project's
+;; [security policy](https://github.com/kirahowe/secrets/blob/main/SECURITY.md)
+;; and use the private reporting route there. Do not put real credentials,
+;; unpatched exploit details, or other sensitive material in a public issue.
 
 ;; ## When to use something else
 

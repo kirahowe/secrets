@@ -6,11 +6,43 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]))
 
-;; The management commands are exposed through one babashka task. The task is
-;; a dispatcher over functions in
-;; `com.kirahowe.secrets.cli`, and those functions are ordinary Clojure: they
-;; take a config map, return data, and throw `ex-info` when something is
-;; wrong. This chapter evaluates several of them.
+;; The management commands are exposed through one Babashka task. The task is a
+;; small dispatcher over ordinary Clojure functions: they take a config map,
+;; return data, and throw `ex-info` when something is wrong. That makes the same
+;; operations usable from a terminal, a REPL, or a script.
+
+;; ## Let the initializer wire it up
+
+;; The [quick start](index.html) uses the project initializer because hand
+;; editing a task definition is not a particularly interesting way to spend
+;; your first five minutes with a library. Once the released dependency is in
+;; `bb.edn`, run the initializer once to preview, then again with `--apply` when
+;; the proposal looks right:
+
+;; ```sh
+;; bb -m com.kirahowe.secrets.init --app myapp --keygen
+;;
+;; bb -m com.kirahowe.secrets.init --app myapp --keygen --apply
+;; ```
+
+;; The initializer merges into `bb.edn` without reformatting existing forms or
+;; dropping comments. It refuses conflicting dependencies and tasks. It also
+;; creates the template and, only after an accepted scaffold succeeds,
+;; generates the private identity requested by `--keygen`.
+
+;; The default `tracked` layout commits ciphertext and manifests while keeping
+;; the identity under `~/.config/<app>`. A `disposable` layout keeps every
+;; artifact, including its key, under ignored `.local/secrets`; it is useful for
+;; demos and throwaway projects, not a durable store. Add `--team` to create a
+;; recipients file. Run the initializer with `--help` for all options.
+
+;; An interactive preview shows only changed regions and redacts obvious opaque
+;; values. Non-interactive runs print paths and actions, never complete file
+;; bodies. `--show-contents` is an explicit escape hatch when you genuinely need
+;; to inspect the full proposed files. Before applying, the initializer also
+;; checks that the project path has trustworthy ownership and permissions; if
+;; it cannot establish that another user cannot swap a directory underneath the
+;; write, it explains the problem and changes nothing.
 
 ;; ## The config map
 
@@ -62,6 +94,12 @@
 ;; Set `:template` and `:manifest` explicitly if you really need another
 ;; extension.
 
+;; Normalization also canonicalizes every artifact path in every environment.
+;; Environments may intentionally share an app identity, a recipients list, or
+;; a template. Other role collisions are errors: a manifest cannot also be a
+;; key, and two environments cannot write the same ciphertext. This check runs
+;; before a command touches the filesystem.
+
 ;; ## The commands
 
 ;; | Command | Args | What it does |
@@ -72,6 +110,7 @@
 ;; | `set` | `[env] <key> [--edn]` | set a key's value from stdin (creates the file if missing) |
 ;; | `rm` | `[env] <key>` | remove a key (fails if the key or file is absent) |
 ;; | `verify` | `[env]` | check the committed manifest against the secrets |
+;; | `doctor` | `[env]` | diagnose configuration and verification readiness without revealing values |
 ;; | `show-key` | `[env]` | print public keys for sharing |
 ;; | `add-recipient` | `[env] [key]` | add a public key to the recipients file |
 ;; | `recipients` | `[env]` | list the configured recipient public keys |
@@ -82,6 +121,19 @@
 ;; Commands that operate on an environment take it first, and omitting it uses
 ;; `:default-environment`. `decrypt` writes the original bytes to stdout, so it
 ;; also supports encrypted binary files.
+
+;; Global and command-specific help are generated from the same command
+;; definitions used for parsing:
+
+;; ```sh
+;; bb secrets --help
+;; bb secrets help set
+;; bb secrets set --help
+;; ```
+
+;; `-h` and `--help` work anywhere before `--`. Everything after `--` is an
+;; operand, even when it looks like an option. That makes dash-leading file and
+;; key names unambiguous.
 
 ;; `set` and `rm` are the non-interactive path: no editor is opened. `set`
 ;; reads the value from **stdin**, which avoids exposing it as a process
@@ -98,6 +150,13 @@
 ;; `<key>` is an EDN keyword (`:some/key`) or a vector path (`[:a :b]`). Both
 ;; re-encrypt and refresh the manifest. Unlike `edit`, they re-render the EDN,
 ;; so comments in the plaintext do not survive a `set` or `rm`.
+
+;; Every secrets-writing command validates the complete EDN, encrypts to staged
+;; sibling files, and atomically replaces the ciphertext and manifest as one
+;; operation with rollback. An invalid edit or a failed manifest write leaves
+;; the previous pair in place. In team mode the recipients file is read,
+;; bounded, and validated once before editing or decryption begins; that exact
+;; list is the one handed to age.
 
 ;; ## A complete workflow
 
@@ -119,6 +178,10 @@
 ^:kindly/hide-code
 (age/keygen! (str dir "/key.txt"))
 
+^:kindly/hide-code
+(spit (str dir "/secrets.edn.example")
+      "{:api/token \"replace-me\" :flags #{}}\n")
+
 ;; Create the encrypted file the way `bb secrets new` would, minus the editor:
 
 (let [plain (str dir "/plain.edn")]
@@ -139,6 +202,13 @@
 ;; The `:exit` value is what `bb secrets verify` uses as its process status: 0
 ;; for a match, 1 for drift, and 2 for a missing ciphertext or manifest (or an
 ;; older manifest with no ciphertext hash when no identity is available).
+
+;; `doctor!` is the value-free troubleshooting counterpart. It checks the raw
+;; config, age installation, artifact state, identity availability, encryption
+;; readiness, and whether keyless or full verification is possible. It returns
+;; exit 0 for healthy, 1 when some action is needed, and 2 for invalid config:
+
+(cli/doctor! config "dev")
 
 ;; `encrypt!` handles arbitrary files:
 
@@ -163,6 +233,27 @@
 ;; a path, a result map, or `:aborted` after a declined confirmation prompt.
 ;; Only `run!`, the entry point wired into `bb.edn`, translates failures into
 ;; process exit codes.
+
+;; ## Bounding CLI inputs
+
+;; A top-level `:limits` map overrides the input bounds for every environment.
+;; The CLI shares the runtime plaintext and EDN-depth limits and adds bounds for
+;; recipients and manifests:
+
+;; ```clojure
+;; {:app "myapp"
+;;  :limits {:max-plaintext-bytes 8388608
+;;           :max-edn-depth 100
+;;           :max-recipients 256
+;;           :max-recipient-chars 1024
+;;           :max-recipients-bytes 262144
+;;           :max-manifest-bytes 1048576
+;;           :max-manifest-entries 10000}
+;;  :environments {:dev {:secrets-file "secrets/secrets.edn.age"}}}
+;; ```
+
+;; You only need to supply values you want to change. Every value must be a
+;; positive integer, and unknown keys are rejected rather than silently ignored.
 
 ^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]

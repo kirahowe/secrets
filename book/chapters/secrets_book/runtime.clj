@@ -7,10 +7,10 @@
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]))
 
-;; Your app can use the library in two ways: load the complete decrypted map
-;; and pass it around, or register reader literals so EDN config files can
-;; reference secrets inline. This chapter covers both APIs and their identity
-;; resolution.
+;; There are two straightforward ways to get secrets into an application. You
+;; can load the complete decrypted map and pass it around, or register reader
+;; literals so an EDN config file can reference secrets inline. Both routes use
+;; the same source rules, identity resolution, and resource limits.
 
 ;; Setup for the examples: a fresh key and an encrypted file in a temp
 ;; directory.
@@ -40,14 +40,21 @@
 
 (secrets/load-secrets (str dir "/secrets.edn.age") key-file)
 
-;; It also accepts a `java.io.File` or URL. This matters because
-;; `clojure.java.io/resource` returns URLs. Inside an uberjar those are `jar:`
-;; URLs, and the library copies the ciphertext out to a temp file so `age` can
-;; read it. The [production chapter](secrets_book.production.html) demonstrates
-;; that with a jar. Here is the same call with a file URL:
+;; It also accepts a `java.io.File`, `java.nio.file.Path`, local `file:` locator,
+;; or a `jar:file:` classpath resource. `clojure.java.io/resource` returns a URL,
+;; and inside an uberjar that URL normally uses `jar:file:`. The library copies
+;; that ciphertext to an owner-only temp file so `age` can read it. The
+;; [production chapter](secrets_book.production.html) demonstrates the jar case.
+;; Here is the same call with a local file URL:
 
 (secrets/load-secrets (.toURL (.toURI (io/file (str dir "/secrets.edn.age"))))
                       key-file)
+
+;; Sources are deliberately local-only. HTTP(S), other remote schemes, nested
+;; jars, malformed local locators, and arbitrary values accepted by
+;; `clojure.java.io/input-stream` are refused before any network access. Secret
+;; loading should not quietly become an HTTP client just because a URL was
+;; passed in.
 
 ;; ## Reading values
 
@@ -101,6 +108,53 @@
   (secrets/load-secrets (str dir "/secrets.edn.age")
                         {:identity-file (str dir "/no-such-key.txt")})
   (catch Exception e (ex-message e)))
+
+;; ### Retiring injected identities
+
+;; Raw and base64 environment identities have to be materialized because age
+;; accepts an identity file path. The library reuses an owner-only temp file
+;; rather than writing a new copy for every decryption. A long-running process
+;; can retire those files when it is finished loading configuration:
+
+;; ```clojure
+;; (secrets/reset-identity-cache!)
+;; ;; => {:generation 1, :deleted 1, :absent 0, :failed 0, :pending 0}
+;; ```
+
+;; A later read materializes a fresh copy. Files you own — an explicit
+;; `:identity-file`, `SECRETS_AGE_IDENTITY_FILE`, or the conventional app key —
+;; are never deleted. `load-secrets`, the reader literals, and the Aero readers
+;; hold their injected identity for the complete decryption, so a concurrent
+;; reset cannot remove it from under a running age process. If you resolve an
+;; injected identity yourself and pass it directly to the lower-level age API,
+;; wrap that call in `secrets/with-identity` to get the same guarantee.
+
+;; ## Resource limits
+
+;; Secret stores are supposed to be small. The runtime therefore bounds each
+;; stage while bytes are moving, before a hostile or accidentally enormous file
+;; can consume the process:
+
+;; | Limit | Default | What it bounds |
+;; |-------|---------|----------------|
+;; | `:max-source-bytes` | 16 MiB | ciphertext read from a local file or jar resource |
+;; | `:max-plaintext-bytes` | 8 MiB | plaintext produced by age |
+;; | `:max-edn-depth` | 100 | nested EDN collections before parsing |
+
+;; Override only what the application genuinely needs:
+
+;; ```clojure
+;; (secrets/load-secrets
+;;  "secrets/secrets.edn.age"
+;;  {:app "myapp"
+;;   :limits {:max-plaintext-bytes (* 2 1024 1024)
+;;            :max-edn-depth 50}})
+;; ```
+
+;; The supplied map is merged over `secrets/default-limits`. Unknown keys,
+;; non-integers, and non-positive values are errors; a misspelled safety limit
+;; should not look as though it was accepted. The same `:limits` option works
+;; with `reader-literals` and `merge-readers`.
 
 ;; ## Reader literals
 
@@ -243,9 +297,11 @@
 
 ;; A per-read `:secrets` opt always wins over a `register!`ed default. Aero
 ;; caches a readers map and its first successful decrypted store or genuine
-;; decryption failure for each distinct secrets configuration. After editing or
-;; repairing ciphertext in a long-running process, call `reset-cache!` before
-;; re-reading the entire config:
+;; decryption failure for each distinct secrets configuration. Calling
+;; `register!` again retires every cache entry from the previous registration,
+;; even when the new map compares equal; `(register! nil)` clears the default
+;; and its cache. After editing or repairing ciphertext in a long-running
+;; process, call `reset-cache!` before re-reading the entire config:
 ;;
 ;; ```clojure
 ;; ;; In another terminal: bb secrets edit dev
