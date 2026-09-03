@@ -1,67 +1,79 @@
 ;; # Quick start
 
 ^:kindly/hide-code
-(ns secrets-book.index
-  (:require [clojure.edn :as edn]
-            [clojure.java.io :as io]
-            [com.kirahowe.secrets :as secrets]
-            [com.kirahowe.secrets.age :as age]))
+(ns secrets-book.index)
 
-;; `com.kirahowe/secrets` stores application secrets in an age-encrypted EDN
-;; file that can be committed with the code. An age identity stays outside the
-;; repository and decrypts the file at runtime. A committed manifest records
-;; key paths and changes without storing plaintext secret values.
+;; `com.kirahowe/secrets` gives a Clojure app one encrypted EDN file for its
+;; secrets. The ciphertext lives in git with the code. The private age identity
+;; does not. You get real EDN values at runtime, plus a value-free manifest that
+;; makes secret changes possible to review without putting the values in a pull
+;; request.
 
-;; You need [age](https://age-encryption.org) (`brew install age` on macOS,
-;; `apt install age` on Debian and Ubuntu) and
-;; [babashka](https://babashka.org) for the management commands.
+;; This is a deliberately small alternative to collecting strings in deployment
+;; dashboards or running a secrets service. It works well for a solo developer
+;; or small team with application secrets that change occasionally. If you need
+;; dynamic credentials, per-secret access rules, or automatic rotation, skip
+;; ahead to [when to use something else](secrets_book.caveats.html#when-to-use-something-else).
 
-;; ## Install the library
+;; ## What you need
 
-;; Add it to your `deps.edn`:
-
-;; ```clojure
-;; com.kirahowe/secrets {:mvn/version "0.1.0"}
-;; ```
-
-;; ## Wire the management task
-
-;; Add a `secrets` task to your project's `bb.edn`. Its config says where each
-;; environment's encrypted file lives:
-
-;; ```clojure
-;; {:deps  {com.kirahowe/secrets {:mvn/version "0.1.0"}}
-;;  :tasks {secrets
-;;          {:doc      "Manage encrypted secrets (age)"
-;;           :requires ([com.kirahowe.secrets.cli :as secrets-cli])
-;;           :task     (secrets-cli/run!
-;;                      {:app "myapp"
-;;                       :default-environment :prod
-;;                       :environments
-;;                       {:prod
-;;                        {:secrets-file "env/prod/resources/secrets.edn.age"}
-;;                        :dev
-;;                        {:secrets-file "env/dev/resources/secrets.edn.age"}}}
-;;                      *command-line-args*)}}}
-;; ```
-
-;; Defaults fill in the other paths. The key lives at
-;; `~/.config/myapp/key.txt`. Each ciphertext gets a sibling `.example`
-;; template and `.manifest` file.
-
-;; ## Create a key and your first secrets
+;; Install [age](https://age-encryption.org) and
+;; [Babashka](https://babashka.org). The one-time dependency resolution shown
+;; below also needs Java; a JVM Clojure project will normally have that already.
 
 ;; ```sh
-;; bb secrets keygen prod
-;; bb secrets new prod
+;; brew install age babashka
 ;; ```
 
-;; `keygen` writes the private identity and prints its public recipient. Back
-;; up the identity somewhere outside git, such as a password manager. `new`
-;; opens a template in your editor. Saving it writes `secrets.edn.age` and its
-;; manifest; commit both files.
+;; On Debian or Ubuntu, `apt install age` installs age. Follow Babashka's
+;; [installation instructions](https://github.com/babashka/babashka#installation)
+;; for the current Babashka package on your platform.
 
-;; The file you edit is plain EDN:
+;; ## Set up a project
+
+;; Add the library to your project's `bb.edn`:
+
+;; ```clojure
+;; {:deps {com.kirahowe/secrets {:mvn/version "0.1.0"}}}
+;; ```
+
+;; A JVM Clojure application also needs the same coordinate in its `deps.edn`;
+;; `bb.edn` supplies the management task, while `deps.edn` supplies application
+;; code at runtime.
+
+;; Now run the initializer from the same directory. Change `myapp` to your
+;; application's name:
+
+;; ```sh
+;; bb -m com.kirahowe.secrets.init --app myapp --keygen
+;; ```
+
+;; The first run is a preview. It lists the files it wants to create or merge
+;; and changes nothing. If the preview looks right, run the same command with
+;; `--apply`:
+
+;; ```sh
+;; bb -m com.kirahowe.secrets.init --app myapp --keygen --apply
+;; ```
+
+;; This keeps the dependency you just added, merges a `bb secrets` task into
+;; `bb.edn`, creates a safe plaintext template, and generates the age identity at
+;; `~/.config/myapp/key.txt`. Existing `bb.edn` comments and unrelated forms are
+;; preserved. A conflicting dependency or task is refused instead of replaced.
+
+;; Back up `~/.config/myapp/key.txt` somewhere outside git, such as a password
+;; manager. It is the only way to decrypt this store, and the library cannot
+;; recover it for you.
+
+;; ## Create the first secrets file
+
+;; ```sh
+;; bb secrets new
+;; ```
+
+;; This opens the generated template in `$VISUAL`, `$EDITOR`, or `vim`. The file
+;; you edit is ordinary EDN, so values can be strings, numbers, sets, vectors, or
+;; nested maps:
 
 ;; ```clojure
 ;; {:database/url "jdbc:postgresql://db.internal/app"
@@ -69,93 +81,99 @@
 ;;  :auth/admins #{"kira@example.com" "sam@example.com"}}
 ;; ```
 
-;; ## A runtime round trip
+;; Saving creates two files:
 
-;; The lower-level age wrapper can create a ciphertext without opening an
-;; editor. Unlike `bb secrets new`, this code does not write a manifest.
+;; ```text
+;; secrets/secrets.edn.age       # encrypted values
+;; secrets/secrets.edn.manifest  # value-free description of what changed
+;; ```
 
-^:kindly/hide-code
-(def dir
-  (str (java.nio.file.Files/createTempDirectory
-        "secrets-quickstart-"
-        (into-array java.nio.file.attribute.FileAttribute []))))
+;; The idea is to commit both. Keep `~/.config/myapp/key.txt` out of the
+;; repository.
 
-(def key-file (str dir "/key.txt"))
+;; If you would rather not open an editor, `set` reads a value from standard
+;; input. It never accepts the value as a command-line argument:
 
-(age/keygen! key-file)
+;; ```sh
+;; printf %s "$DATABASE_URL" | bb secrets set :database/url
+;; printf %s '#{"kira@example.com" "sam@example.com"}' \
+;;   | bb secrets set :auth/admins --edn
+;; ```
 
-;; Write and encrypt a secrets map:
+;; `set` creates the encrypted file when it does not exist yet. Without `--edn`
+;; it stores a string; with `--edn` it reads the value as EDN.
 
-(let [plain (str dir "/secrets.edn")]
-  (spit plain (pr-str {:database/url "jdbc:postgresql://db.internal/app"
-                       :stripe/api-key "sk_live_not_really"
-                       :auth/admins #{"kira@example.com" "sam@example.com"}}))
-  (age/encrypt-file! key-file plain (str dir "/secrets.edn.age"))
-  (io/delete-file plain))
+;; ## Read secrets in the app
 
-;; The ciphertext does not contain readable EDN. Here are its first bytes:
+;; `load-secrets` decrypts the complete map. Passing `{:app "myapp"}` uses the
+;; identity the initializer created locally and still allows production to
+;; override it with a `SECRETS_AGE_IDENTITY*` environment variable:
 
-(subs (slurp (str dir "/secrets.edn.age")) 0 60)
+;; ```clojure
+;; (require '[com.kirahowe.secrets :as secrets])
+;;
+;; (def secret-values
+;;   (secrets/load-secrets "secrets/secrets.edn.age" {:app "myapp"}))
+;;
+;; (secrets/get-secret secret-values :database/url)
+;; (secrets/get-secret secret-values [:r2 :account-id])
+;; ```
 
-;; ## Read secrets in your app
+;; If the rest of your configuration is EDN, reader literals keep each secret
+;; reference beside the setting that uses it:
 
-;; `load-secrets` decrypts and reads the file:
-
-(def loaded
-  (secrets/load-secrets (str dir "/secrets.edn.age") key-file))
-
-(secrets/get-secret loaded :database/url)
-
-;; EDN types are preserved:
-
-(secrets/get-secret loaded :auth/admins)
-
-;; ## Reference secrets from config files
-
-;; If your system config is EDN, `reader-literals` supplies required and
-;; optional secret tags:
-
-(def readers
-  (secrets/reader-literals {:file (str dir "/secrets.edn.age")
-                            :identity-file key-file}))
+;; ```clojure
+;; (require '[clojure.edn :as edn])
+;;
+;; (def readers
+;;   (secrets/reader-literals
+;;    {:file "secrets/secrets.edn.age" :app "myapp"}))
+;;
+;; (edn/read-string
+;;  {:readers readers}
+;;  "{:db {:jdbc-url #secret/req :database/url}
+;;    :email {:api-key #secret/opt :postmark/api-key}}")
+;; ```
 
 ;; `#secret/req` throws when the value cannot be loaded. `#secret/opt` returns
-;; nil when the secret, ciphertext, or identity is absent:
+;; `nil` when the secret, ciphertext, or identity is absent, but it still throws
+;; when an existing ciphertext fails to decrypt. The
+;; [runtime chapter](secrets_book.runtime.html) covers both APIs, classpath
+;; resources, caching, Aero, and input limits.
 
-(edn/read-string {:readers readers}
-                 "{:db    {:jdbc-url #secret/req :database/url}
-                   :email {:api-key  #secret/opt :postmark/api-key}}")
-
-;; The Postmark key remains present with nil as its value. That is the intentional
-;; contract: nil means the optional integration is disabled; key presence carries no
-;; additional meaning. When the ciphertext is a classpath resource, pass
-;; `:resource "secrets.edn.age"` instead of `:file`; resources inside jars are supported.
-
-;; ## Day to day
+;; ## Check the setup
 
 ;; ```sh
-;; bb secrets edit prod      # edit and re-encrypt
-;; bb secrets verify         # check the committed manifest
-;; bb secrets show-key       # print your public recipient
+;; bb secrets doctor
+;; bb secrets verify
 ;; ```
 
-;; `edit` writes plaintext to an owner-only temporary file while the editor is
-;; open. It re-encrypts after a successful edit and deletes the temporary file
-;; in a `finally` block. Deletion is best-effort on filesystems where
-;; overwriting a file cannot guarantee removal of the underlying blocks.
+;; `doctor` explains whether age, the configured identity, ciphertext, template,
+;; recipients, and manifest are ready. It does not print secret values or mutate
+;; anything. `verify` checks that the committed manifest belongs to this app and
+;; agrees with the ciphertext.
 
-;; ## Deploy
-
-;; Supply the age identity through the deployment platform's secret mechanism:
+;; Day to day, this is usually all you need:
 
 ;; ```sh
-;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
+;; bb secrets edit             # decrypt, edit, and re-encrypt
+;; bb secrets set :some/key    # read a replacement from stdin
+;; bb secrets rm :old/key      # remove a value
+;; bb secrets verify           # check the manifest before committing
 ;; ```
 
-;; Ship `secrets.edn.age` with the application and load it at startup. See
-;; [runtime](secrets_book.runtime.html) for the application APIs and
-;; [production and CI](secrets_book.production.html) for deployment details.
+;; Run `bb secrets --help` or `bb secrets help set` whenever you need the exact
+;; command syntax.
 
-^:kindly/hide-code
-(doseq [f (reverse (file-seq (io/file dir)))]
-  (.delete f))
+;; ## Where to go next
+
+;; - [The CLI](secrets_book.cli.html) covers initialization, environments, every
+;;   command, and configuration.
+;; - [Runtime](secrets_book.runtime.html) covers direct loading, reader literals,
+;;   Aero, and deliberate reloads.
+;; - [Teams](secrets_book.teams.html) gives every teammate their own private
+;;   identity.
+;; - [Production and CI](secrets_book.production.html) shows how to inject an
+;;   identity and verify committed artifacts safely.
+;; - [Caveats and threat model](secrets_book.caveats.html) is the important
+;;   boundary of what this library does and does not protect.
