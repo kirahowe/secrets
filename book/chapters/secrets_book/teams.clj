@@ -146,6 +146,10 @@
 ;; A dedicated deploy key keeps production independent of any person's
 ;; identity and can be rotated separately.
 
+;; The [team-ci example](https://github.com/kirahowe/secrets/tree/main/examples/team-ci) is a committed team store: a recipients
+;; list, an encrypted fixture, and a CI job that verifies the manifest without
+;; a private identity.
+
 ;; ## What team mode costs you
 
 ;; Team manifests record structure only: adds, removals, and type changes show

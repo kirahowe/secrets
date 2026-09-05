@@ -74,3 +74,7 @@
 ;;   what this library does and does not protect.
 ;; - [Reference](secrets_book.reference.html) lists the API, configuration
 ;;   keys, environment variables, and exit codes.
+
+;; The repository's [examples](https://github.com/kirahowe/secrets/tree/main/examples) directory holds runnable starter projects
+;; for each application shape. The [quick start](secrets_book.quickstart.html#runnable-examples)
+;; lists them.

@@ -265,6 +265,10 @@ file doesn't exist. `<key>` is a keyword (`:some/key`) or a vector path
 (`[:a :b]`) for both commands, and both refresh the manifest like every other
 write.
 
+Runnable starter projects for each application shape, from a Babashka script
+to an Integrant service and a team with keyless CI, are listed under
+[Examples](#examples).
+
 ## Using secrets at runtime
 
 ### Reader literals (recommended for EDN-configured systems)

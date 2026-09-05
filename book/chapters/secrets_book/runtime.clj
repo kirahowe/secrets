@@ -77,6 +77,9 @@
 ;;   (secrets/load-secrets (io/resource resource) {:app "myapp"}))
 ;; ```
 
+;; The [integrant-service example](https://github.com/kirahowe/secrets/tree/main/examples/integrant-service) is a complete HTTP
+;; service built this way, with separate resource roots per environment.
+
 ;; ## How the key is found
 
 ;; The identity argument accepts three shapes. A path string or `File` names
@@ -321,7 +324,8 @@
 ;; decrypts and looks up `:openrouter/api-key` alone, and
 ;; `:openrouter/evals-api-key` does not need to exist in the store at all;
 ;; reading with `:evals` selects only the other branch. A key used by one
-;; profile can therefore be absent when another profile reads the config.
+;; profile can therefore be absent when another profile reads the config. The
+;; [aero-profiles example](https://github.com/kirahowe/secrets/tree/main/examples/aero-profiles) runs exactly this configuration.
 
 ^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]

@@ -158,3 +158,17 @@
 ;; command and the configuration behind them, and
 ;; [Production and CI](secrets_book.production.html) shows how to get the
 ;; identity into a deployment.
+
+;; ## Runnable examples
+
+;; The repository's [examples directory](https://github.com/kirahowe/secrets/tree/main/examples) has small starter projects that
+;; run from a checkout. Pick the one closest to your application's shape:
+
+;; - [quickstart-bb](https://github.com/kirahowe/secrets/tree/main/examples/quickstart-bb): a minimal Babashka consumer using
+;;   `clojure.edn` reader tags.
+;; - [integrant-service](https://github.com/kirahowe/secrets/tree/main/examples/integrant-service): a JVM HTTP service with
+;;   secrets as an Integrant component.
+;; - [aero-profiles](https://github.com/kirahowe/secrets/tree/main/examples/aero-profiles): profile-aware EDN configuration with
+;;   the Aero integration.
+;; - [team-ci](https://github.com/kirahowe/secrets/tree/main/examples/team-ci): multiple age recipients and keyless CI manifest
+;;   verification.

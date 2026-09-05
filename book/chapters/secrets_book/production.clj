@@ -156,7 +156,8 @@
 ;; `:ciphertext-sha` against the file and exits 0, 1, or 2. Exit 1 means
 ;; drift and should fail the build. Exit 2 means an artifact is missing or an
 ;; older manifest has no ciphertext hash for a keyless check. On a fresh repo,
-;; this usually means someone forgot to commit the manifest.
+;; this usually means someone forgot to commit the manifest. The
+;; [team-ci example](https://github.com/kirahowe/secrets/tree/main/examples/team-ci) commits such a fixture and gates on it.
 
 ;; This job holds no secret, so it needs no gate on which event triggered it —
 ;; there is nothing here for an untrusted pull request to take. It still pins
