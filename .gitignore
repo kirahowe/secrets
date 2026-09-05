@@ -1,14 +1,18 @@
+# Build output, REPL state and editor tooling caches.
 target/
 .cpcache/
-# Track the project lint policy while ignoring clj-kondo caches and imported configs.
-!/.clj-kondo/
-/.clj-kondo/*
-!/.clj-kondo/config.edn
 .lsp/
 .nrepl-port
 .portal/
 *.log
 .DS_Store
+
+# clj-kondo: ignore every .clj-kondo directory (the example projects hold only
+# caches), then track the root lint policy and nothing else beside it.
+.clj-kondo/
+!/.clj-kondo/
+/.clj-kondo/*
+!/.clj-kondo/config.edn
 
 # Scratch space for the demo `bb secrets` task — never commit decrypted secrets.
 tmp/
