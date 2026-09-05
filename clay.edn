@@ -20,5 +20,8 @@
  ;; Use the first chapter (the preface) as the book's index page instead of a
  ;; generated placeholder.
  :first-as-index   true
- :quarto           {:format {:html {:theme :cosmo}}}
+ :quarto           {:format {:html {:theme {:light :flatly
+                                           :dark :darkly}
+                                   :mainfont "Helvetica Neue, Helvetica, Arial, sans-serif"
+                                   :respect-user-color-scheme true}}}
  :hide-info-line   true}
