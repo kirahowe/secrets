@@ -1,19 +1,38 @@
-;; # Quick start
-
 ^:kindly/hide-code
 (ns secrets-book.index)
 
-;; `com.kirahowe/secrets` gives a Clojure app one encrypted EDN file for its
-;; secrets. The ciphertext lives in git with the code. The private age identity
-;; does not. You get real EDN values at runtime, plus a value-free manifest that
-;; makes secret changes possible to review without putting the values in a pull
-;; request.
+;; # Intro
 
-;; This is a deliberately small alternative to collecting strings in deployment
-;; dashboards or running a secrets service. It works well for a solo developer
-;; or small team with application secrets that change occasionally. If you need
-;; dynamic credentials, per-secret access rules, or automatic rotation, skip
-;; ahead to [when to use something else](secrets_book.caveats.html#when-to-use-something-else).
+;; `com.kirahowe/secrets` is a library for managing secrets in your Clojure projects. Encrypted secrets files get committed with your project, which can only be decrypted with a private age identity that you store like you would a secret.
+
+;; ## Features
+;; - deploy one private key instead of many secret values
+;; - real EDN values at runtime, not just strings
+;; - plaintext manifest file shows keys and structure without revealing values
+;; - single-key manifests also show when a value changes
+;; - bb CLI for managing secrets
+;; - encrypted secrets live in git alongside the code that uses them
+;; - separate secrets per environment, environment names are configurable
+;; - teammates use their own private keys to access the same secrets
+;; - read secrets as a plain map or reference them directly in EDN config
+;; - required and optional secrets with #secret/req and #secret/opt
+;; - integration with Aero profiles and Integrant configuration, optionally included
+;; - load encrypted files from disk or bundle them inside your jar
+;; - edit secrets in your usual editor, preserving comments and formatting
+;; - script secret updates through stdin without putting values in command arguments
+;; - check manifest freshness in CI without giving CI a private key
+;; - built-in diagnostics for finding setup problems without printing secrets
+;; - project initializer that previews changes and preserves existing bb.edn content
+;; - everything is just files, no secrets server or cloud account to maintain
+
+;; ## Why, briefly
+
+;; Secrets are essential configuration for most apps, but storing them in environment variables spreads them out in too many places. Environment variables are effectively global mutable state that your app depends on to run and bad things happen when they are spread out across disparate servers and treated as an afterthought and not essential, first class config. Keeping secrets in git alongside your code is one way to make sure they are versioned, reviewable, and shipped with the code they belong with.
+
+;; This also dramatically simplifies spinning up new environments and makes it more repeatable without the need to run or operate a seaprate secrets service. Rather than copying a checklist of secrets from place to place, with no way to know whether you have the right version or right one, with this appraoch secrets travel with the code that needs them and your app config is just more data.
+
+;; This is a deliberately small alternative and imporovement over collecting strings in environment variables. It works well for solo developers or small teams where secrets change infrequently. If you need dynamic credentials, per-secret access rules, or automatic rotation, skip ahead to [when to use something else](secrets_book.caveats.html#when-to-use-something-else).
+
 
 ;; ## What you need
 
