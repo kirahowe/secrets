@@ -1044,8 +1044,9 @@ starters: [quickstart-bb](examples/quickstart-bb/README.md),
 
 ## Development
 
-Project Clojure code follows a 100-column policy. Tests require `age` and a
-JDK.
+Project Clojure code follows a 100-column policy. Book files under `book/chapters`
+are exempt so prose can use editor soft wrapping; other lint checks still apply.
+Tests require `age` and a JDK.
 
 ```sh
 bb format          # format Clojure source with cljfmt

@@ -48,13 +48,16 @@
 
   lint
   {:doc "Lint Clojure source with clj-kondo"
-   :task (clojure
-          (str "-M:lint --lint src test build build.clj bb.edn book/chapters "
-               "examples/aero-profiles/src examples/aero-profiles/test "
-               "examples/aero-profiles/bb.edn examples/quickstart-bb/src "
-               "examples/quickstart-bb/bb.edn examples/integrant-service/src "
-               "examples/integrant-service/test examples/integrant-service/build "
-               "examples/team-ci/bb.edn"))}
+   :task (do
+           (clojure
+            (str "-M:lint --lint src test build build.clj bb.edn "
+                 "examples/aero-profiles/src examples/aero-profiles/test "
+                 "examples/aero-profiles/bb.edn examples/quickstart-bb/src "
+                 "examples/quickstart-bb/bb.edn examples/integrant-service/src "
+                 "examples/integrant-service/test examples/integrant-service/build "
+                 "examples/team-ci/bb.edn"))
+           (clojure
+            "-M:lint --config-dir book/.clj-kondo --lint book/chapters"))}
 
   ;;;; Building and publishing
 
