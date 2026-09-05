@@ -1,3 +1,0 @@
-;; Book prose is authored with editor soft wrapping.
-{:config-paths ["../../.clj-kondo"]
- :linters {:line-length {:level :off}}}

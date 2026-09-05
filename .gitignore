@@ -4,9 +4,6 @@ target/
 !/.clj-kondo/
 /.clj-kondo/*
 !/.clj-kondo/config.edn
-!/book/.clj-kondo/
-/book/.clj-kondo/*
-!/book/.clj-kondo/config.edn
 .lsp/
 .nrepl-port
 .portal/

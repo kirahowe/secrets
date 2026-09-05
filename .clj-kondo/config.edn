@@ -1,3 +1,9 @@
-{:linters {:line-length {:exclude-pattern "^;; \\|"
+;; Top-level comments are exempt from the line-length check. The book chapters are
+;; authored as `;;` Markdown prose that is soft-wrapped in the editor, and this is the
+;; only config clojure-lsp reads, so a per-directory override never reaches the editor.
+;; clj-kondo also measures line length before it knows the namespace, so :config-in-ns
+;; cannot switch the linter off for the book alone. Code lines and indented comments
+;; are still limited to 100 columns everywhere.
+{:linters {:line-length {:exclude-pattern "^;;"
                          :exclude-urls true
                          :max-line-length 100}}}
