@@ -50,6 +50,13 @@ were added, removed, or changed without revealing any value. Secrets travel
 with the code that needs them, so a new environment is a checkout and one key
 rather than a checklist copied between dashboards.
 
+That is the configuration-management principle behind
+[*Continuous Delivery*](https://continuousdelivery.com/foundations/configuration-management/): version everything required to build, test,
+and deploy the system, application configuration included, so that any
+environment can be reproduced and any change traced. Secrets are the part of
+that configuration usually kept out of version control because they are
+sensitive. Encrypting them is what lets them in.
+
 This is a deliberately small tool for solo developers and small teams whose
 secrets change infrequently. If you need dynamic credentials, per-secret
 access rules, or automatic rotation, see

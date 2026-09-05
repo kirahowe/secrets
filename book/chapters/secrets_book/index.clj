@@ -49,6 +49,13 @@
 ;; code that needs them, so a new environment is a checkout and one key rather
 ;; than a checklist copied between dashboards.
 
+;; That is the configuration-management principle behind
+;; [*Continuous Delivery*](https://continuousdelivery.com/foundations/configuration-management/): version everything required to build, test,
+;; and deploy the system, application configuration included, so that any
+;; environment can be reproduced and any change traced. Secrets are the part
+;; of that configuration usually kept out of version control because they are
+;; sensitive. Encrypting them is what lets them in.
+
 ;; This is a deliberately small tool for solo developers and small teams whose
 ;; secrets change infrequently. If you need dynamic credentials, per-secret
 ;; access rules, or automatic rotation, see
@@ -68,8 +75,8 @@
 ;;   without plaintext.
 ;; - [Production and CI](secrets_book.production.html) shows how to inject an
 ;;   identity and gate on the manifest.
-;; - [Design and rationale](secrets_book.design.html) sets out the model, why
-;;   age, and the prior art.
+;; - [Design and rationale](secrets_book.design.html) sets out the model, the
+;;   sources behind the rationale, why age, and the prior art.
 ;; - [Caveats and threat model](secrets_book.caveats.html) is the boundary of
 ;;   what this library does and does not protect.
 ;; - [Reference](secrets_book.reference.html) lists the API, configuration

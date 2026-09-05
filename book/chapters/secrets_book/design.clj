@@ -11,8 +11,12 @@
 
 ;; ## The problem with environment variables
 
-;; Environment variables are a perfectly good place to start. The trouble is
-;; that most applications do not stop at three of them.
+;; Environment variables are a perfectly good place to start. The
+;; [Twelve-Factor App](https://12factor.net/config) makes the case for keeping
+;; configuration out of code, since "config varies substantially across
+;; deploys, code does not", and prescribes environment variables as the
+;; mechanism. This library keeps the separation and replaces the mechanism.
+;; The trouble is that most applications do not stop at three variables.
 
 ;; Each integration adds a few more variables, while the repository may contain
 ;; no complete list of what the application actually needs. Before long the
@@ -36,7 +40,40 @@
 
 ;; Git does not record changes made in a deployment dashboard. A platform may
 ;; have its own audit history, but it is separate from the code change that
-;; consumes the secret.
+;; consumes the secret. Twelve-Factor's own
+;; [build, release, run](https://12factor.net/build-release-run) factor makes
+;; the same point from the other side: a release is a build combined with its
+;; configuration, uniquely identified, and immutable once created. The code
+;; alone does not describe what was deployed. Configuration is half of the
+;; release, and when it lives in a dashboard, half of the release has no
+;; history.
+
+;; ## Configuration belongs in version control
+
+;; The positive case is older than this library. *Continuous Delivery* treats
+;; [configuration management](https://continuousdelivery.com/foundations/configuration-management/) as a foundation: version control
+;; everything required to build, test, and deploy, "including source code,
+;; test and deployment scripts, infrastructure and application configuration
+;; information". It names two goals. Reproducibility: "we should be able to
+;; provision any environment in a fully automated fashion, and know that any
+;; new environment reproduced from the same configuration is identical."
+;; Traceability: for any environment, determine precisely what went into it,
+;; and compare it with a previous version to see what changed.
+
+;; In an [interview about the book](https://www.infoq.com/articles/humble-farley-continuous-delivery/), Jez Humble puts the rule bluntly:
+;; "everything that is required to build, test and deploy your system should
+;; be in version control. It should be possible to plug in a new workstation,
+;; and check out everything you need to build, test and deploy your system to
+;; any environment." David Farley describes the deployment side: when
+;; deployments are tied to version-controlled release numbers, the record of
+;; which version went to which environment, and who approved it, is an audit
+;; trail.
+
+;; Secrets are the part of application configuration that this discipline
+;; usually stops short of, because committing them in the clear is
+;; unacceptable. Encrypting them is what lets them in. A checkout plus one
+;; identity reproduces an environment's configuration, and the
+;; [manifest](secrets_book.manifest.html) makes each change to it traceable.
 
 ;; ## The model
 
