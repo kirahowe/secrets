@@ -6,6 +6,7 @@
 {:format           [:quarto :html]
  :base-source-path "book/chapters"
  :source-path      ["secrets_book/index.clj"
+                    "secrets_book/quickstart.clj"
                     "secrets_book/cli.clj"
                     "secrets_book/runtime.clj"
                     "secrets_book/teams.clj"

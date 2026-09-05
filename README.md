@@ -6,40 +6,54 @@ everything else — structure, defaults, and the encrypted ciphertext itself —
 lives in git, with a committed value-free manifest that makes each change
 reviewable.
 
-- **Babashka CLI parsing.** Command-line options and generated usage are powered
-   by [babashka/cli](https://github.com/babashka/cli), which is built into
-   Babashka and included as a JVM dependency for reproducible resolution. The
-   project otherwise uses core Clojure APIs plus the `age` CLI.
-- **A safe project initializer and `bb secrets` task.** Bootstrap with a
-  previewed `bb.edn` merge, then use `keygen` · `new` · `edit` · `set` · `rm` ·
-  `verify` · `doctor` · `show-key` · `add-recipient` · `recipients` ·
-  `reencrypt` · `encrypt` · `decrypt`, wired into any project with one task
-  definition.
-- **Two ways to consume secrets:** `#secret/req` / `#secret/opt` EDN reader
-  literals, or a plain `load-secrets` map for Integrant/component setups.
+- **One private key to deploy.** Production receives a single age identity
+  through an environment variable or a mounted file, not a list of secret
+  values.
+- **Real EDN at runtime.** Sets, vectors, nested maps, and numbers, not just
+  strings. Load the whole map, or reference values from your EDN config with
+  `#secret/req` and `#secret/opt`. Works with Aero, and the plain map suits
+  Integrant or component.
+- **Encrypted secrets live in git** beside the code that uses them, one file
+  per environment. Load them from disk or from inside the jar.
+- **Reviewable changes.** Every write updates a value-free manifest, so a
+  diff shows which keys were added, removed, or changed. CI can check that
+  the manifest is fresh without holding a key.
 - **Solo or team.** Encrypt to your own key, or to a committed list of
-  recipients so each teammate decrypts with their own key.
-- **A committed manifest.** Every save writes a value-free `*.manifest` beside
-  the ciphertext, so `git diff` shows *which keys changed* without leaking any
-  secret.
+  recipients so each teammate decrypts with their own.
+- **A `bb secrets` task** for the day to day: edit in your editor, set from
+  stdin, diagnose with `doctor`, and a project initializer that previews
+  before it writes.
+- **Just files and age.** No secrets server, no KMS, no cloud account, no
+  GPG keyring.
 
 It wraps [`age`](https://age-encryption.org) — a small, audited, modern
 file-encryption tool — so there are no GPG keyrings, no KMS, no vault to run.
+Command-line parsing uses [babashka/cli](https://github.com/babashka/cli),
+which is built into Babashka and included as a JVM dependency for
+reproducible resolution; the project otherwise uses core Clojure APIs plus
+the `age` CLI.
 
 ## Why not environment variables?
 
-Env vars for secrets are easy to start with and painful to live with: they
-sprawl (every integration adds another), they're untyped strings (a
-comma-separated allowlist becomes parsing code), and they aren't
-version-controlled (no history, no review, just mutable state in a deploy
-platform). Encrypting a plain EDN map fixes all three — the map is real data
-(sets, nested maps, numbers), the encrypted form is committed, and the only
-out-of-band secret is one `age` key.
+Environment variables are easy to start with and painful to live with. They
+sprawl: every integration adds another, and nobody can tell from the
+repository what the application needs. They are untyped strings, so a
+comma-separated allowlist becomes parsing code. And they live outside version
+control, as mutable state in a deploy platform, with no history and no review.
 
-The ciphertext itself diffs opaquely (age re-encrypts the whole file), so the
-committed [manifest](#manifest-seeing-what-changed) is what makes changes
-*reviewable* — it records the shape of the secrets, so a PR shows which keys
-were added, removed, or changed without revealing any value.
+Encrypting a plain EDN map fixes all three. The map is real data, the
+encrypted form is committed, and the only out-of-band secret is one `age` key.
+The ciphertext itself diffs opaquely, since age re-encrypts the whole file, so
+the committed [manifest](#manifest-seeing-what-changed) is what makes changes
+*reviewable*: it records the shape of the secrets, and a PR shows which keys
+were added, removed, or changed without revealing any value. Secrets travel
+with the code that needs them, so a new environment is a checkout and one key
+rather than a checklist copied between dashboards.
+
+This is a deliberately small tool for solo developers and small teams whose
+secrets change infrequently. If you need dynamic credentials, per-secret
+access rules, or automatic rotation, see
+[Trade-offs and limitations](#trade-offs-and-limitations).
 
 ## Install
 

@@ -1,198 +1,76 @@
 ^:kindly/hide-code
 (ns secrets-book.index)
 
-;; # Intro
+;; # Introduction
 
-;; `com.kirahowe/secrets` is a library for managing secrets in your Clojure projects. Encrypted secrets files get committed with your project, which can only be decrypted with a private age identity that you store like you would a secret.
+;; `com.kirahowe/secrets` manages application secrets as a single
+;; **version-controlled, age-encrypted EDN file** instead of a pile of
+;; environment variables. One private key decrypts it. Everything else, the
+;; structure, the defaults, and the ciphertext itself, lives in git, with a
+;; committed value-free manifest that makes each change reviewable.
 
 ;; ## Features
-;; - deploy one private key instead of many secret values
-;; - real EDN values at runtime, not just strings
-;; - plaintext manifest file shows keys and structure without revealing values
-;; - single-key manifests also show when a value changes
-;; - bb CLI for managing secrets
-;; - encrypted secrets live in git alongside the code that uses them
-;; - separate secrets per environment, environment names are configurable
-;; - teammates use their own private keys to access the same secrets
-;; - read secrets as a plain map or reference them directly in EDN config
-;; - required and optional secrets with #secret/req and #secret/opt
-;; - integration with Aero profiles and Integrant configuration, optionally included
-;; - load encrypted files from disk or bundle them inside your jar
-;; - edit secrets in your usual editor, preserving comments and formatting
-;; - script secret updates through stdin without putting values in command arguments
-;; - check manifest freshness in CI without giving CI a private key
-;; - built-in diagnostics for finding setup problems without printing secrets
-;; - project initializer that previews changes and preserves existing bb.edn content
-;; - everything is just files, no secrets server or cloud account to maintain
 
-;; ## Why, briefly
+;; - **One private key to deploy.** Production receives a single age identity
+;;   through an environment variable or a mounted file, not a list of secret
+;;   values.
+;; - **Real EDN at runtime.** Sets, vectors, nested maps, and numbers, not just
+;;   strings. Load the whole map, or reference values from your EDN config with
+;;   `#secret/req` and `#secret/opt`. Works with Aero, and the plain map suits
+;;   Integrant or component.
+;; - **Encrypted secrets live in git** beside the code that uses them, one file
+;;   per environment. Load them from disk or from inside the jar.
+;; - **Reviewable changes.** Every write updates a value-free manifest, so a
+;;   diff shows which keys were added, removed, or changed. CI can check that
+;;   the manifest is fresh without holding a key.
+;; - **Solo or team.** Encrypt to your own key, or to a committed list of
+;;   recipients so each teammate decrypts with their own.
+;; - **A `bb secrets` task** for the day to day: edit in your editor, set from
+;;   stdin, diagnose with `doctor`, and a project initializer that previews
+;;   before it writes.
+;; - **Just files and age.** No secrets server, no KMS, no cloud account, no
+;;   GPG keyring.
 
-;; Secrets are essential configuration for most apps, but storing them in environment variables spreads them out in too many places. Environment variables are effectively global mutable state that your app depends on to run and bad things happen when they are spread out across disparate servers and treated as an afterthought and not essential, first class config. Keeping secrets in git alongside your code is one way to make sure they are versioned, reviewable, and shipped with the code they belong with.
+;; ## Why not environment variables?
 
-;; This also dramatically simplifies spinning up new environments and makes it more repeatable without the need to run or operate a seaprate secrets service. Rather than copying a checklist of secrets from place to place, with no way to know whether you have the right version or right one, with this appraoch secrets travel with the code that needs them and your app config is just more data.
+;; Environment variables are easy to start with and painful to live with. They
+;; sprawl: every integration adds another, and nobody can tell from the
+;; repository what the application needs. They are untyped strings, so a
+;; comma-separated allowlist becomes parsing code. And they live outside version
+;; control, as mutable state in a deploy platform, with no history and no
+;; review.
 
-;; This is a deliberately small alternative and imporovement over collecting strings in environment variables. It works well for solo developers or small teams where secrets change infrequently. If you need dynamic credentials, per-secret access rules, or automatic rotation, skip ahead to [when to use something else](secrets_book.caveats.html#when-to-use-something-else).
+;; Encrypting a plain EDN map fixes all three. The map is real data, the
+;; encrypted form is committed, and the only out-of-band secret is one age key.
+;; The ciphertext itself diffs opaquely, since age re-encrypts the whole file,
+;; so the committed manifest is what makes changes reviewable: it records the
+;; shape of the secrets, and a pull request shows which keys were added,
+;; removed, or changed without revealing any value. Secrets travel with the
+;; code that needs them, so a new environment is a checkout and one key rather
+;; than a checklist copied between dashboards.
 
+;; This is a deliberately small tool for solo developers and small teams whose
+;; secrets change infrequently. If you need dynamic credentials, per-secret
+;; access rules, or automatic rotation, see
+;; [when to use something else](secrets_book.caveats.html#when-to-use-something-else).
 
-;; ## What you need
+;; ## How this book is organized
 
-;; Install [age](https://age-encryption.org) and
-;; [Babashka](https://babashka.org). The one-time dependency resolution shown
-;; below also needs Java; a JVM Clojure project will normally have that already.
-
-;; ```sh
-;; brew install age babashka
-;; ```
-
-;; On Debian or Ubuntu, `apt install age` installs age. Follow Babashka's
-;; [installation instructions](https://github.com/babashka/babashka#installation)
-;; for the current Babashka package on your platform.
-
-;; ## Set up a project
-
-;; Add the library to your project's `bb.edn`:
-
-;; ```clojure
-;; {:deps {com.kirahowe/secrets {:mvn/version "0.1.0"}}}
-;; ```
-
-;; A JVM Clojure application also needs the same coordinate in its `deps.edn`;
-;; `bb.edn` supplies the management task, while `deps.edn` supplies application
-;; code at runtime.
-
-;; Now run the initializer from the same directory. Change `myapp` to your
-;; application's name:
-
-;; ```sh
-;; bb -m com.kirahowe.secrets.init --app myapp --keygen
-;; ```
-
-;; The first run is a preview. It lists the files it wants to create or merge
-;; and changes nothing. If the preview looks right, run the same command with
-;; `--apply`:
-
-;; ```sh
-;; bb -m com.kirahowe.secrets.init --app myapp --keygen --apply
-;; ```
-
-;; This keeps the dependency you just added, merges a `bb secrets` task into
-;; `bb.edn`, creates a safe plaintext template, and generates the age identity at
-;; `~/.config/myapp/key.txt`. Existing `bb.edn` comments and unrelated forms are
-;; preserved. A conflicting dependency or task is refused instead of replaced.
-
-;; Back up `~/.config/myapp/key.txt` somewhere outside git, such as a password
-;; manager. It is the only way to decrypt this store, and the library cannot
-;; recover it for you.
-
-;; ## Create the first secrets file
-
-;; ```sh
-;; bb secrets new
-;; ```
-
-;; This opens the generated template in `$VISUAL`, `$EDITOR`, or `vim`. The file
-;; you edit is ordinary EDN, so values can be strings, numbers, sets, vectors, or
-;; nested maps:
-
-;; ```clojure
-;; {:database/url "jdbc:postgresql://db.internal/app"
-;;  :stripe/api-key "sk_live_..."
-;;  :auth/admins #{"kira@example.com" "sam@example.com"}}
-;; ```
-
-;; Saving creates two files:
-
-;; ```text
-;; secrets/secrets.edn.age       # encrypted values
-;; secrets/secrets.edn.manifest  # value-free description of what changed
-;; ```
-
-;; The idea is to commit both. Keep `~/.config/myapp/key.txt` out of the
-;; repository.
-
-;; If you would rather not open an editor, `set` reads a value from standard
-;; input. It never accepts the value as a command-line argument:
-
-;; ```sh
-;; printf %s "$DATABASE_URL" | bb secrets set :database/url
-;; printf %s '#{"kira@example.com" "sam@example.com"}' \
-;;   | bb secrets set :auth/admins --edn
-;; ```
-
-;; `set` creates the encrypted file when it does not exist yet. Without `--edn`
-;; it stores a string; with `--edn` it reads the value as EDN.
-
-;; ## Read secrets in the app
-
-;; `load-secrets` decrypts the complete map. Passing `{:app "myapp"}` uses the
-;; identity the initializer created locally and still allows production to
-;; override it with a `SECRETS_AGE_IDENTITY*` environment variable:
-
-;; ```clojure
-;; (require '[com.kirahowe.secrets :as secrets])
-;;
-;; (def secret-values
-;;   (secrets/load-secrets "secrets/secrets.edn.age" {:app "myapp"}))
-;;
-;; (secrets/get-secret secret-values :database/url)
-;; (secrets/get-secret secret-values [:r2 :account-id])
-;; ```
-
-;; If the rest of your configuration is EDN, reader literals keep each secret
-;; reference beside the setting that uses it:
-
-;; ```clojure
-;; (require '[clojure.edn :as edn])
-;;
-;; (def readers
-;;   (secrets/reader-literals
-;;    {:file "secrets/secrets.edn.age" :app "myapp"}))
-;;
-;; (edn/read-string
-;;  {:readers readers}
-;;  "{:db {:jdbc-url #secret/req :database/url}
-;;    :email {:api-key #secret/opt :postmark/api-key}}")
-;; ```
-
-;; `#secret/req` throws when the value cannot be loaded. `#secret/opt` returns
-;; `nil` when the secret, ciphertext, or identity is absent, but it still throws
-;; when an existing ciphertext fails to decrypt. The
-;; [runtime chapter](secrets_book.runtime.html) covers both APIs, classpath
-;; resources, caching, Aero, and input limits.
-
-;; ## Check the setup
-
-;; ```sh
-;; bb secrets doctor
-;; bb secrets verify
-;; ```
-
-;; `doctor` explains whether age, the configured identity, ciphertext, template,
-;; recipients, and manifest are ready. It does not print secret values or mutate
-;; anything. `verify` checks that the committed manifest belongs to this app and
-;; agrees with the ciphertext.
-
-;; Day to day, this is usually all you need:
-
-;; ```sh
-;; bb secrets edit             # decrypt, edit, and re-encrypt
-;; bb secrets set :some/key    # read a replacement from stdin
-;; bb secrets rm :old/key      # remove a value
-;; bb secrets verify           # check the manifest before committing
-;; ```
-
-;; Run `bb secrets --help` or `bb secrets help set` whenever you need the exact
-;; command syntax.
-
-;; ## Where to go next
-
-;; - [The CLI](secrets_book.cli.html) covers initialization, environments, every
-;;   command, and configuration.
-;; - [Runtime](secrets_book.runtime.html) covers direct loading, reader literals,
-;;   Aero, and deliberate reloads.
+;; - [Quick start](secrets_book.quickstart.html) installs the tools,
+;;   initializes a project, and writes and reads the first secrets.
+;; - [The CLI](secrets_book.cli.html) covers the initializer, configuration,
+;;   and every command.
+;; - [Runtime](secrets_book.runtime.html) covers loading secrets in an
+;;   application: the map, reader literals, Aero, and caching.
 ;; - [Teams](secrets_book.teams.html) gives every teammate their own private
 ;;   identity.
+;; - [The manifest](secrets_book.manifest.html) explains reviewable changes
+;;   without plaintext.
 ;; - [Production and CI](secrets_book.production.html) shows how to inject an
-;;   identity and verify committed artifacts safely.
-;; - [Caveats and threat model](secrets_book.caveats.html) is the important
-;;   boundary of what this library does and does not protect.
+;;   identity and gate on the manifest.
+;; - [Design and rationale](secrets_book.design.html) sets out the model, why
+;;   age, and the prior art.
+;; - [Caveats and threat model](secrets_book.caveats.html) is the boundary of
+;;   what this library does and does not protect.
+;; - [Reference](secrets_book.reference.html) lists the API, configuration
+;;   keys, environment variables, and exit codes.
