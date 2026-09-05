@@ -7,16 +7,16 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]))
 
-;; Sharing one private key is simple, but it gets awkward as soon as more than
-;; one person needs it. Age can encrypt one file to many public recipients, and
-;; any matching private identity can decrypt it. In team mode every person keeps
-;; their own identity, while the public recipient list is committed to the
-;; repository. Private keys never have to move between teammates.
+;; Sharing a private key gets awkward when you're working with other people.
+;; Age lets us encrypt a file to multiple public recipients, so each person
+;; can decrypt it with their own private identity. We commit the list of
+;; public keys to the repository, and everyone keeps their private key on
+;; their own machine.
 
 ;; ## Two people, two keys
 
-;; Alice and Bob each run `bb secrets keygen` on their own machines. Here,
-;; one temp directory stands in for both machines:
+;; Alice and Bob each run `bb secrets keygen` on their own machines. For this
+;; example, we'll create both keys in a temporary directory:
 
 (def dir
   (str (java.nio.file.Files/createTempDirectory
@@ -50,7 +50,7 @@
                      (str dir "/secrets.edn.age"))
   (io/delete-file plain))
 
-;; One ciphertext, and either private key opens it:
+;; We can read the same encrypted file with either private key:
 
 (secrets/load-secrets (str dir "/secrets.edn.age") alice-key)
 
@@ -58,8 +58,8 @@
 
 ;; ## The CLI does this for you
 
-;; In a project, you switch an environment to team mode by adding one config
-;; key:
+;; To use this through the CLI, add `:recipients-file` to the environment's
+;; configuration:
 
 ;; ```clojure
 ;; {:prod {:secrets-file    "env/prod/resources/secrets.edn.age"
@@ -85,8 +85,8 @@
 
 ;; ### Adding another person
 
-;; Once a store exists, onboarding a teammate is two commands run by the new
-;; person and one by somebody who already has access:
+;; Once the store exists, a new teammate generates a key and adds their public
+;; recipient. Someone who already has access then re-encrypts the file:
 
 ;; ```sh
 ;; bb secrets keygen prod          # new person, their own machine
@@ -98,8 +98,8 @@
 ;; read it. `add-recipient` updates the list and prints a reminder; it does not
 ;; perform the re-encryption itself.
 
-;; Here is `add-recipient!` live, using a config in team mode. A third
-;; teammate joins:
+;; Let's add a third teammate to our example using `add-recipient!`. First
+;; we'll configure the environment to use our recipients file:
 
 (def config
   (cli/normalize-config
@@ -131,7 +131,7 @@
 ;; be usable, rotate them at their source as well. See
 ;; [caveats](secrets_book.caveats.html).
 
-;; ## A key for the robots
+;; ## A key for deployment and CI {#a-key-for-the-robots}
 
 ;; Deployment and CI can use a dedicated recipient instead of a person's key:
 
@@ -150,11 +150,12 @@
 ;; list, an encrypted fixture, and a CI job that verifies the manifest without
 ;; a private identity.
 
-;; ## What team mode costs you
+;; ## Value changes in team mode {#what-team-mode-costs-you}
 
-;; Team manifests record structure only: adds, removals, and type changes show
-;; in diffs, but a rotated string does not. The per-value hashes that catch a
-;; rotation are keyed by the private key, and a team has no shared one. The
+;; Team manifests only record structure. You'll see added and removed keys and
+;; type changes in diffs, but you won't see when a string is replaced with
+;; another string. Detecting that kind of change needs a hash derived from a
+;; shared private key, which we don't have in team mode. The
 ;; [manifest chapter](secrets_book.manifest.html#catching-value-changes-with-a-keyed-hash)
 ;; has the details.
 

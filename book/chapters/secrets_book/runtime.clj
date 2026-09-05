@@ -7,13 +7,13 @@
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]))
 
-;; There are two straightforward ways to get secrets into an application. You
-;; can load the complete decrypted map and pass it around, or register reader
-;; literals so an EDN config file can reference secrets inline. Both routes use
-;; the same source rules, identity resolution, and resource limits.
+;; There are two ways to get secrets into an application. You can load the
+;; complete decrypted map and pass it around, or register reader literals so an
+;; EDN config file can reference secrets inline. Both use the same rules for
+;; sources, identity resolution, and resource limits.
 
-;; Setup for the examples: a fresh key and an encrypted file in a temp
-;; directory.
+;; For the examples, we'll create a fresh key and an encrypted file in a
+;; temporary directory.
 
 (def dir
   (str (java.nio.file.Files/createTempDirectory
@@ -50,11 +50,11 @@
 (secrets/load-secrets (.toURL (.toURI (io/file (str dir "/secrets.edn.age"))))
                       key-file)
 
-;; Sources are deliberately local-only. HTTP(S), other remote schemes, nested
-;; jars, malformed local locators, and arbitrary values accepted by
-;; `clojure.java.io/input-stream` are refused before any network access. Secret
-;; loading should not quietly become an HTTP client just because a URL was
-;; passed in.
+;; Sources are local only. HTTP(S), other remote schemes, nested jars, malformed
+;; local locators, and arbitrary values accepted by
+;; `clojure.java.io/input-stream` are rejected before any network access. This
+;; keeps secret loading from quietly turning into an HTTP request just because
+;; someone passed in a URL.
 
 ;; ## Reading values
 
@@ -83,19 +83,20 @@
 ;; ## How the key is found
 
 ;; The identity argument accepts three shapes. A path string or `File` names
-;; the key file directly. A map gives you the two useful indirections:
+;; the key file directly. A map lets you provide an explicit identity file or
+;; use the conventional path for an app:
 
 ;; ```clojure
 ;; (secrets/load-secrets src {:identity-file "/etc/keys/age.txt"})  ; explicit
 ;; (secrets/load-secrets src {:app "myapp"})   ; ~/.config/myapp/key.txt
 ;; ```
 
-;; Before the `:app` convention, the library consults the
+;; Before using the `:app` convention, the library checks the
 ;; `SECRETS_AGE_IDENTITY_FILE`, `SECRETS_AGE_IDENTITY`, and
-;; `SECRETS_AGE_IDENTITY_B64` environment variables, in that order, and with no
-;; identity argument at all they are the only sources. They win even when you
-;; pass `{:app "myapp"}`, so local development can use
-;; `~/.config/myapp/key.txt` while production overrides it with an injected
+;; `SECRETS_AGE_IDENTITY_B64` environment variables, in that order. With no
+;; identity argument, these environment variables are the only sources. They
+;; also take precedence when you pass `{:app "myapp"}`, so local development can
+;; use `~/.config/myapp/key.txt` while production overrides it with an injected
 ;; identity. The
 ;; [production chapter](secrets_book.production.html#injecting-the-key)
 ;; describes each variable and when to use it.
@@ -111,29 +112,30 @@
 
 ;; ### Retiring injected identities
 
-;; Raw and base64 environment identities have to be materialized because age
-;; accepts an identity file path. The library reuses an owner-only temp file
-;; rather than writing a new copy for every decryption. A long-running process
-;; can retire those files when it is finished loading configuration:
+;; Raw and base64 environment identities have to be written to a file because
+;; age expects an identity file path. The library reuses an owner-only temporary
+;; file instead of writing a new copy for every decryption. A long-running
+;; process can retire those files when it has finished loading its config:
 
 ;; ```clojure
 ;; (secrets/reset-identity-cache!)
 ;; ;; => {:generation 1, :deleted 1, :absent 0, :failed 0, :pending 0}
 ;; ```
 
-;; A later read materializes a fresh copy. Files you own — an explicit
-;; `:identity-file`, `SECRETS_AGE_IDENTITY_FILE`, or the conventional app key —
-;; are never deleted. `load-secrets`, the reader literals, and the Aero readers
-;; hold their injected identity for the complete decryption, so a concurrent
-;; reset cannot remove it from under a running age process. If you resolve an
-;; injected identity yourself and pass it directly to the lower-level age API,
-;; wrap that call in `secrets/with-identity` to get the same guarantee.
+;; A later read materializes a fresh copy. The library never deletes identity
+;; files you provide yourself, whether they come from an explicit
+;; `:identity-file`, `SECRETS_AGE_IDENTITY_FILE`, or the conventional app key.
+;; `load-secrets`, the reader literals, and the Aero readers hold their injected
+;; identity for the complete decryption, so a concurrent reset cannot remove it
+;; from under a running age process. If you resolve an injected identity
+;; yourself and pass it directly to the lower-level age API, wrap that call in
+;; `secrets/with-identity` to get the same guarantee.
 
 ;; ## Resource limits
 
-;; Secret stores are supposed to be small. The runtime therefore bounds each
-;; stage while bytes are moving, before a hostile or accidentally enormous file
-;; can consume the process:
+;; Secret stores are generally small, so the runtime limits each stage while
+;; the bytes are moving. This stops a hostile or accidentally enormous file
+;; before it can exhaust the process's memory:
 
 ;; | Limit | Default | What it bounds |
 ;; |-------|---------|----------------|
@@ -141,7 +143,7 @@
 ;; | `:max-plaintext-bytes` | 8 MiB | plaintext produced by age |
 ;; | `:max-edn-depth` | 100 | nested EDN collections before parsing |
 
-;; Override only what the application genuinely needs:
+;; You can override the limits an application needs to change:
 
 ;; ```clojure
 ;; (secrets/load-secrets
@@ -152,9 +154,9 @@
 ;; ```
 
 ;; The supplied map is merged over `secrets/default-limits`. Unknown keys,
-;; non-integers, and non-positive values are errors; a misspelled safety limit
-;; should not look as though it was accepted. The same `:limits` option works
-;; with `reader-literals` and `merge-readers`.
+;; non-integers, and non-positive values are errors, so a misspelled limit can't
+;; appear to have been accepted. The same `:limits` option works with
+;; `reader-literals` and `merge-readers`.
 
 ;; ## Reader literals
 
@@ -182,9 +184,9 @@
 
 ;; ## Required versus optional
 
-;; `#secret/req` is a hard dependency: the app should not come up without it.
-;; `#secret/opt` is for integrations that can be absent, like an API key for a
-;; feature you only run in prod. The two differ in every failure case:
+;; Use `#secret/req` when the app shouldn't start without a value. Use
+;; `#secret/opt` for something that can be absent, like an API key for a feature
+;; you only run in prod. Here's how the two tags handle each failure case:
 
 ;; | Situation | `#secret/req` | `#secret/opt` |
 ;; |-----------|---------------|---------------|
@@ -201,7 +203,7 @@
   (edn/read-string {:readers readers} "#secret/req :not/in-the-file")
   (catch Exception e (ex-message e)))
 
-;; and an optional read against a source with no key available:
+;; Here is an optional read against a source with no key available:
 
 (let [keyless (secrets/reader-literals
                {:file (str dir "/secrets.edn.age")
@@ -210,25 +212,24 @@
 
 ;; ## Lazy loading, caching, and deliberate reloads
 ;;
-;; Building the readers map does not read the secrets. The file is resolved and
-;; decrypted once, on the first tag actually read. That first successful load
-;; or genuine decryption failure is cached for the life of that readers map. A
+;; Building the readers map doesn't read the secrets. The file is resolved and
+;; decrypted when the first tag is read, and that successful load or genuine
+;; decryption failure is cached for the life of the readers map. This means a
 ;; dev or test config with no secret tags never touches `age` and never needs a
 ;; key, even when a secrets file sits on the classpath. A config with forty tags
-;; decrypts once, not forty times. Keeping one store stable across every tag also
-;; prevents a config read from mixing values from ciphertext changed midway
-;; through the read.
+;; decrypts once. It also uses one stable store for the whole config read, so a
+;; ciphertext change partway through can't mix old and new values.
 ;;
-;; The flip side is deliberate staleness. After ciphertext is edited, the old
-;; readers map keeps its loaded store. If its first tag hit a wrong-key
-;; decryption error, every later tag rethrows that cached failure even after the
-;; ciphertext is repaired. In both cases, construct a new `reader-literals` or
-;; `merge-readers` map and re-read the whole config. A process restart naturally
-;; creates fresh readers and observes the current ciphertext. Readers never poll
-;; or watch the file, and they never retry decryption once per tag.
+;; The old readers map keeps its loaded store after you edit the ciphertext. If
+;; its first tag hit a wrong-key decryption error, every later tag rethrows that
+;; cached failure even after you repair the ciphertext. In either case, create a
+;; new `reader-literals` or `merge-readers` map and read the whole config again.
+;; Restarting the process also creates fresh readers that see the current
+;; ciphertext. Readers don't poll or watch the file, and they don't retry the
+;; decryption for each tag.
 ;;
-;; A safe long-running REPL workflow makes the reload boundary explicit and
-;; inspects only non-secret status or structure:
+;; In a long-running REPL, make the reload explicit and inspect only non-secret
+;; status or structure:
 ;;
 ;; ```clojure
 ;; (defn read-app-config []
@@ -244,8 +245,8 @@
 ;;  :section-count  (count app-config)}
 ;; ```
 ;;
-;; Do not print the config or any secret value to confirm a reload. Edit out of
-;; process and reload deliberately rather than adding filesystem polling.
+;; Don't print the config or any secret value to confirm a reload. Edit it in
+;; another process, then reload the whole config explicitly.
 
 ;; ## Merging with readers you already have
 
@@ -275,12 +276,12 @@
 ;;             [com.kirahowe.secrets.aero :as secrets-aero]))
 ;; ```
 
-;; `aero` is optional: consumers must already have it on their classpath. After
-;; loading the integration namespace, supply the secrets options either to
-;; `register!` or to each `read-config` call.
+;; Aero is an optional dependency, so it must already be on the application's
+;; classpath. After loading the integration namespace, supply the secrets
+;; options either to `register!` or to each `read-config` call.
 
-;; Two ways to supply the secrets config — the same opts map `reader-literals`
-;; takes above:
+;; You can supply the same options map accepted by `reader-literals` either for
+;; the whole process or for one read:
 
 ;; ```clojure
 ;; ;; process-wide, for one app reading its own config in one place
@@ -295,16 +296,16 @@
 ;;  {:secrets {:app "myapp" :resource "secrets.edn.age"}})
 ;; ```
 
-;; A per-read `:secrets` opt always wins over a `register!`ed default. Aero
-;; caches a readers map, and with it the first decrypted store or genuine
-;; decryption failure, for each distinct secrets configuration, with the same
-;; staleness rules as `reader-literals` above. Calling `register!` again
-;; retires every cache entry from the previous registration, even when the new
-;; map compares equal, and `(register! nil)` clears the default and its cache.
-;; After editing or repairing ciphertext in a long-running process, call
-;; `(secrets-aero/reset-cache!)` before re-reading the entire config. It
-;; invalidates every cached reader map and store, including cached failures,
-;; and leaves the registered default intact.
+;; A per-read `:secrets` option always takes precedence over a default supplied
+;; to `register!`. For each distinct secrets configuration, Aero caches the
+;; readers map and its first decrypted store or genuine decryption failure. The
+;; same staleness rules described for `reader-literals` apply here. Calling
+;; `register!` again retires every cache entry from the previous registration,
+;; even when the new map compares equal. `(register! nil)` clears the default
+;; and its cache. After editing or repairing ciphertext in a long-running
+;; process, call `(secrets-aero/reset-cache!)` before reading the entire config
+;; again. It clears every cached readers map, store, and failure while leaving
+;; the registered default intact.
 
 ;; After registering, `#secret/req :database/url` works inside an aero config
 ;; file like any other aero tag.
@@ -320,11 +321,11 @@
 ;; ```
 
 ;; Pass `{:profile :evals}` to `read-config` to select the second branch. Aero
-;; evaluates only the selected branch: reading with `:default`
-;; decrypts and looks up `:openrouter/api-key` alone, and
-;; `:openrouter/evals-api-key` does not need to exist in the store at all;
-;; reading with `:evals` selects only the other branch. A key used by one
-;; profile can therefore be absent when another profile reads the config. The
+;; evaluates only the branch it selects. With `:default`, it decrypts and looks
+;; up `:openrouter/api-key`, and `:openrouter/evals-api-key` doesn't need to
+;; exist in the store. With `:evals`, it looks up only the other key. This means
+;; a key used by one profile can be absent when another profile reads the
+;; config. The
 ;; [aero-profiles example](https://github.com/kirahowe/secrets/tree/main/examples/aero-profiles) runs exactly this configuration.
 
 ^:kindly/hide-code

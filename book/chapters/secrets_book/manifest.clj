@@ -8,8 +8,9 @@
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.manifest :as manifest]))
 
-;; Age uses randomized encryption, so two encryptions of the same plaintext
-;; differ. A ciphertext diff therefore cannot describe the plaintext change:
+;; age uses randomized encryption, which means that encrypting the same
+;; plaintext twice produces different ciphertext. A diff between ciphertexts
+;; therefore can't tell you what changed in the plaintext:
 
 (def dir
   (str (java.nio.file.Files/createTempDirectory
@@ -28,15 +29,15 @@
   (age/encrypt-file! key-file plain (str dir "/two.age"))
   (= (slurp (str dir "/one.age")) (slurp (str dir "/two.age"))))
 
-;; A pull request that changes only `secrets.edn.age` tells a reviewer almost
-;; nothing. The manifest adds the useful part of the diff without storing
-;; plaintext secret values.
+;; If a pull request only changes `secrets.edn.age`, there is very little for a
+;; reviewer to learn from the diff. The manifest records the useful parts of
+;; the change without storing the plaintext secret values.
 
 ;; ## What the manifest records
 
-;; `entries` maps a secrets value to its shape: every key path, the type of
-;; its value, and a count for collections. Plaintext secret values do not
-;; appear:
+;; `entries` describes the shape of a secrets value. It includes every key
+;; path, the type of its value, and a count for collections, but does not
+;; include the plaintext values themselves:
 
 (def secrets-v1
   {:database/url "jdbc:postgresql://db/app"
@@ -45,17 +46,18 @@
 
 (manifest/entries secrets-v1 nil)
 
-;; Secrets-writing CLI commands render this as line-oriented EDN in a
-;; `.manifest` file next to the ciphertext. Committed together, the pair gives
-;; you a reviewable diff: the ciphertext changes opaquely, and the manifest
-;; line for `[:auth :admins]` shows the set grew from 2 to 3.
+;; CLI commands that write secrets render this as line-oriented EDN in a
+;; `.manifest` file beside the ciphertext. When both files are committed, the
+;; ciphertext still changes opaquely, but the manifest gives you something
+;; useful to review. For example, the line for `[:auth :admins]` can show that
+;; the set grew from 2 to 3.
 
 ;; ## Catching value changes with a keyed hash
 
-;; Shape alone misses one case: a value that changed without changing type,
-;; which is what a rotation looks like. For that, single-key environments add
-;; a `:vhash` to each entry, an HMAC of the value keyed by a secret derived
-;; from the private key:
+;; The shape alone can't show a value changing without changing type, which
+;; is what happens during a rotation. In a single-key environment, each entry
+;; therefore includes a `:vhash`: an HMAC of the value, keyed by a secret
+;; derived from the private key.
 
 (def hkey (manifest/hmac-key (slurp key-file)))
 
@@ -63,16 +65,18 @@
 
 (manifest/entries {:token "new-value"} hkey)
 
-;; The shape is unchanged but the hash differs. Someone with only the
-;; repository cannot test guesses for a low-entropy value because the HMAC key
-;; is derived from the private identity. The stored hash is truncated to eight
-;; bytes; it is a change marker, not a general-purpose integrity check.
+;; The shape is the same in these two entries, but the hash is different.
+;; Someone with access only to the repository can't use it to test guesses for
+;; a low-entropy value because the HMAC key comes from the private identity.
+;; The stored hash is truncated to eight bytes. It is intended to mark a
+;; change, rather than serve as a general-purpose integrity check.
 
-;; For a native age identity, key derivation reads only `AGE-SECRET-KEY` lines,
-;; so comments written by `age-keygen` do not matter. If the file has no such
-;; line, as with an SSH identity, derivation uses the complete trimmed contents.
-;; Two copies of the same native key, one with comments stripped, produce
-;; identical hashes:
+;; For a native age identity, key derivation reads only the
+;; `AGE-SECRET-KEY` lines, so comments written by `age-keygen` do not affect the
+;; result. If the file has no such line, as with an SSH identity, derivation
+;; uses the complete trimmed contents. Two copies of the same native key
+;; therefore produce identical hashes even if comments have been removed from
+;; one of them:
 
 (let [with-comments (slurp key-file)
       without-comments (->> (str/split-lines with-comments)
@@ -81,13 +85,13 @@
   (java.util.Arrays/equals (manifest/hmac-key with-comments)
                            (manifest/hmac-key without-comments)))
 
-;; In multi-recipient mode there is no shared private key to derive from, so
-;; team manifests skip `:vhash` and record structure only.
+;; In multi-recipient mode, there is no shared private key to derive the HMAC
+;; key from, so team manifests omit `:vhash` and record only the structure.
 
 ;; ## The rendered file
 
-;; `render` produces the text that gets committed. The header records the
-;; app, a format version, and the SHA-256 of the ciphertext it describes:
+;; `render` produces the text that will be committed. Its header records the
+;; app, a format version, and the SHA-256 hash of the ciphertext it describes:
 
 (def rendered
   (manifest/render {:app "manifest-demo" :ciphertext-sha "0b7d9f31aa..."}
@@ -96,23 +100,25 @@
 ^:kindly/hide-code
 (print rendered)
 
-;; Each key path occupies one line, so git shows entry-level changes.
+;; Each key path occupies one line, which lets git show changes to individual
+;; entries.
 
 ;; ## Diffing two shapes
 
-;; `diff` compares two entry maps and reports what a reviewer would want to
-;; know:
+;; `diff` compares two entry maps and reports the differences a reviewer needs
+;; to know about:
 
 (manifest/diff (manifest/entries {:a 1 :b "x"} nil)
                (manifest/entries {:b :keyword-now :c true} nil))
 
-;; `:changed` covers type changes, count changes, and, when hashes are
+;; `:changed` includes type changes, count changes, and, when hashes are
 ;; present, value changes.
 
 ;; ## Verifying the manifest
 
-;; `bb secrets verify` decrypts the secrets, regenerates the entries, and
-;; compares them to the committed manifest. First set up an environment:
+;; `bb secrets verify` decrypts the secrets, regenerates their entries, and
+;; compares the result with the committed manifest. First, set up an
+;; environment:
 
 (def config
   (cli/normalize-config
@@ -131,8 +137,8 @@
 
 (cli/verify! config "dev")
 
-;; Next, re-encrypt different secrets directly with `age`, without updating
-;; the manifest:
+;; Now re-encrypt a different set of secrets directly with `age`, without
+;; updating the manifest:
 
 (let [plain (str dir "/p3.edn")]
   (spit plain (pr-str (assoc secrets-v1 :sneaky/addition "oops")))
@@ -141,19 +147,20 @@
 
 (cli/verify! config "dev")
 
-;; The returned map contains `:exit 1`, and the output names the added path. A
-;; CI job can use that status to reject a stale manifest. Verification also
-;; refuses a manifest that belongs to another `:app`, or records no app at all;
-;; a perfectly fresh manifest from the wrong project is still the wrong
-;; manifest.
+;; The returned map contains `:exit 1`, and the output names the path that was
+;; added. A CI job can use that status to reject a stale manifest. Verification
+;; also rejects a manifest that belongs to another `:app`, or one that does not
+;; record an app at all. These checks apply even when the manifest is otherwise
+;; up to date.
 
 ;; ## Verifying without the key
 
-;; The manifest header's `:ciphertext-sha` enables a check that needs no
-;; secret material at all. When `verify` finds no identity, it compares the
-;; recorded hash against the actual ciphertext. A CI job with no key, and not
-;; even `age` installed, can detect a ciphertext changed without regenerating
-;; its manifest. Repair the environment, then verify with a missing key:
+;; The manifest header's `:ciphertext-sha` also enables a check that does not
+;; need any secret material. When `verify` cannot find an identity, it compares
+;; the recorded hash with the actual ciphertext. This allows a CI job with no
+;; key, and without even `age` installed, to detect that a ciphertext changed
+;; without its manifest being regenerated. First regenerate the manifest, then
+;; verify with a missing key:
 
 ^:kindly/hide-code
 (cli/reencrypt! config "dev")
@@ -171,37 +178,39 @@
 
 (cli/verify! keyless-config "dev")
 
-;; `:ok-keyless` passes with exit 0. It checks freshness, not values; the
-;; full comparison still needs a key. The
+;; `:ok-keyless` passes with exit 0. This checks freshness, but checking the
+;; values still requires a key. The
 ;; [production chapter](secrets_book.production.html) turns both modes into
 ;; CI jobs.
 
-;; Neither mode proves who wrote the ciphertext: age does not sign, and
-;; `verify` reports drift, not authorship. The
+;; Neither mode proves who wrote the ciphertext. age does not sign files, and
+;; `verify` reports drift rather than authorship. The
 ;; [caveats chapter](secrets_book.caveats.html#no-signatures-the-repository-is-the-boundary)
-;; draws that boundary.
+;; explains what this means for trusting the repository.
 
 ;; ## Format versioning
 
-;; Every manifest records `:version 2`. The version names the encoding used to
-;; hash values, and it is mixed into the HMAC key, so a hash written by one
-;; version can never be read as another's. Version 2 frames each value as
-;; `<type-tag>:<code-unit-count>:<payload>`, recursively: because every field
-;; carries its own length, a `=` or `;` *inside* a secret cannot be mistaken for
-;; the encoding's own punctuation, and because every field carries its own type
-;; tag, `[[1]]` and `[(1)]` hash differently. The framed string is hashed as its
-;; raw UTF-16 code units, not through a charset encoder, which would substitute
-;; a replacement character for an unpaired surrogate and fold two distinct
-;; secrets onto one hash. `verify` reports any other version — including a
-;; legacy `:version 1` file — as drift and asks you to regenerate the file with
-;; `reencrypt` or upgrade the library.
+;; Every manifest records `:version 2`. The version identifies the encoding
+;; used to hash values, and it is mixed into the HMAC key. This prevents a hash
+;; written by one version from being read as if it belonged to another.
+;;
+;; Version 2 recursively frames each value as
+;; `<type-tag>:<code-unit-count>:<payload>`. Since every field includes its own
+;; length, a `=` or `;` *inside* a secret cannot be mistaken for punctuation in
+;; the encoding. Every field also includes its type tag, so `[[1]]` and `[(1)]`
+;; hash differently. The framed string is hashed as raw UTF-16 code units
+;; instead of passing through a charset encoder. A charset encoder would
+;; substitute a replacement character for an unpaired surrogate and could
+;; collapse two distinct secrets into the same hash. `verify` reports any other
+;; version, including a legacy `:version 1` file, as drift and asks you to
+;; regenerate the file with `reencrypt` or upgrade the library.
 
 ;; ## What the manifest leaks, and how to turn it off
 
-;; Key names, value types, and collection counts are visible to anyone with
-;; repo access. If even a key's existence is sensitive, disable the manifest
-;; for that environment with `:manifest false`; its ciphertext diff will be
-;; opaque.
+;; Anyone with repository access can see key names, value types, and collection
+;; counts. If even the existence of a key is sensitive, disable the manifest
+;; for that environment with `:manifest false`. Its ciphertext diff will then
+;; be opaque.
 
 ^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]

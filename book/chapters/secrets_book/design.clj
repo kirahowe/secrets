@@ -5,62 +5,62 @@
   (:require [clojure.edn :as edn]
             [clojure.string :as str]))
 
-;; There are many perfectly reasonable ways to manage secrets. This library is
-;; opinionated about a few of them, so it is worth being clear about the model
-;; and the trade-offs before getting too attached to it.
+;; This library stores encrypted secrets alongside application code. Here's
+;; why it works that way, how it relates to other tools, and where the approach
+;; has limitations.
 
 ;; ## The problem with environment variables
 
-;; Environment variables are a perfectly good place to start. The
+;; Environment variables are a reasonable place to start. The
 ;; [Twelve-Factor App](https://12factor.net/config) makes the case for keeping
 ;; configuration out of code, since "config varies substantially across
 ;; deploys, code does not", and prescribes environment variables as the
-;; mechanism. This library keeps the separation and replaces the mechanism.
-;; The trouble is that most applications do not stop at three variables.
+;; mechanism. We can keep configuration separate from code while storing it
+;; differently, though. The problem with environment variables is that most
+;; applications eventually need quite a few of them.
 
-;; Each integration adds a few more variables, while the repository may contain
-;; no complete list of what the application actually needs. Before long the
-;; active configuration lives in a deployment dashboard rather than beside the
-;; code that consumes it.
+;; Each integration adds a few more, and there may be no complete list in the
+;; repository of what the application actually needs. Eventually you have to
+;; go through a deployment dashboard to figure out how the app is configured.
 
-;; They are untyped. An env var is a string, so a list of admin emails becomes
-;; a comma-separated string and a parser you now maintain. Compare the two
-;; directly. The env var version:
+;; Environment variables are also always strings. If you want a list of admin
+;; emails, for example, you have to decide how to represent it as a string and
+;; then write code to parse it. Here's a typical way to do that:
 
 (str/split "kira@example.com,sam@example.com" #",")
 
-;; The EDN version:
+;; In EDN, we can represent the same emails as a set:
 
 (edn/read-string "#{\"kira@example.com\" \"sam@example.com\"}")
 
-;; The first result is a vector and still requires the application to decide
-;; what commas, blanks, and whitespace mean. The second is already a set. EDN
-;; also gives us nested maps, keywords, numbers, and booleans without inventing
-;; a tiny string format for each setting.
+;; The first result is a vector, and we still have to decide how to handle
+;; commas, blanks, and whitespace. The second is already a set. EDN also
+;; supports nested maps, keywords, numbers, and booleans, so we don't have to
+;; come up with a string format for each setting.
 
 ;; Git does not record changes made in a deployment dashboard. A platform may
 ;; have its own audit history, but it is separate from the code change that
 ;; consumes the secret. Twelve-Factor's own
 ;; [build, release, run](https://12factor.net/build-release-run) factor makes
-;; the same point from the other side: a release is a build combined with its
-;; configuration, uniquely identified, and immutable once created. The code
-;; alone does not describe what was deployed. Configuration is half of the
-;; release, and when it lives in a dashboard, half of the release has no
-;; history.
+;; related point: a release is a build combined with its configuration,
+;; uniquely identified and immutable once created. To know what was deployed,
+;; we need both the code and the configuration. If the configuration only lives
+;; in a dashboard, git can't give us that complete history.
 
 ;; ## Configuration belongs in version control
 
-;; The positive case is older than this library. *Continuous Delivery* treats
+;; *Continuous Delivery* treats
 ;; [configuration management](https://continuousdelivery.com/foundations/configuration-management/) as a foundation: version control
 ;; everything required to build, test, and deploy, "including source code,
 ;; test and deployment scripts, infrastructure and application configuration
-;; information". It names two goals. Reproducibility: "we should be able to
-;; provision any environment in a fully automated fashion, and know that any
+;; information". The goals are reproducibility and traceability. For
+;; reproducibility, "we should be able to provision any environment in a fully
+;; automated fashion, and know that any
 ;; new environment reproduced from the same configuration is identical."
-;; Traceability: for any environment, determine precisely what went into it,
-;; and compare it with a previous version to see what changed.
+;; Traceability means being able to determine precisely what went into any
+;; environment and compare it with a previous version to see what changed.
 
-;; In an [interview about the book](https://www.infoq.com/articles/humble-farley-continuous-delivery/), Jez Humble puts the rule bluntly:
+;; In an [interview about the book](https://www.infoq.com/articles/humble-farley-continuous-delivery/), Jez Humble explains:
 ;; "everything that is required to build, test and deploy your system should
 ;; be in version control. It should be possible to plug in a new workstation,
 ;; and check out everything you need to build, test and deploy your system to
@@ -69,11 +69,10 @@
 ;; which version went to which environment, and who approved it, is an audit
 ;; trail.
 
-;; Secrets are the part of application configuration that this discipline
-;; usually stops short of, because committing them in the clear is
-;; unacceptable. Encrypting them is what lets them in. A checkout plus one
-;; identity reproduces an environment's configuration, and the
-;; [manifest](secrets_book.manifest.html) makes each change to it traceable.
+;; Secrets usually get left out of this process because we can't commit them
+;; in plaintext. Encrypting them lets us keep them in version control too. A
+;; checkout and one identity give us an environment's configuration, and the
+;; [manifest](secrets_book.manifest.html) lets us trace changes to it.
 
 ;; ## The model
 
@@ -99,11 +98,11 @@
 ;; keys and support for X25519 and SSH recipients. It does not require a
 ;; keyring or trust database.
 
-;; Two properties matter here. An identity file can select its own recipient
-;; for encryption and can decrypt the result, so the single-key setup needs one
-;; file. Age can also encrypt to multiple recipients; the
-;; [teams chapter](secrets_book.teams.html) uses a committed list of public keys
-;; while each person retains a separate private identity.
+;; An identity file contains enough information to encrypt a file to its own
+;; recipient and decrypt the result, so we only need one key file for a
+;; single-key setup. Age can also encrypt to multiple recipients. In the
+;; [teams chapter](secrets_book.teams.html), we'll use a committed list of
+;; public keys so each person can keep their own private identity.
 
 ;; The library shells out to the upstream `age` binary rather than implementing
 ;; the format. Every environment that decrypts therefore needs that binary.
@@ -111,12 +110,13 @@
 ;; ## Why one file per environment
 
 ;; Each environment has one EDN map and one ciphertext. Environments share the
-;; app's default key unless a `:key-file` override separates them. There are no
-;; overlays or partially shared files, so the decrypted map is the complete
-;; value the application receives.
+;; app's default key unless you set a separate `:key-file` for an environment.
+;; There are no overlays or partially shared files to combine when loading
+;; secrets. The decrypted map contains everything the application receives.
 
-;; The trade-off is coarse access: an identity opens the entire file. SOPS
-;; encrypts individual values, which makes encrypted diffs field-specific.
+;; This does mean that anyone who can decrypt the file can read every value in
+;; it. SOPS encrypts individual values, which makes encrypted diffs
+;; field-specific.
 ;; This library keeps whole-file encryption and adds a
 ;; [manifest](secrets_book.manifest.html) that records structural changes.
 
@@ -139,8 +139,8 @@
 ;; library instead uses explicit `bb secrets` commands. Vault and the cloud
 ;; secret managers are services, and the
 ;; [caveats chapter](secrets_book.caveats.html#when-to-use-something-else)
-;; says when their dynamic credentials, access policy, and audit log are worth
-;; running one.
+;; discusses when you might need their dynamic credentials, access policy, and
+;; audit log.
 
 ;; ## The EDN choice
 

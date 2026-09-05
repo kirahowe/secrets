@@ -34,7 +34,7 @@
 
 ;; ## com.kirahowe.secrets
 
-;; Runtime loading. This is the namespace your application code requires.
+;; Application code requires this namespace to load secrets at runtime.
 
 (doc-section #'secrets/load-secrets
              #'secrets/get-secret
@@ -49,39 +49,40 @@
              #'secrets/expand-home)
 
 ;; `load-secrets` accepts local filesystem sources, local `file:` locators, and
-;; `jar:file:` classpath resources. It deliberately rejects HTTP(S), remote or
-;; nested jars, and arbitrary input-stream values.
+;; `jar:file:` classpath resources. It rejects HTTP(S), remote or nested jars,
+;; and arbitrary input-stream values.
 
 ;; ## com.kirahowe.secrets.fs
 
-;; Owner-only temporary-file creation for callers that must materialize
-;; sensitive bytes without a default-permission window.
+;; This namespace creates temporary files with owner-only permissions from the
+;; moment they're created, so you can write sensitive data to them safely.
 
 (doc-section #'fs/owner-only-temp-file!)
 
 ;; ## com.kirahowe.secrets.aero
 
-;; Optional Aero integration. Requiring this namespace registers the reader
-;; methods; Aero must already be present in the consuming application.
+;; This namespace provides the optional Aero integration. Requiring it registers
+;; the reader methods; Aero must already be present in the consuming
+;; application.
 
 (doc-section #'secrets-aero/register!
              #'secrets-aero/reset-cache!)
 
 ;; ## com.kirahowe.secrets.age
 
-;; The wrapper over the `age` binary. Use it directly when you script your
-;; own workflows; the CLI and runtime namespaces build on it.
+;; This namespace wraps the `age` binary. You can use it directly in your own
+;; scripts; the CLI and runtime namespaces build on it.
 
 ;; ### Path arguments
 
-;; The positional input is passed behind an option terminator (`--`), so a
-;; filename can never be read as an option, and every path-valued argument —
-;; that input, the `-o` output, the `-i` identity, the `-R` recipients file — is
-;; normalized so a dash-leading path becomes `./-name`: age reads a bare `-`
-;; from standard input even behind the terminator, so the prefix is what keeps
-;; a filename a filename. A blank or nil path throws instead of quietly falling
+;; Positional input comes after an option terminator (`--`), so a filename can't
+;; be read as an option. Every path-valued argument is normalized, including the
+;; input, the `-o` output, the `-i` identity, and the `-R` recipients file. A
+;; path that begins with a dash becomes `./-name`. Age reads a bare `-` from
+;; standard input even after the terminator, so this prefix ensures that age
+;; reads the named file. A blank or nil path throws instead of quietly falling
 ;; back to standard input. Recipient strings passed as `:recipients` are values
-;; rather than paths, and are used as given.
+;; rather than paths and are used as given.
 
 (doc-section #'age/version
              #'age/installed?
@@ -98,8 +99,8 @@
 
 ;; ## com.kirahowe.secrets.manifest
 
-;; Pure functions behind the committed manifest. Nothing here touches the
-;; filesystem or the `age` binary.
+;; These are the pure functions used to build and compare the committed
+;; manifest. They don't touch the filesystem or the `age` binary.
 
 (doc-section #'manifest/entries
              #'manifest/value-type
@@ -109,9 +110,9 @@
 
 ;; ## com.kirahowe.secrets.init
 
-;; The one-shot Babashka project initializer. `-main` is the command-line entry
-;; point; the other functions are available to tools that want to preview or
-;; apply the same scaffold programmatically.
+;; This is the one-shot Babashka project initializer. `-main` is the command-line
+;; entry point, and the other functions let tools preview or apply the same
+;; scaffold programmatically.
 
 (doc-section #'init/init!
              #'init/proposed-config
@@ -122,9 +123,9 @@
 
 ;; ## com.kirahowe.secrets.cli
 
-;; The management task. `run!` is the entry point a `bb.edn` wires up; the
-;; command functions are callable from a REPL and return data instead of
-;; exiting.
+;; This namespace implements the management task. `run!` is the entry point
+;; wired up by `bb.edn`; the command functions can also be called from a REPL
+;; and return data instead of exiting.
 
 (doc-section #'cli/run!
              #'cli/normalize-config

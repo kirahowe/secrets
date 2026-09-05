@@ -3,131 +3,133 @@
 ^:kindly/hide-code
 (ns secrets-book.caveats)
 
-;; Encryption is useful, but it does not make the rest of the system disappear.
-;; This chapter draws the boundary around what the library protects and what is
-;; still your responsibility.
+;; Encryption solves one particular problem: it keeps the values in the
+;; repository from being readable without a private identity. It doesn't make
+;; the rest of the system secure by itself, so this chapter explains what the
+;; library does and does not protect.
 
 ;; ## What the encryption actually protects
 
-;; If the private identities remain separate, repository access alone does not
-;; reveal the encrypted values. The manifest may still reveal key names, types,
-;; and collection sizes.
+;; As long as the private identities are kept somewhere else, access to the
+;; repository alone does not reveal the encrypted values. The manifest may
+;; still reveal key names, types, and collection sizes.
 
-;; It does not protect a running process. The decrypted map sits in memory
-;; like any other config, and code execution in your app reads it as
-;; easily as it reads env vars. No client-side secrets scheme changes this.
+;; This doesn't protect a running process. Once decrypted, the map sits in
+;; memory like any other config, and code running in your app can read it as
+;; easily as it can read environment variables. A client-side secrets scheme
+;; can't avoid that.
 
-;; It also does not reduce production's trust in the deployment platform. The
-;; identity arrives through a mounted file or environment variable, so anyone
-;; who can read that identity and the ciphertext can decrypt the complete file.
+;; You also still have to trust the production deployment platform. The
+;; identity arrives through a mounted file or environment variable, and anyone
+;; who can read both that identity and the ciphertext can decrypt the whole
+;; file.
 
 ;; ## A leaked key exposes history
 
-;; Git history retains old ciphertexts, and age does not provide forward
-;; secrecy across versions of a file. A key that leaks today decrypts every
-;; retained version that was encrypted to its recipient. Three consequences
-;; follow.
+;; Git history keeps old ciphertexts, and age does not provide forward secrecy
+;; across versions of a file. If a key leaks today, it can decrypt every
+;; retained version that was encrypted to its recipient.
 
-;; Rotating the key is not enough after a leak. You must rotate the secret
-;; values, at the upstream services, because the old ciphertexts remain
-;; readable to whoever holds the old key.
+;; Rotating the key is not enough after a leak. You also have to rotate the
+;; secret values at their upstream services, because anyone with the old key
+;; can still read the old ciphertexts.
 
-;; Removing a teammate's recipient and re-encrypting stops access to new
-;; ciphertexts only. Everything committed while they were a recipient stays
-;; readable to them. Rotate the secret values when past access is a concern.
+;; Similarly, removing a teammate's recipient and re-encrypting only stops
+;; access to new ciphertexts. They can still read everything committed while
+;; they were a recipient. If their past access is a concern, rotate the secret
+;; values as well.
 
-;; Value rotation is manual. Nothing in this library rotates a database
-;; password or expires an API key. If your compliance regime requires
-;; scheduled rotation with proof, you want a secrets manager with a server,
-;; not this.
+;; Rotating those values is a manual process. This library can't rotate a
+;; database password or expire an API key for you. If you need scheduled
+;; rotation and proof that it happened, use a server-based secrets manager.
 
 ;; ## Rotation goes through a deploy
 
-;; Changing a secret normally means commit, CI, and deploy. This provides a git
-;; history but may be slower than changing a value directly in a deployment
-;; platform during an incident. Maintain a fast deployment path and know how
-;; to revoke credentials at their source.
+;; Changing a secret normally requires a commit, a CI run, and a deploy. You
+;; get a git history in return, but during an incident this may be slower than
+;; changing a value directly in the deployment platform. Make sure you have a
+;; fast deployment path and know how to revoke credentials at their source.
 
 ;; ## Access is whole-file
 
-;; One matching identity opens an environment's entire file. There is no
-;; per-secret policy, and in team mode every recipient reads everything. Use
-;; separate environments, files, and keys when users need different access.
+;; One matching identity decrypts an environment's entire file. There is no
+;; per-secret access policy, and in team mode every recipient can read
+;; everything. If people need different levels of access, use separate
+;; environments, files, and keys.
 
 ;; ## Plaintext touches disk during edits
 
-;; `bb secrets edit` decrypts to an owner-only (0600) temp file, opens your
-;; editor, re-encrypts, and then deletes the temp file with best-effort
-;; secure deletion. Your editor may write its own swap or undo files, which
-;; the library cannot control. On copy-on-write filesystems like APFS, secure
-;; deletion is mostly symbolic,
-;; since old blocks may persist beneath the filesystem's view. The temp file
-;; also remains plaintext for as long as the editor is open.
+;; `bb secrets edit` decrypts to an owner-only (0600) temporary file, opens
+;; your editor, re-encrypts the result, and then makes a best effort to delete
+;; the temporary file securely. Your editor may write its own swap or undo
+;; files, which the library cannot control. On a copy-on-write filesystem such
+;; as APFS, secure deletion is mostly symbolic because old blocks may remain
+;; below the filesystem's view. The temporary file also remains as plaintext
+;; for as long as the editor is open.
 
 ;; ## The manifest leaks structure
 
-;; The committed manifest lists key names, types, and collection sizes. A
-;; reader learns you hold a `:stripe/api-key` and that `:auth/admins` has
-;; three members, but no values. If even a name is sensitive, set
-;; `:manifest false` for that environment; its ciphertext diffs will then be
-;; opaque.
+;; The committed manifest lists key names, types, and collection sizes. For
+;; example, someone reading it can see that you have a `:stripe/api-key` and
+;; that `:auth/admins` has three members, although they cannot see the values.
+;; If even a key name is sensitive, set `:manifest false` for that environment.
+;; Its ciphertext diffs will then be opaque.
 
 ;; ## No signatures: the repository is the boundary
 
-;; age encrypts to recipients; it does not sign. Four properties are easy to
-;; run together, so this chapter keeps them apart.
+;; age encrypts to recipients, but it does not sign. Here is what that means
+;; for confidentiality, integrity, sender authenticity, and repository trust.
 
-;; Confidentiality is age's. Only a private identity matching one of the file's
-;; recipients decrypts it. Ciphertext integrity is age's too: a modified,
-;; truncated, or spliced ciphertext fails to decrypt rather than yielding
-;; altered plaintext. That is integrity of the payload against corruption and
-;; splicing. It does not establish who created it.
+;; age provides confidentiality: only a private identity matching one of the
+;; file's recipients can decrypt it. It also provides ciphertext integrity. A
+;; modified, truncated, or spliced ciphertext fails to decrypt instead of
+;; producing altered plaintext. This protects the payload from corruption and
+;; splicing, but it doesn't tell you who created it.
 
-;; Sender authenticity is nobody's. A public recipient is meant to be shared
-;; and committed; it permits encryption and is not a signing key. Anyone
-;; holding one can author a file that decrypts cleanly, so a successful
-;; decryption proves readability, never authorship.
+;; age does not provide sender authenticity. A public recipient is meant to be
+;; shared and committed: it permits encryption, but it is not a signing key.
+;; Anyone who has one can create a file that decrypts cleanly. Successful
+;; decryption therefore tells you that the file is readable, not who wrote it.
 
-;; Repository trust is yours. This project deliberately accepts the reviewed
-;; repository and the deployment channel as the sender-authenticity boundary,
-;; rather than provisioning a second, separately trusted signing key and
-;; carrying a signature beside every ciphertext. Accepting a boundary means
-;; holding it: reviewed and protected refs, immutable artifact transfer from
-;; that commit to the running process, and least-privilege write access to
-;; whatever serves the ciphertext.
+;; This project relies on the reviewed repository and the deployment channel
+;; for sender authenticity. It doesn't provision a second signing key or
+;; store a signature beside every ciphertext. In practice, this means using
+;; reviewed and protected refs, transferring an immutable artifact from that
+;; commit to the running process, and limiting write access to whatever serves
+;; the ciphertext.
 
-;; `verify` reports drift between a manifest and its ciphertext; it does not
-;; authenticate who wrote either. In single-key mode the `:vhash`es make a
-;; forged value fail a keyed run, because whoever holds only a public recipient
-;; cannot key the HMAC. In team mode there are no `:vhash`es, so a forgery that
-;; keeps the same shape passes verification and is visible only as a change to
-;; committed files. The README's authenticity contract and threat model states
-;; this in full, including who may hold a public recipient and who may replace
-;; a deployed artifact.
+;; `verify` reports drift between a manifest and its ciphertext, but it doesn't
+;; not authenticate the author of either file. In single-key mode, the
+;; `:vhash`es make a forged value fail a keyed run because someone with only a
+;; public recipient cannot key the HMAC. Team mode has no `:vhash`es, so a
+;; forgery that preserves the same shape passes verification and appears only
+;; as a change to the committed files. The README's authenticity contract and
+;; threat model describe this in full, including who may hold a public
+;; recipient and who may replace a deployed artifact.
 
 ;; ## Operational dependencies
 
-;; Decryption shells out to the `age` binary, so every decrypting
-;; environment, from laptops to the production image, needs it on the PATH.
-;; The exception is keyless `verify`, which compares hashes and needs neither
-;; an identity nor the binary.
+;; Decryption shells out to the `age` binary, so every environment that
+;; decrypts secrets, from a laptop to the production image, needs it on
+;; `PATH`. Keyless `verify` is the exception: it only compares hashes, so it
+;; needs neither an identity nor the binary.
 
-;; Runtime loading is local-only. It accepts files, local `file:` locators, and
-;; `jar:file:` classpath resources; it never fetches a ciphertext over HTTP.
-;; Ciphertext, plaintext, EDN depth, recipient lists, and manifests are bounded
-;; while they are read. The defaults are intentionally generous for a secrets
-;; map, but an application with an unusually large store may need explicit
-;; `:limits`.
+;; Runtime loading only reads local sources. It accepts files, local `file:`
+;; locators, and `jar:file:` classpath resources, and it never fetches a
+;; ciphertext over HTTP. The library applies limits while reading ciphertext,
+;; plaintext, nested EDN, recipient lists, and manifests. The defaults are
+;; deliberately generous for a secrets map, but an unusually large store may
+;; need explicit `:limits`.
 
-;; POSIX file permissions are assumed. Writing decrypted plaintext to a file
-;; now *requires* them: `decrypt-to-file!` stages plaintext in an owner-only
-;; sibling file and fails closed if that mode cannot be established and
-;; verified, rather than falling back to whatever the platform defaults to.
-;; In-memory decryption (`decrypt`, `decrypt-bytes`, `load-secrets`) needs no
-;; permissions and still works. On Windows the owner-only guarantees on temp
-;; files degrade to best effort and the secure-delete path does not exist. The
-;; library targets POSIX systems; treat Windows as unsupported for anything
-;; beyond reading — which this makes literal.
+;; The library assumes POSIX file permissions. Writing decrypted plaintext to
+;; a file *requires* them: `decrypt-to-file!` stages the plaintext in an
+;; owner-only sibling file and fails if it cannot establish and verify that
+;; mode. It will not fall back to the platform's default permissions. In-memory
+;; decryption (`decrypt`, `decrypt-bytes`, `load-secrets`) does not need file
+;; permissions and still works. On Windows, owner-only permissions for
+;; temporary files are best effort, and secure deletion is not available. The
+;; library targets POSIX systems, so treat Windows as unsupported for anything
+;; beyond reading.
 
 ;; If you find a vulnerability in the library itself, follow the project's
 ;; [security policy](https://github.com/kirahowe/secrets/blob/main/SECURITY.md)
@@ -136,12 +138,13 @@
 
 ;; ## When to use something else
 
-;; Use this library when a small team manages application secrets that change
-;; infrequently and wants their encrypted form tracked with the code.
+;; This library is a good fit when a small team manages application secrets
+;; that change infrequently and wants to track their encrypted form with the
+;; code.
 
 ;; Use [SOPS](https://github.com/getsops/sops) when you want field-level
 ;; encrypted diffs or KMS integration.
 
 ;; Use Vault or a cloud secrets manager when you need dynamic credentials,
-;; per-secret access policy, automatic rotation, or a central audit log. Those
-;; requirements need a service rather than a file-encryption wrapper.
+;; per-secret access policies, automatic rotation, or a central audit log.
+;; Those features require a service rather than a file-encryption wrapper.

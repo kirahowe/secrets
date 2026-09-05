@@ -3,9 +3,9 @@
 
 ;; # Quick start
 
-;; This chapter takes a project from nothing to reading its first secret. Each
-;; step has a chapter of its own later in the book; this one only shows the
-;; default path.
+;; In this chapter we'll set up a project, create an encrypted secrets file,
+;; and read it from the app. We'll use the default configuration here and get
+;; into the other options later in the book.
 
 ;; ## What you need
 
@@ -29,9 +29,9 @@
 ;; {:deps {com.kirahowe/secrets {:mvn/version "0.1.0"}}}
 ;; ```
 
-;; A JVM Clojure application also needs the same coordinate in its `deps.edn`;
-;; `bb.edn` supplies the management task, while `deps.edn` supplies application
-;; code at runtime.
+;; If your app runs on JVM Clojure, add the same coordinate to `deps.edn` too.
+;; The dependency in `bb.edn` is for the management task, and the one in
+;; `deps.edn` makes the library available to your application at runtime.
 
 ;; Now run the initializer from the same directory. Change `myapp` to your
 ;; application's name:
@@ -48,14 +48,15 @@
 ;; bb -m com.kirahowe.secrets.init --app myapp --keygen --apply
 ;; ```
 
-;; This keeps the dependency you just added, merges a `bb secrets` task into
-;; `bb.edn`, creates a safe plaintext template, and generates the age identity at
-;; `~/.config/myapp/key.txt`. Existing `bb.edn` comments and unrelated forms are
-;; preserved. A conflicting dependency or task is refused instead of replaced.
+;; This keeps the dependency you just added, adds a `bb secrets` task to
+;; `bb.edn`, creates a plaintext template with placeholder values, and generates
+;; the age identity at `~/.config/myapp/key.txt`. Existing `bb.edn` comments and
+;; unrelated forms are preserved. If there's a conflicting dependency or task,
+;; the initializer stops and tells you about it.
 
 ;; Back up `~/.config/myapp/key.txt` somewhere outside git, such as a password
-;; manager. It is the only way to decrypt this store, and the library cannot
-;; recover it for you.
+;; manager. You'll need it to decrypt this store, and the library can't
+;; recover it for you if you lose it.
 
 ;; ## Create the first secrets file
 
@@ -96,9 +97,10 @@
 
 ;; ## Read secrets in the app
 
-;; `load-secrets` decrypts the complete map. Passing `{:app "myapp"}` uses the
-;; identity the initializer created locally and still allows production to
-;; override it with a `SECRETS_AGE_IDENTITY*` environment variable:
+;; Now we can read the secrets from the app. `load-secrets` decrypts the whole
+;; map. Passing `{:app "myapp"}` uses the identity we just created locally.
+;; In production, we can override it with a `SECRETS_AGE_IDENTITY*` environment
+;; variable:
 
 ;; ```clojure
 ;; (require '[com.kirahowe.secrets :as secrets])
@@ -110,8 +112,8 @@
 ;; (secrets/get-secret secret-values [:r2 :account-id])
 ;; ```
 
-;; If the rest of your configuration is EDN, reader literals keep each secret
-;; reference beside the setting that uses it:
+;; If the rest of your configuration is EDN, you can use reader literals to
+;; reference a secret directly in the setting that needs it:
 
 ;; ```clojure
 ;; (require '[clojure.edn :as edn])
@@ -139,10 +141,10 @@
 ;; bb secrets verify
 ;; ```
 
-;; `doctor` explains whether age, the configured identity, ciphertext, template,
-;; recipients, and manifest are ready. It does not print secret values or mutate
-;; anything. `verify` checks that the committed manifest belongs to this app and
-;; agrees with the ciphertext.
+;; `doctor` checks your age installation, configured identity, ciphertext,
+;; template, recipients, and manifest, and tells you if anything needs attention.
+;; It doesn't print secret values or change any files. `verify` checks that the
+;; committed manifest belongs to this app and agrees with the ciphertext.
 
 ;; Day to day, this is usually all you need:
 
@@ -162,7 +164,7 @@
 ;; ## Runnable examples
 
 ;; The repository's [examples directory](https://github.com/kirahowe/secrets/tree/main/examples) has small starter projects that
-;; run from a checkout. Pick the one closest to your application's shape:
+;; run from a checkout. Pick the one closest to how your app is set up:
 
 ;; - [quickstart-bb](https://github.com/kirahowe/secrets/tree/main/examples/quickstart-bb): a minimal Babashka consumer using
 ;;   `clojure.edn` reader tags.

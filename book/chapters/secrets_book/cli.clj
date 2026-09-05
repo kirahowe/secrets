@@ -6,32 +6,32 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]))
 
-;; The management commands are exposed through one Babashka task. The task is a
-;; small dispatcher over ordinary Clojure functions: they take a config map,
-;; return data, and throw `ex-info` when something is wrong. That makes the same
-;; operations usable from a terminal, a REPL, or a script.
+;; The management commands are exposed through one Babashka task. Underneath,
+;; they're ordinary Clojure functions that take a config map, return data, and
+;; throw `ex-info` when something goes wrong. You can use the same operations
+;; from a terminal, a REPL, or a script.
 
 ;; ## Let the initializer wire it up
 
 ;; The [quick start](secrets_book.quickstart.html) runs the project
-;; initializer once to preview and once with `--apply`, because hand editing a
-;; task definition is not an interesting way to spend your first five minutes
-;; with a library. This section covers the choices it offers beyond that
-;; default run.
+;; initializer once to preview the changes and once with `--apply`. This gives
+;; you a working task definition without having to edit it by hand. This section
+;; covers the other choices the initializer offers.
 
 ;; The default `tracked` layout commits ciphertext and manifests while keeping
-;; the identity under `~/.config/<app>`. A `disposable` layout keeps every
-;; artifact, including its key, under ignored `.local/secrets`; it is useful for
-;; demos and throwaway projects, not a durable store. Add `--team` to create a
-;; recipients file. Run the initializer with `--help` for all options.
+;; the identity under `~/.config/<app>`. The `disposable` layout keeps every
+;; artifact, including its key, under the ignored `.local/secrets` directory.
+;; It's useful for demos and throwaway projects, but it isn't a durable store.
+;; Add `--team` to create a recipients file. Run the initializer with `--help`
+;; for all options.
 
-;; An interactive preview shows only changed regions and redacts obvious opaque
-;; values. Non-interactive runs print paths and actions, never complete file
-;; bodies. `--show-contents` is an explicit escape hatch when you genuinely need
-;; to inspect the full proposed files. Before applying, the initializer also
-;; checks that the project path has trustworthy ownership and permissions; if
-;; it cannot establish that another user cannot swap a directory underneath the
-;; write, it explains the problem and changes nothing.
+;; An interactive preview shows only the regions that changed and redacts
+;; obvious opaque values. Non-interactive runs print paths and actions rather
+;; than complete file bodies. Use `--show-contents` when you need to inspect the
+;; full proposed files. Before applying anything, the initializer checks the
+;; project path's ownership and permissions. If it can't rule out another user
+;; swapping a directory underneath the write, it explains the problem and
+;; leaves the project alone.
 
 ;; ## The config map
 
@@ -54,15 +54,15 @@
     cli/normalize-config
     (get-in [:environments :prod]))
 
-;; In that output, `:template` and `:manifest` derive from the
-;; secrets file name, `:key-file` is the durable path `keygen` writes to, and
-;; `:identity-file` is what decryption actually uses. The two are separate
-;; because the `SECRETS_AGE_IDENTITY*` environment variables override
-;; `:identity-file` but never `:key-file`. A CI runner holding one env var decrypts and
-;; verifies with it; `keygen` on your laptop still writes to the configured
-;; path.
+;; In that output, `:template` and `:manifest` are derived from the secrets file
+;; name. `:key-file` is the durable path where `keygen` writes, while
+;; `:identity-file` is the path decryption uses. They are separate because the
+;; `SECRETS_AGE_IDENTITY*` environment variables override `:identity-file` but
+;; never `:key-file`. A CI runner can decrypt and verify using one of those
+;; environment variables, while `keygen` on your laptop still writes to the
+;; configured path.
 
-;; ## Validation catches the dangerous config
+;; ## Validating the configuration {#validation-catches-the-dangerous-config}
 
 ;; `:app` is required. It names the default key path; using an implicit app
 ;; name could make unrelated projects share `~/.config/<app>/key.txt`.
@@ -83,11 +83,11 @@
 ;; Set `:template` and `:manifest` explicitly if you really need another
 ;; extension.
 
-;; Normalization also canonicalizes every artifact path in every environment.
-;; Environments may intentionally share an app identity, a recipients list, or
-;; a template. Other role collisions are errors: a manifest cannot also be a
-;; key, and two environments cannot write the same ciphertext. This check runs
-;; before a command touches the filesystem.
+;; Normalization also turns every artifact path in every environment into a
+;; canonical path. Environments can intentionally share an app identity, a
+;; recipients list, or a template. Other collisions are errors: a manifest
+;; can't also be a key, and two environments can't write the same ciphertext.
+;; The check runs before a command touches the filesystem.
 
 ;; ## The commands
 
@@ -124,28 +124,28 @@
 ;; operand, even when it looks like an option. That makes dash-leading file and
 ;; key names unambiguous.
 
-;; `set` and `rm` are the non-interactive path: no editor is opened. `set`
-;; reads the value from **stdin**, which avoids exposing it as a process
-;; argument. The value is stored as a
-;; string unless `--edn` parses stdin as EDN first, so a set, a number, or a
-;; nested map can be set as itself rather than a string of digits or braces.
-;; A blank value on stdin is refused rather than stored — the same rule the
-;; library applies to a set-but-empty `SECRETS_AGE_IDENTITY`, because a blank
-;; is almost always an unset variable expanding to nothing, and `--edn` with
-;; `""` is the deliberate way to store an empty string on purpose. `set`
-;; creates the environment's secrets file from an empty map when it doesn't
-;; exist yet, which is what makes bootstrapping a brand-new environment
-;; scriptable. `rm` fails when the key or file is absent. In both commands,
-;; `<key>` is an EDN keyword (`:some/key`) or a vector path (`[:a :b]`). Both
-;; re-encrypt and refresh the manifest. Unlike `edit`, they re-render the EDN,
-;; so comments in the plaintext do not survive a `set` or `rm`.
+;; `set` and `rm` don't open an editor. `set` reads the value from **stdin**, so
+;; it isn't exposed as a process argument. By default the value is stored as a
+;; string. With `--edn`, stdin is parsed as EDN first, so a set, number, or
+;; nested map is stored as that value rather than as a string of digits or
+;; braces. A blank value on stdin is rejected. The library applies the same rule
+;; to a set-but-empty `SECRETS_AGE_IDENTITY`, because a blank usually means an
+;; unset variable expanded to nothing. To store an empty string intentionally,
+;; use `--edn` with `""`.
+;;
+;; If the environment's secrets file doesn't exist yet, `set` creates it from
+;; an empty map. This makes it possible to bootstrap a new environment from a
+;; script. `rm` fails when the key or file is absent. For both commands, `<key>`
+;; can be an EDN keyword (`:some/key`) or a vector path (`[:a :b]`). Both
+;; commands re-encrypt the secrets and refresh the manifest. They also re-render
+;; the EDN, so plaintext comments don't survive a `set` or `rm`.
 
-;; Every secrets-writing command validates the complete EDN, encrypts to staged
-;; sibling files, and atomically replaces the ciphertext and manifest as one
-;; operation with rollback. An invalid edit or a failed manifest write leaves
-;; the previous pair in place. In team mode the recipients file is read,
-;; bounded, and validated once before editing or decryption begins; that exact
-;; list is the one handed to age.
+;; Every command that writes secrets validates the complete EDN and encrypts to
+;; staged sibling files. It then replaces the ciphertext and manifest together,
+;; atomically, with rollback. An invalid edit or a failed manifest write leaves
+;; the previous pair in place. In team mode, the recipients file is read,
+;; bounded, and validated once before editing or decryption begins. That exact
+;; list is then passed to age.
 
 ;; ## A complete workflow
 
@@ -183,8 +183,8 @@
 
 (cli/reencrypt! config "dev")
 
-;; Now `verify!`. It returns data rather than exiting, which makes it as
-;; useful from a REPL as from CI:
+;; We can now call `verify!`. It returns data instead of exiting, so the same
+;; function works from a REPL or in CI:
 
 (cli/verify! config "dev")
 
@@ -192,10 +192,11 @@
 ;; for a match, 1 for drift, and 2 for a missing ciphertext or manifest (or an
 ;; older manifest with no ciphertext hash when no identity is available).
 
-;; `doctor!` is the value-free troubleshooting counterpart. It checks the raw
+;; `doctor!` checks the setup without revealing any values. It examines the raw
 ;; config, age installation, artifact state, identity availability, encryption
 ;; readiness, and whether keyless or full verification is possible. It returns
-;; exit 0 for healthy, 1 when some action is needed, and 2 for invalid config:
+;; exit 0 when everything is healthy, 1 when some action is needed, and 2 when
+;; the config is invalid:
 
 (cli/doctor! config "dev")
 
@@ -205,11 +206,12 @@
   (spit (str dir "/service-account.json") "{\"type\": \"service_account\"}")
   (cli/encrypt! config "dev" (str dir "/service-account.json")))
 
-;; ## Errors carry their remediation
+;; ## Understanding errors {#errors-carry-their-remediation}
 
-;; Command functions throw `ex-info` with the exit code and any hints in the
-;; data. The `run!` dispatcher prints those details and exits with the attached
-;; status. From a REPL, the same information is available in the exception:
+;; Command functions throw `ex-info` with the exit code and any suggestions in
+;; the exception data. The `run!` dispatcher prints those details and exits with
+;; the attached status. At the REPL, you can read the same information from the
+;; exception:
 
 (try
   (cli/verify! config "nope")
@@ -226,8 +228,9 @@
 ;; ## Bounding CLI inputs
 
 ;; A top-level `:limits` map overrides the input bounds for every environment.
-;; The CLI shares the runtime plaintext and EDN-depth limits and adds bounds for
-;; recipients and manifests. Supply only the values you want to change:
+;; The CLI uses the runtime limits for plaintext size and EDN depth, and adds
+;; limits for recipients and manifests. Include only the values you want to
+;; change:
 
 ;; ```clojure
 ;; {:app "myapp"

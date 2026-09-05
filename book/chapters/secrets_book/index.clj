@@ -11,53 +11,50 @@
 
 ;; ## Features
 
-;; - **One private key to deploy.** Production receives a single age identity
-;;   through an environment variable or a mounted file, not a list of secret
-;;   values.
-;; - **Real EDN at runtime.** Sets, vectors, nested maps, and numbers, not just
-;;   strings. Load the whole map, or reference values from your EDN config with
-;;   `#secret/req` and `#secret/opt`. Works with Aero, and the plain map suits
-;;   Integrant or component.
-;; - **Encrypted secrets live in git** beside the code that uses them, one file
-;;   per environment. Load them from disk or from inside the jar.
-;; - **Reviewable changes.** Every write updates a value-free manifest, so a
-;;   diff shows which keys were added, removed, or changed. CI can check that
-;;   the manifest is fresh without holding a key.
-;; - **Solo or team.** Encrypt to your own key, or to a committed list of
-;;   recipients so each teammate decrypts with their own.
-;; - **A `bb secrets` task** for the day to day: edit in your editor, set from
-;;   stdin, diagnose with `doctor`, and a project initializer that previews
-;;   before it writes.
-;; - **Just files and age.** No secrets server, no KMS, no cloud account, no
-;;   GPG keyring.
+;; - You only need to supply one private key to production, either through an
+;;   environment variable or a mounted file.
+;; - Secrets are ordinary EDN, so you can use sets, vectors, nested maps, and
+;;   numbers. Load the whole map or reference individual values in your EDN
+;;   config with `#secret/req` and `#secret/opt`. There's an Aero integration,
+;;   and the map works with Integrant or component.
+;; - The encrypted files live in git alongside the code that uses them, with
+;;   one file per environment. You can load them from disk or inside a jar.
+;; - Every write updates a manifest that lets you review which keys were added,
+;;   removed, or changed without exposing their values. CI can check whether
+;;   the manifest is up to date without needing a private key.
+;; - You can encrypt to your own key or to a committed list of public keys so
+;;   each teammate can decrypt with their own private key.
+;; - The `bb secrets` task lets you edit secrets in your editor, set values from
+;;   stdin, and troubleshoot your setup with `doctor`. The project initializer
+;;   shows you what it will change before writing anything.
+;; - It uses files and age. You don't need a secrets server, KMS, cloud account,
+;;   or GPG keyring.
 
 ;; ## Why not environment variables?
 
-;; Environment variables are easy to start with and painful to live with. They
-;; sprawl: every integration adds another, and nobody can tell from the
-;; repository what the application needs. They are untyped strings, so a
-;; comma-separated allowlist becomes parsing code. And they live outside version
-;; control, as mutable state in a deploy platform, with no history and no
-;; review.
+;; Environment variables work fine when you only have a few of them. As you
+;; add integrations, though, it gets harder to keep track of what the app
+;; needs. They're all strings, so even something like a list of admin emails
+;; needs parsing code. And when you change them in a deployment dashboard,
+;; those changes aren't part of your git history or code review.
 
-;; Encrypting a plain EDN map fixes all three. The map is real data, the
-;; encrypted form is committed, and the only out-of-band secret is one age key.
-;; The ciphertext itself diffs opaquely, since age re-encrypts the whole file,
-;; so the committed manifest is what makes changes reviewable: it records the
-;; shape of the secrets, and a pull request shows which keys were added,
-;; removed, or changed without revealing any value. Secrets travel with the
-;; code that needs them, so a new environment is a checkout and one key rather
-;; than a checklist copied between dashboards.
+;; With an encrypted EDN map, we can keep structured data in version control
+;; and only manage one age key separately. There's still a problem with
+;; reviewing changes, though, because age re-encrypts the whole file each time.
+;; The encrypted diff doesn't tell us what changed. That's what the manifest
+;; is for: it records the structure of the secrets so a pull request can show
+;; which keys were added, removed, or changed without revealing their values.
+;; To set up a new environment, you check out the code and supply its key.
 
-;; That is the configuration-management principle behind
+;; This follows the configuration-management principle described in
 ;; [*Continuous Delivery*](https://continuousdelivery.com/foundations/configuration-management/): version everything required to build, test,
 ;; and deploy the system, application configuration included, so that any
-;; environment can be reproduced and any change traced. Secrets are the part
-;; of that configuration usually kept out of version control because they are
-;; sensitive. Encrypting them is what lets them in.
+;; environment can be reproduced and any change traced. We usually leave
+;; secrets out of version control because they're sensitive, but encrypting
+;; them lets us track them along with the rest of the configuration.
 
-;; This is a deliberately small tool for solo developers and small teams whose
-;; secrets change infrequently. If you need dynamic credentials, per-secret
+;; This library is intended for solo developers and small teams whose secrets
+;; change infrequently. If you need dynamic credentials, per-secret
 ;; access rules, or automatic rotation, see
 ;; [when to use something else](secrets_book.caveats.html#when-to-use-something-else).
 
@@ -74,14 +71,14 @@
 ;; - [The manifest](secrets_book.manifest.html) explains reviewable changes
 ;;   without plaintext.
 ;; - [Production and CI](secrets_book.production.html) shows how to inject an
-;;   identity and gate on the manifest.
-;; - [Design and rationale](secrets_book.design.html) sets out the model, the
-;;   sources behind the rationale, why age, and the prior art.
-;; - [Caveats and threat model](secrets_book.caveats.html) is the boundary of
-;;   what this library does and does not protect.
+;;   identity and check the manifest in CI.
+;; - [Design and rationale](secrets_book.design.html) explains the model, why
+;;   it uses age, and the ideas and tools it's based on.
+;; - [Caveats and threat model](secrets_book.caveats.html) explains what the
+;;   library protects and what you still need to handle yourself.
 ;; - [Reference](secrets_book.reference.html) lists the API, configuration
 ;;   keys, environment variables, and exit codes.
 
-;; The repository's [examples](https://github.com/kirahowe/secrets/tree/main/examples) directory holds runnable starter projects
-;; for each application shape. The [quick start](secrets_book.quickstart.html#runnable-examples)
+;; The repository's [examples](https://github.com/kirahowe/secrets/tree/main/examples) directory has runnable starter projects
+;; for a few common setups. The [quick start](secrets_book.quickstart.html#runnable-examples)
 ;; lists them.

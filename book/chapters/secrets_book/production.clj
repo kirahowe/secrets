@@ -6,13 +6,14 @@
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]))
 
-;; A deployment needs the ciphertext and a matching identity. The ciphertext
-;; can ship with the code in an image or jar. Supply the identity through the
-;; deployment platform's secret mechanism.
+;; A deployment needs both the ciphertext and a matching identity. The
+;; ciphertext can ship with the code in an image or jar, while the identity
+;; comes from the deployment platform's secret mechanism.
 
 ;; ## Injecting the key
 
-;; Three environment variables provide the key, checked in this order:
+;; You can provide the key through one of three environment variables. They
+;; are checked in this order:
 
 ;; | Variable | Contents | Use it when |
 ;; |----------|----------|-------------|
@@ -20,26 +21,27 @@
 ;; | `SECRETS_AGE_IDENTITY` | the raw key file contents | the platform stores secret strings |
 ;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the contents | the platform mangles newlines |
 
-;; `SECRETS_AGE_IDENTITY` is used verbatim, never decoded.
-;; `SECRETS_AGE_IDENTITY_B64` is always decoded, and invalid base64 is an error
-;; rather than a silent fallback. Separate variables avoid guessing whether a
-;; value is encoded. Key contents are written to an owner-only temp file once
-;; per distinct value because this wrapper passes the identity to `age` as a
-;; file path.
+;; `SECRETS_AGE_IDENTITY` is used verbatim and is never decoded.
+;; `SECRETS_AGE_IDENTITY_B64` is always decoded; invalid base64 is an error
+;; rather than a reason to fall back silently. Using separate variables means
+;; the library doesn't have to guess whether a value is encoded. Because this
+;; wrapper passes identities to `age` as file paths, it writes the contents to
+;; an owner-only temporary file once per distinct value.
 
-;; A long-running process can call `secrets/reset-identity-cache!` once its
-;; configuration has loaded, so that materialized copy does not stay on disk.
+;; A long-running process can call `secrets/reset-identity-cache!` after its
+;; configuration has loaded so that the temporary copy doesn't stay on disk.
 ;; The [runtime chapter](secrets_book.runtime.html#retiring-injected-identities)
 ;; describes what it deletes and what it leaves alone.
 
-;; A variable that is **set but empty** throws, naming itself, rather than
-;; being treated as unset. This matters in CI: the workflow snippet later in
-;; this chapter maps a repository secret into
-;; `SECRETS_AGE_IDENTITY`, and if that secret is missing or misnamed the
-;; runner expands it to the empty string rather than leaving it unset. Falling
-;; through to the next variable — and eventually to the local
-;; `~/.config/<app>/key.txt` — would let a broken deployment succeed on a
-;; developer machine using the wrong key. Unset the variable to allow fallback.
+;; If one of these variables is **set but empty**, the library throws an error
+;; that names it instead of treating it as unset. This matters in CI. The
+;; workflow later in this chapter maps a repository secret to
+;; `SECRETS_AGE_IDENTITY`; if that secret is missing or misspelled, the runner
+;; expands it to an empty string rather than leaving it unset. Falling through
+;; to the next variable, and eventually to the local
+;; `~/.config/<app>/key.txt`, could make a broken deployment appear to work on
+;; a developer's machine with the wrong key. If you want fallback behaviour,
+;; leave the variable unset.
 
 ;; On Fly, that means one command:
 
@@ -47,7 +49,7 @@
 ;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
 ;; ```
 
-;; and for a store that eats newlines:
+;; If the store mangles newlines, use the base64 variable instead:
 
 ;; ```sh
 ;; some-platform set SECRETS_AGE_IDENTITY_B64="$(base64 < ~/.config/myapp/key.txt)"
@@ -62,8 +64,8 @@
 ;; ```
 
 ;; The encrypted file itself needs no special handling. If
-;; `env/prod/resources` is on the classpath, `secrets.edn.age` rides along
-;; into the uberjar with everything else.
+;; `env/prod/resources` is on the classpath, `secrets.edn.age` will be included
+;; in the uberjar with everything else.
 
 ;; ## Runtimes without `age`
 
@@ -72,8 +74,8 @@
 ;; serverless and edge runtimes do not allow application code to start
 ;; subprocesses.
 
-;; This library cannot decrypt in those runtimes because it wraps a CLI tool.
-;; You can still use it in development and CI, then supply the required values
+;; Because this library wraps a CLI tool, it can't decrypt in those runtimes.
+;; You can still use it in development and CI, then provide the required values
 ;; through the runtime's own secret store in production.
 
 ;; | Where | How the identity gets there |
@@ -112,22 +114,23 @@
    (java.net.URL. (str "jar:file:" jar "!/secrets.edn.age"))
    key-file))
 
-;; The library recognizes the local `jar:file:` source, streams it out to an
-;; owner-only temp copy under the configured 16 MiB source limit, hands that to
-;; `age`, and deletes the copy. Remote and nested jar URLs are refused; runtime
-;; secret loading never performs a network request.
+;; The library recognizes the local `jar:file:` source, streams it to an
+;; owner-only temporary copy under the configured 16 MiB source limit, passes
+;; that file to `age`, and then deletes it. It refuses remote and nested jar
+;; URLs, so loading secrets at runtime never makes a network request.
 
 ;; ## Startup wiring
 
-;; Application code passes `{:app "myapp"}`, as the
+;; Application code can pass `{:app "myapp"}`, as the
 ;; [runtime chapter](secrets_book.runtime.html#reading-values) shows for an
-;; Integrant component, and lets the environment variables win when they are
-;; present. On a laptop that resolves to `~/.config/myapp/key.txt`; in the
-;; container, `SECRETS_AGE_IDENTITY` overrides it. Same code, no branches.
+;; Integrant component, and let environment variables take precedence when
+;; they are present. On a laptop, this resolves to
+;; `~/.config/myapp/key.txt`. In the container, `SECRETS_AGE_IDENTITY`
+;; overrides that path, so the application code stays the same in both places.
 
-;; The component decrypts during startup. `load-secrets` has no global cache
-;; or hot reload, so changing a secret normally means a commit, deploy, and
-;; restart. The
+;; The component decrypts the secrets during startup. `load-secrets` has no
+;; global cache or hot reload, so changing a secret normally requires a commit,
+;; deploy, and restart. The
 ;; [caveats chapter](secrets_book.caveats.html#rotation-goes-through-a-deploy)
 ;; discusses what that means for emergency rotation.
 
@@ -136,7 +139,7 @@
 ;; CI can run a keyless freshness check or a full check with an identity.
 
 ;; The keyless job checks that each enabled manifest matches its ciphertext.
-;; It holds no secret material and does not need `age`:
+;; It needs neither an identity nor `age`, because it doesn't decrypt anything:
 
 ;; ```yaml
 ;; verify-secrets-freshness:
@@ -152,22 +155,24 @@
 ;;     - run: bb secrets verify
 ;; ```
 
-;; With no identity available, `verify` compares the manifest's recorded
-;; `:ciphertext-sha` against the file and exits 0, 1, or 2. Exit 1 means
-;; drift and should fail the build. Exit 2 means an artifact is missing or an
-;; older manifest has no ciphertext hash for a keyless check. On a fresh repo,
-;; this usually means someone forgot to commit the manifest. The
-;; [team-ci example](https://github.com/kirahowe/secrets/tree/main/examples/team-ci) commits such a fixture and gates on it.
+;; When no identity is available, `verify` compares the manifest's recorded
+;; `:ciphertext-sha` with the file and exits with 0, 1, or 2. Exit 1 indicates
+;; drift and should fail the build. Exit 2 means an artifact is missing, or
+;; that an older manifest has no ciphertext hash for a keyless check. In a new
+;; repository, this usually means someone forgot to commit the manifest. The
+;; [team-ci example](https://github.com/kirahowe/secrets/tree/main/examples/team-ci)
+;; commits such a fixture and uses it as a gate.
 
-;; This job holds no secret, so it needs no gate on which event triggered it —
-;; there is nothing here for an untrusted pull request to take. It still pins
-;; each action to a commit and asks for the least permission that can check a
-;; repository out, because a job with no secret is still a job running
-;; third-party code with a token.
+;; Since this job holds no secret, it doesn't need a gate based on the event
+;; that triggered it: an untrusted pull request has no secret to take. It still
+;; pins each action to a commit and requests only enough permission to check out
+;; the repository. Even without a secret, the job runs third-party code with a
+;; token.
 
-;; The full job decrypts and regenerates the manifest entries. In single-key
-;; mode this includes the keyed value hashes; in team mode it checks structure.
-;; Give the runner a dedicated deploy identity and install `age`:
+;; The full job decrypts the file and regenerates the manifest entries. In
+;; single-key mode, this includes the keyed value hashes; in team mode, it
+;; checks the structure. Give the runner a dedicated deploy identity and
+;; install `age`:
 
 ;; ```yaml
 ;; verify-secrets:
@@ -189,36 +194,37 @@
 ;;         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ;; ```
 
-;; The full job makes CI a holder of an identity that can decrypt the file.
-;; Use it only when that access is appropriate. The keyless job still detects
-;; a ciphertext that no longer matches its committed manifest.
+;; This full check gives CI an identity that can decrypt the file, so only use
+;; it when that access is appropriate. The keyless job can still detect a
+;; ciphertext that no longer matches its committed manifest.
 
-;; The identity is declared on the verify step rather than on the job. Checkout,
-;; the `apt-get` install, and the Babashka setup action all run in this job and
-;; none of them needs a key; a job-level `env:` would hand the identity to every
-;; one of them, so a change in any of them would be a change in code holding a
-;; private key. Every `uses:` is a full commit SHA with the version that commit
-;; is beside it, for the same reason: a tag is a name upstream can move, so a
-;; tagged action can become different code with no diff here — and that code
-;; would be the code running beside the credential.
+;; The example declares the identity on the verify step rather than on the
+;; whole job. Checkout, the `apt-get` install, and the Babashka setup action all
+;; run in this job, but none of them needs the key. A job-level `env:` would
+;; give the identity to every step, which means a change in any one of them
+;; would change the code that runs with the private key available. For the same
+;; reason, every `uses:` points to a full commit SHA, with the version noted
+;; beside it. An upstream project can move a tag, allowing the action's code to
+;; change without producing a diff in this repository, while that code still
+;; runs beside the credential.
 
-;; The `if:` keeps untrusted code out of the keyed path. A `pull_request` from a
-;; fork receives no repository secrets, so this job cannot leak the identity to
-;; one today; the condition says so explicitly anyway, because a job that looks
-;; like it grants a key to a pull request invites the next person to "fix" the
-;; empty variable by moving to `pull_request_target`, which runs with the
-;; secrets available and a contributor's unreviewed code checked out. The
-;; `permissions:` block is the other half of the same argument: without one the
-;; job inherits the repository or organization default, and `contents: read` is
-;; all a verification job needs.
+;; The `if:` keeps untrusted code out of the job that has the key. GitHub does
+;; not provide repository secrets to a `pull_request` from a fork, so today the
+;; job could not leak the identity to one anyway. The condition makes that
+;; restriction explicit. Otherwise, someone trying to fix an empty variable
+;; later might switch the job to `pull_request_target`, which provides secrets
+;; while a contributor's unreviewed code is checked out. The `permissions:`
+;; block applies the same care to the job's token. Without it, the job inherits
+;; the repository or organization default, while verification only needs
+;; `contents: read`.
 
 ;; ## A job that reads secrets
 
 ;; Verification does not pass secret values to application code. A job that
-;; needs them, such as an evaluation that calls an external API, also needs
-;; `age` and the identity in its environment — on the step that runs the
-;; evaluation, under the same gate and permissions, because this job holds the
-;; same key:
+;; does need them, such as an evaluation that calls an external API, needs
+;; `age` and the identity in its environment. Put the identity on the step that
+;; runs the evaluation and use the same gate and permissions, since this job
+;; holds the same key:
 
 ;; ```yaml
 ;; evals:
@@ -242,26 +248,28 @@
 ;;         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ;; ```
 
-;; The repository secret's value is the *contents* of `~/.config/<app>/key.txt`,
-;; not a path — and the ciphertext it decrypts is the one already committed to
-;; the repo. GitHub receives an identity that can decrypt the ciphertext in the
-;; checkout, so protect that repository secret accordingly. Set it with:
+;; The repository secret's value is the *contents* of
+;; `~/.config/<app>/key.txt`, rather than a path. It decrypts the ciphertext
+;; already committed to the repository. GitHub therefore receives an identity
+;; that can decrypt the ciphertext in the checkout, so protect the repository
+;; secret accordingly. Set it with:
 
 ;; ```sh
 ;; gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
 ;; ```
 
-;; None of this applies to a recipients file. The lines in `recipients.txt` are
-;; age *public* keys: they are what encryption needs rather than what decryption
-;; needs, they are meant to be committed and read, and a fork's pull request
-;; learns nothing from holding one. Scope, gate, and pin around the private
-;; identity — a public recipient is ordinary repository content.
+;; These precautions apply to the private identity. The lines in
+;; `recipients.txt` are age *public* keys: encryption needs them, decryption
+;; does not, and they are meant to be committed and read. A pull request from a
+;; fork learns nothing from having one. Keep the private identity limited to
+;; the steps that need it, keep untrusted code out, and pin third-party actions.
+;; A public recipient is ordinary repository content.
 
 ;; ## Back up the identity
 
-;; The identity is a small text file that is not stored in git. Losing every
-;; copy means recovering or replacing each secret value at its source. Back it
-;; up in the team's approved secret storage when it is created.
+;; The identity is a small text file that is not stored in git. If every copy
+;; is lost, you will have to recover or replace each secret value at its source.
+;; Back it up in the team's approved secret storage when you create it.
 
 ^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]
