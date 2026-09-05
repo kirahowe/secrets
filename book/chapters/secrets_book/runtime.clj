@@ -87,18 +87,15 @@
 ;; (secrets/load-secrets src {:app "myapp"})   ; ~/.config/myapp/key.txt
 ;; ```
 
-;; With no identity argument at all, only the environment variables are
-;; consulted, in this order:
-
-;; | Variable | Meaning |
-;; |----------|---------|
-;; | `SECRETS_AGE_IDENTITY_FILE` | a path to the key file |
-;; | `SECRETS_AGE_IDENTITY` | the raw key file contents, used verbatim |
-;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the contents; invalid base64 throws |
-
-;; The environment variables win even when you pass `{:app "myapp"}`. Local
-;; development can therefore use `~/.config/myapp/key.txt`, while production
-;; overrides it with an injected identity.
+;; Before the `:app` convention, the library consults the
+;; `SECRETS_AGE_IDENTITY_FILE`, `SECRETS_AGE_IDENTITY`, and
+;; `SECRETS_AGE_IDENTITY_B64` environment variables, in that order, and with no
+;; identity argument at all they are the only sources. They win even when you
+;; pass `{:app "myapp"}`, so local development can use
+;; `~/.config/myapp/key.txt` while production overrides it with an injected
+;; identity. The
+;; [production chapter](secrets_book.production.html#injecting-the-key)
+;; describes each variable and when to use it.
 
 ;; There is no default key path when no app is named. This prevents unrelated
 ;; applications from sharing a conventional path by accident. The error lists
@@ -296,27 +293,15 @@
 ;; ```
 
 ;; A per-read `:secrets` opt always wins over a `register!`ed default. Aero
-;; caches a readers map and its first successful decrypted store or genuine
-;; decryption failure for each distinct secrets configuration. Calling
-;; `register!` again retires every cache entry from the previous registration,
-;; even when the new map compares equal; `(register! nil)` clears the default
-;; and its cache. After editing or repairing ciphertext in a long-running
-;; process, call `reset-cache!` before re-reading the entire config:
-;;
-;; ```clojure
-;; ;; In another terminal: bb secrets edit dev
-;; (secrets-aero/reset-cache!)
-;; (def app-config (aero/read-config "config.edn"))
-;; {:config-loaded? (map? app-config)
-;;  :section-count  (count app-config)}
-;; ```
-;;
-;; `reset-cache!` invalidates every cached Aero reader map and decrypted store,
-;; including cached failures, but leaves the process-wide default supplied by
-;; `register!` intact. Without reset, a loaded store remains stale and a cached
-;; decryption failure keeps rethrowing. A process restart starts with an empty
-;; Aero cache and reads current ciphertext. Never print secret values to check a
-;; reload, poll the ciphertext, or reset and decrypt once per tag.
+;; caches a readers map, and with it the first decrypted store or genuine
+;; decryption failure, for each distinct secrets configuration, with the same
+;; staleness rules as `reader-literals` above. Calling `register!` again
+;; retires every cache entry from the previous registration, even when the new
+;; map compares equal, and `(register! nil)` clears the default and its cache.
+;; After editing or repairing ciphertext in a long-running process, call
+;; `(secrets-aero/reset-cache!)` before re-reading the entire config. It
+;; invalidates every cached reader map and store, including cached failures,
+;; and leaves the registered default intact.
 
 ;; After registering, `#secret/req :database/url` works inside an aero config
 ;; file like any other aero tag.

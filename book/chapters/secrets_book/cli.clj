@@ -13,22 +13,11 @@
 
 ;; ## Let the initializer wire it up
 
-;; The [quick start](index.html) uses the project initializer because hand
-;; editing a task definition is not a particularly interesting way to spend
-;; your first five minutes with a library. Once the released dependency is in
-;; `bb.edn`, run the initializer once to preview, then again with `--apply` when
-;; the proposal looks right:
-
-;; ```sh
-;; bb -m com.kirahowe.secrets.init --app myapp --keygen
-;;
-;; bb -m com.kirahowe.secrets.init --app myapp --keygen --apply
-;; ```
-
-;; The initializer merges into `bb.edn` without reformatting existing forms or
-;; dropping comments. It refuses conflicting dependencies and tasks. It also
-;; creates the template and, only after an accepted scaffold succeeds,
-;; generates the private identity requested by `--keygen`.
+;; The [quick start](secrets_book.quickstart.html) runs the project
+;; initializer once to preview and once with `--apply`, because hand editing a
+;; task definition is not an interesting way to spend your first five minutes
+;; with a library. This section covers the choices it offers beyond that
+;; default run.
 
 ;; The default `tracked` layout commits ciphertext and manifests while keeping
 ;; the identity under `~/.config/<app>`. A `disposable` layout keeps every
@@ -238,22 +227,19 @@
 
 ;; A top-level `:limits` map overrides the input bounds for every environment.
 ;; The CLI shares the runtime plaintext and EDN-depth limits and adds bounds for
-;; recipients and manifests:
+;; recipients and manifests. Supply only the values you want to change:
 
 ;; ```clojure
 ;; {:app "myapp"
-;;  :limits {:max-plaintext-bytes 8388608
-;;           :max-edn-depth 100
-;;           :max-recipients 256
-;;           :max-recipient-chars 1024
-;;           :max-recipients-bytes 262144
-;;           :max-manifest-bytes 1048576
-;;           :max-manifest-entries 10000}
+;;  :limits {:max-plaintext-bytes 2097152
+;;           :max-recipients 32}
 ;;  :environments {:dev {:secrets-file "secrets/secrets.edn.age"}}}
 ;; ```
 
-;; You only need to supply values you want to change. Every value must be a
-;; positive integer, and unknown keys are rejected rather than silently ignored.
+;; Every value must be a positive integer, and unknown keys are rejected rather
+;; than silently ignored. The
+;; [reference](secrets_book.reference.html#configuration-limits) lists every
+;; limit and its default.
 
 ^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]

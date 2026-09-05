@@ -27,11 +27,10 @@
 ;; per distinct value because this wrapper passes the identity to `age` as a
 ;; file path.
 
-;; In a long-running process, call `secrets/reset-identity-cache!` after the
-;; configuration has loaded if you do not want that materialized copy to remain
-;; on disk. A copy still in use is deleted when its last decryption finishes;
-;; an explicit or mounted identity file is owned by the caller and is never
-;; touched. A later load materializes the injected value again.
+;; A long-running process can call `secrets/reset-identity-cache!` once its
+;; configuration has loaded, so that materialized copy does not stay on disk.
+;; The [runtime chapter](secrets_book.runtime.html#retiring-injected-identities)
+;; describes what it deletes and what it leaves alone.
 
 ;; A variable that is **set but empty** throws, naming itself, rather than
 ;; being treated as unset. This matters in CI: the workflow snippet later in
@@ -120,22 +119,17 @@
 
 ;; ## Startup wiring
 
-;; Application code passes `{:app "myapp"}` and lets the environment
-;; variables win when they are present:
+;; Application code passes `{:app "myapp"}`, as the
+;; [runtime chapter](secrets_book.runtime.html#reading-values) shows for an
+;; Integrant component, and lets the environment variables win when they are
+;; present. On a laptop that resolves to `~/.config/myapp/key.txt`; in the
+;; container, `SECRETS_AGE_IDENTITY` overrides it. Same code, no branches.
 
-;; ```clojure
-;; (defmethod ig/init-key ::secrets [_ {:keys [resource]}]
-;;   (secrets/load-secrets (io/resource resource) {:app "myapp"}))
-;; ```
-
-;; On a laptop, that resolves to `~/.config/myapp/key.txt`. In the container,
-;; `SECRETS_AGE_IDENTITY` overrides it. Same code, no branches.
-
-;; In this wiring, the component decrypts during startup. `load-secrets` does
-;; not provide global caching or hot reload: each call decrypts the source.
-;; Changing a secret normally means a commit, deploy, and restart. The
-;; [caveats chapter](secrets_book.caveats.html) discusses what that means
-;; for emergency rotation.
+;; The component decrypts during startup. `load-secrets` has no global cache
+;; or hot reload, so changing a secret normally means a commit, deploy, and
+;; restart. The
+;; [caveats chapter](secrets_book.caveats.html#rotation-goes-through-a-deploy)
+;; discusses what that means for emergency rotation.
 
 ;; ## CI: gate the manifest
 

@@ -148,13 +148,11 @@
 
 ;; ## What team mode costs you
 
-;; In single-key mode, the manifest can include a keyed hash per value, which
-;; lets `verify` and reviewers see that a value changed even when its shape
-;; did not. Those hashes are keyed by the shared private key, and in team mode
-;; there is no shared private key, so team manifests record structure only.
-;; Adds, removals, and type changes still show in diffs; a rotated string
-;; does not. The [manifest chapter](secrets_book.manifest.html) has the
-;; details.
+;; Team manifests record structure only: adds, removals, and type changes show
+;; in diffs, but a rotated string does not. The per-value hashes that catch a
+;; rotation are keyed by the private key, and a team has no shared one. The
+;; [manifest chapter](secrets_book.manifest.html#catching-value-changes-with-a-keyed-hash)
+;; has the details.
 
 ^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]

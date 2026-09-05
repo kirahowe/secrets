@@ -99,14 +99,11 @@
 ;; SOPS keeps document keys visible and encrypts leaf values, so a diff shows
 ;; which encrypted field changed. This library uses a separate manifest for
 ;; that information. Git-crypt applies encryption through git filters; this
-;; library instead uses explicit `bb secrets` commands.
-
-;; ## Scope
-
-;; There is no server, daemon, cloud account, or rotation scheduler. Use a
-;; secrets manager when you need dynamic credentials, fine-grained access
-;; policy, or a central audit log. The [caveats chapter](secrets_book.caveats.html)
-;; describes those limits.
+;; library instead uses explicit `bb secrets` commands. Vault and the cloud
+;; secret managers are services, and the
+;; [caveats chapter](secrets_book.caveats.html#when-to-use-something-else)
+;; says when their dynamic credentials, access policy, and audit log are worth
+;; running one.
 
 ;; ## The EDN choice
 

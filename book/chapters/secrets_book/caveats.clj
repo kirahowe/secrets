@@ -72,11 +72,6 @@
 ;; `:manifest false` for that environment; its ciphertext diffs will then be
 ;; opaque.
 
-;; Value-change hashes (`:vhash`) exist only in single-key mode, because they
-;; are keyed by the shared private key and teams do not have one. Team
-;; manifests still show adds, removals, and type changes; a rotated string
-;; without a shape change does not show.
-
 ;; ## No signatures: the repository is the boundary
 
 ;; age encrypts to recipients; it does not sign. Four properties are easy to
