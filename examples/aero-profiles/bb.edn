@@ -10,7 +10,13 @@
          run       {:doc "Read config for the selected Aero profile"
                     :override-builtin true
                     :requires ([aero-profiles.core :as app])
-                    :task (apply app/run! *command-line-args*)}
+                    ;; The app is named here, in project configuration, and the
+                    ;; key comes from the environment: ~/.config/aero-profiles/key.txt
+                    ;; by default, or the disposable tmp/key.txt when
+                    ;; SECRETS_AGE_IDENTITY_FILE points at it.
+                    :task (apply app/run!
+                                 {:file "tmp/secrets.edn.age" :app "aero-profiles"}
+                                 *command-line-args*)}
          test      {:doc "Run the focused consumer smoke tests"
                     :requires ([aero-profiles.core-test]
                                [clojure.test :as t])

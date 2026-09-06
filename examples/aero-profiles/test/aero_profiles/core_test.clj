@@ -4,6 +4,11 @@
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing use-fixtures]]))
 
+(def ^:private secrets
+  "Pin the disposable key explicitly, so the test depends neither on the
+  environment nor on a key under ~/.config."
+  {:file "tmp/secrets.edn.age" :identity-file "tmp/key.txt"})
+
 (defn- with-disposable-secrets [f]
   (try
     (bootstrap/run!)
@@ -21,8 +26,8 @@
 
 (deftest profiles-select-different-safe-results-test
   (testing "default and evals select their own required key branches"
-    (let [default (app/run!)
-          evals (app/run! "evals")]
+    (let [default (app/run! secrets)
+          evals (app/run! secrets "evals")]
       (is (= :default (:profile default)))
       (is (= "default" (:profile-name default)))
       (is (= :evals (:profile evals)))
