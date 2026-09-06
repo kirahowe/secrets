@@ -1161,11 +1161,12 @@ A release is built once, from the tag, and the bytes that were inspected are the
 bytes that get published.
 
 1. Write the `CHANGELOG.md` entry under a `## [<version>]` heading and commit it.
-   The version lives in exactly one place —
-   `com.kirahowe.secrets.release/version`, under `build/`, so it never ships in
-   the jar — and the tag, jar name, pom, embedded `pom.properties`, and
-   CHANGELOG heading are all checked against it rather than maintained beside
-   it.
+   The version lives in exactly one place, `src/com/kirahowe/secrets/coordinate.edn`,
+   beside the Maven coordinate and the git tag the initializer scaffolds. The
+   release guards read that file from the repository and the initializer reads
+   it as a classpath resource, and the tag, jar name, pom, embedded
+   `pom.properties`, CHANGELOG heading, and the coordinates this README shows
+   are all checked against it rather than maintained beside it.
 2. Tag that commit `v<version>` and push the tag.
 3. The `release` workflow takes over: it is restricted to the protected
    `release` GitHub environment, builds from the tag, inspects the artifact, and
@@ -1182,7 +1183,8 @@ clojure -M:deploy          # uploads exactly the files named in the receipt
 
 `release` refuses a working tree with modified *or untracked* files, a `HEAD`
 that is not exactly the tag naming the declared version (a descendant of the tag
-is a refusal, not a pass), and a version the CHANGELOG does not document. It
+is a refusal, not a pass), a version the CHANGELOG does not document, and a
+scaffolded git pin whose tag does not name the commit it records. It
 then exports the tag with `git worktree` and builds from that snapshot, so
 nothing that changes after the guards pass can reach the jar. The artifact must
 name the version in its file name, in both embedded Maven descriptors, and as

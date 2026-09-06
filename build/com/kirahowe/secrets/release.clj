@@ -19,7 +19,27 @@
            [java.util Arrays]
            [java.util.zip ZipFile]))
 
-;;;; The authoritative version
+;;;; The authoritative coordinates
+
+(def coordinate-file
+  "Where the library's coordinates are written, relative to the repository, and
+  the only place they are: the release version, the Maven coordinate, and the
+  git tag and commit the initializer scaffolds. It sits under `src/` so the
+  initializer ships with the same facts these guards check."
+  "src/com/kirahowe/secrets/coordinate.edn")
+
+(defn read-coordinates
+  "The coordinates written in [[coordinate-file]] under `dir`, failing when the
+  file is missing rather than falling back to values nobody wrote."
+  [dir]
+  (let [file (io/file dir coordinate-file)]
+    (when-not (.isFile file)
+      (throw (ex-info (str "No coordinate file at " file
+                           "; the library's version and coordinates are written there.")
+                      {:reason ::missing-coordinates :file (str file)})))
+    (edn/read-string (slurp file))))
+
+(def ^:private coordinates (read-coordinates "."))
 
 (def ^:private version-pattern
   #"\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?")
@@ -35,20 +55,26 @@
   s)
 
 (def lib
-  "The published Maven coordinate.
+  "The published Maven coordinate, from [[coordinate-file]].
 
   Its group and artifact also name the `META-INF/maven` descriptors embedded in
   the jar, so the deployed coordinate and the artifact's own metadata cannot
   drift apart."
-  'com.kirahowe/secrets)
+  (:lib coordinates))
 
 (def version
-  "The authoritative release version, and the only place it is written.
+  "The authoritative release version, from [[coordinate-file]].
 
   Every other appearance — the git tag, the jar file name, the pom, the embedded
   `pom.properties`, the CHANGELOG heading — is checked against this string
   rather than maintained beside it."
-  (checked-version "0.1.0"))
+  (checked-version (:version coordinates)))
+
+(def git-coordinate
+  "The git coordinate the initializer scaffolds, from [[coordinate-file]]: the
+  last released `:tag`, the `:sha` it names, and the `:lib` it is declared
+  under. See [[git-coordinate!]] for what has to hold between them."
+  (:git coordinates))
 
 (defn release-tag
   "The git tag that must name the release commit for a version."
@@ -56,10 +82,10 @@
   ([version] (str "v" (checked-version version))))
 
 (defn- config
-  "Fills in the defaults every guard shares: the repository at `.` and the
-  authoritative [[version]]."
+  "Fills in the defaults every guard shares: the repository at `.`, the
+  authoritative [[version]], and the scaffolded [[git-coordinate]]."
   [opts]
-  (merge {:dir "." :version version} opts))
+  (merge {:dir "." :version version :git git-coordinate} opts))
 
 ;;;; Repository state
 
@@ -96,15 +122,20 @@
                        {:reason ::dirty-tree :dir (str dir) :status status})))
      dir)))
 
+(defn- resolve-tag
+  "The commit that `tag` names in `dir`, or nil when no such tag exists."
+  [dir tag]
+  (let [{:keys [exit out]} (git dir ["rev-parse" "--verify" (str "refs/tags/" tag "^{commit}")])]
+    (when (zero? exit)
+      (str/trim out))))
+
 (defn- tagged-commit
   "The commit that `tag` names in `dir`; throws when no such tag exists."
   [dir tag]
-  (let [{:keys [exit out]} (git dir ["rev-parse" "--verify" (str "refs/tags/" tag "^{commit}")])]
-    (when-not (zero? exit)
+  (or (resolve-tag dir tag)
       (throw (ex-info (str "Release tag " tag " does not exist in " dir
                            "; create it on the release commit first.")
-                      {:reason ::missing-tag :dir (str dir) :tag tag})))
-    (str/trim out)))
+                      {:reason ::missing-tag :dir (str dir) :tag tag}))))
 
 (defn exact-tag!
   "Fails unless `HEAD` in `:dir` is exactly the release tag for `:version`.
@@ -124,6 +155,31 @@
                        {:reason ::head-not-tag :dir (str dir) :tag tag
                         :expected commit :found head})))
      {:tag tag :commit commit})))
+
+(defn git-coordinate!
+  "Fails unless the git coordinate the initializer scaffolds resolves in `:dir`:
+  its `:tag` must exist, and the commit that tag names must be its `:sha`.
+  Returns the coordinate.
+
+  This is the last *released* tag, not the release tag for `:version`, and it
+  lags by design, since a commit cannot contain its own hash. What has to hold
+  is that the two halves agree, so a consumer who takes the initializer's pin
+  resolves exactly the tree the tag advertises."
+  ([] (git-coordinate! nil))
+  ([opts]
+   (let [{:keys [dir] pin :git} (config opts)
+         {:keys [tag sha]} pin
+         commit (resolve-tag dir tag)]
+     (when-not commit
+       (throw (ex-info (str "The initializer pins git tag " tag ", which does not exist in "
+                            dir ".")
+                       {:reason ::missing-pinned-tag :dir (str dir) :tag tag})))
+     (when-not (= sha commit)
+       (throw (ex-info (str "The initializer pins " tag " at " sha ", but that tag names "
+                            commit " in " dir ".")
+                       {:reason ::pinned-sha-mismatch :dir (str dir) :tag tag
+                        :expected commit :found sha})))
+     pin)))
 
 (defn changelog-entry!
   "Fails unless `CHANGELOG.md` under `:dir` documents `:version`.

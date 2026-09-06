@@ -21,6 +21,7 @@
               [com.kirahowe.secrets.aero-test]
               [com.kirahowe.secrets.cli-property-test]
               [com.kirahowe.secrets.cli-test]
+              [com.kirahowe.secrets.coordinate-test]
               [com.kirahowe.secrets.init-property-test]
               [com.kirahowe.secrets.init-test]
               [com.kirahowe.secrets.manifest-property-test]
@@ -31,6 +32,7 @@
    :task (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
                                                  'com.kirahowe.secrets.cli-test
                                                  'com.kirahowe.secrets.aero-test
+                                                 'com.kirahowe.secrets.coordinate-test
                                                  'com.kirahowe.secrets.init-test
                                                  'com.kirahowe.secrets.release-test
                                                  'com.kirahowe.secrets.site-policy-test

@@ -1,6 +1,7 @@
 (ns com.kirahowe.secrets.init
   "Standalone, one-shot project bootstrapper for `bb secrets`."
   (:require [babashka.cli :as bbcli]
+            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
@@ -16,11 +17,30 @@
 
 ;;;; Configuration
 
-(def ^:private known-coordinates #{'com.kirahowe/secrets 'io.github.kirahowe/secrets})
+(def ^:private coordinate-resource
+  "The library's coordinates, shipped beside this namespace and shared with the
+  release guards, so what the initializer scaffolds is what a release checks."
+  "com/kirahowe/secrets/coordinate.edn")
+
+(defn- read-coordinates []
+  (let [resource (io/resource coordinate-resource)]
+    (when-not resource
+      (throw (ex-info (str "The initializer cannot find " coordinate-resource
+                           " on the classpath; the library's source tree is incomplete.")
+                      {:resource coordinate-resource})))
+    (edn/read-string (slurp resource))))
+
+(def ^:private coordinates (read-coordinates))
+
+(def ^:private known-coordinates
+  "Either name a project may already declare this library under."
+  #{(:lib coordinates) (get-in coordinates [:git :lib])})
+
 (def ^:private default-dependency
-  {'io.github.kirahowe/secrets
-   {:git/tag "v0.1.0"
-    :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}})
+  "What a project that declares neither gets: the last released git tag, until
+  a Maven artifact exists to point at instead."
+  (let [{:keys [lib tag sha]} (:git coordinates)]
+    {lib {:git/tag tag :git/sha sha}}))
 
 (def ^:private init-spec
   [[:app {:coerce :string :desc "Application name"}]

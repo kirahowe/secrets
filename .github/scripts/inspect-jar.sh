@@ -25,13 +25,20 @@ deps_edn_path="$(pwd)/deps.edn"
 babashka_cli_version="$(clojure -M -e "(print (get-in (clojure.edn/read-string (slurp \"${deps_edn_path}\")) [:deps (quote org.babashka/cli) :mvn/version]))")"
 test -n "${babashka_cli_version}"
 
+# The library's own version comes from the one file that writes it, the same
+# file the release guards and the initializer read, so this inspection can never
+# approve a jar the release itself would refuse.
+coordinate_edn_path="$(pwd)/src/com/kirahowe/secrets/coordinate.edn"
+library_version="$(clojure -M -e "(print (:version (clojure.edn/read-string (slurp \"${coordinate_edn_path}\"))))")"
+test -n "${library_version}"
+
 mkdir -p target
 
 jar tf "${jar_path}" > target/jar-entries.txt
 test -s target/jar-entries.txt
 jar tf "${jar_path}" > /dev/null
 
-find src -type f -name '*.clj' | LC_ALL=C sort | sed 's#^src/##' > target/expected-src-entries.txt
+find src -type f \( -name '*.clj' -o -name '*.edn' \) | LC_ALL=C sort | sed 's#^src/##' > target/expected-src-entries.txt
 test -s target/expected-src-entries.txt
 
 awk '
@@ -55,7 +62,7 @@ test -s target/jar-pom.properties
 
 grep -q '<groupId>com.kirahowe</groupId>' target/jar-pom.xml
 grep -q '<artifactId>secrets</artifactId>' target/jar-pom.xml
-grep -q '<version>0.1.0</version>' target/jar-pom.xml
+grep -qF "<version>${library_version}</version>" target/jar-pom.xml
 grep -q '<description>Manage application secrets as a version-controlled, age-encrypted EDN file\.</description>' target/jar-pom.xml
 grep -q '<name>MIT</name>' target/jar-pom.xml
 grep -q '<url>https://opensource.org/license/mit</url>' target/jar-pom.xml
@@ -65,7 +72,7 @@ grep -q '<url>https://github.com/kirahowe/secrets</url>' target/jar-pom.xml
 # checked out. Whichever this jar is, the pom may not advertise a tag that
 # disagrees with the version it declares.
 if grep -q '<tag>' target/jar-pom.xml; then
-  grep -q '<tag>v0.1.0</tag>' target/jar-pom.xml
+  grep -qF "<tag>v${library_version}</tag>" target/jar-pom.xml
 fi
 grep -q '<groupId>org.clojure</groupId>' target/jar-pom.xml
 grep -q '<artifactId>clojure</artifactId>' target/jar-pom.xml
@@ -73,7 +80,7 @@ grep -q '<version>1.12.4</version>' target/jar-pom.xml
 
 grep -q '^groupId=com.kirahowe$' target/jar-pom.properties
 grep -q '^artifactId=secrets$' target/jar-pom.properties
-grep -q '^version=0.1.0$' target/jar-pom.properties
+grep -qFx "version=${library_version}" target/jar-pom.properties
 
 inspect_tmpdir="$(mktemp -d)"
 trap 'rm -rf "${inspect_tmpdir}"' EXIT

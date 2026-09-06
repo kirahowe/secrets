@@ -284,13 +284,17 @@
 (defn- fixture-release!
   "A disposable repository holding a receipted release the publisher will accept.
 
-  It carries the project's own `deps.edn` and `build` tree, so the subprocess
-  runs the committed `:deploy` alias rather than a copy of it, and one commit
-  tagged for the authoritative version, because the publisher re-verifies the
-  receipt against the repository before it uploads anything."
+  It carries the project's own `deps.edn`, `build` tree, and coordinate file,
+  so the subprocess runs the committed `:deploy` alias rather than a copy of it
+  and the guards read the coordinates they would read in the repository, and
+  one commit tagged for the authoritative version, because the publisher
+  re-verifies the receipt against the repository before it uploads anything."
   [dir]
   (copy-tree! "build" (io/file dir "build"))
   (io/copy (io/file "deps.edn") (io/file dir "deps.edn"))
+  (let [coordinates (io/file dir release/coordinate-file)]
+    (io/make-parents coordinates)
+    (io/copy (io/file release/coordinate-file) coordinates))
   (git! dir "init" "-q" "-b" "main")
   (doseq [[k v] {"user.email" "publish-test@example.invalid" "user.name" "Publish Test"
                  "commit.gpgsign" "false" "tag.gpgsign" "false"}]

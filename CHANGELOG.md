@@ -174,6 +174,14 @@ All notable changes to this project are documented here. The format follows
   digest, or materialized path reaches a cleanup result, message, or `ex-data`.
 
 ### Changed
+- The library's coordinates are written in one file,
+  `src/com/kirahowe/secrets/coordinate.edn`: the release version, the Maven
+  coordinate, and the git tag and commit the initializer scaffolds. The release
+  guards read it from the repository and the initializer reads it as a
+  classpath resource, so the version a release checks and the pin a scaffolded
+  project receives can no longer be edited apart. `clojure -T:build release`
+  also refuses a pin whose tag does not name the commit it records, and a test
+  holds the README's copies of both coordinates to the same file.
 - Publication runs on a classpath of its own, and no longer resolves a
   deployment library at all. `clojure -M:deploy` (`bb deploy`) replaces
   `clojure -T:build deploy`: a new `:deploy` alias whose `:replace-deps` and
