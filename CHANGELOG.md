@@ -6,6 +6,10 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- `bb secrets set` prompts for the value with echo turned off when run from a
+  terminal, and keeps reading stdin when the input is piped or redirected, so
+  scripts and CI are unchanged. Values are stored verbatim as strings; `--edn`
+  parses the input and stores the value with the type its syntax implies.
 - Babashka CLI 0.12.86 now provides declarative initializer option parsing,
   management-command dispatch, positional validation, and generated help. JVM
   users resolve it as a runtime dependency while Babashka supplies the same

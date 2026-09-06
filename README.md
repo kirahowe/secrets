@@ -20,9 +20,9 @@ reviewable.
   the manifest is fresh without holding a key.
 - **Solo or team.** Encrypt to your own key, or to a committed list of
   recipients so each teammate decrypts with their own.
-- **A `bb secrets` task** for the day to day: edit in your editor, set from
-  stdin, diagnose with `doctor`, and a project initializer that previews
-  before it writes.
+- **A `bb secrets` task** for the day to day: edit in your editor, set one
+  value from a hidden prompt or from stdin, diagnose with `doctor`, and a
+  project initializer that previews before it writes.
 - **Just files and age.** No secrets server, no KMS, no cloud account, no
   GPG keyring.
 
@@ -139,12 +139,12 @@ print paths and actions only. Other layout options are described under
 [Initialization layouts](#initialization-layouts), and what a preview does and
 does not print under [Preview output](#initializer-preview-output).
 
-**2. Set the first value through stdin.** This interactive shell form disables
-echo while reading and never places the value in shell history or a process
+**2. Set the first value.** Run `set` from a terminal and it prompts for the
+value with echo turned off, so nothing lands in shell history or a process
 argument:
 
 ```sh
-IFS= read -rs SECRET; printf '%s' "$SECRET" | bb secrets set :example/api-key; unset SECRET
+bb secrets set :example/api-key
 ```
 
 **3. Verify the resulting store:**
@@ -252,25 +252,33 @@ Every command takes the environment first (`bb secrets decrypt [env] <file>`);
 omit it to use the default environment. `decrypt` writes to stdout byte-for-byte,
 so it works for any `.age` file, not just EDN.
 
-Non-interactively (scripts, bootstrap, CI):
+From a terminal, `set` prompts for the value with echo turned off. In a
+script or CI, where stdin is a pipe or a file, it reads the whole input
+instead:
 
 ```sh
-printf %s "sk-live-…" | bb secrets set dev :openrouter/api-key
-echo '#{"a@b.com" "b@b.com"}' | bb secrets set dev :auth/admins --edn
+printf %s "$OPENROUTER_API_KEY" | bb secrets set dev :openrouter/api-key
+printf %s '#{"a@b.com" "b@b.com"}' | bb secrets set dev :auth/admins --edn
 bb secrets rm dev :openrouter/old-key
 ```
 
-`set` reads the value from **stdin**, never a command-line argument, so it
-never lands in shell history or `ps`. The value is stored as a string unless
-`--edn` parses stdin as EDN — sets, numbers, nested maps. `set` creates the
-environment's secrets file when it doesn't exist yet, so bootstrapping a new
-environment end to end is scriptable; a blank value on stdin is refused (an
-unset CI variable expands to nothing, and storing that silently is worse than
-failing loudly) — pass `--edn` with `""` if you genuinely want an empty
-string. `rm` fails, rather than quietly doing nothing, when the key or the
-file doesn't exist. `<key>` is a keyword (`:some/key`) or a vector path
-(`[:a :b]`) for both commands, and both refresh the manifest like every other
-write.
+`set` never takes the value as a command-line argument, so it never lands in
+shell history or `ps`. Piped input loses one trailing newline. Values are
+stored verbatim as strings unless you pass `--edn`, in which case the input
+is parsed as EDN and its type follows from the syntax: a set, a number, a
+nested map. `set` creates the environment's secrets file when it doesn't
+exist yet, so bootstrapping a new environment end to end is scriptable. A
+blank value is refused, because an unset CI variable expands to nothing and
+storing that silently is worse than failing loudly; pass `--edn` with `""` if
+you genuinely want an empty string. `rm` fails, rather than quietly doing
+nothing, when the key or the file doesn't exist. `<key>` is a keyword
+(`:some/key`) or a vector path (`[:a :b]`) for both commands, and both
+refresh the manifest like every other write.
+
+Two shell habits undo the argument-free design. Typing the literal value into
+`printf` at an interactive shell records it in that shell's history, so use
+the prompt there. `set -x` prints every expanded command to stderr before
+running it, value included, so turn tracing off around that line.
 
 Runnable starter projects for each application shape, from a Babashka script
 to an Integrant service and a team with keyless CI, are listed under

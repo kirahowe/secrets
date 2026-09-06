@@ -96,7 +96,7 @@
 ;; | `keygen` | `[env]` | generate the age key for an environment |
 ;; | `new` | `[env]` | create a secrets file from a template, using `$VISUAL`, `$EDITOR`, or `vim` |
 ;; | `edit` | `[env]` | decrypt, edit, re-encrypt |
-;; | `set` | `[env] <key> [--edn]` | set a key's value from stdin (creates the file if missing) |
+;; | `set` | `[env] <key> [--edn]` | set a key's value from a hidden prompt or stdin (creates the file if missing) |
 ;; | `rm` | `[env] <key>` | remove a key (fails if the key or file is absent) |
 ;; | `verify` | `[env]` | check the committed manifest against the secrets |
 ;; | `doctor` | `[env]` | diagnose configuration and verification readiness without revealing values |
@@ -124,14 +124,22 @@
 ;; operand, even when it looks like an option. That makes dash-leading file and
 ;; key names unambiguous.
 
-;; `set` and `rm` don't open an editor. `set` reads the value from **stdin**, so
-;; it isn't exposed as a process argument. By default the value is stored as a
-;; string. With `--edn`, stdin is parsed as EDN first, so a set, number, or
-;; nested map is stored as that value rather than as a string of digits or
-;; braces. A blank value on stdin is rejected. The library applies the same rule
-;; to a set-but-empty `SECRETS_AGE_IDENTITY`, because a blank usually means an
-;; unset variable expanded to nothing. To store an empty string intentionally,
-;; use `--edn` with `""`.
+;; `set` and `rm` don't open an editor. `set` never takes the value as a
+;; command-line argument, so it isn't exposed in `ps` or shell history. From a
+;; terminal it prompts for the value with echo turned off. When stdin is a pipe
+;; or a file, as in a script or CI, it reads the whole input minus one trailing
+;; newline. Values are stored verbatim as strings unless you pass `--edn`, in
+;; which case the input is parsed as EDN and its type follows from the syntax,
+;; so a set, number, or nested map is stored as that value rather than as a
+;; string of digits or braces. A blank value is rejected. The library applies
+;; the same rule to a set-but-empty `SECRETS_AGE_IDENTITY`, because a blank
+;; usually means an unset variable expanded to nothing. To store an empty string
+;; intentionally, use `--edn` with `""`.
+;;
+;; Two shell habits undo this. Typing the literal value into `printf` at an
+;; interactive shell records it in that shell's history, so use the prompt
+;; there. `set -x` prints every expanded command to stderr before running it,
+;; value included, so turn tracing off around that line.
 ;;
 ;; If the environment's secrets file doesn't exist yet, `set` creates it from
 ;; an empty map. This makes it possible to bootstrap a new environment from a

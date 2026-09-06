@@ -117,6 +117,18 @@
   (flush)
   (= "y" (some-> (read-line) str/trim str/lower-case)))
 
+(defn- prompt-hidden!
+  "Prompt on the terminal with echo turned off and return the typed line
+  without its newline, or nil at end of input. Only valid when `tty?` is true.
+  The console hands back a char array; it is copied into a string and zeroed."
+  [prompt]
+  (let [console (System/console)
+        chars (.readPassword console "%s" (object-array [prompt]))]
+    (when chars
+      (let [value (String. chars)]
+        (java.util.Arrays/fill chars (char 0))
+        value))))
+
 ;;;; Config
 
 (defn- canonical-path
@@ -1148,13 +1160,32 @@
         secrets-file
         (finally (secure-delete! tmp))))))
 
+(defn- read-set-value!
+  "The value for `set`: one line typed at a hidden terminal prompt when
+  `interactive?`, otherwise everything on stdin minus one trailing newline.
+  Both are bounded by `:max-plaintext-bytes`."
+  [env path interactive?]
+  (let [max-bytes (get-in env [:limits :max-plaintext-bytes])
+        context {:environment (:name env) :key path}]
+    (if interactive?
+      (let [value (or (prompt-hidden! (str (paint :yellow "?") " Value for " (pr-str path)
+                                           " (input hidden): "))
+                      "")
+            observed (alength (.getBytes ^String value "UTF-8"))]
+        (when (> observed max-bytes)
+          (input-too-large! "Typed value" :max-plaintext-bytes max-bytes observed context))
+        value)
+      (strip-trailing-newline
+       (read-reader-bounded! *in* max-bytes "Standard input" :max-plaintext-bytes context)))))
+
 (defn set-secret!
-  "Set a value read from stdin. `key-arg` is a keyword or a non-empty vector of
-  keyword/string path elements. One trailing newline is removed. The value is
-  a string unless `edn?` is true, in which case stdin must contain one EDN
-  value. Blank input is rejected. Creates a missing secrets file from an empty
-  map, then re-encrypts and updates the manifest. Returns the secrets-file
-  path. Re-rendering removes plaintext comments."
+  "Set a value typed at a hidden terminal prompt, or read from stdin when
+  stdin is not a terminal. `key-arg` is a keyword or a non-empty vector of
+  keyword/string path elements. Piped input loses one trailing newline. The
+  value is stored verbatim as a string unless `edn?` is true, in which case
+  the input must be one EDN value. Blank input is rejected. Creates a missing
+  secrets file from an empty map, then re-encrypts and updates the manifest.
+  Returns the secrets-file path. Re-rendering removes plaintext comments."
   [config env-arg key-arg edn?]
   (require-age!)
   (let [env (resolve-env config env-arg)
@@ -1163,20 +1194,18 @@
         exists? (.exists (io/file secrets-file))]
     (when exists? (require-identity! env))
     (let [target (encrypt-target! env)
-          raw (strip-trailing-newline
-               (read-reader-bounded!
-                *in* (get-in env [:limits :max-plaintext-bytes])
-                "Standard input" :max-plaintext-bytes
-                {:environment (:name env) :key path}))
+          interactive? (tty?)
+          raw (read-set-value! env path interactive?)
           _ (when (str/blank? raw)
                   ;; The same rule the library applies to a set-but-empty
                   ;; SECRETS_AGE_IDENTITY: blank almost always means an unset
                   ;; variable expanded to nothing (`echo "$KEY" | bb secrets
                   ;; set …` in CI), and storing it produces a secret that
                   ;; fails much later, far from the cause.
-              (fail! (str "Nothing on stdin — refusing to store a blank value for "
-                          (pr-str path) ".\n"
-                          "    Pipe the value in:  printf %s \"$VALUE\" | bb secrets set …\n"
+              (fail! (str (if interactive? "Nothing entered" "Nothing on stdin")
+                          " — refusing to store a blank value for " (pr-str path) ".\n"
+                          (when-not interactive?
+                            "    Pipe the value in:  printf %s \"$VALUE\" | bb secrets set …\n")
                           "    To store an empty value deliberately, use --edn with \"\".")
                      {:key path}))
           value (if edn?
@@ -2057,14 +2086,16 @@
     :exec-fn (fn [{:keys [env]}]
                (edit! (normalize-config config) (operand operands env)))}
    {:cmds ["set"]
-    :doc (str "Set a key from stdin. With one argument it is the key in the default environment; "
+    :doc (str "Set a key from a hidden prompt, or from stdin when it is not a terminal. "
+              "With one argument it is the key in the default environment; "
               "with two, the first is the environment and the second is the key.")
     :args->opts [:env-or-key :key]
     :require [:env-or-key]
     :restrict-args true
     :spec [[:env-or-key {:positional true :coerce :string :desc "Environment or key"}]
            [:key {:positional true :coerce :string :desc "Key when an environment is supplied"}]
-           [:edn {:coerce :boolean :desc "Parse stdin as EDN instead of a string"}]]
+           [:edn {:coerce :boolean
+                  :desc "Parse the value as EDN instead of storing it verbatim as a string"}]]
     :exec-fn (fn [{:keys [env-or-key key edn]}]
                (if key
                  (set-secret! (normalize-config config)

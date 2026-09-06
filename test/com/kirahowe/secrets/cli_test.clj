@@ -1130,7 +1130,8 @@
     (is (= via-help via-long-flag via-short-flag))
     (is (str/starts-with? via-help
                           "Usage: bb secrets set [options] <env-or-key> [<key>]"))
-    (is (str/includes? via-help "Parse stdin as EDN instead of a string")))
+    (is (str/includes? via-help
+                       "Parse the value as EDN instead of storing it verbatim as a string")))
   (let [out (management-help ["help" "keygen"])]
     (is (str/starts-with? out "Usage: bb secrets keygen [options] [<env>]"))
     (is (str/includes? out "Generate an age key for an environment"))))
@@ -1608,6 +1609,44 @@
       (testing "--edn is the escape hatch for a deliberately empty value"
         (with-out-str (with-in-str "\"\"" (cli/set-secret! config "dev" ":a" true)))
         (is (= {:a ""} (edn/read-string (age/decrypt *key* encrypted))))))))
+
+(deftest set-prompts-on-a-terminal-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
+          prompts (atom [])
+          typed (atom nil)
+          at-terminal (fn [f]
+                        (with-redefs-fn {(cli-private 'tty?) (constantly true)
+                                         (cli-private 'prompt-hidden!)
+                                         (fn [prompt] (swap! prompts conj prompt) @typed)}
+                          f))
+          stored #(edn/read-string (age/decrypt *key* encrypted))]
+      (testing "a terminal gets a hidden prompt and stdin is left alone"
+        (reset! typed "typed-secret")
+        (with-out-str
+          (with-in-str "piped-and-ignored"
+            (at-terminal #(cli/set-secret! config "dev" ":api/key" false))))
+        (is (= {:api/key "typed-secret"} (stored)))
+        (is (= 1 (count @prompts)))
+        (is (str/includes? (first @prompts) ":api/key") "the prompt names the key"))
+      (testing "--edn parses the typed line"
+        (reset! typed "#{\"a@b.com\"}")
+        (with-out-str (at-terminal #(cli/set-secret! config "dev" ":auth/admins" true)))
+        (is (= #{"a@b.com"} (:auth/admins (stored)))))
+      (testing "a blank line is refused like blank stdin"
+        (reset! typed "")
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"(?i)nothing entered"
+             (with-out-str (at-terminal #(cli/set-secret! config "dev" ":blank" false))))))
+      (testing "end of input at the prompt is refused the same way"
+        (reset! typed nil)
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"(?i)nothing entered"
+             (with-out-str (at-terminal #(cli/set-secret! config "dev" ":eof" false))))))
+      (is (= {:api/key "typed-secret" :auth/admins #{"a@b.com"}} (stored))
+          "refused values left the store untouched"))))
 
 (deftest set-writes-a-store-that-stays-readable-test
   (if (age-env-set?)
