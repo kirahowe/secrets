@@ -658,6 +658,13 @@
   (truncate (escape-control (redact line))))
 
 ;;;; Preview and Application
+;;; Every report is built first as a vector of strings, one per line, by a pure
+;;; function, and reaches the terminal only through `emit!`.
+
+(defn- emit!
+  "Write `lines` to `*out*`, one per line."
+  [lines]
+  (run! println lines))
 
 (def ^:private proposed-labels
   {:create "create"
@@ -673,13 +680,13 @@
    " already sitting in one of them (an existing bb.edn, most likely) is"
    " printed unredacted, so do not do this into a shared log."])
 
-(defn- print-action! [{:keys [path action]}]
-  (println (str " " (render-path path) ": " (proposed-labels action))))
+(defn- action-line [{:keys [path action]}]
+  (str " " (render-path path) ": " (proposed-labels action)))
 
-(defn- print-counts! [actions]
+(defn- counts-line [actions]
   (let [writes (count (filter (comp write-actions :action) actions))]
-    (println (str " " writes (if (= 1 writes) " file to write, " " files to write, ")
-                  (- (count actions) writes) " left as is."))))
+    (str " " writes (if (= 1 writes) " file to write, " " files to write, ")
+         (- (count actions) writes) " left as is.")))
 
 (def ^:private hunk-context 3)
 
@@ -713,30 +720,53 @@
 (defn- span [from n]
   (str (if (zero? n) 0 (inc from)) "," n))
 
-(defn- print-hunk! [old content]
+(defn- hunk-lines
+  "The changed region between `old` and `content` as a unified-diff hunk, every
+  line of it rendered safe."
+  [old content]
   (let [olds (lines old)
         news (lines content)
         {:keys [from before removed added after]} (changed-region olds news)
         context (+ (count before) (count after))]
-    (println (str "  @@ -" (span from (+ context (count removed)))
-                  " +" (span from (+ context (count added))) " @@"))
-    (doseq [line before]
-      (println (str "   " (render-line line))))
-    (doseq [line removed]
-      (println (str "  -" (render-line line))))
-    (doseq [line added]
-      (println (str "  +" (render-line line))))
-    (doseq [line after]
-      (println (str "   " (render-line line))))))
+    (-> [(str "  @@ -" (span from (+ context (count removed)))
+              " +" (span from (+ context (count added))) " @@")]
+        (into (map #(str "   " (render-line %))) before)
+        (into (map #(str "  -" (render-line %))) removed)
+        (into (map #(str "  +" (render-line %))) added)
+        (into (map #(str "   " (render-line %))) after))))
 
-(defn- print-content! [path old content]
-  (println (str "--- " (if (nil? old) "/dev/null" (str "a/" (render-path path)))))
-  (println (str "+++ b/" (render-path path)))
-  (when (some? old)
-    (doseq [line (str/split-lines old)]
-      (println (str "-" line))))
-  (doseq [line (str/split-lines content)]
-    (println (str "+" line))))
+(defn- content-lines
+  "Both bodies in full, as `--show-contents` asked: unredacted by design."
+  [path old content]
+  (-> [(str "--- " (if (nil? old) "/dev/null" (str "a/" (render-path path))))
+       (str "+++ b/" (render-path path))]
+      (into (map #(str "-" %)) (when (some? old) (str/split-lines old)))
+      (into (map #(str "+" %)) (str/split-lines content))))
+
+(defn- body-lines [mode old {:keys [path content]}]
+  (if (= :full mode)
+    (content-lines path old content)
+    (hunk-lines old content)))
+
+(defn- preview-lines
+  "The preview: each path with its action, the body of each change when `mode`
+  shows bodies, and the totals. `current` maps a change's path to what is on
+  disk there now, for the modes that render it."
+  [{:keys [actions changes mode current]}]
+  (let [bodies (when (not= :summary mode)
+                 (into {} (map (juxt :path identity)) changes))]
+    (-> ["Secrets initializer preview:"]
+        (into (when (= :full mode) contents-warning))
+        (into (if (seq actions)
+                (-> []
+                    (into (mapcat (fn [{:keys [path] :as action}]
+                                    (cons (action-line action)
+                                          (when-let [change (get bodies path)]
+                                            (body-lines mode (get current path) change)))))
+                          actions)
+                    (conj (counts-line actions)))
+                [" no project changes are needed."]))
+        (conj " Private identities are never created unless --keygen is supplied."))))
 
 (defn- current-content
   "Read what is on disk at `path` under `root`, to render it and let it go."
@@ -745,20 +775,6 @@
     (when (.exists file)
       (slurp file))))
 
-(defn- print-body! [mode root {:keys [path content]}]
-  (if (= :full mode)
-    (print-content! path (current-content root path) content)
-    (print-hunk! (current-content root path) content)))
-
-(defn- print-plan! [mode root actions changes]
-  (let [bodies (when (not= :summary mode)
-                 (into {} (map (juxt :path identity)) changes))]
-    (doseq [{:keys [path] :as action} actions]
-      (print-action! action)
-      (when-let [change (get bodies path)]
-        (print-body! mode root change)))
-    (print-counts! actions)))
-
 (defn print-preview!
   "Print the proposed initializer changes.
 
@@ -766,21 +782,22 @@
   what every noninteractive or `--apply` run gets, names each path and its
   action and prints no file body at all. `:hunks` adds the changed region of
   each file, redacted and escaped. `:full` prints whole bodies behind a warning,
-  and only because `--show-contents` asked for them."
+  and only because `--show-contents` asked for them. The files a body needs are
+  read here, rendered, and let go."
   [{:keys [root actions changes mode]}]
-  (println "Secrets initializer preview:")
-  (when (= :full mode)
-    (run! println contents-warning))
-  (if (seq actions)
-    (print-plan! (or mode :summary) root actions changes)
-    (println " no project changes are needed."))
-  (println " Private identities are never created unless --keygen is supplied."))
+  (let [mode (or mode :summary)
+        current (when (not= :summary mode)
+                  (into {}
+                        (map (fn [{:keys [path]}] [path (current-content root path)]))
+                        changes))]
+    (emit! (preview-lines {:actions actions :changes changes :mode mode :current current}))))
 
-(defn- print-applied! [changes]
+(defn- applied-lines [changes]
   (when (seq changes)
-    (println "Applied:")
-    (doseq [{:keys [path action]} changes]
-      (println (str " " (render-path path) ": " (applied-labels action))))))
+    (into ["Applied:"]
+          (map (fn [{:keys [path action]}]
+                 (str " " (render-path path) ": " (applied-labels action))))
+          changes)))
 
 (def ^:private staging-options
   ;; O_CREAT|O_EXCL: the open fails outright on any existing entry, a symlink
@@ -873,7 +890,7 @@
 (defn- choice! [{:keys [choice input]}]
   (or choice
       (do
-        (println "Choose: [a]pply, [m]anual, [c]ancel")
+        (emit! ["Choose: [a]pply, [m]anual, [c]ancel"])
         (let [read! (or input read-line)]
           (case (some-> (read!) str/trim str/lower-case)
             ("a" "apply") :apply
@@ -895,11 +912,31 @@
                 :message (or (ex-message e) (str e))}
                (select-keys (ex-data e) [:reason :path]))))))
 
-(defn- print-trust! [{:keys [trusted? message]}]
+(defn- trust-line [{:keys [trusted? message]}]
   (if trusted?
-    (println " Project path is trusted for safe writes.")
-    (println (str " Project path is not trusted; --apply will be refused. "
-                  message))))
+    " Project path is trusted for safe writes."
+    (str " Project path is not trusted; --apply will be refused. " message)))
+
+(defn- manual-lines
+  "The manual integration as copyable EDN: each file, then its snippet, pretty
+  printed with namespace-map shorthand and the print limits off."
+  [manual]
+  (binding [*print-namespace-maps* false
+            *print-length* nil
+            *print-level* nil]
+    (into ["Manual integration (no files changed):"]
+          (mapcat (fn [[file snippet]]
+                    [(str file ":")
+                     (str/trim-newline (with-out-str (pprint/pprint snippet)))]))
+          manual)))
+
+(defn- preview-outcome-lines
+  "What a preview-only run ends with when there was something to apply."
+  [changes trust]
+  (when (seq changes)
+    [(if (:trusted? trust)
+       "No files changed. Rerun with --apply to apply this plan."
+       "No files changed. Fix the project-path trust problem above, then preview again.")]))
 
 (defn- output-mode
   "Choose how much file content this run's preview may print.
@@ -931,7 +968,7 @@
         proposal (assoc (proposed-changes opts) :root (:root opts))
         trust (root-trust (:root opts))
         _ (print-preview! (assoc proposal :mode (output-mode opts)))
-        _ (print-trust! trust)
+        _ (emit! [(trust-line trust)])
         selected (cond
                    (:apply? opts) :apply
                    (:tty? opts) (choice! opts)
@@ -941,47 +978,40 @@
       :apply
       (do
         (apply-changes! (:root opts) (:changes proposal))
-        (print-applied! (:changes proposal))
+        (emit! (applied-lines (:changes proposal)))
         (when (:keygen? opts)
           (cli/keygen! (:normalized-config proposal) (:env opts)))
         (assoc result :status :applied))
 
       :manual
       (do
-        (println "Manual integration (no files changed):")
-        (binding [*print-namespace-maps* false
-                  *print-length* nil
-                  *print-level* nil]
-          (doseq [[file snippet] (:manual proposal)]
-            (println (str file ":"))
-            (pprint/pprint snippet)))
+        (emit! (manual-lines (:manual proposal)))
         (assoc result :status :manual))
 
       :cancel
       (assoc result :status :cancelled)
 
       (do
-        (when (seq (:changes proposal))
-          (if (:trusted? trust)
-            (println "No files changed. Rerun with --apply to apply this plan.")
-            (println (str "No files changed. Fix the project-path trust problem above, "
-                          "then preview again."))))
+        (emit! (preview-outcome-lines (:changes proposal) trust))
         (assoc result :status :preview)))))
 
 ;;;; Entry Point
 
-(defn- print-init-help! []
-  (println "Secrets project initializer")
-  (println)
-  (println "Usage: -m com.kirahowe.secrets.init --app NAME [options]")
-  (println)
-  (println "Options:")
-  (println (bbcli/format-opts {:spec init-spec})))
+(defn- help-lines []
+  ["Secrets project initializer"
+   ""
+   "Usage: -m com.kirahowe.secrets.init --app NAME [options]"
+   ""
+   "Options:"
+   (bbcli/format-opts {:spec init-spec})])
+
+(defn- error-lines [e]
+  [(str "secrets init: " (ex-message e))
+   "Run with --help for usage and options."])
 
 (defn- print-init-error! [e]
   (binding [*out* *err*]
-    (println "secrets init:" (ex-message e))
-    (println "Run with --help for usage and options.")))
+    (emit! (error-lines e))))
 
 (defn -main
   "Run the secrets initializer from command-line arguments."
@@ -989,7 +1019,7 @@
   (try
     (let [opts (parse-args args)]
       (if (:help? opts)
-        (print-init-help!)
+        (emit! (help-lines))
         (init! opts)))
     (catch clojure.lang.ExceptionInfo e
       (print-init-error! e)
