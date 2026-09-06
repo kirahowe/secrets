@@ -1091,6 +1091,14 @@ bb test            # run the suite under Babashka
 clojure -M:test    # run the suite under JVM Clojure
 ```
 
+Both runners include the property-based suites, the `*_property_test.clj`
+files under `test/`. They use test.check to generate inputs for the pure parts
+of the library: the EDN boundary, the manifest, the CLI's argument and quoting
+helpers, and the initializer's rendering and merging. A failing property prints
+the seed and the smallest failing input it found. To replay one, call the spec
+as a function with that seed, for example
+`(parse-reads-back-every-printable-value 200 :seed 1234)`.
+
 Other development tasks:
 
 ```sh

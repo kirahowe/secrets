@@ -6,6 +6,11 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Property-based tests with test.check, run by both `bb test` and
+  `clojure -M:test`. Generated inputs now cover the untrusted-EDN parser, the
+  manifest encoding and diff, the CLI's shell quoting, argv handling, key
+  paths, and limits, and the initializer's preview redaction and file
+  merging, alongside the hand-picked examples those suites already had.
 - The initializer declares this library's coordinate in one file per project.
   When a `deps.edn` exists it owns the coordinate and `bb.edn` gets a
   `{:local/root "."}` dependency on the project, so the Babashka task and the

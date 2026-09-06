@@ -1,5 +1,7 @@
 ;;; cljfmt has no configured-width wrapping; clj-kondo enforces the 100-column policy.
-{:normalize-newlines-at-file-end? true
+{;; test.check's for-all takes a binding vector and a body, like let.
+ :extra-indents {for-all [[:block 1]]}
+ :normalize-newlines-at-file-end? true
  :paths ["src"
          "test"
          "book/chapters"

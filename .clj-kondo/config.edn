@@ -6,4 +6,8 @@
 ;; are still limited to 100 columns everywhere.
 {:linters {:line-length {:exclude-pattern "^;;"
                          :exclude-urls true
-                         :max-line-length 100}}}
+                         :max-line-length 100}}
+ ;; test.check's defspec defines a test var the way deftest does; clj-kondo
+ ;; ships no rule for it, so every property test would otherwise be an
+ ;; unresolved symbol.
+ :lint-as {clojure.test.check.clojure-test/defspec clojure.test/deftest}}
