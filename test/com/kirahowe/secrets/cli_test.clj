@@ -2226,12 +2226,12 @@
                           :max-manifest-entries 2)]
         (is (= value
                (:committed
-                (read-supported "dev" "cli-test" manifest-file limits))))))
+                (read-supported "cli-test" manifest-file limits))))))
     (testing "the first byte over is rejected with content-free bounds"
       (spit manifest-file (str exact-content " "))
       (let [e (try
                 (read-supported
-                 "dev" "cli-test" manifest-file
+                 "cli-test" manifest-file
                  (assoc base-limits :max-manifest-bytes (count exact-content)))
                 (catch clojure.lang.ExceptionInfo e e))]
         (is (= :input-too-large (:reason (ex-data e))))
@@ -2240,7 +2240,7 @@
       (spit manifest-file exact-content)
       (let [e (try
                 (read-supported
-                 "dev" "cli-test" manifest-file
+                 "cli-test" manifest-file
                  (assoc base-limits
                         :max-manifest-bytes (count exact-content)
                         :max-manifest-entries 1))

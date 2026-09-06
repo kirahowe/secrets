@@ -89,17 +89,60 @@
 
 ;;;; Output
 
+;;; Everything a command reports is a *line*: a vector whose first element is
+;;; its level and whose remaining elements are segments, joined with one space
+;;; the way `println` joins its arguments. A segment is a string or a
+;;; `[style string]` pair to paint. Commands build lines as plain data — the
+;;; `*-lines` functions below are pure — and `say!` is the one place a line is
+;;; painted and written out.
+;;;
+;;;   :line    stdout, no marker          :stderr  stderr, no marker
+;;;   :info •  :ok ✓  :warn ⚠  stdout     :oops ✗  stderr
+
 (def ^:private ansi
   {:reset "\033[0m" :bold "\033[1m" :dim "\033[2m"
    :red "\033[31m" :green "\033[32m" :yellow "\033[33m" :blue "\033[34m"})
 
-(defn- tty? [] (some? (System/console)))
-(defn- paint [color s] (if (tty?) (str (ansi color) s (ansi :reset)) s))
+(def ^:private level-markers
+  {:info [:blue "•"] :ok [:green "✓"] :warn [:yellow "⚠"] :oops [:red "✗"]})
 
-(defn- info [& xs] (println (paint :blue "•") (str/join " " xs)))
-(defn- ok [& xs] (println (paint :green "✓") (str/join " " xs)))
-(defn- warn [& xs] (println (paint :yellow "⚠") (str/join " " xs)))
-(defn- oops [& xs] (binding [*out* *err*] (println (paint :red "✗") (str/join " " xs))))
+(def ^:private stderr-levels #{:oops :stderr})
+
+(defn- tty? [] (some? (System/console)))
+
+(defn- paint
+  "`s` wrapped in the ANSI codes for `style` when `color?`, else `s` itself."
+  [color? style s]
+  (if color? (str (ansi style) s (ansi :reset)) s))
+
+(defn- render-segment [color? segment]
+  (if (vector? segment)
+    (let [[style s] segment] (paint color? style s))
+    (str segment)))
+
+(defn- render-line
+  "The text of one line: its marker and styled segments, painted when `color?`."
+  [color? [level & segments]]
+  (let [text (str/join " " (map #(render-segment color? %) segments))]
+    (if-let [[style marker] (level-markers level)]
+      (str (paint color? style marker) " " text)
+      text)))
+
+(defn- say!
+  "Write `lines`, each to the stream its level names. Color is decided once per
+  call, and this is the only place a report reaches `*out*` or `*err*`."
+  [lines]
+  (let [color? (tty?)]
+    (doseq [[level :as line] lines]
+      (if (stderr-levels level)
+        (binding [*out* *err*] (println (render-line color? line)))
+        (println (render-line color? line))))))
+
+(defn- info [& xs] (say! [(into [:info] xs)]))
+(defn- ok [& xs] (say! [(into [:ok] xs)]))
+(defn- warn [& xs] (say! [(into [:warn] xs)]))
+
+(defn- question-marker [] (paint (tty?) :yellow "?"))
 
 (defn- fail!
   "Throw an `ex-info` for a user-facing failure. `run!` catches these, prints
@@ -113,7 +156,7 @@
   "Prompt y/N; true on \"y\", false otherwise. Never exits — callers decide
   what a declined prompt means."
   [prompt]
-  (print (str (paint :yellow "?") " " prompt " [y/N] "))
+  (print (str (question-marker) " " prompt " [y/N] "))
   (flush)
   (= "y" (some-> (read-line) str/trim str/lower-case)))
 
@@ -838,6 +881,21 @@
              (merge {:secrets-file (str secrets-file)}
                     (edn-failure-data parsed))))))
 
+(defn- decrypt-and-parse
+  "Decrypt the environment's store and parse it under its limits, returning
+  `safe-edn/parse`'s result map."
+  [{:keys [secrets-file identity-file limits] :as env}]
+  (safe-edn/parse (age/decrypt identity-file secrets-file (decrypt-opts env)) limits))
+
+(defn- decrypt-secrets!
+  "The environment's store as one EDN value, or a failure naming why it is not."
+  [{:keys [secrets-file] :as env}]
+  (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
+    (if ok?
+      value
+      (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
+             (merge {:secrets-file secrets-file} (edn-failure-data parsed))))))
+
 (defn- parse-key-path
   "Parse a `set`/`rm` CLI key argument as EDN into the vector `assoc-in` /
   `get-in` / `update-in` expect: a bare keyword becomes a one-element path,
@@ -1004,6 +1062,14 @@
         (.delete ciphertext-temp)
         (when manifest-temp (.delete manifest-temp))))))
 
+(defn- report-written!
+  "Report `outcome` for the ciphertext and, when the environment keeps a
+  manifest, that it was rewritten beside it."
+  [{:keys [manifest]} & outcome]
+  (apply ok outcome)
+  (when (string? manifest)
+    (info "Manifest updated:" manifest)))
+
 (defn- append-recipient!
   "Atomically replace recipients file `f` with already-bounded `content`."
   [f content]
@@ -1038,6 +1104,35 @@
     (when (apply = (map (comp canonical-path :key-file) envs))
       (first envs))))
 
+(defn- keygen-lines
+  "The report after a key is written: who shares it, the public key, and how to
+  back it up and deploy it. `sharing` is every environment name resolving to
+  `key-file`; `app-default?` says that is the app-wide default path."
+  [environment-name key-file recipients-file sharing app-default? pub]
+  (cond-> [[:ok "Key written:" key-file]
+           [:line (str "    Used by: " (str/join ", " (map name sharing))
+                       (when app-default?
+                         " — every environment without its own :key-file"))]
+           [:line]
+           [:line [:bold "  Public key:"] pub]
+           [:line]
+           [:warn "Back this key up (e.g. a password manager). It is NOT in git and"]
+           [:line (str "    cannot be recovered. To deploy, set it as the "
+                       "SECRETS_AGE_IDENTITY secret:")]
+           ;; `cat --` for the same reason `age`, `rm`, and `shred` get one: a
+           ;; key file named `-n` or `--help` has to reach cat as a pathname.
+           ;; The surrounding "$(…)" is the shell's own construct, not
+           ;; interpolated data, and is what makes the file contents one
+           ;; argument to flyctl.
+           [:line [:dim (str "      flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat -- "
+                             (shell-quote key-file) ")\"")]]]
+    recipients-file
+    (into [[:line]
+           [:info "This project encrypts to a shared recipients file. Add your public"]
+           [:line "    key so teammates encrypt secrets you can read:"]
+           [:line [:dim (str "      bb secrets add-recipient "
+                             (shell-quote (name environment-name)))]]])))
+
 (defn keygen!
   "Generate an age identity at an environment's key-file. Returns the key-file
   path, or :aborted when an existing key is kept.
@@ -1060,40 +1155,13 @@
     (if-not proceed?
       (do (info "Aborted.") :aborted)
       (do
-        (info "Generating age key for" (clojure.core/name environment-name) "…")
+        (info "Generating age key for" (name environment-name) "…")
         (let [pub (age/keygen! key-file)
               sharing (sharing-environments (:environments config) key-file)
               app-default? (= (canonical-path key-file)
                               (canonical-path (default-key-file (:app config))))]
-          (ok "Key written:" key-file)
-          (println
-           (str "    Used by: " (str/join ", " (map clojure.core/name sharing))
-                (when app-default?
-                  " — every environment without its own :key-file")))
-          (println)
-          (println (paint :bold "  Public key:") pub)
-          (println)
-          (warn "Back this key up (e.g. a password manager). It is NOT in git and")
-          (println
-           "    cannot be recovered. To deploy, set it as the SECRETS_AGE_IDENTITY secret:")
-          (println
-           (paint :dim
-                  ;; `cat --` for the same reason `age`, `rm`, and `shred`
-                  ;; get one: a key file named `-n` or `--help` has to reach
-                  ;; cat as a pathname. The surrounding "$(…)" is the
-                  ;; shell's own construct, not interpolated data, and is
-                  ;; what makes the file contents one argument to flyctl.
-                  (str "      flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat -- "
-                       (shell-quote key-file)
-                       ")\"")))
-          (when recipients-file
-            (println)
-            (info "This project encrypts to a shared recipients file. Add your public")
-            (println "    key so teammates encrypt secrets you can read:")
-            (println
-             (paint :dim
-                    (str "      bb secrets add-recipient "
-                         (shell-quote (clojure.core/name environment-name))))))
+          (say! (keygen-lines environment-name key-file recipients-file
+                              sharing app-default? pub))
           key-file)))))
 
 (defn new!
@@ -1121,9 +1189,7 @@
           (run-editor! tmp)
           (info "Encrypting…")
           (write-secrets! env target tmp)
-          (ok "Encrypted secrets written:" secrets-file)
-          (when (string? (:manifest env))
-            (info "Manifest updated:" (:manifest env)))
+          (report-written! env "Encrypted secrets written:" secrets-file)
           secrets-file
           (finally (secure-delete! tmp)))))))
 
@@ -1154,9 +1220,7 @@
             (do
               (info "Re-encrypting…")
               (write-secrets! env target tmp)
-              (ok "Secrets updated:" secrets-file)
-              (when (string? (:manifest env))
-                (info "Manifest updated:" (:manifest env))))))
+              (report-written! env "Secrets updated:" secrets-file))))
         secrets-file
         (finally (secure-delete! tmp))))))
 
@@ -1168,7 +1232,7 @@
   (let [max-bytes (get-in env [:limits :max-plaintext-bytes])
         context {:environment (:name env) :key path}]
     (if interactive?
-      (let [value (or (prompt-hidden! (str (paint :yellow "?") " Value for " (pr-str path)
+      (let [value (or (prompt-hidden! (str (question-marker) " Value for " (pr-str path)
                                            " (input hidden): "))
                       "")
             observed (alength (.getBytes ^String value "UTF-8"))]
@@ -1190,7 +1254,7 @@
   (require-age!)
   (let [env (resolve-env config env-arg)
         path (parse-key-path key-arg (:limits env))
-        {:keys [secrets-file identity-file]} env
+        {:keys [secrets-file]} env
         exists? (.exists (io/file secrets-file))]
     (when exists? (require-identity! env))
     (let [target (encrypt-target! env)
@@ -1221,24 +1285,13 @@
       (try
         (let [current (if exists?
                         (do (info "Decrypting" secrets-file "…")
-                            (let [{:keys [ok? value] :as parsed}
-                                  (safe-edn/parse
-                                   (age/decrypt identity-file secrets-file
-                                                (decrypt-opts env))
-                                   (:limits env))]
-                              (if ok?
-                                value
-                                (fail! (str "Secrets are not valid EDN ("
-                                            (edn-failure-message parsed) ").")
-                                       (merge {:secrets-file secrets-file}
-                                              (edn-failure-data parsed))))))
+                            (decrypt-secrets! env))
                         (do (info "No secrets file at" secrets-file "— creating it.")
                             {}))]
           (spit tmp (render-secrets (assoc-in current path value)))
           (info (if exists? "Re-encrypting…" "Encrypting…"))
           (write-secrets! env target tmp)
-          (ok "Set" (pr-str path) "in" secrets-file)
-          (when (string? (:manifest env)) (info "Manifest updated:" (:manifest env)))
+          (report-written! env "Set" (pr-str path) "in" secrets-file)
           secrets-file)
         (finally (secure-delete! tmp))))))
 
@@ -1251,7 +1304,7 @@
   (require-age!)
   (let [env (resolve-env config env-arg)
         path (parse-key-path key-arg (:limits env))
-        {:keys [secrets-file identity-file] environment-name :name} env]
+        {:keys [secrets-file] environment-name :name} env]
     (require-identity! env)
     (when-not (.exists (io/file secrets-file))
       (fail! (str "No secrets file at " secrets-file "\n"
@@ -1269,16 +1322,7 @@
           tmp (temp-plaintext!)]
       (try
         (info "Decrypting" secrets-file "…")
-        (let [{:keys [ok? value] :as parsed}
-              (safe-edn/parse
-               (age/decrypt identity-file secrets-file (decrypt-opts env))
-               (:limits env))
-              current (if ok?
-                        value
-                        (fail! (str "Secrets are not valid EDN ("
-                                    (edn-failure-message parsed) ").")
-                               (merge {:secrets-file secrets-file}
-                                      (edn-failure-data parsed))))]
+        (let [current (decrypt-secrets! env)]
           (when (= ::missing (get-in current path ::missing))
             (fail! (str "No such key: " (pr-str path) " in " secrets-file)
                    {:secrets-file secrets-file :key path}))
@@ -1290,11 +1334,17 @@
             (spit tmp (render-secrets updated))
             (info "Re-encrypting…")
             (write-secrets! env target tmp)
-            (ok "Removed" (pr-str path) "from" secrets-file)
-            (when (string? (:manifest env))
-              (info "Manifest updated:" (:manifest env)))
+            (report-written! env "Removed" (pr-str path) "from" secrets-file)
             secrets-file))
         (finally (secure-delete! tmp))))))
+
+(defn- show-key-line
+  "One line per environment: its public key, or a warning that the key file
+  is absent."
+  [environment-name key-file pub]
+  (if pub
+    [:line (format "  %-6s %s" (str (name environment-name) ":") pub)]
+    [:warn (format "%s: no key at %s" (name environment-name) key-file)]))
 
 (defn show-key!
   "Print the public key(s) — share these so teammates can encrypt to you.
@@ -1309,15 +1359,7 @@
     (into {}
           (map (fn [{:keys [key-file] environment-name :name}]
                  (let [pub (age/public-key key-file)]
-                   (if pub
-                     (println
-                      (format "  %-6s %s"
-                              (str (clojure.core/name environment-name) ":")
-                              pub))
-                     (warn
-                      (format "%s: no key at %s"
-                              (clojure.core/name environment-name)
-                              key-file)))
+                   (say! [(show-key-line environment-name key-file pub)])
                    [environment-name pub])))
           (distinct-by :key-file envs))))
 
@@ -1388,11 +1430,23 @@
         (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
         (info "Re-encrypting to current recipients…")
         (write-secrets! env target tmp)
-        (ok "Re-encrypted:" secrets-file)
-        (when (string? (:manifest env))
-          (info "Manifest updated:" (:manifest env)))
+        (report-written! env "Re-encrypted:" secrets-file)
         secrets-file
         (finally (secure-delete! tmp))))))
+
+(defn- recipient-added-lines
+  "The report after a recipient is appended: what to run next, which turns on
+  whether a ciphertext already exists to re-encrypt."
+  [environment-label recipients-file pub ciphertext?]
+  (into [[:ok "Added recipient to" recipients-file]
+         [:line "   " pub]]
+        (if ciphertext?
+          [[:warn "Re-encrypt so the new recipient can read existing secrets:"]
+           [:line [:dim (str "      bb secrets reencrypt " (shell-quote environment-label))]]]
+          [[:info "No ciphertext exists yet. Create the initial store with either:"]
+           [:line [:dim (str "      printf %s \"$VALUE\" | bb secrets set "
+                             (shell-quote environment-label) " :secret/key")]]
+           [:line [:dim (str "      bb secrets new " (shell-quote environment-label))]]])))
 
 (defn add-recipient!
   "Add an age public key to an environment's recipients file. With no key given,
@@ -1462,27 +1516,23 @@
                  {:recipients-file (str recipients-file)
                   :environment environment-name}))
               (append-recipient! f content)
-              (ok "Added recipient to" recipients-file)
-              (println "   " pub)
-              (if (.exists (io/file secrets-file))
-                (do
-                  (warn "Re-encrypt so the new recipient can read existing secrets:")
-                  (println
-                   (paint :dim
-                          (str "      bb secrets reencrypt "
-                               (shell-quote environment-label)))))
-                (do
-                  (info "No ciphertext exists yet. Create the initial store with either:")
-                  (println
-                   (paint :dim
-                          (str "      printf %s \"$VALUE\" | bb secrets set "
-                               (shell-quote environment-label)
-                               " :secret/key")))
-                  (println
-                   (paint :dim
-                          (str "      bb secrets new "
-                               (shell-quote environment-label))))))
+              (say! (recipient-added-lines environment-label recipients-file pub
+                                           (.exists (io/file secrets-file))))
               pub)))))))
+
+(defn- recipients-lines
+  "The listing for `recipients`, marking any line encryption would refuse."
+  [environment-label recipients-file recipients]
+  (if (empty? recipients)
+    [[:warn "No recipients yet in" recipients-file]]
+    (into [[:line [:bold (str "Recipients for " environment-label
+                              " (" recipients-file "):")]]]
+          (map (fn [recipient]
+                 (if (age/valid-recipient? recipient)
+                   [:line "  " recipient]
+                   [:line "  " recipient
+                    [:yellow "← invalid; encryption refuses this line"]])))
+          recipients)))
 
 (defn recipients!
   "List the recipients an environment encrypts to. Returns them as an eager seq
@@ -1499,18 +1549,7 @@
               "is in single-key mode — it encrypts to its own key, not a recipients list.")
         nil)
       (let [recipients (read-recipients env)]
-        (if (empty? recipients)
-          (warn "No recipients yet in" recipients-file)
-          (do
-            (println
-             (paint :bold
-                    (str "Recipients for " environment-label " (" recipients-file "):")))
-            (doseq [recipient recipients]
-              (println "  " (if (age/valid-recipient? recipient)
-                              recipient
-                              (str recipient " "
-                                   (paint :yellow
-                                          "← invalid; encryption refuses this line")))))))
+        (say! (recipients-lines environment-label recipients-file recipients))
         recipients))))
 
 (defn- enforce-manifest-entry-limit!
@@ -1544,8 +1583,8 @@
                           [:reason :limit :configured :observed :bytes :count])))))
 
 (defn- read-supported-manifest
-  "The committed manifest at `manifest-path`, or a `:status` when it cannot be
-  compared at all.
+  "The committed manifest at `manifest-path` as `{:committed value}`, or a
+  `{:problem …}` naming why it cannot be compared at all.
 
   Two gates, both of which reject rather than diff. The `:version` gate keeps a
   v1 hash from ever being read as a v2 one. The `:app` gate is the wrong-app
@@ -1555,154 +1594,161 @@
   Single-key mode would usually still catch that on a `:vhash` derived from
   different key material, but a team manifest carries no `:vhash` at all, so a
   refreshed `:ciphertext-sha` would otherwise verify clean."
-  [environment-label expected-app manifest-path limits]
+  [expected-app manifest-path limits]
   (let [parsed (safe-edn/parse (read-manifest-bounded! manifest-path limits) limits)
-        value (:value parsed)
-        _ (when (:ok? parsed)
-            (enforce-manifest-entry-limit! manifest-path value limits))
-        version (:version value)
-        app (:app value)]
+        {:keys [version app] :as value} (:value parsed)]
+    (when (:ok? parsed)
+      (enforce-manifest-entry-limit! manifest-path value limits))
     (cond
       (not (:ok? parsed))
-      (do
-        (oops environment-label "— manifest is not valid EDN:"
-              (edn-failure-message parsed))
-        {:status :drift})
+      {:problem {:reason :manifest-invalid-edn :failure (edn-failure-data parsed)}}
 
       (not= 2 version)
-      (do
-        (oops environment-label
-              "— manifest version"
-              (pr-str version)
-              "is unsupported by this version of the library.")
-        (println
-         (str "    Regenerate it with `bb secrets reencrypt "
-              (shell-quote environment-label)
-              "`, or upgrade the library."))
-        {:status :drift})
+      {:problem {:reason :unsupported-version :version version}}
 
       (not= expected-app app)
-      (do
-        (oops environment-label
-              "— manifest describes app"
-              (pr-str app)
-              (str "but this project is " (pr-str expected-app) "."))
-        (println
-         (str "    It belongs to a different store. Regenerate it with "
-              "`bb secrets reencrypt " (shell-quote environment-label) "`."))
-        {:status :drift})
+      {:problem {:reason :wrong-app :app app}}
 
       :else
-      {:committed (:value parsed)})))
+      {:committed value})))
 
-(defn- verify-keyless
-  "Verify freshness without a key. `identity-location` is where a message may say
-  the missing identity is — `at <path>` when the caller supplied that path, else
-  `from <VARIABLE>`, never a path this library materialized."
-  [environment-label secrets-file manifest-path identity-location committed]
-  (let [ciphertext-sha (:ciphertext-sha committed)]
+;;; A verification is computed as a *finding* — `:status` (:ok, :ok-keyless,
+;;; :drift, or :missing), a `:reason`, and whatever the report needs — and
+;;; rendered by `finding-lines`. `verify-one!` does the reading, hashing, and
+;;; decrypting; the two functions between it and the report are pure.
+
+(defn- keyless-finding
+  "Freshness without a key: the manifest's recorded `:ciphertext-sha` against
+  `actual-sha`, the digest of the ciphertext on disk."
+  [committed actual-sha]
+  (let [recorded (:ciphertext-sha committed)]
     (cond
-      (nil? ciphertext-sha)
-      (do
-        (warn environment-label
-              (str "— no identity " identity-location)
-              "and the manifest records no :ciphertext-sha; cannot verify.")
-        :missing)
+      (nil? recorded) {:status :missing :reason :no-ciphertext-sha}
+      (= recorded actual-sha) {:status :ok-keyless :reason :ciphertext-agrees}
+      :else {:status :drift :reason :ciphertext-changed})))
 
-      (= ciphertext-sha (sha256 secrets-file))
-      (do
-        (ok environment-label
-            "— ciphertext agrees with the manifest"
-            "(freshness only: no key, so values are not checked).")
-        :ok-keyless)
+(defn- keyed-finding
+  "Full agreement: the committed entries against `fresh`, the entries of the
+  decrypted store, plus the recorded `:ciphertext-sha` against `actual-sha`
+  when one is recorded. Either disagreement is drift; both are reported."
+  [committed fresh actual-sha]
+  (let [diff (manifest/diff (:keys committed) fresh)
+        stale-entries? (not (every? empty? (vals diff)))
+        recorded (:ciphertext-sha committed)
+        stale-sha? (boolean (and recorded (not= recorded actual-sha)))]
+    (if (or stale-entries? stale-sha?)
+      {:status :drift
+       :reason :stale
+       :diff (when stale-entries? diff)
+       :ciphertext-changed? stale-sha?}
+      {:status :ok :reason :manifest-matches})))
 
-      :else
-      (do
-        (oops environment-label
-              "— ciphertext changed since the manifest was written"
-              (str "(" manifest-path ")."))
-        (println (str "    Regenerate with:  bb secrets reencrypt "
-                      (shell-quote environment-label)))
-        :drift))))
-
-(defn- verify-keyed-diff
-  [environment-label
-   {:keys [secrets-file manifest identity-file] :as env}
-   committed]
-  (let [{:keys [ok? value] :as parsed}
-        (safe-edn/parse
-         (age/decrypt identity-file secrets-file (decrypt-opts env))
-         (:limits env))]
-    (if-not ok?
-      (do
-        (oops environment-label "— encrypted secrets are not valid EDN:"
-              (edn-failure-message parsed))
-        :drift)
-      (let [fresh (manifest/entries value (manifest-hmac-key env))
-            manifest-diff (manifest/diff (:keys committed) fresh)
-            stale-entries? (not (every? empty? (vals manifest-diff)))
-            ciphertext-sha (:ciphertext-sha committed)
-            stale-sha? (and ciphertext-sha
-                            (not= ciphertext-sha (sha256 secrets-file)))]
-        (when stale-entries?
-          (oops environment-label "— manifest is STALE" (str "(" manifest "):"))
-          (doseq [path (:added manifest-diff)]
-            (println "    +" (pr-str path) "— in secrets, missing from manifest"))
-          (doseq [path (:removed manifest-diff)]
-            (println "    -" (pr-str path) "— in manifest, gone from secrets"))
-          (doseq [path (:changed manifest-diff)]
-            (println "    ~" (pr-str path) "— value or type changed")))
-        (when stale-sha?
-          (oops environment-label
-                "— ciphertext was re-encrypted out-of-band since the manifest was written."))
-        (if (or stale-entries? stale-sha?)
-          (do
-            (println "    Regenerate with:"
-                     (str "bb secrets reencrypt " (shell-quote environment-label)))
-            :drift)
-          (do
-            (ok environment-label "— manifest matches" (str "(" manifest ")"))
-            :ok))))))
-
-(defn- verify-one
-  "Verify one environment's committed manifest against its encrypted secrets.
-  Prints a human-readable result and returns :ok, :ok-keyless, :drift, or
-  :missing. Without an identity, falls back to comparing the manifest's
-  recorded :ciphertext-sha against the actual ciphertext (freshness only).
+(defn- verify-one!
+  "Verify one environment's committed manifest against its encrypted secrets,
+  returning its finding. Without an identity, falls back to comparing the
+  manifest's recorded :ciphertext-sha against the actual ciphertext (freshness
+  only).
 
   This establishes *agreement* between the two committed artifacts — drift
   detection — and never who authored either of them; see [[verify!]]."
-  [{:keys [app secrets-file manifest identity-file] environment-name :name :as env}]
-  (let [environment-label (clojure.core/name environment-name)]
-    (cond
-      (not (string? manifest))
-      (do
-        (info environment-label "— manifest disabled; skipping.")
-        :ok)
+  [{:keys [app secrets-file manifest identity-file limits] :as env}]
+  (cond
+    (not (string? manifest))
+    {:status :ok :reason :manifest-disabled}
 
-      (not (.exists (io/file secrets-file)))
-      (do
-        (warn environment-label "— no secrets file at" secrets-file)
-        :missing)
+    (not (.exists (io/file secrets-file)))
+    {:status :missing :reason :no-secrets-file}
 
-      (not (.exists (io/file (str manifest))))
-      (do
-        (warn environment-label
-              "— no manifest at"
-              manifest
-              (str "(run `bb secrets edit " (shell-quote environment-label)
-                   "` to create it)"))
-        :missing)
+    (not (.exists (io/file manifest)))
+    {:status :missing :reason :no-manifest}
 
-      :else
-      (let [{:keys [committed status]}
-            (read-supported-manifest environment-label app manifest (:limits env))]
-        (if status
-          status
-          (if-not (.exists (io/file identity-file))
-            (verify-keyless
-             environment-label secrets-file manifest (identity-location env) committed)
-            (verify-keyed-diff environment-label env committed)))))))
+    :else
+    (let [{:keys [committed problem]} (read-supported-manifest app manifest limits)]
+      (cond
+        problem
+        (assoc problem :status :drift)
+
+        (not (.exists (io/file identity-file)))
+        (keyless-finding committed (sha256 secrets-file))
+
+        :else
+        (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
+          (if ok?
+            (keyed-finding committed
+                           (manifest/entries value (manifest-hmac-key env))
+                           (sha256 secrets-file))
+            {:status :drift
+             :reason :secrets-invalid-edn
+             :failure (edn-failure-data parsed)}))))))
+
+(defn- diff-lines
+  "One line per key path that moved between the manifest and the store."
+  [{:keys [added removed changed]}]
+  (concat
+   (for [path added] [:line "    +" (pr-str path) "— in secrets, missing from manifest"])
+   (for [path removed] [:line "    -" (pr-str path) "— in manifest, gone from secrets"])
+   (for [path changed] [:line "    ~" (pr-str path) "— value or type changed"])))
+
+(defn- finding-lines
+  "The report for one environment's finding."
+  [{:keys [app secrets-file manifest] environment-name :name :as env}
+   {:keys [reason] :as finding}]
+  (let [label (name environment-name)
+        reencrypt (str "bb secrets reencrypt " (shell-quote label))]
+    (case reason
+      :manifest-disabled
+      [[:info label "— manifest disabled; skipping."]]
+
+      :no-secrets-file
+      [[:warn label "— no secrets file at" secrets-file]]
+
+      :no-manifest
+      [[:warn label "— no manifest at" manifest
+        (str "(run `bb secrets edit " (shell-quote label) "` to create it)")]]
+
+      :manifest-invalid-edn
+      [[:oops label "— manifest is not valid EDN:" (edn-failure-message (:failure finding))]]
+
+      :unsupported-version
+      [[:oops label "— manifest version" (pr-str (:version finding))
+        "is unsupported by this version of the library."]
+       [:line (str "    Regenerate it with `" reencrypt "`, or upgrade the library.")]]
+
+      :wrong-app
+      [[:oops label "— manifest describes app" (pr-str (:app finding))
+        (str "but this project is " (pr-str app) ".")]
+       [:line (str "    It belongs to a different store. Regenerate it with `"
+                   reencrypt "`.")]]
+
+      :no-ciphertext-sha
+      [[:warn label (str "— no identity " (identity-location env))
+        "and the manifest records no :ciphertext-sha; cannot verify."]]
+
+      :ciphertext-agrees
+      [[:ok label "— ciphertext agrees with the manifest"
+        "(freshness only: no key, so values are not checked)."]]
+
+      :ciphertext-changed
+      [[:oops label "— ciphertext changed since the manifest was written"
+        (str "(" manifest ").")]
+       [:line (str "    Regenerate with:  " reencrypt)]]
+
+      :secrets-invalid-edn
+      [[:oops label "— encrypted secrets are not valid EDN:"
+        (edn-failure-message (:failure finding))]]
+
+      :stale
+      (-> []
+          (into (when-let [diff (:diff finding)]
+                  (cons [:oops label "— manifest is STALE" (str "(" manifest "):")]
+                        (diff-lines diff))))
+          (into (when (:ciphertext-changed? finding)
+                  [[:oops label (str "— ciphertext was re-encrypted out-of-band since "
+                                     "the manifest was written.")]]))
+          (conj [:line "    Regenerate with:" reencrypt]))
+
+      :manifest-matches
+      [[:ok label "— manifest matches" (str "(" manifest ")")]])))
 
 (defn verify!
   "Check that each environment's committed manifest matches its encrypted
@@ -1724,7 +1770,12 @@
   (let [envs (if env-arg
                [(resolve-env config env-arg)]
                (vals (:environments config)))
-        results (into {} (map (juxt :name verify-one)) envs)
+        results (into {}
+                      (map (fn [env]
+                             (let [finding (verify-one! env)]
+                               (say! (finding-lines env finding))
+                               [(:name env) (:status finding)])))
+                      envs)
         statuses (set (vals results))]
     {:results results
      :exit (cond (statuses :drift) 1
@@ -1896,50 +1947,51 @@
      :status status
      :exit (case status :healthy 0 :warning 1 :invalid 2)}))
 
-(defn- print-artifact-state!
+(defn- artifact-state-line
   [label {:keys [state path exists?]}]
-  (println (str label ": "
-                (case state
-                  :disabled "disabled"
-                  :unconfigured "unconfigured"
-                  (str (if exists? "present" "missing") " — " path)))))
+  [:line (str label ": "
+              (case state
+                :disabled "disabled"
+                :unconfigured "unconfigured"
+                (str (if exists? "present" "missing") " — " path)))])
 
-(defn- print-doctor!
+(def ^:private artifact-labels
+  [[:ciphertext "Ciphertext"]
+   [:manifest "Manifest"]
+   [:template "Template"]
+   [:key "Key"]
+   [:recipients "Recipients file"]])
+
+(defn- doctor-lines
+  "The `doctor` report: one stable, value-free line per diagnostic."
   [{:keys [configuration age environment artifacts identity encryption verify status]}]
-  (if-not (:valid? configuration)
-    (println "Configuration: invalid")
-    (do
-      (println "Age:" (if (:available? age)
-                        (str "available — " (:version age))
-                        "unavailable"))
-      (println "Environment:" (clojure.core/name environment))
-      (doseq [[kind label] [[:ciphertext "Ciphertext"]
-                            [:manifest "Manifest"]
-                            [:template "Template"]
-                            [:key "Key"]
-                            [:recipients "Recipients file"]]]
-        (print-artifact-state! label (artifacts kind)))
-      (println "Identity:"
-               (str (identity-source-display-label (:source identity))
-                    " — " (if (:usable? identity) "usable" "unusable")))
-      (println "Encryption mode:" (clojure.core/name (:mode encryption)))
-      (let [{:keys [state valid? invalid-count] recipient-count :count}
-            (:recipients encryption)]
-        (println "Recipients:"
-                 (str (clojure.core/name state)
-                      " — count " (if (nil? recipient-count)
-                                    "unknown"
-                                    recipient-count)
-                      " — valid " (if (nil? valid?) "unknown" valid?)
-                      (when invalid-count
-                        (str " — invalid count " invalid-count)))))
-      (println "Verify keyless:" (if (= :skipped (:state verify))
-                                   "skipped"
-                                   (if (:keyless? verify) "available" "unavailable")))
-      (println "Verify full:" (if (= :skipped (:state verify))
-                                "skipped"
-                                (if (:full? verify) "available" "unavailable")))))
-  (println "Status:" (clojure.core/name status)))
+  (let [verify-label (fn [available?]
+                       (cond
+                         (= :skipped (:state verify)) "skipped"
+                         available? "available"
+                         :else "unavailable"))
+        {:keys [state valid? invalid-count] recipient-count :count} (:recipients encryption)]
+    (conj
+     (if-not (:valid? configuration)
+       [[:line "Configuration: invalid"]]
+       (-> [[:line "Age:" (if (:available? age)
+                            (str "available — " (:version age))
+                            "unavailable")]
+            [:line "Environment:" (name environment)]]
+           (into (map (fn [[kind label]] (artifact-state-line label (artifacts kind))))
+                 artifact-labels)
+           (conj [:line "Identity:"
+                  (str (identity-source-display-label (:source identity))
+                       " — " (if (:usable? identity) "usable" "unusable"))]
+                 [:line "Encryption mode:" (name (:mode encryption))]
+                 [:line "Recipients:"
+                  (str (name state)
+                       " — count " (if (nil? recipient-count) "unknown" recipient-count)
+                       " — valid " (if (nil? valid?) "unknown" valid?)
+                       (when invalid-count (str " — invalid count " invalid-count)))]
+                 [:line "Verify keyless:" (verify-label (:keyless? verify))]
+                 [:line "Verify full:" (verify-label (:full? verify))])))
+     [:line "Status:" (name status)])))
 
 (defn doctor!
   "Safely diagnose one selected/default environment. Accepts raw config,
@@ -1960,7 +2012,7 @@
                     :verify nil
                     :status :invalid
                     :exit 2}))]
-    (print-doctor! result)
+    (say! (doctor-lines result))
     result))
 
 ;;;; Dispatch
@@ -2000,16 +2052,16 @@
 (defn- operand-token? [x]
   (and (string? x) (re-matches #"\d+" x)))
 
-(defn- print-error!
-  "Print an ex-info the way `run!` reports failures."
+(defn- error-lines
+  "How `run!` reports an ex-info: its message, then any :hint, :install,
+  :error, or :docs from its data, all on stderr."
   [e]
-  (oops (ex-message e))
-  (binding [*out* *err*]
-    (doseq [k [:hint :install :error :docs]
-            :let [v (get (ex-data e) k)]
-            :when (and (some? v) (not (str/blank? (str v))))
-            line (str/split-lines (str/trim-newline (str v)))]
-      (println "   " line))))
+  (into [[:oops (ex-message e)]]
+        (for [k [:hint :install :error :docs]
+              :let [v (get (ex-data e) k)]
+              :when (and (some? v) (not (str/blank? (str v))))
+              line (str/split-lines (str/trim-newline (str v)))]
+          [:stderr "   " line])))
 
 (defn- restore-error-operand [data operands]
   (cond
@@ -2231,5 +2283,5 @@
   (try
     (dispatch! config args)
     (catch clojure.lang.ExceptionInfo e
-      (print-error! e)
+      (say! (error-lines e))
       (System/exit (:secrets/exit (ex-data e) 1)))))
