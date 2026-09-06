@@ -318,6 +318,13 @@ All notable changes to this project are documented here. The format follows
   enabled for `github-actions` weekly — it bumps a pinned SHA and rewrites the
   comment beside it, keeping the pins maintainable as reviewable diffs rather
   than silent tag drift.
+- `bb book:watch` re-renders only the chapter you saved and reloads the page
+  you are on. Clay now writes just that chapter's `.qmd`, and `quarto preview`
+  renders it and reloads the browser in place; a save no longer re-evaluates
+  every chapter, re-renders the whole book, and returns the browser to the
+  first page. The driver is `com.kirahowe.secrets.book-watch` under `build/`,
+  and arguments to the task go to `quarto preview`, so `bb book:watch
+  --no-browser` and `bb book:watch --port 4444` work.
 
 ### Fixed
 - Production publication is fixed to the exact `https://repo.clojars.org`

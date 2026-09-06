@@ -1121,7 +1121,7 @@ so every example is evaluated against the real library at build time.
 ```sh
 bb book:build     # render the book into book/rendered (needs JDK + quarto + age)
 bb book:preview   # serve the rendered book locally
-bb book:watch     # re-render chapters on save (Clay live reload)
+bb book:watch     # re-render a chapter when you save it, and reload it in the browser
 ```
 
 The published book carries no third-party executable assets. Clay injects jQuery

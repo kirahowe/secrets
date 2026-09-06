@@ -19,7 +19,9 @@
   ;;; Clay's newest release still selects older Ring/Jackson components. Keep
   ;;; the overrides here, inside :book, so the renderer gets reviewed fixed
   ;;; lines without adding build-only dependencies to the library graph.
-  :book {:extra-paths ["book/chapters"]
+  ;;; "build" is on the path for com.kirahowe.secrets.book-watch, which drives
+  ;;; `bb book:watch`.
+  :book {:extra-paths ["book/chapters" "build"]
          :extra-deps {aero/aero {:mvn/version "1.1.6"}
                       org.scicloj/clay {:mvn/version "2.0.21"}
                       rewrite-clj/rewrite-clj {:mvn/version "1.2.55"}}

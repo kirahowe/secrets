@@ -105,11 +105,10 @@
   {:doc "Strip third-party assets from book/rendered, add its CSP, and check the result"
    ;;; Part of book:build rather than a separate gate, so a local render cannot
    ;;; produce an artifact that would fail CI. book:preview and book:watch do
-   ;;; not run it: quarto and Clay re-render into the same directory as you
-   ;;; save, overwriting the rewrite, and Clay's live reload injects a websocket
-   ;;; client that `connect-src 'self'` would refuse. Those tasks serve a
-   ;;; development render; `bb book:build` is what produces the published
-   ;;; artifact, and it is the only one CI uploads.
+   ;;; not run it: quarto preview re-renders as you save, so the next render
+   ;;; would overwrite the rewrite. Those tasks serve a development render;
+   ;;; `bb book:build` is what produces the published artifact, and it is the
+   ;;; only one CI uploads.
    :requires ([com.kirahowe.secrets.site-policy :as site-policy])
    :task (let [rewritten (site-policy/rewrite! "book/rendered")
                found (site-policy/violations "book/rendered")]
@@ -128,10 +127,12 @@
              (shell "quarto preview book/rendered"))}
 
   book:watch
-  {:doc "Watch the chapters and re-render on save (Clay live reload)"
+  {:doc "Re-render a chapter when you save it and reload the browser in place"
    :requires ([babashka.fs :as fs])
-   ;; Start from a clean slate: leftover HTML from a previous book:build
-   ;; confuses quarto's incremental render inside watch mode.
+   ;; Start from a clean slate: a previous book:build leaves its HTML and
+   ;; Quarto's cache here, and this run should serve only what it rendered.
+   ;; Extra arguments go to `quarto preview` (`--no-browser`, `--port 4444`).
    :task (do (when (fs/exists? "book/rendered")
                (fs/delete-tree "book/rendered"))
-             (clojure "-M:book -m scicloj.clay.v2.main book/chapters"))}}}
+             (apply clojure "-M:book" "-m" "com.kirahowe.secrets.book-watch"
+                    *command-line-args*))}}}
