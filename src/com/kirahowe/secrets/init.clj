@@ -601,7 +601,10 @@
         ;; open a quoted "value" that runs on into the next one.
         separator "(?:\"?\\s*[:=]\\s*|\"?\\s+)"
         value "(\"[^\"]*\"|[-\\w+/=.:@~$]{4,})"]
-    (re-pattern (str "(?i)(" name-part secretish name-part separator ")" value))))
+    ;; After the secret-like word the name ends at the first place a separator
+    ;; fits. Greedy, it would take `:hunter2` from `password:hunter2 host=x` as
+    ;; part of the name and hide the host instead of the password.
+    (re-pattern (str "(?i)(" name-part secretish name-part "?" separator ")" value))))
 (def ^:private age-secret-key #"AGE-SECRET-KEY-1[0-9A-Za-z]+")
 (def ^:private opaque-token #"[A-Za-z0-9+/=_-]{32,}")
 

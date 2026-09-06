@@ -339,6 +339,10 @@ All notable changes to this project are documented here. The format follows
   --no-browser` and `bb book:watch --port 4444` work.
 
 ### Fixed
+- The initializer preview hides the value after a credential-like key even
+  when a `:` joins them with no space and another `key value` pair follows on
+  the line. The name match used to run on past that separator, so
+  `password:hunter2 host=x` printed the password and hid the host instead.
 - Production publication is fixed to the exact `https://repo.clojars.org`
   origin. The production entry point rejects every command-line argument and
   every nonblank value of the retired `SECRETS_DEPLOY_REPOSITORY_URL` override
