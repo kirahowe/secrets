@@ -6,6 +6,14 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- The initializer declares this library's coordinate in one file per project.
+  When a `deps.edn` exists it owns the coordinate and `bb.edn` gets a
+  `{:local/root "."}` dependency on the project, so the Babashka task and the
+  JVM application resolve the same version from one declaration. Without a
+  `deps.edn`, `bb.edn` owns it as before, and a `bb.edn` that already declares
+  it keeps doing so. A project declaring it in both files is refused with the
+  fix spelled out. Manual integration output now names the file each snippet
+  belongs in.
 - `bb secrets set` prompts for the value with echo turned off when run from a
   terminal, and keeps reading stdin when the input is piped or redirected, so
   scripts and CI are unchanged. Values are stored verbatim as strings; `--edn`

@@ -197,6 +197,95 @@
             "{:deps {} :tasks {secrets {:task (println :other)}}}"
             config))))))
 
+(deftest deps-edn-owns-the-coordinate-when-present-test
+  (let [config (init/proposed-config {:app "reader"})
+        deps-source (str ";; app deps\n"
+                         "{:paths [\"src\"]\n"
+                         " :aliases {:build {:deps {io.github.clojure/tools.build"
+                         " {:mvn/version \"0.10.13\"}}}}\n"
+                         " :deps {org.clojure/clojure {:mvn/version \"1.12.4\"}}}\n")]
+    (testing "deps.edn gains the coordinate at the top level, comments intact"
+      (let [{:keys [content added-dependency?]} (init/merge-deps-edn deps-source)
+            parsed (edn/read-string content)]
+        (is added-dependency?)
+        (is (str/includes? content ";; app deps"))
+        (is (contains? (:deps parsed) 'io.github.kirahowe/secrets))
+        (is (= #{'io.github.clojure/tools.build}
+               (set (keys (get-in parsed [:aliases :build :deps]))))
+            "the alias's own :deps map, which comes first in the file, is left alone")))
+    (testing "a deps.edn that already declares the library is returned unchanged"
+      (let [source "{:deps {com.kirahowe/secrets {:mvn/version \"0.1.0\"}}}\n"
+            result (init/merge-deps-edn source)]
+        (is (= source (:content result)))
+        (is (not (:changed? result)))
+        (is (= 'com.kirahowe/secrets (:dependency result)))))
+    (testing "bb.edn gets a self dependency and the task, and no coordinate"
+      (let [{:keys [content added-self-dependency? added-dependency?]}
+            (init/merge-bb-edn nil config :deps.edn)
+            parsed (edn/read-string content)]
+        (is added-self-dependency?)
+        (is (not added-dependency?))
+        (is (= {'reader/reader {:local/root "."}} (:deps parsed)))
+        (is (contains? (:tasks parsed) 'secrets))
+        (is (not (re-find #"kirahowe/secrets" content)))))
+    (testing "an existing self dependency under any key is reused"
+      (let [result (init/merge-bb-edn "{:deps {acme/app {:local/root \".\"}}}\n"
+                                      config :deps.edn)]
+        (is (not (:added-self-dependency? result)))
+        (is (= {'acme/app {:local/root "."}}
+               (:deps (edn/read-string (:content result)))))))
+    (testing "deps.edn is the owner only when a deps.edn exists"
+      (is (= :bb.edn (:owner (init/integration-plan nil nil config))))
+      (is (= :deps.edn (:owner (init/integration-plan nil deps-source config)))))
+    (testing "a bb.edn that already owns the coordinate keeps it and deps.edn is untouched"
+      (let [plan (init/integration-plan
+                  "{:deps {com.kirahowe/secrets {:local/root \"../secrets\"}}}\n"
+                  deps-source config)]
+        (is (= :bb.edn (:owner plan)))
+        (is (nil? (:deps-edn plan)))))
+    (testing "both files declaring the library is refused with the fix spelled out"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"both declare.*reader/reader"
+           (init/integration-plan
+            "{:deps {com.kirahowe/secrets {:mvn/version \"0.1.0\"}}}\n"
+            "{:deps {com.kirahowe/secrets {:mvn/version \"0.1.0\"}}}\n"
+            config))))))
+
+(deftest self-dependency-key-is-a-readable-symbol-test
+  (are [app expected] (= {expected {:local/root "."}} (init/self-dependency app))
+    "myapp" 'myapp/myapp
+    "my app!" 'my-app/my-app
+    "9lives" 'app-9lives/app-9lives))
+
+(deftest deps-edn-project-previews-and-applies-both-files-test
+  (spit (io/file *dir* "deps.edn") "{:deps {org.clojure/clojure {:mvn/version \"1.12.4\"}}}\n")
+  (let [proposal (init/proposed-changes {:root *dir* :app "reader"})
+        actions (into {} (map (juxt :path :action)) (:actions proposal))]
+    (is (= :deps.edn (:owner proposal)))
+    (is (= :merge (get actions "deps.edn")))
+    (is (= :create (get actions "bb.edn")))
+    (is (= ["deps.edn" "bb.edn"] (map first (:manual proposal))))
+    (testing "applying writes both, and bb.edn carries no coordinate"
+      (with-out-str (init/init! {:root *dir* :app "reader" :tty? false :apply? true}))
+      (let [deps (edn/read-string (slurp (io/file *dir* "deps.edn")))
+            bb (edn/read-string (slurp (io/file *dir* "bb.edn")))]
+        (is (contains? (:deps deps) 'io.github.kirahowe/secrets))
+        (is (= {'reader/reader {:local/root "."}} (:deps bb)))
+        (is (contains? (:tasks bb) 'secrets))))
+    (testing "a second run finds nothing left to write for either file"
+      (let [again (into {} (map (juxt :path :action))
+                        (:actions (init/proposed-changes {:root *dir* :app "reader"})))]
+        (is (= :unchanged (get again "deps.edn")))
+        (is (= :unchanged (get again "bb.edn")))))))
+
+(deftest manual-integration-names-each-file-test
+  (spit (io/file *dir* "deps.edn") "{:deps {}}\n")
+  (let [out (with-out-str
+              (init/init! {:root *dir* :app "reader" :tty? true :choice :manual}))]
+    (is (str/includes? out "deps.edn:\n{:deps"))
+    (is (str/includes? out "bb.edn:\n{:deps {reader/reader {:local/root \".\"}}"))
+    (is (str/includes? out "io.github.kirahowe/secrets"))))
+
 ;;;; Preview and Interaction
 
 (deftest noninteractive-preview-and-manual-cancel-do-not-mutate-test

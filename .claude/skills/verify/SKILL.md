@@ -44,6 +44,13 @@ Exercise the pinned version once (`bb secrets set` / `verify`), then edit
 the consumer's `bb.edn` dep to `{:local/root "<checkout>"}` so every later
 phase tests the current code.
 
+**JVM project variant:** in a second scratch dir, write a `deps.edn` with any
+dependency, then run the same two commands. Check: `deps.edn` gained the
+pinned coordinate at the top level with its comments intact; `bb.edn` has
+`{verifydemo/verifydemo {:local/root "."}}` and the `secrets` task but no
+library coordinate; and `bb secrets --help` runs, which proves Babashka
+resolves the coordinate through `deps.edn`.
+
 ## Phase 2 — migration from the previously pinned release
 
 If Phase 1's pinned release wrote a `:version 1` manifest: current `verify`

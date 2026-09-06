@@ -82,18 +82,18 @@
    :requires '([com.kirahowe.secrets.cli :as cli])
    :task (list 'cli/run! config '*command-line-args*)})
 
-;;;; bb.edn Integration
+;;;; bb.edn and deps.edn Integration
 
-(defn- parse-bb [source]
+(defn- parse-edn-map [source file]
   (try
     (let [loc (z/of-string source)]
       (when-not (z/map? loc)
-        (throw (ex-info "bb.edn must be a top-level map" {})))
+        (throw (ex-info (str file " must be a top-level map") {:file file})))
       [loc (z/sexpr loc)])
     (catch clojure.lang.ExceptionInfo e
       (throw e))
     (catch Exception e
-      (throw (ex-info "Could not read bb.edn" {:cause (.getMessage e)} e)))))
+      (throw (ex-info (str "Could not read " file) {:file file :cause (.getMessage e)} e)))))
 
 (defn- append-entry [map-loc k v]
   ;; Node-level editing keeps every existing comment and reader form intact.
@@ -105,59 +105,160 @@
            (node/whitespace-node " ")
            (node/coerce v)]))
 
-(defn- add-root-entry [source k v]
-  (let [[loc _] (parse-bb source)]
+(defn- add-root-entry [source file k v]
+  (let [[loc _] (parse-edn-map source file)]
     (z/root-string (append-entry loc k v))))
 
-(defn- add-nested-entry [source parent k v]
-  (let [[loc _] (parse-bb source)
-        key-loc (z/find-value loc z/next parent)
-        map-loc (some-> key-loc z/right)]
+(defn- top-level-value
+  "Zipper location of the value under top-level key `k` of `map-loc`, or nil.
+  Walks the map's own entries only, so a `:deps` nested inside a deps.edn
+  alias is never mistaken for the top-level one."
+  [map-loc k]
+  (loop [loc (z/down map-loc)]
+    (when loc
+      (if (= k (z/sexpr loc))
+        (z/right loc)
+        (recur (some-> loc z/right z/right))))))
+
+(defn- add-nested-entry [source file parent k v]
+  (let [[loc _] (parse-edn-map source file)
+        map-loc (top-level-value loc parent)]
     (when-not (z/map? map-loc)
-      (throw (ex-info (str parent " must be a map") {:field parent})))
+      (throw (ex-info (str parent " in " file " must be a map") {:file file :field parent})))
     (z/root-string (append-entry map-loc k v))))
 
+(defn- deps-map [edn file]
+  (let [deps (get edn :deps {})]
+    (when-not (map? deps)
+      (throw (ex-info (str ":deps in " file " must be a map") {:file file})))
+    deps))
+
+(defn- known-dependency [deps]
+  (some #(when (contains? deps %) %) known-coordinates))
+
+(defn- declares-library? [source file]
+  (let [[_ edn] (parse-edn-map source file)]
+    (some? (known-dependency (deps-map edn file)))))
+
+(defn self-dependency
+  "The bb.edn dependency that puts the project's own deps.edn on Babashka's
+  classpath: `{myapp/myapp {:local/root \".\"}}`. The key is the app name
+  reduced to symbol-safe characters, so the entry says what it is."
+  [app]
+  (let [word (-> (str app)
+                 (str/replace #"[^A-Za-z0-9_-]+" "-")
+                 (str/replace #"^-+|-+$" ""))
+        word (if (re-find #"^[A-Za-z_]" word) word (str "app-" word))]
+    {(symbol word word) {:local/root "."}}))
+
+(defn- self-dependency? [[_ coordinate]]
+  (and (map? coordinate) (= "." (:local/root coordinate))))
+
 (defn merge-bb-edn
-  "Merge this library and generated `secrets` task without reformatting existing
-  bb.edn content. Known library coordinates are retained; task conflicts fail."
-  [source config]
-  (let [original (or source "{}\n")
-        [_ bb] (parse-bb original)
-        deps (get bb :deps {})
-        tasks (get bb :tasks {})
-        _ (when-not (map? deps)
-            (throw (ex-info ":deps must be a map" {})))
-        _ (when-not (map? tasks)
-            (throw (ex-info ":tasks must be a map" {})))
-        known-dependency (some #(when (contains? deps %) %) known-coordinates)
-        desired-task (task-spec config)
-        _ (when (and (contains? tasks 'secrets)
-                     (not= (get tasks 'secrets) desired-task))
-            (throw (ex-info "bb.edn already has a conflicting secrets task"
-                            {:task 'secrets})))
-        add-dependency? (nil? known-dependency)
-        source-with-dependency
-        (if add-dependency?
-          (if (contains? bb :deps)
-            (add-nested-entry original
-                              :deps
-                              (ffirst default-dependency)
-                              (val (first default-dependency)))
-            (add-root-entry original :deps default-dependency))
-          original)
-        [_ parsed-source-with-dependency] (parse-bb source-with-dependency)
-        add-task? (not (contains? tasks 'secrets))
-        final-source
-        (if add-task?
-          (if (contains? parsed-source-with-dependency :tasks)
-            (add-nested-entry source-with-dependency :tasks 'secrets desired-task)
-            (add-root-entry source-with-dependency :tasks {'secrets desired-task}))
-          source-with-dependency)]
-    {:content final-source
-     :changed? (not= original final-source)
-     :dependency (or known-dependency (ffirst default-dependency))
-     :added-dependency? add-dependency?
-     :added-task? add-task?}))
+  "Merge the generated `secrets` task, and whatever bb.edn needs to load this
+  library, without reformatting existing content. With `owner` `:bb.edn` (the
+  default) a known coordinate is retained and a missing one is added. With
+  `:deps.edn` no coordinate is added; bb.edn instead gets a `:local/root \".\"`
+  dependency on the project, unless one is already there, so Babashka reads
+  the coordinate from deps.edn. Task conflicts fail."
+  ([source config] (merge-bb-edn source config :bb.edn))
+  ([source config owner]
+   (let [original (or source "{}\n")
+         [_ bb] (parse-edn-map original "bb.edn")
+         deps (deps-map bb "bb.edn")
+         tasks (get bb :tasks {})
+         _ (when-not (map? tasks)
+             (throw (ex-info ":tasks in bb.edn must be a map" {:file "bb.edn"})))
+         known (known-dependency deps)
+         desired-task (task-spec config)
+         _ (when (and (contains? tasks 'secrets)
+                      (not= (get tasks 'secrets) desired-task))
+             (throw (ex-info "bb.edn already has a conflicting secrets task"
+                             {:task 'secrets})))
+         add-dependency? (and (= owner :bb.edn) (nil? known))
+         add-self? (and (= owner :deps.edn) (not (some self-dependency? deps)))
+         entry (cond add-dependency? default-dependency
+                     add-self? (self-dependency (:app config)))
+         source-with-dependency
+         (if entry
+           (if (contains? bb :deps)
+             (add-nested-entry original "bb.edn" :deps (ffirst entry) (val (first entry)))
+             (add-root-entry original "bb.edn" :deps entry))
+           original)
+         [_ parsed-source-with-dependency] (parse-edn-map source-with-dependency "bb.edn")
+         add-task? (not (contains? tasks 'secrets))
+         final-source
+         (if add-task?
+           (if (contains? parsed-source-with-dependency :tasks)
+             (add-nested-entry source-with-dependency "bb.edn" :tasks 'secrets desired-task)
+             (add-root-entry source-with-dependency "bb.edn" :tasks {'secrets desired-task}))
+           source-with-dependency)]
+     {:content final-source
+      :changed? (not= original final-source)
+      :owner owner
+      :dependency (or known (ffirst default-dependency))
+      :added-dependency? add-dependency?
+      :added-self-dependency? add-self?
+      :added-task? add-task?})))
+
+(defn merge-deps-edn
+  "Make deps.edn declare this library without reformatting existing content.
+  A known coordinate already there is kept as is."
+  [source]
+  (let [[_ edn] (parse-edn-map source "deps.edn")
+        known (known-dependency (deps-map edn "deps.edn"))
+        content (cond
+                  known source
+                  (contains? edn :deps)
+                  (add-nested-entry source "deps.edn" :deps
+                                    (ffirst default-dependency)
+                                    (val (first default-dependency)))
+                  :else (add-root-entry source "deps.edn" :deps default-dependency))]
+    {:content content
+     :changed? (not= source content)
+     :dependency (or known (ffirst default-dependency))
+     :added-dependency? (nil? known)}))
+
+(defn integration-plan
+  "Decide which file owns this library's coordinate, then merge each file.
+
+  Without a deps.edn, bb.edn owns the coordinate. With one, deps.edn owns it
+  and bb.edn reaches it through a `:local/root \".\"` dependency on the
+  project, so the coordinate is declared once and the JVM application and
+  the Babashka task load the same version. A bb.edn that already declares
+  the coordinate keeps owning it, because a project may run the task without
+  needing the library at runtime. Both files declaring it is refused."
+  [bb-source deps-source config]
+  (let [bb-declares? (declares-library? (or bb-source "{}\n") "bb.edn")
+        deps-declares? (and (some? deps-source) (declares-library? deps-source "deps.edn"))]
+    (cond
+      (and bb-declares? deps-declares?)
+      (throw (ex-info (str "bb.edn and deps.edn both declare this library. Keep the "
+                           "coordinate in deps.edn and let bb.edn reach it through the "
+                           "project itself: {:deps "
+                           (binding [*print-namespace-maps* false]
+                             (pr-str (self-dependency (:app config))))
+                           "}")
+                      {:files ["bb.edn" "deps.edn"]}))
+
+      (or (nil? deps-source) bb-declares?)
+      {:owner :bb.edn
+       :bb-edn (merge-bb-edn bb-source config :bb.edn)}
+
+      :else
+      {:owner :deps.edn
+       :deps-edn (merge-deps-edn deps-source)
+       :bb-edn (merge-bb-edn bb-source config :deps.edn)})))
+
+(defn- manual-integration
+  "What to paste where, as `[file snippet]` pairs with the owner first."
+  [{:keys [owner deps-edn]} config]
+  (let [task {'secrets (task-spec config)}]
+    (case owner
+      :bb.edn [["bb.edn" {:deps default-dependency :tasks task}]]
+      :deps.edn (cond-> []
+                  (:added-dependency? deps-edn) (conj ["deps.edn" {:deps default-dependency}])
+                  true (conj ["bb.edn" {:deps (self-dependency (:app config)) :tasks task}])))))
 
 ;;;; Trusted Ancestry
 ;;; Babashka cannot reach `SecureDirectoryStream`, so openat-style anchoring is
@@ -382,17 +483,27 @@
   Returns `:changes`, the entries to write, and `:actions`, one `:path` and
   `:action` (`:create`, `:merge`, `:preserve`, or `:unchanged`) per proposed
   file so every one of them stays auditable. Neither retains the existing
-  contents of a file it is about to replace."
+  contents of a file it is about to replace. `:owner` names the file that
+  declares this library's coordinate (see [[integration-plan]]) and `:manual`
+  holds the snippets a manual integration would paste."
   [{:keys [root layout team?] :as opts}]
   (let [root (or root ".")
         config (proposed-config opts)
         normalized (cli/normalize-config config)
-        bb-file (io/file root "bb.edn")
-        merged (merge-bb-edn (when (.exists bb-file) (slurp bb-file)) config)
+        source (fn [name]
+                 (let [file (io/file root name)]
+                   (when (.exists file) (slurp file))))
+        plan (integration-plan (source "bb.edn") (source "deps.edn") config)
         raw (into
-             [{:path "bb.edn"
-               :content (:content merged)
-               :replace? true}]
+             (cond-> []
+               (:deps-edn plan)
+               (conj {:path "deps.edn"
+                      :content (get-in plan [:deps-edn :content])
+                      :replace? true})
+               true
+               (conj {:path "bb.edn"
+                      :content (get-in plan [:bb-edn :content])
+                      :replace? true}))
              (for [[path content] (scaffold-files {:layout layout :team? team?})
                    :let [file (io/file root path)
                          exists? (.exists file)]]
@@ -447,6 +558,8 @@
                         raw)]
       {:config config
        :normalized-config normalized
+       :owner (:owner plan)
+       :manual (manual-integration plan config)
        :actions (mapv #(select-keys % [:path :action]) planned)
        :changes (filterv (comp write-actions :action) planned)})))
 
@@ -826,8 +939,9 @@
         (binding [*print-namespace-maps* false
                   *print-length* nil
                   *print-level* nil]
-          (pprint/pprint {:deps default-dependency
-                          :tasks {'secrets (task-spec (:config proposal))}}))
+          (doseq [[file snippet] (:manual proposal)]
+            (println (str file ":"))
+            (pprint/pprint snippet)))
         (assoc result :status :manual))
 
       :cancel
