@@ -158,16 +158,32 @@
 
 ;;;; Symbols and configurations
 
-(defspec self-dependency-is-a-symbol-every-reader-accepts 200
-  (prop/for-all [app g/text]
+(def ^:private plain-app-name
+  "An app name the initializer accepts: a letter, then letters, digits, dots,
+  hyphens, or underscores."
+  (gen/let [head gen/char-alpha
+            tail (gen/vector (gen/one-of [gen/char-alphanumeric (gen/elements [\- \_ \.])])
+                             0 15)]
+    (str/join (cons head tail))))
+
+(defspec self-dependency-is-the-app-name-as-a-symbol 200
+  (prop/for-all [app plain-app-name]
     (let [dependency (init/self-dependency app)
           [sym coordinate] (first dependency)]
       (and (= 1 (count dependency))
            (= {:local/root "."} coordinate)
-           (symbol? sym)
-           (= (name sym) (namespace sym))
-           (some? (re-matches #"[A-Za-z_][A-Za-z0-9_-]*" (name sym)))
+           (= app (name sym) (namespace sym))
            (= dependency (edn/read-string (pr-str dependency)))))))
+
+(defspec self-dependency-refuses-a-name-that-is-not-plain 200
+  (prop/for-all [app (gen/such-that #(not (re-matches #"[A-Za-z][A-Za-z0-9._-]*" %))
+                                    g/text
+                                    100)]
+    (try
+      (init/self-dependency app)
+      false
+      (catch clojure.lang.ExceptionInfo e
+        (str/includes? (ex-message e) "plain name")))))
 
 (def ^:private name-text
   (gen/fmap str/join
@@ -200,7 +216,7 @@
   (gen/vector (gen/elements ["--team" "--keygen" "--apply" "--show-contents"]) 0 4))
 
 (defspec parse-args-reads-back-the-options-it-was-given 100
-  (prop/for-all [app argument-text
+  (prop/for-all [app plain-app-name
                  env argument-text
                  layout (gen/elements ["tracked" "disposable"])
                  flags init-flags]

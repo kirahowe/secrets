@@ -42,6 +42,18 @@
    :show-contents :show-contents?
    :help :help?})
 
+(def ^:private plain-app-name #"[A-Za-z][A-Za-z0-9._-]*")
+
+(defn- require-plain-app-name!
+  "An app name is a plain identifier: it becomes a directory name under
+  `~/.config`, the manifest's `:app` gate, and the bb.edn key that points
+  Babashka at the project's deps.edn, so it has to read as a symbol as is."
+  [app]
+  (when-not (and (string? app) (re-matches plain-app-name app))
+    (throw (ex-info (str "--app must be a plain name: letters, digits, dots, hyphens, or "
+                         "underscores, starting with a letter (got " (pr-str app) ")")
+                    {:app app}))))
+
 (defn parse-args
   "Parse initializer options, including standalone `-h` and `--help`."
   [args]
@@ -55,9 +67,10 @@
                             m))
                         (apply dissoc parsed (keys boolean-option-names))
                         boolean-option-names)]
-    (when-not (or (:help? opts)
-                  (and (string? (:app opts)) (not (str/blank? (:app opts)))))
-      (throw (ex-info "--app <name> is required" {})))
+    (when-not (:help? opts)
+      (when-not (and (string? (:app opts)) (not (str/blank? (:app opts))))
+        (throw (ex-info "--app <name> is required" {})))
+      (require-plain-app-name! (:app opts)))
     opts))
 
 (defn proposed-config
@@ -142,14 +155,11 @@
 
 (defn self-dependency
   "The bb.edn dependency that puts the project's own deps.edn on Babashka's
-  classpath: `{myapp/myapp {:local/root \".\"}}`. The key is the app name
-  reduced to symbol-safe characters, so the entry says what it is."
+  classpath: `{myapp/myapp {:local/root \".\"}}`, keyed by the app name so
+  the entry says what it is."
   [app]
-  (let [word (-> (str app)
-                 (str/replace #"[^A-Za-z0-9_-]+" "-")
-                 (str/replace #"^-+|-+$" ""))
-        word (if (re-find #"^[A-Za-z_]" word) word (str "app-" word))]
-    {(symbol word word) {:local/root "."}}))
+  (require-plain-app-name! app)
+  {(symbol app app) {:local/root "."}})
 
 (defn- self-dependency? [[_ coordinate]]
   (and (map? coordinate) (= "." (:local/root coordinate))))

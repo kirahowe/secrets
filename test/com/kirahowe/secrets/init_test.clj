@@ -251,11 +251,18 @@
             "{:deps {com.kirahowe/secrets {:mvn/version \"0.1.0\"}}}\n"
             config))))))
 
-(deftest self-dependency-key-is-a-readable-symbol-test
-  (are [app expected] (= {expected {:local/root "."}} (init/self-dependency app))
-    "myapp" 'myapp/myapp
-    "my app!" 'my-app/my-app
-    "9lives" 'app-9lives/app-9lives))
+(deftest app-name-must-read-as-a-symbol-test
+  (testing "the self dependency is keyed by the app name as is"
+    (is (= {'my-app.v2/my-app.v2 {:local/root "."}} (init/self-dependency "my-app.v2"))))
+  (testing "a name that would not read back as a symbol is refused up front"
+    (doseq [app ["my app!" "9lives" "-app" "app/x"]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"plain name"
+                            (init/self-dependency app))))
+    ;; A dash-leading value never reaches the check: babashka.cli reads it as
+    ;; the next option and reports the missing --app value instead.
+    (doseq [app ["my app!" "9lives" "app/x"]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"plain name"
+                            (init/parse-args ["--app" app]))))))
 
 (deftest deps-edn-project-previews-and-applies-both-files-test
   (spit (io/file *dir* "deps.edn") "{:deps {org.clojure/clojure {:mvn/version \"1.12.4\"}}}\n")
