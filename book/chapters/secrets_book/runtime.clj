@@ -70,11 +70,15 @@
 (secrets/get-secret loaded :missing/key "fallback")
 
 ;; `loaded` is an ordinary immutable map.
-;; If you use Integrant, the component that provides it is one `defmethod`:
+;; If you use Integrant, the component that provides it is one `defmethod`.
+;; Both the resource name and the app name come from the component's config,
+;; so the code holds no literal of its own:
 
 ;; ```clojure
-;; (defmethod ig/init-key ::secrets [_ {:keys [resource]}]
-;;   (secrets/load-secrets (io/resource resource) {:app "myapp"}))
+;; {::secrets {:resource "secrets.edn.age" :app "myapp"}}
+;;
+;; (defmethod ig/init-key ::secrets [_ {:keys [resource app]}]
+;;   (secrets/load-secrets (io/resource resource) {:app app}))
 ;; ```
 
 ;; The [integrant-service example](https://github.com/kirahowe/secrets/tree/main/examples/integrant-service) is a complete HTTP

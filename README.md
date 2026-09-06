@@ -478,11 +478,14 @@ with no resolvable identity throws (listing your options) rather than silently
 reading some other app's key. Passing `{:app "myapp"}` gives you the local
 default *and* still lets the env vars win in production.
 
-An Integrant `init-key` is two lines:
+An Integrant `init-key` is two lines. Both the resource name and the app name
+come from the component's config, so the code holds no literal of its own:
 
 ```clojure
-(defmethod ig/init-key ::secrets [_ {:keys [resource]}]
-  (secrets/load-secrets (io/resource resource) {:app "myapp"}))
+{::secrets {:resource "secrets.edn.age" :app "myapp"}}
+
+(defmethod ig/init-key ::secrets [_ {:keys [resource app]}]
+  (secrets/load-secrets (io/resource resource) {:app app}))
 ```
 
 ### Source provenance: local only
