@@ -275,10 +275,12 @@ nothing, when the key or the file doesn't exist. `<key>` is a keyword
 (`:some/key`) or a vector path (`[:a :b]`) for both commands, and both
 refresh the manifest like every other write.
 
-Two shell habits undo the argument-free design. Typing the literal value into
-`printf` at an interactive shell records it in that shell's history, so use
-the prompt there. `set -x` prints every expanded command to stderr before
-running it, value included, so turn tracing off around that line.
+Two things can still expose the value. If you type the value itself into a
+`printf` command at an interactive shell, the shell saves that command, value
+included, in its history. Use the prompt instead. If shell tracing (`set -x`)
+is on, the shell prints each command with its variables expanded before
+running it, so the value appears in the trace output. Turn tracing off before
+the `set` line and back on after it.
 
 Runnable starter projects for each application shape, from a Babashka script
 to an Integrant service and a team with keyless CI, are listed under
