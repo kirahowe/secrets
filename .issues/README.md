@@ -23,8 +23,12 @@ established, so the repository finding remains Conditional Medium.
 
 ## Open
 
-There are no open alpha backlog items. The unconditional gate and conditional
-source-contract decision are satisfied.
+The alpha backlog is clear: the unconditional gate and conditional
+source-contract decision are satisfied. One post-review item remains open.
+
+| Issue | Problem |
+| --- | --- |
+| [035 — Scaffold the running version](035-scaffold-the-running-version.md) | The initializer pins the previous tagged release, so a project can never be bootstrapped at the version that bootstrapped it. |
 
 ## Completed
 
