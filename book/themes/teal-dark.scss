@@ -1,2 +1,8 @@
 /*-- scss:defaults --*/
 $green: #64d1dd;
+
+// Quarto keeps Bootstrap's light-gray inline-code background under darkly and
+// only re-tints code inside p, li and td. Anywhere else, headings included,
+// darkly's inherited white text lands on that light gray and disappears. A
+// translucent white lifts the code off whatever surface it sits on.
+$code-bg: rgba(255, 255, 255, 0.1);
