@@ -24,11 +24,8 @@ established, so the repository finding remains Conditional Medium.
 ## Open
 
 The alpha backlog is clear: the unconditional gate and conditional
-source-contract decision are satisfied. One post-review item remains open.
-
-| Issue | Problem |
-| --- | --- |
-| [035 — Scaffold the running version](035-scaffold-the-running-version.md) | The initializer pins the previous tagged release, so a project can never be bootstrapped at the version that bootstrapped it. |
+source-contract decision are satisfied, and the post-review item 035 is
+resolved. Nothing is open.
 
 ## Completed
 
@@ -68,3 +65,4 @@ source-contract decision are satisfied. One post-review item remains open.
 | [032 — Enforce strict base64 identity input](032-enforce-strict-base64-identity-input.md) | Required canonical standard base64 after removing only documented ASCII whitespace, before any identity materialization. |
 | [033 — Audit build dependency advisories](033-audit-build-dependency-advisories.md) | Patched affected tooling-only graphs and added one reproducible exact-coordinate advisory gate across every project alias. |
 | [034 — Publish security reporting path](034-security-reporting-path.md) | Published a GitHub-recognized security policy with a private reporting route, supported-version scope, and coordinated-disclosure process. |
+| [035 — Scaffold the running version](035-scaffold-the-running-version.md) | Made the initializer pin the checkout it runs from, tag and commit at a release tag and the commit alone elsewhere, or the Maven version from the jar, and dropped the stored commit and its release guard. |
