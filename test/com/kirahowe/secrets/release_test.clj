@@ -228,26 +228,6 @@
       (.delete (io/file dir "CHANGELOG.md"))
       (is (false? (:changelog-exists? (refusal #(release/changelog-entry! {:dir dir}))))))))
 
-;;;; The scaffolded git coordinate
-
-(deftest git-coordinate-requires-the-pinned-tag-to-name-the-pinned-commit-test
-  (let [dir (repo!)
-        commit (git! dir "rev-parse" "HEAD")
-        pin {:lib 'io.github.kirahowe/secrets :tag "v0.1.0" :sha commit}
-        zeros (str/join (repeat 40 "0"))]
-    (testing "a pin whose tag names its commit passes and is returned"
-      (is (= pin (release/git-coordinate! {:dir dir :git pin}))))
-    (testing "a pin recording a commit the tag does not name is refused"
-      (let [{:keys [reason expected found]}
-            (refusal #(release/git-coordinate! {:dir dir :git (assoc pin :sha zeros)}))]
-        (is (= ::release/pinned-sha-mismatch reason))
-        (is (= commit expected))
-        (is (= zeros found))))
-    (testing "a pin naming a tag that does not exist is refused"
-      (is (= ::release/missing-pinned-tag
-             (:reason (refusal #(release/git-coordinate!
-                                 {:dir dir :git (assoc pin :tag "v9.9.9")}))))))))
-
 ;;;; The verified source snapshot
 
 (deftest verified-source-exports-the-tag-not-the-worktree-test

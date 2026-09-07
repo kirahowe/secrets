@@ -35,14 +35,18 @@ Check: `bb.edn` + `secrets/secrets.edn.example` created, key at
 `~/.config/verifydemo/key.txt` mode 0600, public key printed with backup
 warning.
 
-**Release-critical:** the scaffolded `bb.edn` pins a `:git/tag`/`:git/sha`.
-Confirm that tag exists on the GitHub remote AND is (or will be, as part of
-this release) a version whose CLI matches the current README — an older pin
-means users get commands like `doctor` documented but missing.
+**Release-critical:** the scaffolded `bb.edn` pins the commit `<checkout>` is
+at: `{:git/tag "v<version>" :git/sha <HEAD>}` when HEAD is the release tag and
+`{:git/sha <HEAD>}` otherwise. Confirm the sha is `git rev-parse HEAD` and,
+for a release, that the tag is present; the preview names the coordinate and
+says when the commit is not a tag. A consumer resolves the pin from GitHub, so
+an unpushed commit cannot be exercised as written.
 
-Exercise the pinned version once (`bb secrets set` / `verify`), then edit
-the consumer's `bb.edn` dep to `{:local/root "<checkout>"}` so every later
-phase tests the current code.
+Exercise the pin once (`bb secrets set` / `verify`) if the commit is pushed.
+Otherwise run those commands with
+`-Sdeps '{:deps {io.github.kirahowe/secrets {:local/root "<checkout>"}}}'`,
+which overrides the coordinate for that invocation. Either way, every phase
+tests the current code.
 
 **JVM project variant:** in a second scratch dir, write a `deps.edn` with any
 dependency, then run the same two commands. Check: `deps.edn` gained the
@@ -51,12 +55,15 @@ pinned coordinate at the top level with its comments intact; `bb.edn` has
 library coordinate; and `bb secrets --help` runs, which proves Babashka
 resolves the coordinate through `deps.edn`.
 
-## Phase 2 — migration from the previously pinned release
+## Phase 2 — migration from v0.1.0
 
-If Phase 1's pinned release wrote a `:version 1` manifest: current `verify`
-must report it as unsupported with a message naming
-`bb secrets reencrypt <env>`; running that must rewrite the manifest to
-`:version 2`, after which `verify` and `doctor` both exit 0.
+Put a `v0.1.0` checkout of the library on the consumer's classpath
+(`git worktree add <dir> v0.1.0`, then the `-Sdeps` `:local/root` override
+above pointing at it) and run `bb secrets set` so the store carries a
+`:version 1` manifest. Back on the current code, `verify` must report it as
+unsupported with a message naming `bb secrets reencrypt <env>`; running that
+must rewrite the manifest to `:version 2`, after which `verify` and `doctor`
+both exit 0.
 
 ## Phase 3 — CLI surface (current code)
 
@@ -137,4 +144,4 @@ Each example must run with its own README's commands and leave nothing behind:
 
 - Remove `~/.config/<app>/` and the scratch dir.
 - Report: each phase pass/fail, README promises that didn't hold, and any
-  release-critical items (e.g. the initializer's pinned tag).
+  release-critical items (e.g. a pin whose commit is not yet pushed).

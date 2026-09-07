@@ -83,8 +83,9 @@ an explicit classpath. (A `:local/root` does not resolve inside a remote Docker
 build, where the sibling isn't in the build context):
 
 ```clojure
-;; git
-io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}
+;; git: a release tag and the commit it names. The initializer fills the commit
+;; in; by hand, `git rev-parse v0.1.0` in a checkout prints it.
+io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "<commit the tag names>"}
 ;; or Maven, after `clojure -T:build install` locally or a Clojars release (see
 ;; [Releasing](#releasing) — nothing is published yet)
 com.kirahowe/secrets {:mvn/version "0.1.0"}
@@ -108,6 +109,11 @@ bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
 
 Use the same launcher with `-h` or `--help` to see the initializer's readable
 usage and option list without supplying `--app`.
+
+The dependency it writes is the commit that checkout is at, so the project runs
+the code that initialized it: `:git/tag` and `:git/sha` at a release tag, a bare
+`:git/sha` anywhere else. The preview names the coordinate. A commit that is not
+a release tag has to be pushed before another machine can resolve it.
 
 The initializer proposes a minimal `dev` store, names every file it would
 create, merge, or leave alone, and then offers to apply it, print the
@@ -154,13 +160,13 @@ bb secrets verify
 ```
 
 For comparison, the minimum configuration the initializer adds is the same
-manual wiring shown below. Use this directly when you choose the initializer's
-"manual" option or need a layout it should not infer:
+manual wiring shown below, with the commit filled in. Use this directly when you
+choose the initializer's "manual" option or need a layout it should not infer:
 
 ```clojure
 {:deps  {io.github.kirahowe/secrets
          {:git/tag "v0.1.0"
-          :git/sha "89ded34ce8bd146754cc3ec9971d1ea1fd25da28"}}
+          :git/sha "<commit the tag names>"}}
  :tasks {secrets
          {:doc      "Manage encrypted secrets (age)"
           :requires ([com.kirahowe.secrets.cli :as secrets-cli])
@@ -1165,11 +1171,13 @@ bytes that get published.
 
 1. Write the `CHANGELOG.md` entry under a `## [<version>]` heading and commit it.
    The version lives in exactly one place, `src/com/kirahowe/secrets/coordinate.edn`,
-   beside the Maven coordinate and the git tag the initializer scaffolds. The
-   release guards read that file from the repository and the initializer reads
-   it as a classpath resource, and the tag, jar name, pom, embedded
-   `pom.properties`, CHANGELOG heading, and the coordinates this README shows
-   are all checked against it rather than maintained beside it.
+   beside the two names the library is declared under. The release guards read
+   that file from the repository and the initializer reads it as a classpath
+   resource, and the tag, jar name, pom, embedded `pom.properties`, CHANGELOG
+   heading, and the coordinates this README shows are all checked against it
+   rather than maintained beside it. No commit is written there: the
+   initializer pins the checkout it runs from, and tagging the release is what
+   puts the tag into scaffolded projects.
 2. Tag that commit `v<version>` and push the tag.
 3. The `release` workflow takes over: it is restricted to the protected
    `release` GitHub environment, builds from the tag, inspects the artifact, and
@@ -1186,8 +1194,7 @@ clojure -M:deploy          # uploads exactly the files named in the receipt
 
 `release` refuses a working tree with modified *or untracked* files, a `HEAD`
 that is not exactly the tag naming the declared version (a descendant of the tag
-is a refusal, not a pass), a version the CHANGELOG does not document, and a
-scaffolded git pin whose tag does not name the commit it records. It
+is a refusal, not a pass), and a version the CHANGELOG does not document. It
 then exports the tag with `git worktree` and builds from that snapshot, so
 nothing that changes after the guards pass can reach the jar. The artifact must
 name the version in its file name, in both embedded Maven descriptors, and as

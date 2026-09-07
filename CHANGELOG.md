@@ -176,12 +176,17 @@ All notable changes to this project are documented here. The format follows
 ### Changed
 - The library's coordinates are written in one file,
   `src/com/kirahowe/secrets/coordinate.edn`: the release version, the Maven
-  coordinate, and the git tag and commit the initializer scaffolds. The release
-  guards read it from the repository and the initializer reads it as a
-  classpath resource, so the version a release checks and the pin a scaffolded
-  project receives can no longer be edited apart. `clojure -T:build release`
-  also refuses a pin whose tag does not name the commit it records, and a test
-  holds the README's copies of both coordinates to the same file.
+  coordinate, and the name the library is declared under as a git dependency.
+  The release guards read it from the repository and the initializer reads it
+  as a classpath resource, so the version a release checks and the version a
+  scaffolded project receives can no longer be edited apart. A test holds the
+  README's copies of both coordinates to the same file.
+- The initializer pins the library that is running instead of a commit copied
+  into a file, which could only ever name the release before it. From a source
+  checkout it writes that checkout's `HEAD`, with the release tag when the tag
+  names it; from the published jar it writes the Maven version. The preview
+  names the coordinate and says when the commit is not a release tag, since a
+  consumer can resolve such a pin only once it is pushed.
 - Publication runs on a classpath of its own, and no longer resolves a
   deployment library at all. `clojure -M:deploy` (`bb deploy`) replaces
   `clojure -T:build deploy`: a new `:deploy` alias whose `:replace-deps` and

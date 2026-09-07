@@ -3,6 +3,7 @@
   (:require [babashka.cli :as bbcli]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.java.shell :as sh]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [com.kirahowe.secrets.cli :as cli]
@@ -22,25 +23,76 @@
   release guards, so what the initializer scaffolds is what a release checks."
   "com/kirahowe/secrets/coordinate.edn")
 
-(defn- read-coordinates []
-  (let [resource (io/resource coordinate-resource)]
-    (when-not resource
+(defn- coordinate-url
+  "Where [[coordinate-resource]] was loaded from, which also says where the
+  running library is: a `file:` URL inside a source checkout, or a `jar:` URL
+  inside a Maven artifact."
+  []
+  (or (io/resource coordinate-resource)
       (throw (ex-info (str "The initializer cannot find " coordinate-resource
                            " on the classpath; the library's source tree is incomplete.")
-                      {:resource coordinate-resource})))
-    (edn/read-string (slurp resource))))
+                      {:resource coordinate-resource}))))
 
-(def ^:private coordinates (read-coordinates))
+(def ^:private coordinates (edn/read-string (slurp (coordinate-url))))
 
 (def ^:private known-coordinates
   "Either name a project may already declare this library under."
-  #{(:lib coordinates) (get-in coordinates [:git :lib])})
+  #{(:lib coordinates) (:git-lib coordinates)})
+
+(defn- git
+  "Runs `git` with the argv `args` in `dir`, returning `clojure.java.shell/sh`'s
+  result map. A `git` that cannot be started answers like one that failed, so
+  the caller sees one shape."
+  [dir & args]
+  (try
+    (apply sh/sh "git" (concat args [:dir dir]))
+    (catch java.io.IOException e
+      {:exit 127 :out "" :err (ex-message e)})))
+
+(defn- git!
+  "Runs `git` through the runner `run` and returns its trimmed stdout, throwing
+  when it fails."
+  [run dir & args]
+  (let [{:keys [exit out err]} (apply run dir args)]
+    (when-not (zero? exit)
+      (throw (ex-info (str "The initializer pins the commit of the checkout it runs from, but "
+                           "`git " (str/join " " args) "` failed in " dir ": " (str/trim err)
+                           ". Run it from a git clone of the library, or add the dependency "
+                           "by hand.")
+                      {:dir (str dir) :args (vec args) :exit exit})))
+    (str/trim out)))
+
+(defn library-dependency
+  "The dependency that resolves to the library that is running, as the single
+  `{lib coordinate}` entry a project's `:deps` needs, given the `url` its
+  coordinate resource was loaded from.
+
+  A `file:` URL is a source checkout, and the coordinate is that checkout's
+  `HEAD`: `{:git/tag \"v<version>\" :git/sha <commit>}` when the release tag
+  names it, and `{:git/sha <commit>}` otherwise. tools.deps wants the commit
+  beside a tag, and no commit can record its own hash, so asking git is how the
+  initializer writes the version that is running rather than the one before it.
+  A checkout under `~/.gitlibs` is a git worktree and answers the same way. Any
+  other URL is the jar of a Maven artifact, and the version the resource
+  declares is the version that jar was built from.
+
+  `run` executes a git argv in a directory and returns `clojure.java.shell/sh`'s
+  map. It is a parameter so each shape can be tested without a repository."
+  [^java.net.URL url {:keys [lib git-lib version]} run]
+  (if (= "file" (.getProtocol url))
+    (let [dir (.getParentFile (io/file url))
+          commit (git! run dir "rev-parse" "HEAD")
+          tags (set (str/split-lines (git! run dir "tag" "--points-at" "HEAD")))
+          tag (str "v" version)]
+      {git-lib (if (contains? tags tag)
+                 {:git/tag tag :git/sha commit}
+                 {:git/sha commit})})
+    {lib {:mvn/version version}}))
 
 (def ^:private default-dependency
-  "What a project that declares neither gets: the last released git tag, until
-  a Maven artifact exists to point at instead."
-  (let [{:keys [lib tag sha]} (:git coordinates)]
-    {lib {:git/tag tag :git/sha sha}}))
+  "What a project that declares neither name gets: the library that is running,
+  located once per run and only when a plan needs it."
+  (delay (library-dependency (coordinate-url) coordinates git)))
 
 (def ^:private init-spec
   [[:app {:coerce :string :desc "Application name"}]
@@ -207,7 +259,7 @@
                              {:task 'secrets})))
          add-dependency? (and (= owner :bb.edn) (nil? known))
          add-self? (and (= owner :deps.edn) (not (some self-dependency? deps)))
-         entry (cond add-dependency? default-dependency
+         entry (cond add-dependency? @default-dependency
                      add-self? (self-dependency (:app config)))
          source-with-dependency
          (if entry
@@ -226,7 +278,7 @@
      {:content final-source
       :changed? (not= original final-source)
       :owner owner
-      :dependency (or known (ffirst default-dependency))
+      :dependency (or known (ffirst @default-dependency))
       :added-dependency? add-dependency?
       :added-self-dependency? add-self?
       :added-task? add-task?})))
@@ -241,12 +293,12 @@
                   known source
                   (contains? edn :deps)
                   (add-nested-entry source "deps.edn" :deps
-                                    (ffirst default-dependency)
-                                    (val (first default-dependency)))
-                  :else (add-root-entry source "deps.edn" :deps default-dependency))]
+                                    (ffirst @default-dependency)
+                                    (val (first @default-dependency)))
+                  :else (add-root-entry source "deps.edn" :deps @default-dependency))]
     {:content content
      :changed? (not= source content)
-     :dependency (or known (ffirst default-dependency))
+     :dependency (or known (ffirst @default-dependency))
      :added-dependency? (nil? known)}))
 
 (defn integration-plan
@@ -285,9 +337,9 @@
   [{:keys [owner deps-edn]} config]
   (let [task {'secrets (task-spec config)}]
     (case owner
-      :bb.edn [["bb.edn" {:deps default-dependency :tasks task}]]
+      :bb.edn [["bb.edn" {:deps @default-dependency :tasks task}]]
       :deps.edn (cond-> []
-                  (:added-dependency? deps-edn) (conj ["deps.edn" {:deps default-dependency}])
+                  (:added-dependency? deps-edn) (conj ["deps.edn" {:deps @default-dependency}])
                   true (conj ["bb.edn" {:deps (self-dependency (:app config)) :tasks task}])))))
 
 ;;;; Trusted Ancestry
@@ -514,8 +566,10 @@
   `:action` (`:create`, `:merge`, `:preserve`, or `:unchanged`) per proposed
   file so every one of them stays auditable. Neither retains the existing
   contents of a file it is about to replace. `:owner` names the file that
-  declares this library's coordinate (see [[integration-plan]]) and `:manual`
-  holds the snippets a manual integration would paste."
+  declares this library's coordinate (see [[integration-plan]]), `:added-dependency`
+  is the `{lib coordinate}` entry the plan declares there, or nil when the
+  project already declares one, and `:manual` holds the snippets a manual
+  integration would paste."
   [{:keys [root layout team?] :as opts}]
   (let [root (or root ".")
         config (proposed-config opts)
@@ -589,6 +643,9 @@
       {:config config
        :normalized-config normalized
        :owner (:owner plan)
+       :added-dependency (when (or (get-in plan [:bb-edn :added-dependency?])
+                                   (get-in plan [:deps-edn :added-dependency?]))
+                           @default-dependency)
        :manual (manual-integration plan config)
        :actions (mapv #(select-keys % [:path :action]) planned)
        :changes (filterv (comp write-actions :action) planned)})))
@@ -768,11 +825,24 @@
     (content-lines path old content)
     (hunk-lines old content)))
 
+(defn- dependency-lines
+  "The coordinate a plan adds, named in full, since a bb.edn hunk redacts the
+  commit as an opaque token. A commit that is not a release tag can be resolved
+  only once it is pushed, and that is said here rather than found out at
+  resolve time."
+  [added-dependency]
+  (when-let [[lib coordinate] (first added-dependency)]
+    (cond-> [(str " Dependency: " lib " "
+                  (binding [*print-namespace-maps* false] (pr-str coordinate)))]
+      (and (:git/sha coordinate) (not (:git/tag coordinate)))
+      (conj (str " That commit is the checkout's HEAD, not a release tag. Push it before"
+                 " another machine resolves this project.")))))
+
 (defn- preview-lines
   "The preview: each path with its action, the body of each change when `mode`
-  shows bodies, and the totals. `current` maps a change's path to what is on
-  disk there now, for the modes that render it."
-  [{:keys [actions changes mode current]}]
+  shows bodies, the totals, and the dependency the plan adds. `current` maps a
+  change's path to what is on disk there now, for the modes that render it."
+  [{:keys [actions changes mode current added-dependency]}]
   (let [bodies (when (not= :summary mode)
                  (into {} (map (juxt :path identity)) changes))]
     (-> ["Secrets initializer preview:"]
@@ -786,6 +856,7 @@
                           actions)
                     (conj (counts-line actions)))
                 [" no project changes are needed."]))
+        (into (dependency-lines added-dependency))
         (conj " Private identities are never created unless --keygen is supplied."))))
 
 (defn- current-content
@@ -804,13 +875,14 @@
   each file, redacted and escaped. `:full` prints whole bodies behind a warning,
   and only because `--show-contents` asked for them. The files a body needs are
   read here, rendered, and let go."
-  [{:keys [root actions changes mode]}]
+  [{:keys [root actions changes mode added-dependency]}]
   (let [mode (or mode :summary)
         current (when (not= :summary mode)
                   (into {}
                         (map (fn [{:keys [path]}] [path (current-content root path)]))
                         changes))]
-    (emit! (preview-lines {:actions actions :changes changes :mode mode :current current}))))
+    (emit! (preview-lines {:actions actions :changes changes :mode mode :current current
+                           :added-dependency added-dependency}))))
 
 (defn- applied-lines [changes]
   (when (seq changes)

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 
 # Bootstrap with this checkout's source because a consumer cannot yet have the
-# dependency wired. After that first command, deliberately run the generated
-# task normally so its pinned Git dependency is resolved like a fresh consumer.
+# dependency wired. The initializer pins the commit this checkout is at, which
+# is asserted below. The generated task then runs with that coordinate
+# overridden to this checkout through -Sdeps, so the consumer half exercises
+# the code under test whether or not the commit has been pushed: resolving the
+# pin from GitHub needs it there, and a pull request's merge commit never is.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+head_commit="$(git -C "${repo_root}" rev-parse HEAD)"
+checkout_override="{:deps {io.github.kirahowe/secrets {:local/root \"${repo_root}\"}}}"
 work_dir="$(mktemp -d)"
 
 cleanup() {
@@ -23,6 +28,15 @@ assert_status() {
     printf '%s\n' "${actual}" >&2
     echo "Expected:" >&2
     printf '%s\n' "${expected}" >&2
+    exit 1
+  fi
+}
+
+assert_pin() {
+  local file="$1"
+  if ! grep -q -F ":git/sha \"${head_commit}\"" "${file}"; then
+    echo "Expected ${file} to pin this checkout's HEAD ${head_commit}, found:" >&2
+    cat "${file}" >&2
     exit 1
   fi
 }
@@ -46,8 +60,10 @@ run_case() {
 
     bb "-Duser.home=${isolated_home}" -cp "${repo_root}/src" -m com.kirahowe.secrets.init \
       --app "initializer-smoke-${layout}" --layout "${layout}" --apply --keygen
-    printf '%s' 'smoke-first-secret' | bb "-Duser.home=${isolated_home}" secrets set :example/api-key
-    bb "-Duser.home=${isolated_home}" secrets verify
+    assert_pin bb.edn
+    printf '%s' 'smoke-first-secret' | bb "-Duser.home=${isolated_home}" \
+      -Sdeps "${checkout_override}" secrets set :example/api-key
+    bb "-Duser.home=${isolated_home}" -Sdeps "${checkout_override}" secrets verify
   )
 
   test -f "${consumer}/bb.edn"

@@ -23,9 +23,9 @@
 
 (def coordinate-file
   "Where the library's coordinates are written, relative to the repository, and
-  the only place they are: the release version, the Maven coordinate, and the
-  git tag and commit the initializer scaffolds. It sits under `src/` so the
-  initializer ships with the same facts these guards check."
+  the only place they are: the release version and the two names the library is
+  declared under. It sits under `src/` so the initializer ships with the same
+  facts these guards check."
   "src/com/kirahowe/secrets/coordinate.edn")
 
 (defn read-coordinates
@@ -70,22 +70,16 @@
   rather than maintained beside it."
   (checked-version (:version coordinates)))
 
-(def git-coordinate
-  "The git coordinate the initializer scaffolds, from [[coordinate-file]]: the
-  last released `:tag`, the `:sha` it names, and the `:lib` it is declared
-  under. See [[git-coordinate!]] for what has to hold between them."
-  (:git coordinates))
-
 (defn release-tag
   "The git tag that must name the release commit for a version."
   ([] (release-tag version))
   ([version] (str "v" (checked-version version))))
 
 (defn- config
-  "Fills in the defaults every guard shares: the repository at `.`, the
-  authoritative [[version]], and the scaffolded [[git-coordinate]]."
+  "Fills in the defaults every guard shares: the repository at `.` and the
+  authoritative [[version]]."
   [opts]
-  (merge {:dir "." :version version :git git-coordinate} opts))
+  (merge {:dir "." :version version} opts))
 
 ;;;; Repository state
 
@@ -155,31 +149,6 @@
                        {:reason ::head-not-tag :dir (str dir) :tag tag
                         :expected commit :found head})))
      {:tag tag :commit commit})))
-
-(defn git-coordinate!
-  "Fails unless the git coordinate the initializer scaffolds resolves in `:dir`:
-  its `:tag` must exist, and the commit that tag names must be its `:sha`.
-  Returns the coordinate.
-
-  This is the last *released* tag, not the release tag for `:version`, and it
-  lags by design, since a commit cannot contain its own hash. What has to hold
-  is that the two halves agree, so a consumer who takes the initializer's pin
-  resolves exactly the tree the tag advertises."
-  ([] (git-coordinate! nil))
-  ([opts]
-   (let [{:keys [dir] pin :git} (config opts)
-         {:keys [tag sha]} pin
-         commit (resolve-tag dir tag)]
-     (when-not commit
-       (throw (ex-info (str "The initializer pins git tag " tag ", which does not exist in "
-                            dir ".")
-                       {:reason ::missing-pinned-tag :dir (str dir) :tag tag})))
-     (when-not (= sha commit)
-       (throw (ex-info (str "The initializer pins " tag " at " sha ", but that tag names "
-                            commit " in " dir ".")
-                       {:reason ::pinned-sha-mismatch :dir (str dir) :tag tag
-                        :expected commit :found sha})))
-     pin)))
 
 (defn changelog-entry!
   "Fails unless `CHANGELOG.md` under `:dir` documents `:version`.

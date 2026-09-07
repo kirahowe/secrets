@@ -99,9 +99,8 @@
   "Builds the release artifact once, from the verified release tag, with a receipt.
 
   Refuses a dirty or untracked working tree, a `HEAD` that is not exactly the
-  tag naming the authoritative version, a version the CHANGELOG does not
-  document, and a scaffolded git pin whose tag does not name the commit it
-  records. The jar is then built from a `git worktree` export of that tag — not
+  tag naming the authoritative version, and a version the CHANGELOG does not
+  document. The jar is then built from a `git worktree` export of that tag — not
   from live files, which can change after the guards pass — its embedded metadata
   and tag are checked against the version, and the jar, the pom that ships beside
   it, the commit, and the jar's SHA-256 are recorded in `target/release.edn` for
@@ -110,7 +109,6 @@
   (release/clean-tree!)
   (let [{:keys [tag commit]} (release/exact-tag!)]
     (release/changelog-entry!)
-    (release/git-coordinate!)
     (clean nil)
     (try
       (release-jar! (release/verified-source!) tag)

@@ -19,7 +19,7 @@
 (def ^:private render-line @#'init/render-line)
 (def ^:private changed-region @#'init/changed-region)
 (def ^:private merge-gitignore @#'init/merge-gitignore)
-(def ^:private default-dependency @#'init/default-dependency)
+(def ^:private default-dependency @@#'init/default-dependency)
 
 ;;;; Escaping
 
