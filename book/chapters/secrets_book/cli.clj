@@ -6,37 +6,19 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]))
 
-;; The management commands are exposed through one Babashka task. Underneath,
-;; they're ordinary Clojure functions that take a config map, return data, and
-;; throw `ex-info` when something goes wrong. You can use the same operations
-;; from a terminal, a REPL, or a script.
+;; The management commands are exposed through one Babashka task. Underneath, they're ordinary Clojure functions that take a config map, return data, and throw `ex-info` when something goes wrong. You can use the same operations from a terminal, a REPL, or a script.
 
-;; ## Let the initializer wire it up
+;; ## `bb init` wires up the task for you
 
-;; The [quick start](secrets_book.quickstart.html) runs the project
-;; initializer once to preview the changes and once with `--apply`. This gives
-;; you a working task definition without having to edit it by hand. This section
-;; covers the other choices the initializer offers.
+;; The [quick start](secrets_book.quickstart.html#set-up-a-projectsecrets_book.quickstart.html) shows how to run the project initializer to install the bb task in your project. It runs in preview mode by default, and running with `--apply` applies the changes it describes. This gives you a working task definition without having to edit it by hand. This section covers the other choices the initializer offers.
 
-;; The default `tracked` layout commits ciphertext and manifests while keeping
-;; the identity under `~/.config/<app>`. The `disposable` layout keeps every
-;; artifact, including its key, under the ignored `.local/secrets` directory.
-;; It's useful for demos and throwaway projects, but it isn't a durable store.
-;; Add `--team` to create a recipients file. Run the initializer with `--help`
-;; for all options.
+;; The default `tracked` layout commits ciphertext and manifests while keeping the identity under `~/.config/<app>`. There's also a `disposable` layout that keeps every artifact, including its key, under the ignored `.local/secrets` directory. It's useful for demos, tests, and throwaway projects but not meant for normal use. Add `--team` to create a recipients file. Run the initializer with `--help`for all options.
 
-;; An interactive preview shows only the regions that changed and redacts
-;; obvious opaque values. Non-interactive runs print paths and actions rather
-;; than complete file bodies. Use `--show-contents` when you need to inspect the
-;; full proposed files. Before applying anything, the initializer checks the
-;; project path's ownership and permissions. If it can't rule out another user
-;; swapping a directory underneath the write, it explains the problem and
-;; leaves the project alone.
+;; An interactive preview shows only the regions that changed and redacts obvious opaque values. Non-interactive runs print paths and actions rather than complete file bodies. Use `--show-contents` when you need to inspect the full proposed files. Before applying anything, the initializer checks the project path's ownership and permissions. If it can't rule out another user swapping a directory underneath the write, it explains the problem and leaves the project alone.
 
 ;; ## The config map
 
-;; The setup starts with a `bb.edn` map from environment names to file
-;; locations:
+;; The setup starts with a `bb.edn` map from environment names to file locations:
 
 ;; ```clojure
 ;; {:app "myapp"
@@ -46,8 +28,7 @@
 ;;   :dev  {:secrets-file "env/dev/resources/secrets.edn.age"}}}
 ;; ```
 
-;; The CLI calls `normalize-config` first. Calling it directly shows the
-;; expanded defaults:
+;; The CLI calls `normalize-config` first. Calling it directly shows the expanded defaults:
 
 (-> {:app "myapp"
      :environments {:prod {:secrets-file "env/prod/resources/secrets.edn.age"}}}
