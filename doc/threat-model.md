@@ -1,204 +1,269 @@
-# Threat model
+# Threat model and design boundaries
 
-This is the decision rule for what belongs in this library. Every defense in the
-code should trace to a named adversary below, or to a named operator mistake. A
-defense that traces to neither gets deleted, however careful it is.
+This is the decision rule for what belongs in this library. It records the
+requirements, trust boundaries, and lessons from the September 2026 architecture
+review. It is a design target, not a claim that the implementation already meets
+every requirement below.
 
-It replaces the reasoning previously spread across the README's "Authenticity
-contract and threat model" section, `SECURITY.md`, and the resolved issues in
-`.issues/`. Those documents described individual defenses well. What they never
-did was say which attacks are out of scope, so nothing ever got removed.
+The library is unreleased and has no users. Compatibility with existing commands,
+formats, options, and identity resolution rules is not a constraint. Ergonomics,
+security, simplicity, maintainability, and correctness are goals. We want useful
+protection against plausible mistakes and named threats, without building a
+subsystem for every hypothetical adversary.
+
+This document owns the threat and design rationale. `SECURITY.md` still owns
+vulnerability reporting and response; it is not replaced by this document.
+
+## The essential problem
+
+- Keep structured application secrets encrypted in version control.
+- Decrypt them into application data using an authorized identity.
+- Let an operator create and update them without exposing plaintext or damaging
+  the usable store.
+- Make changes meaningfully reviewable without decrypting. The committed manifest
+  is a valuable part of the product, not an optional convenience to discard just
+  to reduce code. The intended experience includes added and removed paths, type
+  changes, and value-change indicators for both solo and team use.
+
+Those are requirements. Global caches, arbitrary-file encryption commands,
+automatic editing of existing project configuration, and a particular manifest
+format are implementation or product choices that must justify their cost.
 
 ## What this protects
 
-Three assets, in order of how much damage their loss does:
+- Private age identities, which can decrypt ciphertext addressed to them,
+  including historical versions.
+- Plaintext secret values and any confidential manifest hashing key.
+- The correctness and availability of the stored configuration. A wrong endpoint
+  can leak data or break an application; losing the only usable store is also a
+  failure worth preventing.
 
-1. The private age identity. It decrypts every ciphertext encrypted to it,
-   including every version in git history.
-2. The plaintext secret values.
-3. The correctness of what the application loads. A wrong `:database/url` is a
-   breach even though no secret leaked.
+The application remains responsible for validating the meaning of its own
+configuration. The library cannot decide whether a database URL is the right one.
 
-## Adversaries in scope
+## Trust assumptions
 
-### A1. A reader of the repository who holds no identity
+The deployment process selects an approved configuration artifact and protects
+the route from review to the running application. A repository contribution is
+not automatically an approved deployment. The library provides no sender
+authentication or protection against replay of an older valid artifact.
 
-They have the ciphertext, the manifest, `recipients.txt`, the full source, and
-all of git history. For a public repository this is everyone.
+The operator chooses a trusted working/output directory. The decrypting host,
+application process, and installed `age` binary are trusted. These assumptions
+do not make accidental malformed or oversized input impossible.
 
-This is the adversary the library exists to stop, and the only one it stops by
-cryptography rather than by convention. They must learn nothing beyond the
-manifest's declared shape: key paths, value types, collection sizes.
+## Threats and mistakes in scope
 
-What this justifies:
+### A1. A repository reader without an identity
 
-- age encryption, and never committing plaintext.
-- A manifest that records shape and no values.
-- `:vhash` as an HMAC keyed on private key material. An unkeyed hash of a
-  six-character password is brute-forceable from the repository alone, so the
-  key is what makes the hash safe to commit.
-- The injective encoding in `manifest.clj`. If two different values can produce
-  one `vhash`, the manifest reports "no change" when a value changed, and the
-  review that the manifest exists to enable silently fails.
-- Owner-only permissions on any plaintext the CLI writes to disk.
+They can read ciphertext, manifests, public recipients, source, and git history.
+For a public repository, this is everyone. They must not obtain secret values or
+enough public information to cheaply test guesses of low-entropy values.
 
-### A2. Operator mistake
+Reviewability deliberately discloses metadata: key paths, value types, collection
+sizes, and value equality/change indicators where hashes are present. Ciphertext
+size and committed change history are also visible. Manifest key paths must be
+treated as public metadata; secret values do not belong in map keys.
 
-Not an adversary, and the source of nearly every real incident this tool will
-ever see. It earns first-class standing because it justifies more code than any
-attacker does.
+Age provides encryption. If public value-change indicators use hashes, those
+hashes need a confidential, unpredictable key. Unkeyed hashes of passwords are
+not an acceptable substitute. Deterministic, unambiguous value encoding avoids
+false equality caused by serialization, but a finite hash is not collision-free.
+The current 64-bit truncated HMAC must not be described as an injective hash.
 
-The mistakes worth writing code against are the ones that fail *quietly*:
+The manifest exists for reviewability. Confidentiality constrains how we build
+it; confidentiality alone does not justify the manifest's entire design.
 
-- A CI runner expands a missing or misnamed secret to the empty string, so
-  `SECRETS_AGE_IDENTITY` is set but blank. Falling through to the next source
-  would use the developer's local key and pass on a laptop while the deployment
-  it was meant to configure is broken. Using the value encrypts to nothing and
-  exits zero.
-- A path argument that starts with `-`, or is blank, reaching `age`. age reads a
-  bare `-` as stdin and a blank path as stdin, so the command succeeds and
-  produces a ciphertext of nothing.
-- A `:secrets-file` that does not end in `.age`, so the derived `.manifest` and
-  `.example` names collide with the ciphertext and overwrite it.
-- Two environments configured to write one ciphertext or one manifest.
-- A crash between writing the ciphertext and writing the manifest, leaving the
-  two disagreeing with no plaintext left to rebuild from.
-- A URI where a filesystem path was expected, resolving somewhere the operator
-  did not intend.
-- Trailing junk after the EDN value, silently ignored by a plain reader.
+### A2. Operator mistakes and ordinary failures
 
-Each of these is worth a check that fails loudly. None is worth a subsystem.
+Prefer small checks for failures that would otherwise be silent or destructive:
 
-### A3. Whoever reads the logs
+- A missing CI secret expands to a blank identity setting, and fallback silently
+  selects a different identity.
+- Blank or dash-leading path arguments are interpreted as subprocess options or
+  standard input instead of the intended file.
+- Derived artifact names collide, or environments assign incompatible roles to
+  the same file.
+- An interrupted write damages the only ciphertext, or leaves its manifest stale.
+- A URI is supplied where a local path was expected.
+- A parser ignores trailing input or exposes secret text in its errors.
+- An accidental large file or deeply nested EDN exhausts resources.
+- Invalid manifest metadata silently disables value-change reporting.
 
-Exception messages, stack traces, and CI output travel further than the
-repository does, into log aggregators and error trackers with wider read access.
+Modest byte and nesting bounds remain useful for mistakes. Share their
+implementation and avoid unnecessary configuration modes. A check is not worth
+keeping in its current form just because it can be called a security defense.
 
-In scope: a secret value must never appear in a message, and neither must the
-private key. A parser that echoes the malformed text it rejected can print a
-secret, so failures carry a reason and a location rather than the input.
+### A3. A reader of logs or diagnostics
 
-Out of scope: file paths. A path is not a secret. The identity temp file is 0600
-and short-lived, and anyone who can read it can read the process heap, which
-holds the same key already. Naming a path in a diagnostic costs nothing and is
-most of a good error message's value.
+Secret values, private identities, and manifest hashing keys must not appear in
+errors, exception causes, logs, or generated public examples. This applies to
+ordinary failures as well as malicious inputs. Parser errors should report a
+reason and useful location without reproducing the rejected text.
+
+Caller-supplied filesystem paths are permitted diagnostic metadata, including
+identity paths. We do not need a provenance subsystem solely to hide temporary
+pathnames. This is a disclosure policy, not a claim that every possible path is
+non-sensitive. Credentials embedded in locators and arbitrary source objects
+must not be rendered wholesale.
 
 ### A4. Another local user on a shared machine
 
-If another account can read `~/.config/<app>/key.txt`, or a plaintext temp file
-while `bb secrets edit` is open, they have everything.
+Create private files with owner-only permissions from the moment they exist.
+Use exclusive temporary-file creation, cleanup scoped to the operation, and
+replacement operations that do not write through a substituted destination link.
+If private creation is unavailable, do not silently write sensitive bytes with
+default permissions.
 
-In scope: create files with owner-only permissions, from the instant they exist
-rather than by chmod afterwards. This is cheap, standard, and correct.
+These are local guarantees about operations the library performs. We do not
+attempt to prove every ancestor of a project directory untamperable or defend
+against an attacker controlling the selected working directory. Such control
+also does not necessarily imply control of the application's source; that
+equivalence is not a reason to remove ordinary safe filesystem operations.
 
-Out of scope: proving that no other user could have raced or redirected a write.
-That is an unbounded claim about the entire filesystem, and an attacker who can
-swap a directory on the way to your project root can also edit the source that
-project is about to run.
+### A5. A former recipient observing future changes
 
-The line: restrict permissions on files we create. Do not attempt to prove the
-filesystem was untampered with.
+Revocation cannot make someone forget values or keys they already read. But new
+values published after revocation should not become guessable through the public
+manifest using a hashing key that former recipient retained.
 
-## Adversaries out of scope
+A shared manifest key inside the encrypted store creates this obligation.
+Re-encrypting to fewer recipients alone does not revoke knowledge of that key.
+Any replacement design must address its renewal before publishing future values,
+or explicitly revisit the product's revocation guarantee. The operator still
+rotates credentials at their provider; manifest-key handling cannot revoke an
+already disclosed provider credential.
 
-### B1. Anyone who can write the repository, the build, or the deploy channel
+## Threats out of scope
 
-age encrypts to recipients and does not sign. Every recipient is public by
-design and committed in the clear. So anyone holding a public recipient can
-author a ciphertext that decrypts cleanly for every reader, and if they can also
-replace the file the application reads, they choose the configuration.
+### B1. An attacker who can replace the deployed configuration artifact
 
-No check this library performs can distinguish their file from a legitimate one,
-because there is no authorship signal to check. Adding one means a second key
-that is separately provisioned, distributed, rotated, and trusted, which is the
-infrastructure "no GPG keyrings, no KMS, no vault" exists to avoid.
+Public recipients allow anyone to encrypt chosen contents. Age does not identify
+the sender. Someone who can replace both deployed ciphertext and its manifest
+can make those artifacts agree with each other. Agreement does not establish
+approval or authorship.
 
-**This is the concession most of the current code has not absorbed.** Its
-consequence: any input arriving through the ciphertext is exactly as trusted as
-the repository. If it is not, the deployment is already compromised in ways the
-library cannot see, let alone fix.
+Protecting the repository, build, and deployment channel is the deployment
+system's responsibility. We will not add an authorship infrastructure to this
+library. This exclusion does not eliminate the usefulness of bounded input,
+safe parsing, or local-only source contracts against operator mistakes.
 
-So the following buy no security:
+### B2. A former recipient's access to previously disclosed values
 
-- Byte limits on the ciphertext or the plaintext. Someone who can hand you a
-  two-gigabyte file can hand you a two-kilobyte file that points your database
-  at their host, which is worse and invisible.
-- A nesting-depth limit on the decrypted EDN. Deep nesting crashes the process.
-  Attacker-chosen configuration does not.
-- Rejecting remote source locators as an attack surface. The source comes from
-  the operator's own config, so this is a mistake-catcher (A2), not a defense.
+Git history can retain ciphertext that their identity still decrypts. Removing a
+recipient and re-encrypting the current store cannot revoke historical access or
+make an old credential unusable. Rotate the credential at its provider. A5
+separately covers new values and retained manifest hashing keys.
 
-Denial of service against a process that is about to load attacker-chosen
-configuration is not a threat worth ranking.
+### B3. A compromised decrypting host or application process
 
-### B2. A former recipient, for values they could already read
+The application holds plaintext in memory. Root, a heap dump, an attached
+debugger, or compromised code in the same process may read it. A library cannot
+defend its own address space. This does not justify retaining temporary private
+files longer than their operation needs them.
 
-Anyone who was ever in `recipients.txt` holds a key that decrypts every
-ciphertext they had access to, and git history keeps those forever. `reencrypt`
-protects values written after their removal and nothing before it.
+### B4. A hostile `age` binary
 
-The answer is rotating the underlying credential at the provider. There is no
-code change that helps, and pretending otherwise would be worse than saying so.
+The installed `age` executable is part of the trusted system. We do not attempt
+to contain a hostile encryption implementation.
 
-### B3. The host that decrypts
+## Manifest guarantees and recovery
 
-The application holds the plaintext map in memory. Root on that box, a heap
-dump, an attached debugger, or any compromised dependency in the same process
-reads it. A library cannot defend its own address space.
-
-### B4. The `age` binary itself
-
-We shell out to whatever `age` is on `PATH`. If that is hostile, so is
-everything downstream of it.
-
-## Properties, and who provides each
-
-| Property | Provided by |
+| Property | Responsibility or limit |
 | --- | --- |
-| Confidentiality of values against a repository reader | age |
-| Integrity of the ciphertext against corruption and splicing | age |
-| Reviewability of what changed | the committed manifest |
-| Detection of a value change by a party without the key | `:vhash`, single-key mode only |
-| Sender authenticity | nobody. Out of scope, see B1 |
-| Freshness of the manifest against the ciphertext, without a key | `:ciphertext-sha` |
+| Confidentiality of encrypted values | age, plus confidential hashing material for public value indicators |
+| Ciphertext integrity against corruption | age |
+| Reviewable paths, types, and value changes | the committed manifest; desired consistently for solo and team use |
+| Keyless digest check | detects disagreement with the recorded ciphertext digest; cannot prove the manifest describes the plaintext |
+| Verification with an identity | compares the decrypted store with the manifest; does not establish authorship |
+| Sender authenticity or replay prevention | outside this library |
 
-Team mode has no shared private key, so team manifests carry no `:vhash` and
-detect shape changes only. A same-shape value change is invisible to `verify`
-there. That is a documented boundary, not a defect.
+Ciphertext is the authoritative artifact. A manifest is derived metadata that an
+authorized recipient can regenerate. Losing a temporary plaintext file does not
+prevent regeneration when valid ciphertext and a usable identity remain.
 
-## Safety is not security
+Atomic replacement protects a single ciphertext from partial writes. Two atomic
+renames do not make a ciphertext/manifest pair one atomic transaction. Rollback
+can help with caught I/O failures but cannot run after process termination.
+A simpler recovery contract can permit detectable manifest staleness after
+interruption. The exact write/recovery behavior remains a separate implementation
+task; do not claim that pairwise atomicity or power-loss durability follows from
+rename alone.
 
-Several checks in this codebase are worth keeping for reasons that have nothing
-to do with an attacker. Framing them as security is what made them elaborate.
+## Lessons from the manifest experiment
 
-A safety check answers "will this fail loudly when someone makes a mistake?" It
-needs to be correct and small. It does not need to be adversary-proof, it does
-not need a content-free failure mode, and it does not need to hold under
-concurrent modification by a hostile local process.
+The session reviewed commits `4f4467e`, `c8ede1d`, and `6d4c838`. These findings
+describe that experiment, not a claim that it is the current implementation or
+that its proposed remedies have been accepted as a complete design.
 
-Atomic replacement is the clearest case. A crash mid-write leaving a corrupt
-ciphertext is a real way to lose secrets, and rename-into-place fixes it in a
-few lines. It does not need a two-phase commit with rollback, because the
-failure being prevented is a crash, not an adversary.
+Moving from identity-derived hashes to a random per-store key inside the
+encrypted payload is a promising direction. It lets different recipients compute
+the same value hashes and removes private-identity parsing. Keep reviewability
+while evaluating this design; do not expand it into another key-management
+subsystem by default.
 
-## How to validate a change
+The review found the following issues to resolve individually:
 
-For each defense currently in the code:
+1. **Revocation:** a two-recipient reproduction removed one recipient,
+   re-encrypted, and changed a synthetic PIN. The removed identity could no longer
+   decrypt, but its retained manifest key identified the new PIN from candidate
+   hashes. See A5. Calling this key "not itself a secret" is incorrect.
+2. **Silent downgrade:** setting the reserved metadata key to `nil` produced no
+   value hashes and still passed verification. Arbitrary short or non-string key
+   values were also accepted. Generated metadata needs a clear validity contract;
+   no compatibility requirement mandates a structure-only fallback.
+3. **Cleanup:** the additional keyed plaintext temporary file was populated
+   before entering its cleanup scope. An injected later staging failure left it
+   on disk until process exit. Every acquired private resource needs cleanup even
+   when the next acquisition fails.
+4. **Ownership and ergonomics:** the editor and `set`/`rm` exposed reserved
+   hashing metadata to ordinary editing. A copied or shared template containing
+   that key could also give different stores the same key. Library-owned metadata,
+   creation semantics, and template handling should be considered together.
+5. **Validation:** tests should exercise actual store creation, edits by different
+   recipients, and loading through the public API. A test helper that strips the
+   reserved key itself does not verify that `load-secrets` hides it. Comparing
+   manifest entries should account for the ciphertext digest changing on
+   re-encryption.
 
-1. Name the in-scope adversary it stops (A1, A3, A4). If there is one, keep it.
-2. If not, name the operator mistake it catches loudly (A2). If there is one,
-   keep the check and shrink it to the smallest thing that catches the mistake.
-3. If neither, delete it.
-4. Whatever survives: is it implemented once, or four times?
+Fresh random keys distinguish independently initialized stores; copying a keyed
+store does not generate a fresh key. Documentation must state the actual behavior
+and distinguish approved requirements, design proposals, and verified guarantees.
 
-Step 4 is where most of the remaining volume is. Bounded reading exists in four
-places, atomic owner-only writing in four, limit resolution in two, EDN failure
-rendering in two.
+## Architecture questions for separate sessions
 
-## What this model does not change
+The review also identified candidates beyond the manifest. These are bounded
+work items to evaluate individually, not instructions to implement them all:
 
-The library keeps every user-facing behavior it has today: the same commands,
-the same reader literals, the same manifest format and `verify` exit codes, the
-same identity resolution order. The plan is to remove machinery, not features.
-Where a defense is removed, this document is where the reasoning lives, so the
-decision stays reviewable rather than becoming folklore.
+- Replace global identity caching, generations, and leases with operation-owned
+  temporary identities where possible.
+- Scope Aero loading to a configuration read or application-owned lifecycle,
+  instead of a global cache keyed by configuration equality.
+- Make normalization pure and use one identity precedence rule. The reviewed
+  runtime favored explicit identity options while the CLI favored environment
+  variables; normalization could also materialize a private file.
+- Evaluate a common recipient-based encryption path for solo and team use.
+- Keep setup ergonomic while reducing the initializer's responsibility for
+  modifying existing projects and proving filesystem ancestry.
+- Narrow overlapping source/argument forms and general-purpose file commands;
+  put store operations beneath prompts and CLI rendering.
+- Reduce duplicated build/documentation policy and verification. Moving code to
+  another package does not by itself remove maintenance cost.
+
+## How to decide what to change
+
+1. Name the required behavior and the plausible failure or in-scope threat.
+2. Ask whether simpler ownership, a narrower interface, or removing an optional
+   behavior eliminates the need for the defense.
+3. Retain the smallest mechanism that establishes the needed invariant. Safety
+   errors still follow the disclosure policy, and ordinary failures still need
+   cleanup.
+4. Share a surviving primitive where that makes its contract clearer. Avoid
+   replacing a few straightforward functions with a general framework.
+5. Verify the observable behavior and relevant failure path. Do not preserve
+   tests of obsolete internal machinery as requirements in their own right.
+
+Work on one concern at a time in a fresh session. Record the chosen contract and
+its tradeoffs before extending the implementation. An identified risk belongs
+here even when its remedy is still undecided; recording it is not authorization
+to implement every proposed fix at once.
