@@ -37,11 +37,11 @@
 
 ;; In that output, `:template` and `:manifest` are derived from the secrets file
 ;; name. `:key-file` is the durable path where `keygen` writes, while
-;; `:identity-file` is the path decryption uses. They are separate because the
-;; `SECRETS_AGE_IDENTITY*` environment variables override `:identity-file` but
-;; never `:key-file`. A CI runner can decrypt and verify using one of those
-;; environment variables, while `keygen` on your laptop still writes to the
-;; configured path.
+;; `:identity-file` is an optional explicit path for decrypting commands.
+;; Normalization validates configured paths but does not read identity
+;; environment variables or create temporary identity files. Each command
+;; resolves its identity when it runs, using `:identity-file`, then the
+;; environment variables, then `:key-file` or the app default.
 
 ;; ## Validating the configuration {#validation-catches-the-dangerous-config}
 

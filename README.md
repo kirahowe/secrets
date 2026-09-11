@@ -182,22 +182,27 @@ choose the initializer's "manual" option or need a layout it should not infer:
 
 Per-environment defaults fill in automatically: `:key-file` →
 `~/.config/<app>/key.txt`, `:template` → `<secrets-file>.example`, `:manifest` →
-`<secrets-file>.manifest`. The config is validated up front: `:app` and each
+`<secrets-file>.manifest`. The optional `:identity-file` is an explicit path
+used by decrypting commands. Configuration normalization validates the paths
+provided in the config, but does not read identity environment variables or
+materialize a temporary identity. Each command resolves its identity when it
+runs, using an explicit `:identity-file` first, then the identity environment
+variables, then the configured `:key-file` or its app default. The config is
+validated up front: `:app` and each
 `:secrets-file` are required (`:app` names the default key path, so there is no
 default — unrelated projects must not share a key by accident), and the secrets
 file must end in `.age` — otherwise the derived template/manifest names would
 collide with (and overwrite) the ciphertext itself — unless you set both
-`:template` and `:manifest` explicitly. Every resolved artifact path — the
-ciphertext, manifest, template, key file, recipients file, and the identity an
-environment actually reads — is canonicalized and checked as one global table
+`:template` and `:manifest` explicitly. Every configured artifact path — the
+ciphertext, manifest, template, key file, recipients file, and an explicit
+identity file — is canonicalized and checked as one global table
 across all environments, so reusing a path for an incompatible role is rejected
 before any command touches the filesystem, within one environment or between
 two. Exactly three kinds of sharing are permitted: one identity/key artifact
-(`:identity-file` defaults to `:key-file`, and `:key-file` defaults to one
-app-wide path), one recipients list shared by several environments, and one
-shared template. Anything else — two environments writing one ciphertext or one
-manifest, an identity path doubling as a manifest, a key file doubling as
-ciphertext — is a configuration error.
+where the configured paths agree, one recipients list shared by several
+environments, and one shared template. Anything else, such as two environments
+writing one ciphertext or one manifest, an identity path doubling as a
+manifest, or a key file doubling as ciphertext, is a configuration error.
 
 An optional top-level `:limits` map bounds untrusted inputs before any `age`
 subprocess starts. It is merged over the defaults and resolved onto every
@@ -478,11 +483,14 @@ never selects it.
 
 The second argument selects the identity (private key): a path string/File, or
 an opts map with `:identity-file` (an explicit path) or `:app` (→
-`~/.config/<app>/key.txt`). Without it, only the `SECRETS_AGE_IDENTITY*` environment
-variables are consulted — there is deliberately no default key path, so loading
-with no resolvable identity throws (listing your options) rather than silently
-reading some other app's key. Passing `{:app "myapp"}` gives you the local
-default *and* still lets the env vars win in production.
+`~/.config/<app>/key.txt`). Resolution is scoped to the operation. An explicit
+path wins first, followed by `SECRETS_AGE_IDENTITY_FILE`,
+`SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then the app's default
+key path. Without an explicit identity or app, the environment variables are
+the only sources. Raw and base64 values are written to a private temporary file
+for the operation and removed before it returns. Passing `{:app "myapp"}`
+provides the local fallback while still allowing an injected identity when no
+explicit path was supplied.
 
 An Integrant `init-key` is two lines. Both the resource name and the app name
 come from the component's config, so the code holds no literal of its own:
@@ -576,9 +584,8 @@ and refusing it would break a documented command.
 
 ## Production & CI: injecting the key
 
-Locally the key lives at `~/.config/<app>/key.txt`. Anywhere else, provide it
-through one of three environment variables, checked in this order (and before
-the local default path):
+When an operation has no explicit identity path, it can use one of three
+environment variables, checked in this order and before the local default path:
 
 | Var                 | Value                                                                 |
 | ------------------- | --------------------------------------------------------------------- |
@@ -621,39 +628,31 @@ an uberjar (the ciphertext is copied to an owner-only temp file so `age` can
 read it), so the file works the same whether it sits on disk or inside the jar.
 `SECRETS_AGE_IDENTITY` decrypts it at startup.
 
-### The temp file `SECRETS_AGE_IDENTITY` writes
+### Scoped temporary identities
 
-`age` reads its identity from a file, so raw and base64 contents are materialized
-to an owner-only (0600) temp file, one per distinct value. That file is this
-library's to remove. `(secrets/reset-identity-cache!)` checks deletion of every
-identity materialized from `SECRETS_AGE_IDENTITY` or
-`SECRETS_AGE_IDENTITY_B64`; a failed deletion remains tracked for the next reset,
-and a later read materializes afresh instead of reusing a retired path. Identity
-files *you* own — `SECRETS_AGE_IDENTITY_FILE`, an explicit `:identity-file`,
-`~/.config/<app>/key.txt` — are never touched. It returns
-`{:generation g :deleted n :absent n :failed n :pending n}`: successful
-deletions, already-absent paths, retained failures, and newly deferred leases,
-with no path, digest, or key content.
+`age` reads its identity from a file. For raw or base64 environment values, each
+operation creates an exclusive temporary file with owner-only (0600)
+permissions, uses it for the operation, and checks its deletion on both success
+and failure. Caller-owned paths, including `SECRETS_AGE_IDENTITY_FILE`, an
+explicit `:identity-file`, and `~/.config/<app>/key.txt`, are never deleted.
 
-Deletion waits for the decryption using the file. `load-secrets` holds the
-identity for the whole call — which covers the reader literals and the Aero
-readers, since both load through it — so a reset that lands mid-decryption defers
-to the last release rather than deleting a file `age` is still reading. A path
-you took out of `resolve-identity-file` and use later is outside that lease;
-wrap it in `(secrets/with-identity path (fn [p] …))` when you hand it to `age`
-yourself. No API can hold a lease a caller never opened.
+`load-secrets` owns this scope automatically. Code that passes an identity to a
+lower-level operation can use the same contract:
 
-`deleteOnExit` stays registered, but only as the backstop for a process that
-never calls the reset. **An abnormal exit — `SIGKILL`, a container OOM kill, a
-hard crash — can still leave the file on disk** (CWE-459), and no deletion here
-is secure erasure: on a journaling or copy-on-write filesystem the bytes can
-outlive the unlink. So prefer not materializing at all where the platform
-allows it. `SECRETS_AGE_IDENTITY_FILE` pointing at a secret file the platform
-mounts (a Kubernetes `Secret` volume, systemd `LoadCredential`, a Docker/Fly
-secret file) writes no key anywhere and is the better deployment shape wherever
-it exists; failing that, a memory-backed temp directory
-(`-Djava.io.tmpdir=/dev/shm`, a `tmpfs` mount) keeps a materialized identity out
-of persistent storage.
+```clojure
+(secrets/with-identity {:app "myapp"}
+  (fn [{:keys [identity-file]}]
+    (age/decrypt identity-file "secrets.edn.age")))
+```
+
+The callback receives the resolved path and its source keyword. A cleanup
+failure throws a structured error that includes the temporary path so an
+operator can remove it. Paths are allowed in diagnostics for recovery; key
+contents are never included. If the process crashes before cleanup, the
+temporary file can remain on disk, so use a mounted identity file when the
+deployment platform provides one. Temporary-file deletion is not secure
+erasure on every filesystem. The extra temporary-file write per operation is
+the cost of avoiding shared identity state.
 
 ### GitHub Actions
 
@@ -1029,13 +1028,9 @@ leaks. A *path* can carry a token too, so keeping it is a judgement rather than
 a safe default: a diagnostic that cannot name the failing resource is not one,
 and that residual risk is real, not zero.
 
-An identity path is named only when you supplied it. A path materialized from
-`SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64` appears in no message, no
-`ex-data`, and no `bb secrets` output: you never saw that path, and it points at
-key material. `age/decrypt`, `age/decrypt-bytes`, and `age/decrypt-to-file!`
-therefore leave the identity path out unless the call passes
-`{:identity-nameable? true}`; a wrong key still says so, with the captured
-stderr and its hint.
+Identity paths are permitted diagnostic metadata. A cleanup failure for a
+temporary identity includes its path for recovery, while identity contents and
+environment values are never included.
 
 An I/O failure's own message travels only with a filesystem path source, where
 it can name nothing the failure does not already name. A local locator failure
@@ -1052,11 +1047,7 @@ bound that trips carries the byte count and the limit, never content.
 - `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is local-only: a filesystem path string, File, Path, local `file:` locator, or `jar:file:` classpath resource; the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`. Every failure throws `ex-info` with a `:reason`: `:no-identity`, `:no-file`, or `:disallowed-source` for anything outside the provenance contract. No HTTP operation exists and no DNS, connection, redirect, or response read occurs for a rejected locator. Every failure about the source also carries `:source`, allowlisted metadata naming which source failed and never the source value — see *What a failure carries*.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
 - `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
-- `(identity-from-env)` — identity path from `SECRETS_AGE_IDENTITY_FILE` / `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`, or nil when none is set. A variable that is set but empty throws.
-- `(resolve-identity-file)` / `(resolve-identity-file app-or-opts)` — the env vars first, then `~/.config/<app>/key.txt` when an app name is known; nil otherwise. The path is *conventional* — it's never checked for existence, so a non-nil result doesn't mean a usable key is actually there.
-- `(identity-available?)` / `(identity-available? app-or-opts)` — true when an identity actually resolves **and** its file exists on disk. The "do I have a key, or should I tell the user to run `keygen`?" check; `app-or-opts` also accepts an opts map's `:identity-file`.
-- `(reset-identity-cache!)` — retire every identity temp file materialized from `SECRETS_AGE_IDENTITY` / `SECRETS_AGE_IDENTITY_B64`: check deletion of each one no decryption is using, defer the rest to their last release, retain failures for retry, and materialize afresh on the next read. Idempotent; never touches an identity file you own. Returns path-free `{:generation g :deleted n :absent n :failed n :pending n}` outcome counts.
-- `(with-identity path f)` — call `(f path)` with `path` held against `reset-identity-cache!` for exactly that call. `load-secrets` already does this for its own decryption; use it when you hand a resolved path to `age` yourself.
+- `(with-identity identity-or-opts f)` — resolve an identity for one operation and call `f` with `{:identity-file path :identity-source source}`. Explicit paths are left untouched; raw and base64 environment values are materialized to an owner-only temporary file and cleaned up when the callback returns or throws. A cleanup failure includes the temporary path in structured error data.
 - `(owner-only-temp-file! prefix suffix)` — a delete-on-exit temp file that is 0600 from the moment it exists.
 - `(expand-home path)`.
 
@@ -1064,7 +1055,7 @@ bound that trips carries the byte count and the limit, never content.
 
 `com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
 
-`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits. `(verify! config env)` returns `{:results {env status} :exit code}`; `(doctor! config env)` safely normalizes one raw selected/default environment and returns its structured age, artifact, identity-source, recipient, and verification-capability fields plus `:status` and `:exit`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :identity-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, no blank path strings, `.age` extension unless both `:template` and `:manifest` are explicit), and each environment's decrypt-side identity resolves from the `SECRETS_AGE_IDENTITY*` env vars before an explicit `:identity-file`, then falls back to its configured/default `:key-file`.
+`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits. `(verify! config env)` returns `{:results {env status} :exit code}`; `(doctor! config env)` safely normalizes one raw selected/default environment and returns its structured age, artifact, identity-source, recipient, and verification-capability fields plus `:status` and `:exit`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :identity-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, no blank path strings, `.age` extension unless both `:template` and `:manifest` are explicit). Normalization does not read identity environment variables or create temporary files. Each command selects its environment, resolves its identity in a scoped operation, validates the resolved path against the configured artifact roles, and then performs the command using an explicit `:identity-file`, the environment variables, or the configured/default `:key-file` in that order.
 
 `com.kirahowe.secrets.init` — Babashka-only project bootstrap entrypoint.
 `(-main & args)` parses `--app`, optional `--env`, `--layout`, `--team`,
@@ -1480,11 +1471,11 @@ exploit instructions in a public issue.
   `:manifest false` for that environment.
 - Sensitive temp files (injected identities, plaintext during `edit`) are
   created owner-only (0600) atomically on POSIX filesystems. On non-POSIX
-  filesystems (e.g. Windows) the permissions are applied best-effort after
-  creation — the library targets POSIX systems. An injected identity is deleted
-  by `reset-identity-cache!` rather than only at JVM exit; see [the temp file
-  `SECRETS_AGE_IDENTITY` writes](#the-temp-file-secrets_age_identity-writes) for
-  what an abnormal exit still leaves behind.
+  filesystems (e.g. Windows), private-file creation fails closed when those
+  permissions cannot be established. Raw and base64 injected identities are
+  removed when their owning operation finishes, including failure cleanup. A
+  process crash can still leave a temporary identity behind; see
+  [Scoped temporary identities](#scoped-temporary-identities).
 - **Decrypted plaintext files are published 0600, never written in place.**
   `decrypt-to-file!` writes into an owner-only sibling staging file and then
   atomically renames it over the destination, so the result does not depend on

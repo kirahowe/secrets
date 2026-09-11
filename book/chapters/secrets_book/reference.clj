@@ -41,11 +41,7 @@
              #'secrets/reader-literals
              #'secrets/merge-readers
              #'secrets/default-limits
-             #'secrets/identity-from-env
-             #'secrets/resolve-identity-file
-             #'secrets/identity-available?
              #'secrets/with-identity
-             #'secrets/reset-identity-cache!
              #'secrets/expand-home)
 
 ;; `load-secrets` accepts local filesystem sources, local `file:` locators, and
@@ -160,13 +156,14 @@
 ;; |-----|----------|---------|
 ;; | `:secrets-file` | yes | path to the ciphertext; must end in `.age` unless both `:template` and `:manifest` are explicit |
 ;; | `:key-file` | no | durable key path; default `~/.config/<app>/key.txt` |
-;; | `:identity-file` | no | explicit decrypt-side identity; environment variables still win |
+;; | `:identity-file` | no | explicit decrypt-side identity; commands use it before environment variables |
 ;; | `:template` | no | seed for `new`; default `<secrets-file>` with `.example` |
 ;; | `:manifest` | no | manifest path, or `false` to disable; default `<secrets-file>` with `.manifest` |
 ;; | `:recipients-file` | no | committed list of age public keys; enables team mode |
 
-;; Normalization also computes `:identity-file` per environment: the
-;; `SECRETS_AGE_IDENTITY*` environment variables when set, otherwise `:key-file`.
+;; Normalization preserves an explicit `:identity-file` and validates configured
+;; paths. It does not read identity environment variables or materialize a
+;; temporary identity. Commands resolve their identity when they run.
 
 ;; ### Configuration limits
 

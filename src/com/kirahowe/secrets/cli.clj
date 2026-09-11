@@ -24,10 +24,11 @@
                      from it.
     :identity-file — what decrypt-side operations (edit, decrypt, reencrypt,
                      verify) and single-key encryption use. Resolved in order:
-                       1. $SECRETS_AGE_IDENTITY_FILE — a path to the key file
-                       2. $SECRETS_AGE_IDENTITY      — raw key contents (→ 0600 temp file)
-                       3. $SECRETS_AGE_IDENTITY_B64  — base64-encoded key contents
-                       4. the environment's :key-file
+                       1. an explicit :identity-file
+                       2. $SECRETS_AGE_IDENTITY_FILE — a path to the key file
+                       3. $SECRETS_AGE_IDENTITY      — raw key contents (→ 0600 temp file)
+                       4. $SECRETS_AGE_IDENTITY_B64  — base64-encoded key contents
+                       5. the environment's :key-file
                      So CI holding only an SECRETS_AGE_IDENTITY* variable can encrypt,
                      decrypt, and verify, while `keygen` still writes to the
                      configured key path.
@@ -188,11 +189,6 @@
   [app]
   (secrets/expand-home (str "~/.config/" app "/key.txt")))
 
-(def ^:private identity-env-sources
-  [["SECRETS_AGE_IDENTITY_FILE" :secrets-age-identity-file]
-   ["SECRETS_AGE_IDENTITY" :secrets-age-identity]
-   ["SECRETS_AGE_IDENTITY_B64" :secrets-age-identity-b64]])
-
 (def ^:private identity-source-display-label
   "How a message or a `doctor` report names where an identity came from."
   {:secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
@@ -205,46 +201,10 @@
 (defn- getenv [variable-name]
   (System/getenv variable-name))
 
-(defn- configured-identity-source
-  "Name the first configured identity environment variable without retaining or
-  returning its value. `identity-from-env` remains responsible for validation
-  and materialization."
-  []
-  (some (fn [[variable source]]
-          (when (some? (getenv variable)) source))
-        identity-env-sources))
-
-(def ^:private materialized-identity-sources
-  "The identity sources `com.kirahowe.secrets` materializes into a temp file:
-  both carry key *contents*, and `age` reads its identity from a file."
-  #{:secrets-age-identity :secrets-age-identity-b64})
-
-(defn- nameable-identity
-  "The environment's decrypt-side identity path when a message may name it, else
-  nil. A caller-supplied path — an env var naming a file, an explicit
-  `:identity-file`, a configured or default key path — is the caller's own, and
-  naming it is most of a failure's value. A path materialized from key contents
-  is not: the caller never saw it, and it points at key material."
-  [{:keys [identity-file identity-source]}]
-  (when-not (materialized-identity-sources identity-source)
-    (str identity-file)))
-
-(defn- identity-location
-  "Where a message says the environment's decrypt-side identity is: `at <path>`
-  when the caller supplied that path, else `from <VARIABLE>` — the variable the
-  key contents arrived in, never the temp path they were materialized to."
-  [{:keys [identity-source] :as env}]
-  (if-let [path (nameable-identity env)]
-    (str "at " path)
-    (str "from " (identity-source-display-label identity-source))))
-
 (defn- decrypt-opts
-  "The trailing `age` options for decrypting with this environment's identity:
-  whether a failure may name the identity path and the resolved plaintext
-  bound."
+  "The plaintext bound for decrypting this environment's store."
   [env]
-  {:identity-nameable? (some? (nameable-identity env))
-   :limits (select-keys (:limits env) [:max-plaintext-bytes])})
+  {:limits (select-keys (:limits env) [:max-plaintext-bytes])})
 
 (def ^:private artifact-uri-scheme
   "A URI scheme at the start of a configured artifact location."
@@ -431,13 +391,8 @@
                    (default-key-file app))
         explicit-identity (when configured-identity-file?
                             (secrets/expand-home identity-file))
-        env-identity (secrets/identity-from-env)
-        key-file-source (if configured-key-file? :configured :default)
-        identity-source (or (when env-identity (configured-identity-source))
-                            (when configured-identity-file? :identity-file)
-                            (if configured-key-file?
-                              :configured-key-file
-                              :default-key-file))
+        key-file-source (or (:key-file-source env-config)
+                            (if configured-key-file? :configured :default))
         template (if (contains? env-config :template)
                    template
                    (str/replace secrets-file #"\.age$" ".example"))
@@ -457,10 +412,7 @@
            :limits limits
            :secrets-file secrets-file
            :key-file key-file
-           ;; Decrypt-side identity: SECRETS_AGE_IDENTITY* env vars win, then
-           ;; an explicit :identity-file, then the configured/default key path.
-           :identity-file (or env-identity explicit-identity key-file)
-           :identity-source identity-source
+           :identity-file explicit-identity
            :key-file-source key-file-source
            ;; Explicit values (including :manifest false) are always kept;
            ;; absent values are derived from the secrets file.
@@ -469,14 +421,14 @@
            :recipients-file recipients-file)))
 
 (defn normalize-config
-  "Apply per-environment defaults (:key-file, :identity-file, :template,
-  :manifest), resolve the input :limits, validate the configuration, and stamp
+  "Apply per-environment defaults (:key-file, :template, :manifest), preserve
+  explicit :identity-file options, resolve input :limits, validate, and stamp
   each env with its :name and the resolved limits. Requires a non-blank :app,
   at least one environment, and a non-blank :secrets-file string per
   environment. A secrets path not ending in `.age` requires explicit :template
   and :manifest values. Every resolved artifact path is checked for role
-  collisions across all environments before any command performs I/O. Throws
-  ex-info on invalid input."
+  collisions across all environments. Does not select an environment identity
+  or create private files. Throws ex-info on invalid input."
   [{:keys [app environments] :as config}]
   (when (empty? environments)
     (fail! "secrets config has no :environments" {:config config}))
@@ -513,6 +465,17 @@
         (fail! (str "Unknown environment: " (name env-key) ". One of: "
                     (str/join ", " (map name (keys environments))))
                {:environment env-key}))))
+
+(defn- with-environment-identity
+  "Hold one resolved identity through the command's decryption and hashing."
+  [config env f]
+  (secrets/with-identity env
+    (fn [identity]
+      (let [resolved (merge env identity)]
+        (require-path! (:name env) :identity-file (:identity-file resolved))
+        (validate-artifact-roles!
+         (assoc (:environments config) (:name env) resolved))
+        (f resolved)))))
 
 ;;;; Utilities
 
@@ -699,26 +662,17 @@
                 "    Docs:   https://age-encryption.org"))))
 
 (defn- require-identity!
-  "Ensure the environment's decrypt-side identity file exists.
-
-  The failure names a caller-supplied path, which is the overwhelmingly common
-  case and most of the message's value. A path materialized from
-  SECRETS_AGE_IDENTITY / SECRETS_AGE_IDENTITY_B64 is named by the variable it
-  came from instead: that path is a temp file holding key material, and the
-  caller never saw it."
-  [{environment-name :name :as env}]
-  (when-not (.exists (io/file (:identity-file env)))
-    (let [nameable (nameable-identity env)]
-      (fail! (str "No age identity for " (clojure.core/name environment-name)
-                  " " (identity-location env)
-                  "\n"
-                  "    Create one with:  bb secrets keygen "
-                  (shell-quote (clojure.core/name environment-name)) "\n"
-                  "    Or point at an existing key via SECRETS_AGE_IDENTITY_FILE (a path),\n"
-                  "    SECRETS_AGE_IDENTITY (raw key contents), or "
-                  "SECRETS_AGE_IDENTITY_B64 (base64 contents).")
-             (cond-> {:environment environment-name}
-               nameable (assoc :identity-file nameable))))))
+  "Require the resolved identity file, naming its path when it is missing."
+  [{environment-name :name :keys [identity-file]}]
+  (when-not (and identity-file (.exists (io/file identity-file)))
+    (fail! (str "No age identity for " (name environment-name)
+                " at " identity-file "\n"
+                "    Create one with:  bb secrets keygen "
+                (shell-quote (name environment-name)) "\n"
+                "    Or point at an existing key via SECRETS_AGE_IDENTITY_FILE (a path),\n"
+                "    SECRETS_AGE_IDENTITY (raw key contents), or "
+                "SECRETS_AGE_IDENTITY_B64 (base64 contents).")
+           {:environment environment-name :identity-file identity-file})))
 
 ;;;; Recipients (multi-recipient mode)
 
@@ -1169,60 +1123,64 @@
   or vim. Returns the secrets-file path, or :aborted when an existing file is
   kept. Plaintext is held in an owner-only temp file during editing."
   [config env-arg]
-  (require-age!)
-  (let [{:keys [secrets-file] environment-name :name :as env}
-        (resolve-env config env-arg)
-        target (encrypt-target! env)
-        proceed? (or (not (.exists (io/file secrets-file)))
-                     (do
-                       (warn "Secrets file already exists:" secrets-file)
-                       (confirm!
-                        (str "Overwrite it? (To change values, use `bb secrets edit "
-                             (shell-quote (clojure.core/name environment-name))
-                             "` instead.)"))))]
-    (if-not proceed?
-      (do (info "Aborted.") :aborted)
-      (let [tmp (temp-plaintext!)]
-        (try
-          (spit tmp (template-content env))
-          (info "Opening" (editor) "…")
-          (run-editor! tmp)
-          (info "Encrypting…")
-          (write-secrets! env target tmp)
-          (report-written! env "Encrypted secrets written:" secrets-file)
-          secrets-file
-          (finally (secure-delete! tmp)))))))
+  (with-environment-identity config (resolve-env config env-arg)
+    (fn [env]
+      (require-age!)
+      (let [{:keys [secrets-file] environment-name :name :as env}
+            env
+            target (encrypt-target! env)
+            proceed? (or (not (.exists (io/file secrets-file)))
+                         (do
+                           (warn "Secrets file already exists:" secrets-file)
+                           (confirm!
+                            (str "Overwrite it? (To change values, use `bb secrets edit "
+                                 (shell-quote (clojure.core/name environment-name))
+                                 "` instead.)"))))]
+        (if-not proceed?
+          (do (info "Aborted.") :aborted)
+          (let [tmp (temp-plaintext!)]
+            (try
+              (spit tmp (template-content env))
+              (info "Opening" (editor) "…")
+              (run-editor! tmp)
+              (info "Encrypting…")
+              (write-secrets! env target tmp)
+              (report-written! env "Encrypted secrets written:" secrets-file)
+              secrets-file
+              (finally (secure-delete! tmp)))))))))
 
 (defn edit!
   "Edit an existing secrets file through an owner-only plaintext temp file.
   Re-encrypts only when the plaintext changes and deletes the temp file on a
   best-effort basis. Returns the secrets-file path."
   [config env-arg]
-  (require-age!)
-  (let [{:keys [secrets-file identity-file] environment-name :name :as env}
-        (resolve-env config env-arg)]
-    (require-identity! env)
-    (when-not (.exists (io/file secrets-file))
-      (fail! (str "No secrets file at " secrets-file "\n"
-                  "    Create one with:  bb secrets new "
-                  (shell-quote (clojure.core/name environment-name)))
-             {:secrets-file secrets-file
-              :environment environment-name}))
-    (let [target (encrypt-target! env)
-          tmp (temp-plaintext!)]
-      (try
-        (info "Decrypting" secrets-file "…")
-        (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
-        (let [before (sha256 tmp)]
-          (run-editor! tmp)
-          (if (= before (sha256 tmp))
-            (warn "No changes — leaving" secrets-file "untouched.")
-            (do
-              (info "Re-encrypting…")
-              (write-secrets! env target tmp)
-              (report-written! env "Secrets updated:" secrets-file))))
-        secrets-file
-        (finally (secure-delete! tmp))))))
+  (with-environment-identity config (resolve-env config env-arg)
+    (fn [env]
+      (require-age!)
+      (let [{:keys [secrets-file identity-file] environment-name :name :as env}
+            env]
+        (require-identity! env)
+        (when-not (.exists (io/file secrets-file))
+          (fail! (str "No secrets file at " secrets-file "\n"
+                      "    Create one with:  bb secrets new "
+                      (shell-quote (clojure.core/name environment-name)))
+                 {:secrets-file secrets-file
+                  :environment environment-name}))
+        (let [target (encrypt-target! env)
+              tmp (temp-plaintext!)]
+          (try
+            (info "Decrypting" secrets-file "…")
+            (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
+            (let [before (sha256 tmp)]
+              (run-editor! tmp)
+              (if (= before (sha256 tmp))
+                (warn "No changes — leaving" secrets-file "untouched.")
+                (do
+                  (info "Re-encrypting…")
+                  (write-secrets! env target tmp)
+                  (report-written! env "Secrets updated:" secrets-file))))
+            secrets-file
+            (finally (secure-delete! tmp))))))))
 
 (defn- read-set-value!
   "The value for `set`: one line typed at a hidden terminal prompt when
@@ -1251,49 +1209,50 @@
   secrets file from an empty map, then re-encrypts and updates the manifest.
   Returns the secrets-file path. Re-rendering removes plaintext comments."
   [config env-arg key-arg edn?]
-  (require-age!)
-  (let [env (resolve-env config env-arg)
-        path (parse-key-path key-arg (:limits env))
-        {:keys [secrets-file]} env
-        exists? (.exists (io/file secrets-file))]
-    (when exists? (require-identity! env))
-    (let [target (encrypt-target! env)
-          interactive? (tty?)
-          raw (read-set-value! env path interactive?)
-          _ (when (str/blank? raw)
+  (with-environment-identity config (resolve-env config env-arg)
+    (fn [env]
+      (require-age!)
+      (let [path (parse-key-path key-arg (:limits env))
+            {:keys [secrets-file]} env
+            exists? (.exists (io/file secrets-file))]
+        (when exists? (require-identity! env))
+        (let [target (encrypt-target! env)
+              interactive? (tty?)
+              raw (read-set-value! env path interactive?)
+              _ (when (str/blank? raw)
                   ;; The same rule the library applies to a set-but-empty
                   ;; SECRETS_AGE_IDENTITY: blank almost always means an unset
                   ;; variable expanded to nothing (`echo "$KEY" | bb secrets
                   ;; set …` in CI), and storing it produces a secret that
                   ;; fails much later, far from the cause.
-              (fail! (str (if interactive? "Nothing entered" "Nothing on stdin")
-                          " — refusing to store a blank value for " (pr-str path) ".\n"
-                          (when-not interactive?
-                            "    Pipe the value in:  printf %s \"$VALUE\" | bb secrets set …\n")
-                          "    To store an empty value deliberately, use --edn with \"\".")
-                     {:key path}))
-          value (if edn?
-                  (let [{:keys [ok? value] :as parsed}
-                        (safe-edn/parse raw (:limits env))]
-                    (if ok?
-                      value
-                      (fail! (str "Value on stdin is not valid EDN ("
-                                  (edn-failure-message parsed) ").")
-                             (merge {:key path} (edn-failure-data parsed)))))
-                  raw)
-          tmp (temp-plaintext!)]
-      (try
-        (let [current (if exists?
-                        (do (info "Decrypting" secrets-file "…")
-                            (decrypt-secrets! env))
-                        (do (info "No secrets file at" secrets-file "— creating it.")
-                            {}))]
-          (spit tmp (render-secrets (assoc-in current path value)))
-          (info (if exists? "Re-encrypting…" "Encrypting…"))
-          (write-secrets! env target tmp)
-          (report-written! env "Set" (pr-str path) "in" secrets-file)
-          secrets-file)
-        (finally (secure-delete! tmp))))))
+                  (fail! (str (if interactive? "Nothing entered" "Nothing on stdin")
+                              " — refusing to store a blank value for " (pr-str path) ".\n"
+                              (when-not interactive?
+                                "    Pipe the value in:  printf %s \"$VALUE\" | bb secrets set …\n")
+                              "    To store an empty value deliberately, use --edn with \"\".")
+                         {:key path}))
+              value (if edn?
+                      (let [{:keys [ok? value] :as parsed}
+                            (safe-edn/parse raw (:limits env))]
+                        (if ok?
+                          value
+                          (fail! (str "Value on stdin is not valid EDN ("
+                                      (edn-failure-message parsed) ").")
+                                 (merge {:key path} (edn-failure-data parsed)))))
+                      raw)
+              tmp (temp-plaintext!)]
+          (try
+            (let [current (if exists?
+                            (do (info "Decrypting" secrets-file "…")
+                                (decrypt-secrets! env))
+                            (do (info "No secrets file at" secrets-file "— creating it.")
+                                {}))]
+              (spit tmp (render-secrets (assoc-in current path value)))
+              (info (if exists? "Re-encrypting…" "Encrypting…"))
+              (write-secrets! env target tmp)
+              (report-written! env "Set" (pr-str path) "in" secrets-file)
+              secrets-file)
+            (finally (secure-delete! tmp))))))))
 
 (defn remove-secret!
   "Remove a keyword or vector key path, then re-encrypt and update the
@@ -1301,42 +1260,43 @@
   pruned. Returns the secrets-file path. Re-rendering removes plaintext
   comments."
   [config env-arg key-arg]
-  (require-age!)
-  (let [env (resolve-env config env-arg)
-        path (parse-key-path key-arg (:limits env))
-        {:keys [secrets-file] environment-name :name} env]
-    (require-identity! env)
-    (when-not (.exists (io/file secrets-file))
-      (fail! (str "No secrets file at " secrets-file "\n"
-                  "    Create one with:  bb secrets new "
-                  (shell-quote (clojure.core/name environment-name)) "\n"
-                  "    or:               bb secrets set "
-                  (shell-quote (clojure.core/name environment-name)) " "
+  (with-environment-identity config (resolve-env config env-arg)
+    (fn [env]
+      (require-age!)
+      (let [path (parse-key-path key-arg (:limits env))
+            {:keys [secrets-file] environment-name :name} env]
+        (require-identity! env)
+        (when-not (.exists (io/file secrets-file))
+          (fail! (str "No secrets file at " secrets-file "\n"
+                      "    Create one with:  bb secrets new "
+                      (shell-quote (clojure.core/name environment-name)) "\n"
+                      "    or:               bb secrets set "
+                      (shell-quote (clojure.core/name environment-name)) " "
                   ;; A string `key-arg` already is the EDN text argv
                   ;; carried; any other accepted value is printed to get
                   ;; that text back.
-                  (shell-quote (if (string? key-arg) key-arg (pr-str key-arg))))
-             {:secrets-file secrets-file
-              :environment environment-name}))
-    (let [target (encrypt-target! env)
-          tmp (temp-plaintext!)]
-      (try
-        (info "Decrypting" secrets-file "…")
-        (let [current (decrypt-secrets! env)]
-          (when (= ::missing (get-in current path ::missing))
-            (fail! (str "No such key: " (pr-str path) " in " secrets-file)
-                   {:secrets-file secrets-file :key path}))
-          (let [parent (butlast path)
-                k (last path)
-                updated (if (seq parent)
-                          (update-in current (vec parent) dissoc k)
-                          (dissoc current k))]
-            (spit tmp (render-secrets updated))
-            (info "Re-encrypting…")
-            (write-secrets! env target tmp)
-            (report-written! env "Removed" (pr-str path) "from" secrets-file)
-            secrets-file))
-        (finally (secure-delete! tmp))))))
+                      (shell-quote (if (string? key-arg) key-arg (pr-str key-arg))))
+                 {:secrets-file secrets-file
+                  :environment environment-name}))
+        (let [target (encrypt-target! env)
+              tmp (temp-plaintext!)]
+          (try
+            (info "Decrypting" secrets-file "…")
+            (let [current (decrypt-secrets! env)]
+              (when (= ::missing (get-in current path ::missing))
+                (fail! (str "No such key: " (pr-str path) " in " secrets-file)
+                       {:secrets-file secrets-file :key path}))
+              (let [parent (butlast path)
+                    k (last path)
+                    updated (if (seq parent)
+                              (update-in current (vec parent) dissoc k)
+                              (dissoc current k))]
+                (spit tmp (render-secrets updated))
+                (info "Re-encrypting…")
+                (write-secrets! env target tmp)
+                (report-written! env "Removed" (pr-str path) "from" secrets-file)
+                secrets-file))
+            (finally (secure-delete! tmp))))))))
 
 (defn- show-key-line
   "One line per environment: its public key, or a warning that the key file
@@ -1368,15 +1328,16 @@
   recipients (its recipients file, or its own identity in single-key mode).
   Returns the ciphertext path."
   [config env-arg file]
-  (require-age!)
-  (let [env (resolve-env config env-arg)
-        target (encrypt-target! env)]
-    (when-not (and file (.exists (io/file file)))
-      (fail! (str "No such file: " file) {:file file}))
-    (let [out (str file ".age")]
-      (age/encrypt-file! target file out)
-      (ok "Encrypted:" out)
-      out)))
+  (with-environment-identity config (resolve-env config env-arg)
+    (fn [env]
+      (require-age!)
+      (let [target (encrypt-target! env)]
+        (when-not (and file (.exists (io/file file)))
+          (fail! (str "No such file: " file) {:file file}))
+        (let [out (str file ".age")]
+          (age/encrypt-file! target file out)
+          (ok "Encrypted:" out)
+          out)))))
 
 (def ^:private max-arbitrary-plaintext-bytes
   "Plaintext bound for `decrypt!`, the general-purpose file command (1 GiB).
@@ -1394,17 +1355,18 @@
   Bounded by `max-arbitrary-plaintext-bytes`, not by the tighter secrets-store
   limit: this command decrypts whatever file it is given."
   [config env-arg file]
-  (require-age!)
-  (let [env (resolve-env config env-arg)]
-    (require-identity! env)
-    (when-not (and file (.exists (io/file file)))
-      (fail! (str "No such file: " file) {:file file}))
-    (age/decrypt-to-stream!
-     (:identity-file env) file System/out
-     (assoc (decrypt-opts env)
-            :limits {:max-plaintext-bytes max-arbitrary-plaintext-bytes}))
-    (.flush System/out)
-    file))
+  (with-environment-identity config (resolve-env config env-arg)
+    (fn [env]
+      (require-age!)
+      (require-identity! env)
+      (when-not (and file (.exists (io/file file)))
+        (fail! (str "No such file: " file) {:file file}))
+      (age/decrypt-to-stream!
+       (:identity-file env) file System/out
+       (assoc (decrypt-opts env)
+              :limits {:max-plaintext-bytes max-arbitrary-plaintext-bytes}))
+      (.flush System/out)
+      file)))
 
 (defn reencrypt!
   "Decrypt and immediately re-encrypt to the environment's current recipients —
@@ -1413,26 +1375,28 @@
   before the decryption, so it is exactly the list the command was started
   against. Rewrites the manifest too. Returns the secrets-file path."
   [config env-arg]
-  (require-age!)
-  (let [{:keys [secrets-file identity-file] environment-name :name :as env}
-        (resolve-env config env-arg)]
-    (require-identity! env)
-    (when-not (.exists (io/file secrets-file))
-      (fail! (str "No secrets file at " secrets-file "\n"
-                  "    Create one with:  bb secrets new "
-                  (shell-quote (clojure.core/name environment-name)))
-             {:secrets-file secrets-file
-              :environment environment-name}))
-    (let [target (encrypt-target! env)
-          tmp (temp-plaintext!)]
-      (try
-        (info "Decrypting" secrets-file "…")
-        (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
-        (info "Re-encrypting to current recipients…")
-        (write-secrets! env target tmp)
-        (report-written! env "Re-encrypted:" secrets-file)
-        secrets-file
-        (finally (secure-delete! tmp))))))
+  (with-environment-identity config (resolve-env config env-arg)
+    (fn [env]
+      (require-age!)
+      (let [{:keys [secrets-file identity-file] environment-name :name :as env}
+            env]
+        (require-identity! env)
+        (when-not (.exists (io/file secrets-file))
+          (fail! (str "No secrets file at " secrets-file "\n"
+                      "    Create one with:  bb secrets new "
+                      (shell-quote (clojure.core/name environment-name)))
+                 {:secrets-file secrets-file
+                  :environment environment-name}))
+        (let [target (encrypt-target! env)
+              tmp (temp-plaintext!)]
+          (try
+            (info "Decrypting" secrets-file "…")
+            (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
+            (info "Re-encrypting to current recipients…")
+            (write-secrets! env target tmp)
+            (report-written! env "Re-encrypted:" secrets-file)
+            secrets-file
+            (finally (secure-delete! tmp))))))))
 
 (defn- recipient-added-lines
   "The report after a recipient is appended: what to run next, which turns on
@@ -1721,7 +1685,7 @@
                    reencrypt "`.")]]
 
       :no-ciphertext-sha
-      [[:warn label (str "— no identity " (identity-location env))
+      [[:warn label (str "— no identity at " (:identity-file env))
         "and the manifest records no :ciphertext-sha; cannot verify."]]
 
       :ciphertext-agrees
@@ -1772,9 +1736,11 @@
                (vals (:environments config)))
         results (into {}
                       (map (fn [env]
-                             (let [finding (verify-one! env)]
-                               (say! (finding-lines env finding))
-                               [(:name env) (:status finding)])))
+                             (with-environment-identity config env
+                               (fn [env]
+                                 (let [finding (verify-one! env)]
+                                   (say! (finding-lines env finding))
+                                   [(:name env) (:status finding)])))))
                       envs)
         statuses (set (vals results))]
     {:results results
@@ -1913,39 +1879,41 @@
 
 (defn- doctor-data
   [config env-arg]
-  (let [config (normalize-config config)
-        {:keys [secrets-file manifest template key-file recipients-file
-                identity-file identity-source]
-         environment-name :name :as env} (resolve-env config env-arg)
-        artifacts {:ciphertext (artifact-state secrets-file :unconfigured)
-                   :manifest (artifact-state manifest :disabled)
-                   :template (artifact-state template :unconfigured)
-                   :key (artifact-state key-file :unconfigured)
-                   :recipients (artifact-state recipients-file :unconfigured)}
-        identity {:source identity-source
-                  :usable? (usable-file? identity-file)}
-        age (age-state)
-        recipients (recipient-state env (:recipients artifacts))
-        mode (if recipients-file :multi-recipient :single-key)
-        manifest-capability (manifest-state manifest (:manifest artifacts) (:limits env))
-        verify (doctor-verification-capability
-                age identity artifacts manifest-capability)
-        status (doctor-status
-                age
-                identity
-                artifacts
-                recipients
-                manifest-capability
-                verify)]
-    {:configuration {:valid? true}
-     :age age
-     :environment environment-name
-     :artifacts artifacts
-     :identity identity
-     :encryption {:mode mode :recipients recipients}
-     :verify verify
-     :status status
-     :exit (case status :healthy 0 :warning 1 :invalid 2)}))
+  (let [config (normalize-config config)]
+    (with-environment-identity config (resolve-env config env-arg)
+      (fn [env]
+        (let [{:keys [secrets-file manifest template key-file recipients-file
+                      identity-file identity-source]
+               environment-name :name :as env} env
+              artifacts {:ciphertext (artifact-state secrets-file :unconfigured)
+                         :manifest (artifact-state manifest :disabled)
+                         :template (artifact-state template :unconfigured)
+                         :key (artifact-state key-file :unconfigured)
+                         :recipients (artifact-state recipients-file :unconfigured)}
+              identity {:source identity-source
+                        :usable? (usable-file? identity-file)}
+              age (age-state)
+              recipients (recipient-state env (:recipients artifacts))
+              mode (if recipients-file :multi-recipient :single-key)
+              manifest-capability (manifest-state manifest (:manifest artifacts) (:limits env))
+              verify (doctor-verification-capability
+                      age identity artifacts manifest-capability)
+              status (doctor-status
+                      age
+                      identity
+                      artifacts
+                      recipients
+                      manifest-capability
+                      verify)]
+          {:configuration {:valid? true}
+           :age age
+           :environment environment-name
+           :artifacts artifacts
+           :identity identity
+           :encryption {:mode mode :recipients recipients}
+           :verify verify
+           :status status
+           :exit (case status :healthy 0 :warning 1 :invalid 2)})))))
 
 (defn- artifact-state-line
   [label {:keys [state path exists?]}]
@@ -2002,7 +1970,10 @@
   [config env-arg]
   (let [result (try
                  (doctor-data config env-arg)
-                 (catch Exception _
+                 (catch Exception e
+                   (when (or (= :identity-cleanup-failed (:reason (ex-data e)))
+                             (:cleanup (ex-data e)))
+                     (throw e))
                    {:configuration {:valid? false}
                     :age nil
                     :environment nil
@@ -2053,15 +2024,18 @@
   (and (string? x) (re-matches #"\d+" x)))
 
 (defn- error-lines
-  "How `run!` reports an ex-info: its message, then any :hint, :install,
-  :error, or :docs from its data, all on stderr."
+  "Render the error, remediation, and any remaining private file on stderr."
   [e]
-  (into [[:oops (ex-message e)]]
-        (for [k [:hint :install :error :docs]
-              :let [v (get (ex-data e) k)]
-              :when (and (some? v) (not (str/blank? (str v))))
-              line (str/split-lines (str/trim-newline (str v)))]
-          [:stderr "   " line])))
+  (let [data (ex-data e)
+        cleanup (if (= :identity-cleanup-failed (:reason data)) data (:cleanup data))]
+    (cond-> (into [[:oops (ex-message e)]]
+                  (for [k [:hint :install :error :docs]
+                        :let [v (get data k)]
+                        :when (and (some? v) (not (str/blank? (str v))))
+                        line (str/split-lines (str/trim-newline (str v)))]
+                    [:stderr "   " line]))
+      cleanup (conj [:stderr "Temporary identity cleanup failed; remove the private file:"
+                     (:identity-file cleanup)]))))
 
 (defn- restore-error-operand [data operands]
   (cond

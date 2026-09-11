@@ -20,8 +20,8 @@
 (defmethod ig/init-key secrets-key
   [_ {:keys [app identity-file] :as opts}]
   ;; `load-secrets` accepts a classpath URL, which also works when this example
-  ;; is packaged as an uberjar.  The identity is resolved from the documented
-  ;; environment variables unless an explicit path is supplied.
+  ;; is packaged as an uberjar.  An explicit identity path wins; otherwise the
+  ;; library resolves the documented environment variables and app fallback.
   (let [identity-or-options (cond-> {}
                               app (assoc :app app)
                               identity-file (assoc :identity-file identity-file))]

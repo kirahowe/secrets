@@ -95,14 +95,12 @@
 ;; (secrets/load-secrets src {:app "myapp"})   ; ~/.config/myapp/key.txt
 ;; ```
 
-;; Before using the `:app` convention, the library checks the
+;; Identity resolution is scoped to each operation. An explicit path, including
+;; `:identity-file`, wins first. The library then checks
 ;; `SECRETS_AGE_IDENTITY_FILE`, `SECRETS_AGE_IDENTITY`, and
-;; `SECRETS_AGE_IDENTITY_B64` environment variables, in that order. With no
-;; identity argument, these environment variables are the only sources. They
-;; also take precedence when you pass `{:app "myapp"}`, so local development can
-;; use `~/.config/myapp/key.txt` while production overrides it with an injected
-;; identity. The
-;; [production chapter](secrets_book.production.html#injecting-the-key)
+;; `SECRETS_AGE_IDENTITY_B64`, in that order, followed by the conventional app
+;; path. With no explicit path or app, the environment variables are the only
+;; sources. The [production chapter](secrets_book.production.html#injecting-the-key)
 ;; describes each variable and when to use it.
 
 ;; There is no default key path when no app is named. This prevents unrelated
@@ -114,26 +112,28 @@
                         {:identity-file (str dir "/no-such-key.txt")})
   (catch Exception e (ex-message e)))
 
-;; ### Retiring injected identities
+;; ### Scoped injected identities
 
 ;; Raw and base64 environment identities have to be written to a file because
-;; age expects an identity file path. The library reuses an owner-only temporary
-;; file instead of writing a new copy for every decryption. A long-running
-;; process can retire those files when it has finished loading its config:
+;; age expects an identity file path. Each operation creates an exclusive
+;; owner-only temporary file and checks its deletion when the operation finishes.
+;; The library never deletes a caller-owned identity path.
+
+;; `load-secrets` owns this scope automatically. Code that passes an identity to
+;; a lower-level operation can use the callback form:
 
 ;; ```clojure
-;; (secrets/reset-identity-cache!)
-;; ;; => {:generation 1, :deleted 1, :absent 0, :failed 0, :pending 0}
+;; (secrets/with-identity {:app "myapp"}
+;;   (fn [{:keys [identity-file]}]
+;;     (age/decrypt identity-file (str dir "/secrets.edn.age"))))
 ;; ```
 
-;; A later read materializes a fresh copy. The library never deletes identity
-;; files you provide yourself, whether they come from an explicit
-;; `:identity-file`, `SECRETS_AGE_IDENTITY_FILE`, or the conventional app key.
-;; `load-secrets`, the reader literals, and the Aero readers hold their injected
-;; identity for the complete decryption, so a concurrent reset cannot remove it
-;; from under a running age process. If you resolve an injected identity
-;; yourself and pass it directly to the lower-level age API, wrap that call in
-;; `secrets/with-identity` to get the same guarantee.
+;; The callback receives the resolved path and its source keyword. A cleanup
+;; failure throws structured error data containing the temporary path so an
+;; operator can remove it. Paths are allowed in diagnostics for recovery, but
+;; key contents are never included. A process crash can leave a temporary file
+;; behind, and temporary-file deletion is not secure erasure on every
+;; filesystem.
 
 ;; ## Resource limits
 

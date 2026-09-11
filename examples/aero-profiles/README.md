@@ -8,7 +8,8 @@ The config demonstrates three useful behaviours:
 
 - `:api-key` selects a different required key for `:default` and `:evals`.
 - `#secret/opt` makes an absent optional integration resolve to `nil`.
-- `reset-cache!` is called by the REPL-friendly `run!` helper when requested.
+- `reset-cache!` clears Aero's cached reader and decrypted store when requested
+  by the REPL-friendly `run!` helper.
 
 All setup data is disposable fake data. From this checkout you need `bb`,
 `age`, and `java` on `PATH`: this example's `bb.edn` uses both Maven
@@ -30,10 +31,10 @@ profile and configured/presence status, never secret values.
 The application code names no files. The secrets options, the ciphertext path
 and `:app "aero-profiles"`, are passed to `run!` from `bb.edn`, the project's
 own configuration. They cannot sit inside `config.edn`, because Aero needs them
-before it can read that file. The key is then found the way the library always
-finds it: `SECRETS_AGE_IDENTITY_FILE` and the other injection variables first,
-then `~/.config/aero-profiles/key.txt`. The `export` above points the demo at
-the disposable key instead of a real one under `~/.config`.
+before it can read that file. With no explicit identity path, the key is found
+through the identity environment variables first, then
+`~/.config/aero-profiles/key.txt`. The `export` above points the demo at the
+disposable key instead of a real one under `~/.config`.
 
 `bb bootstrap` is safe to rerun: it removes and recreates only those exact
 disposable files. `bb clean` removes them explicitly. In a real application,
@@ -42,4 +43,5 @@ this starter intentionally keeps its runtime ciphertext under ignored `tmp/`.
 
 For a REPL started with the same variable exported, load the namespace and call
 `(aero-profiles.core/run! {:file "tmp/secrets.edn.age" :app "aero-profiles"} "evals")`;
-call `(aero-profiles.core/reset-cache!)` after editing the encrypted store.
+call `(aero-profiles.core/reset-cache!)` after editing the encrypted store to
+clear Aero's cached read.

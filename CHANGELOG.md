@@ -151,29 +151,16 @@ All notable changes to this project are documented here. The format follows
   page with no policy; `bb book:build` and CI's `build-book` job both fail on
   any finding, and a browser confirms rendering, navigation, search, and
   clipboard copy still work under the policy.
-- `secrets/reset-identity-cache!` retires the temp files that
-  `SECRETS_AGE_IDENTITY` and `SECRETS_AGE_IDENTITY_B64` materialize, so a
-  long-running process no longer keeps an injected private key on disk until it
-  exits and an abnormal exit has less to leave behind (CWE-459). It checks
-  deletion of every materialized identity no decryption is using, defers the
-  rest to their last release, and is idempotent; a later read materializes
-  afresh rather than reusing a retired path, and identity files the caller owns
-  (`SECRETS_AGE_IDENTITY_FILE`, an explicit `:identity-file`,
-  `~/.config/<app>/key.txt`) are never touched. Its path-free result separates
-  successful `:deleted`, already `:absent`, retained `:failed`, and newly
-  `:pending` counts. A failed deletion remains tracked for the next reset
-  instead of fabricating success or losing the retry.
-  Deletion cannot race a running `age`: `load-secrets` holds the identity
-  through `secrets/with-identity` for its whole call — which covers the reader
-  literals and the Aero readers — and the same scope is public for a caller
-  that hands a resolved path to `age` itself. A failed write and a
-  materialization that loses to a retirement use the same checked retry
-  lifecycle rather than orphaning a key nothing points at, the identity state
-  keeps one generation and its entries in one atom the way the Aero reader
-  cache does, `deleteOnExit` is now only the backstop, and no identity content,
-  digest, or materialized path reaches a cleanup result, message, or `ex-data`.
 
 ### Changed
+- Identity handling is now scoped to each operation. Explicit identity paths
+  take precedence over environment variables in both runtime and CLI commands,
+  which then fall back to the configured or app-default key path. Raw and
+  base64 environment identities use an exclusive 0600 temporary file that the
+  operation cleans up. `with-identity` now passes a descriptor map to its
+  callback. Removed the shared cache, `reset-identity-cache!`, and the
+  materializing `identity-from-env`, `resolve-identity-file`, and
+  `identity-available?` APIs.
 - The library's coordinates are written in one file,
   `src/com/kirahowe/secrets/coordinate.edn`: the release version, the Maven
   coordinate, and the name the library is declared under as a git dependency.

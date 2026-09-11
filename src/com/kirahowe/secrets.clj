@@ -24,7 +24,7 @@
         :jdbc-url #secret/req :database/url  ; required — throws if absent
         :api-key  #secret/opt :llm/api-key   ; optional — nil if absent
 
-  Identity resolution (where the private key comes from), in order:
+  An explicit identity path takes precedence. Otherwise resolution uses:
     1. $SECRETS_AGE_IDENTITY_FILE — a path to the key file.
     2. $SECRETS_AGE_IDENTITY      — the raw key file *contents*, used verbatim and
        materialized to a 0600 temp file. Lets a deploy inject the key as one
@@ -37,9 +37,8 @@
   When none of these yields an identity, resolution returns nil and loading
   throws with the options above rather than guessing a path.
 
-  The temp files that sources 2 and 3 materialize are this library's to clean
-  up: `reset-identity-cache!` deletes them, waiting for any decryption still
-  holding one, and `.deleteOnExit` is only the backstop."
+  Sources 2 and 3 are materialized into a private temporary file only while an
+  operation needs them, then deleted before that operation returns."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.age :as age]
@@ -63,69 +62,6 @@
       s)))
 
 ;;;; Identity resolution
-
-;;; `identity-state` holds every injected identity this library materialized and
-;;; the generation they belong to:
-;;;
-;;;     {:generation 0
-;;;      :entries {digest entry}
-;;;      :retired {path users}
-;;;      :cleanup #{path}}
-;;;
-;;; An `:entries` entry is a `delay` while its file is being written and
-;;; `{:path … :users n}` once the file exists, where `:users` counts the leases
-;;; [[with-identity]] holds. One atom rather than three, for the reason
-;;; `com.kirahowe.secrets.aero` documents: a generation and the files that
-;;; belong to it have to move together, and replacing `:entries` wholesale is
-;;; the single mechanism that retires them.
-;;;
-;;; `:retired` is where an entry waits for a lease that outlived its generation.
-;;; `:cleanup` retains unleased paths until checked deletion confirms the file is
-;;; absent. Both are keyed by path because a temp path is unique to one
-;;; materialization, so neither depends on a digest a newer generation may have
-;;; re-materialized.
-;;;
-;;; `:generation` gives a lifecycle an identity that tests and diagnostics can
-;;; name. It is deliberately not part of any key.
-
-(defonce ^:private identity-state
-  (atom {:generation 0 :entries {} :retired {} :cleanup #{}}))
-
-(defn- try-delete-identity-file!
-  "Attempt to delete `file`. Kept as the narrow filesystem seam for tests."
-  [file]
-  (.delete file))
-
-(defn- delete-identity-file!
-  "Return `:deleted`, `:absent`, or `:failed` after checked deletion of `path`."
-  [path]
-  (let [file (io/file path)]
-    (try
-      (cond
-        (not (.exists file)) :absent
-        (try-delete-identity-file! file) :deleted
-        (.exists file) :failed
-        :else :absent)
-      (catch SecurityException _
-        :failed))))
-
-(defn- track-cleanup
-  "Retain `path` in `state` until checked deletion confirms it absent."
-  [state path]
-  (update state :cleanup (fnil conj #{}) path))
-
-(defn- forget-cleanup
-  "Forget `path` after checked deletion confirms it absent."
-  [state path]
-  (update state :cleanup (fnil disj #{}) path))
-
-(defn- cleanup-identity-file!
-  "Delete tracked `path`, retaining it when deletion fails."
-  [path]
-  (let [outcome (delete-identity-file! path)]
-    (when (not= :failed outcome)
-      (swap! identity-state forget-cleanup path))
-    outcome))
 
 (def ^:private identity-b64-whitespace-re
   "ASCII whitespace permitted in base64 identity transport: space, horizontal
@@ -159,215 +95,6 @@
       (throw (invalid-b64-identity)))
     (String. decoded "UTF-8")))
 
-(defn- identity-digest
-  "Return a stable SHA-256 cache key without retaining the raw identity contents."
-  [contents]
-  (let [bytes (.digest (java.security.MessageDigest/getInstance "SHA-256")
-                       (.getBytes (str contents) "UTF-8"))]
-    (.encodeToString (java.util.Base64/getEncoder) bytes)))
-
-(defn- write-identity!
-  "Write identity contents verbatim to an owner-only temp file and return its
-  path.
-
-  A failed write deletes the file it created: a partial identity nothing points
-  at is exactly the residue this lifecycle exists to avoid. The failure is
-  reported by exception class only, with no cause attached — the underlying
-  IOException names the temp file, and a diagnostic must not."
-  [contents]
-  (let [file (fs/owner-only-temp-file! "age-identity-" ".txt")]
-    (try
-      (spit file contents)
-      (.getAbsolutePath file)
-      (catch Exception e
-        (let [path (.getAbsolutePath file)]
-          (swap! identity-state track-cleanup path)
-          (cleanup-identity-file! path))
-        (throw (ex-info (str "Could not write the injected age identity to a temp file ("
-                             (.getName (class e)) "). Check the temp directory is writable.")
-                        {:reason :identity-not-materialized}))))))
-
-(defn- install-identity
-  "Install in-flight `candidate` at `digest`, unless this generation has an entry."
-  [state digest candidate]
-  (cond-> state
-    (not (contains? (:entries state) digest))
-    (assoc-in [:entries digest] candidate)))
-
-(defn- promote-identity
-  "Replace the in-flight `entry` at `digest` with the `path` it wrote, leaving a
-  state that has since retired it untouched."
-  [state digest entry path]
-  (cond-> state
-    (identical? entry (get-in state [:entries digest]))
-    (assoc-in [:entries digest] {:path path :users 0})))
-
-(defn- drop-identity
-  "Remove the in-flight `entry` at `digest`, unless a retirement already did."
-  [state digest entry]
-  (cond-> state
-    (identical? entry (get-in state [:entries digest]))
-    (update :entries dissoc digest)))
-
-(defn- materialize-identity!
-  "Materialize identity `contents` to an owner-only temp file once per generation
-  and return its path.
-
-  Installing a delay in the same `swap!` that reads it back is what makes
-  concurrent callers with identical contents share one write, and what makes a
-  [[reset-identity-cache!]] that commits first send this `swap!` around again
-  against the new generation rather than write into a retired one. The state
-  retains only a digest and, once the write lands, the path.
-
-  A write that throws drops the entry, and losing the promotion to a retirement
-  deletes the file and materializes afresh: a file no entry points at is an
-  identity nothing would ever delete."
-  [contents]
-  (let [digest (identity-digest contents)
-        candidate (delay (write-identity! contents))
-        entry (get-in (swap! identity-state install-identity digest candidate)
-                      [:entries digest])]
-    (if-not (delay? entry)
-      (:path entry)
-      (let [path (try
-                   @entry
-                   (catch Exception e
-                     (swap! identity-state drop-identity digest entry)
-                     (throw e)))
-            promoted (swap! identity-state promote-identity digest entry path)]
-        (if (= path (get-in promoted [:entries digest :path]))
-          path
-          (do (swap! identity-state track-cleanup path)
-              (cleanup-identity-file! path)
-              (recur contents)))))))
-
-;;;; Identity leases and retirement
-
-(defn- live-digest
-  "The digest whose materialized entry holds `path`, or nil. Entries are keyed by
-  digest while a lease names a path, so this scans: a generation holds one entry
-  per distinct injected identity, and a second index would be a second thing to
-  keep true."
-  [entries path]
-  (some (fn [[digest entry]]
-          (when (and (map? entry) (= path (:path entry))) digest))
-        entries))
-
-(defn- acquire-identity!
-  "Add one active user to the materialized identity at `path` and return true, or
-  false when `path` is not a live materialized identity — a key file the caller
-  owns, or one already retired.
-
-  Atomic against [[reset-identity-cache!]]: either the retirement commits first
-  and this returns false, or the retirement sees the user added here and leaves
-  the deletion to [[release-identity!]]."
-  [path]
-  (let [[before] (swap-vals! identity-state
-                             (fn [state]
-                               (if-let [digest (live-digest (:entries state) path)]
-                                 (update-in state [:entries digest :users] inc)
-                                 state)))]
-    (some? (live-digest (:entries before) path))))
-
-(defn- release-user
-  "Drop one active user of `path`, moving a retired path whose last user leaves
-  into checked cleanup."
-  [{:keys [entries retired] :as state} path]
-  (if (contains? retired path)
-    (if (= 1 (get retired path))
-      (-> state
-          (update :retired dissoc path)
-          (track-cleanup path))
-      (update-in state [:retired path] dec))
-    (if-let [digest (live-digest entries path)]
-      (update-in state [:entries digest :users] dec)
-      state)))
-
-(defn- release-identity!
-  "Release one active user of the identity at `path`, checking deferred deletion
-  when the last user leaves and retaining a failed path for the next reset."
-  [path]
-  (let [[before] (swap-vals! identity-state release-user path)]
-    (when (= 1 (get (:retired before) path))
-      (cleanup-identity-file! path))
-    nil))
-
-(defn with-identity
-  "Call `(f path)` with the identity at `path` held against
-  [[reset-identity-cache!]] for exactly the duration of the call, and return what
-  `f` returns.
-
-  When this library materialized `path` from `SECRETS_AGE_IDENTITY` or
-  `SECRETS_AGE_IDENTITY_B64`, a retirement during the call defers its deletion
-  until `f` returns, so a running `age` subprocess never reads a file that has
-  been deleted underneath it. A path the caller owns is not tracked and is passed
-  through untouched.
-
-  `load-secrets` already wraps its own decryption this way, which covers the
-  reader literals and the Aero readers too. Wrap any identity path you resolved
-  yourself and hand to `age` directly: a path taken out of
-  `resolve-identity-file` and used later sits outside every lease, and no API can
-  hold a lease a caller never opened."
-  [path f]
-  (let [held? (acquire-identity! path)]
-    (try
-      (f path)
-      (finally
-        (when held? (release-identity! path))))))
-
-(defn- retire-entry
-  "Move materialized `entry` to active retirement or checked cleanup."
-  [state _ entry]
-  (if (map? entry)
-    (if (pos? (:users entry))
-      (assoc-in state [:retired (:path entry)] (:users entry))
-      (track-cleanup state (:path entry)))
-    state))
-
-(defn- retire-identities
-  "Move `state` to a new generation, retaining every materialized path until its
-  active leases finish and checked deletion confirms it absent."
-  [{:keys [generation entries retired cleanup]}]
-  (reduce-kv retire-entry
-             {:generation (inc generation)
-              :entries {}
-              :retired retired
-              :cleanup (or cleanup #{})}
-             entries))
-
-(defn- cleanup-identities!
-  "Clean `paths` and return truthful outcome counts without exposing paths."
-  [paths]
-  (reduce (fn [counts path]
-            (update counts (cleanup-identity-file! path) inc))
-          {:deleted 0 :absent 0 :failed 0}
-          paths))
-
-(defn reset-identity-cache!
-  "Retire every temp identity file this library materialized from
-  `SECRETS_AGE_IDENTITY` or `SECRETS_AGE_IDENTITY_B64`: check deletion of each one
-  no decryption is using, and leave the rest to the last [[with-identity]] release
-  holding them. Identity files the caller owns — `SECRETS_AGE_IDENTITY_FILE`,
-  an explicit `:identity-file`, `~/.config/<app>/key.txt` — are never touched.
-
-  This is the primary lifecycle for an injected identity, so a long-running
-  process can stop keeping a private key on disk without exiting.
-  `.deleteOnExit` stays only as the backstop for a process that never reaches
-  here, and an abnormal exit can still leave the file behind. A resolution after
-  this call materializes a fresh file rather than reusing a retired path.
-
-  Returns `{:generation g :deleted n :absent n :failed n :pending n}`. `:deleted`
-  counts successful delete operations, `:absent` counts tracked paths already
-  gone, `:failed` counts existing paths still retained for a later retry, and
-  `:pending` counts newly retired paths still leased. No path, digest, or identity
-  content is returned."
-  []
-  (let [[before after] (swap-vals! identity-state retire-identities)
-        outcomes (cleanup-identities! (:cleanup after))]
-    (assoc outcomes
-           :generation (:generation after)
-           :pending (- (count (:retired after)) (count (:retired before))))))
-
 (def ^:private identity-env-help
   "What each identity variable should contain, for the set-but-empty error."
   {"SECRETS_AGE_IDENTITY_FILE" "a path to the age key file"
@@ -399,63 +126,120 @@
   [k]
   (identity-env-value k (System/getenv k)))
 
-(defn- env-identity
-  "The environment's age identity as `[path materialized?]`, or nil.
-  `materialized?` marks a temp file this library wrote: [[with-identity]] can
-  hold one, and a diagnostic must not name one, because the caller never had it."
-  []
-  (or (when-let [p (identity-env "SECRETS_AGE_IDENTITY_FILE")]
-        [p false])
-      (when-let [c (identity-env "SECRETS_AGE_IDENTITY")]
-        [(materialize-identity! c) true])
-      (when-let [c (identity-env "SECRETS_AGE_IDENTITY_B64")]
-        [(materialize-identity! (decode-b64-identity c)) true])))
+(defn- identity-candidate
+  "Choose an identity without materializing injected contents.
 
-(defn identity-from-env
-  "Return an age identity file path from the environment, or nil. Sources are
-  checked in order:
-    $SECRETS_AGE_IDENTITY_FILE — a path to the key file, returned as-is.
-    $SECRETS_AGE_IDENTITY      — the raw key file contents, used verbatim.
-    $SECRETS_AGE_IDENTITY_B64  — canonical base64-encoded key file contents;
-      ASCII space, horizontal tab, carriage return, and line feed are ignored.
-  Every other nonalphabet character or malformed encoding throws. A blank value
-  throws. Raw or decoded contents are materialized into owner-only
-  temp files, one per distinct value per lifecycle; `reset-identity-cache!`
-  deletes them, and a path returned here is outside every [[with-identity]]
-  lease until you wrap it in one."
-  []
-  (first (env-identity)))
+  The callback scope owns raw and base64 identities. This function only selects
+  a source, which keeps option normalization and availability checks free of
+  private filesystem effects."
+  [identity-or-opts]
+  (let [opts (if (map? identity-or-opts) identity-or-opts {})
+        explicit (if (map? identity-or-opts) (:identity-file opts) identity-or-opts)]
+    (or (when explicit
+          {:identity-file explicit :identity-source :identity-file})
+        (when-let [path (identity-env "SECRETS_AGE_IDENTITY_FILE")]
+          {:identity-file path :identity-source :secrets-age-identity-file})
+        (when-let [contents (identity-env "SECRETS_AGE_IDENTITY")]
+          {:contents contents :identity-source :secrets-age-identity})
+        (when-let [contents (identity-env "SECRETS_AGE_IDENTITY_B64")]
+          {:contents (decode-b64-identity contents)
+           :identity-source :secrets-age-identity-b64})
+        (when-let [path (:key-file opts)]
+          {:identity-file path
+           :identity-source (case (:key-file-source opts)
+                              :default :default-key-file
+                              :configured :configured-key-file
+                              :configured-key-file)})
+        (when-let [app (:app opts)]
+          {:identity-file (expand-home (str "~/.config/" app "/key.txt"))
+           :identity-source :default-key-file})
+        {:identity-file nil :identity-source nil})))
 
-(defn- conventional-identity
-  "`resolve-identity-file` with provenance: `[path materialized?]`, or nil."
-  [app-or-opts]
-  (let [app (if (map? app-or-opts) (:app app-or-opts) app-or-opts)]
-    (or (env-identity)
-        (when app [(expand-home (str "~/.config/" app "/key.txt")) false]))))
+(defn- try-delete-identity-file!
+  "Attempt to delete `file`. Kept as the narrow filesystem seam for tests."
+  [file]
+  (.delete file))
 
-(defn resolve-identity-file
-  "Return the conventional identity path: `identity-from-env` first, then
-  `~/.config/<app>/key.txt` when `app-or-opts` supplies an app name. Does not
-  check whether the file exists. Returns nil when neither source is available."
-  ([] (resolve-identity-file nil))
-  ([app-or-opts] (first (conventional-identity app-or-opts))))
+(defn- cleanup-failure
+  [path source]
+  (ex-info "Could not delete the temporary age identity file."
+           {:reason :identity-cleanup-failed
+            :identity-file path
+            :identity-source source}))
+
+(defn- delete-materialized-identity!
+  "Delete a temporary identity, returning nil or a safe cleanup exception."
+  [path source]
+  (let [file (io/file path)]
+    (try
+      (cond
+        (not (.exists file)) nil
+        (try-delete-identity-file! file) nil
+        (not (.exists file)) nil
+        :else (cleanup-failure path source))
+      (catch SecurityException _
+        (cleanup-failure path source)))))
+
+(defn- write-identity!
+  "Materialize injected contents in a private temp file for one operation."
+  [contents source]
+  (let [file (fs/owner-only-temp-file! "age-identity-" ".txt")
+        path (.getAbsolutePath file)]
+    (try
+      (spit file contents)
+      path
+      (catch Exception e
+        (let [cleanup (delete-materialized-identity! path source)]
+          (throw (ex-info (str "Could not write the injected age identity to a temp file ("
+                               (.getName (class e)) "). Check the temp directory is writable.")
+                          (cond-> {:reason :identity-not-materialized
+                                   :identity-file path
+                                   :identity-source source}
+                            cleanup (assoc :cleanup (ex-data cleanup))))))))))
+
+(defn with-identity
+  "Call `f` with an operation-owned identity descriptor.
+
+  `identity-or-opts` accepts an explicit path or an options map. `f` receives
+  `{:identity-file path-or-nil :identity-source source}`. Resolution is an
+  explicit path, then SECRETS_AGE_IDENTITY_FILE/raw/base64, then `:key-file`,
+  then an `:app` default; no configured identity gives a nil path for keyless
+  operations. Paths owned by callers pass through untouched. Raw and base64
+  identities are materialized only for this callback and deleted when it
+  returns. If both the callback and cleanup fail, the callback error keeps its
+  reason and message and carries the safe cleanup diagnostic in `:cleanup`."
+  [identity-or-opts f]
+  (let [{:keys [contents identity-source] :as candidate}
+        (identity-candidate identity-or-opts)]
+    (if (contains? candidate :contents)
+      (let [path (write-identity! contents identity-source)
+            descriptor {:identity-file path :identity-source identity-source}
+            callback-failure (volatile! nil)]
+        (try
+          (f descriptor)
+          (catch Throwable t
+            (vreset! callback-failure t)
+            (throw t))
+          (finally
+            (when-let [cleanup (delete-materialized-identity! path identity-source)]
+              (if-let [failure @callback-failure]
+                (if (instance? clojure.lang.ExceptionInfo failure)
+                  (throw (ex-info (ex-message failure)
+                                  (assoc (ex-data failure) :cleanup (ex-data cleanup))
+                                  failure))
+                  (throw (ex-info (ex-message cleanup)
+                                  {:reason :identity-cleanup-failed
+                                   :identity-file path
+                                   :identity-source identity-source
+                                   :cleanup (ex-data cleanup)}
+                                  failure)))
+                (throw cleanup))))))
+      (f (select-keys candidate [:identity-file :identity-source])))))
 
 (defn- identity-file-exists?
   "True when `path` names an identity file that exists."
   [path]
   (boolean (and path (.exists (io/file (str path))))))
-
-(defn identity-available?
-  "True when the resolved identity file exists. `app-or-opts` accepts an app
-  name or an options map with `:app` or `:identity-file`; an explicit
-  `:identity-file` takes priority."
-  ([] (identity-available? nil))
-  ([app-or-opts]
-   (let [identity (if (map? app-or-opts)
-                    (or (:identity-file app-or-opts)
-                        (resolve-identity-file app-or-opts))
-                    (resolve-identity-file app-or-opts))]
-     (identity-file-exists? identity))))
 
 (def ^:private identity-options
   "One-line remediation appended to \"no identity\" errors."
@@ -511,26 +295,10 @@
 
 ;;;; Loading
 
-(defn- load-identity
-  "The identity for one `load-secrets` call as `[path materialized?]`. An
-  explicit `:identity-file`, or a bare path argument, is the caller's own file;
-  anything resolved from here may be a temp file this library materialized."
-  [identity-or-opts]
-  (let [explicit (if (map? identity-or-opts)
-                   (:identity-file identity-or-opts)
-                   identity-or-opts)]
-    (if explicit
-      [explicit false]
-      (conventional-identity (when (map? identity-or-opts) identity-or-opts)))))
-
 (defn- validate-load-identity!
-  "Throw unless `identity` names an existing file.
-
-  A caller-supplied path is named in the failure: the caller already has it, and
-  naming it is most of the message's value. A path this library materialized is
-  not — the caller never saw it, and it points at a file holding key material."
-  [descriptor identity materialized?]
-  (let [nameable (and identity (not materialized?) (str identity))]
+  "Throw unless `identity` names an existing file."
+  [descriptor identity]
+  (let [nameable (some-> identity str)]
     (when-not (identity-file-exists? identity)
       (throw (ex-info (str "No age identity found"
                            (when nameable (str " (" nameable " does not exist)"))
@@ -575,19 +343,17 @@
                       (edn-failure-data parsed))))))
 
 (defn- decrypt-and-read!
-  "Decrypt and read `file` under `opts` — `:limits`, the `:source` descriptor,
-  and whether the identity is `:materialized-identity?` — always running its
-  source cleanup function.
+  "Decrypt and read `file` under `opts` — `:limits` and the `:source`
+  descriptor — always running its source cleanup function.
 
   A failure below here knows the file `age` was handed, which for a copied
   source is a temp file the caller never named, so it is re-thrown with the
   source descriptor added. Content-free EDN failures deliberately drop their
   intermediate exception; other failures retain their cause."
-  [identity file {:keys [limits source materialized-identity?]} cleanup!]
+  [identity file {:keys [limits source]} cleanup!]
   (try
     (read-secrets-edn (age/decrypt identity (.getAbsolutePath ^java.io.File file)
-                                   {:limits limits
-                                    :identity-nameable? (not materialized-identity?)})
+                                   {:limits limits})
                       limits)
     (catch clojure.lang.ExceptionInfo e
       (let [data (assoc (ex-data e) :source source)]
@@ -597,26 +363,22 @@
     (finally
       (cleanup!))))
 
-(defn- load-from
-  "Load `source` with the already-resolved identity `[path materialized?]` under
-  `limits`.
-
-  Provenance travels with the path rather than being re-derived: nothing can
-  recover from a path alone whether the caller supplied it or this library
-  materialized it from an injected key, and every diagnostic below here turns on
-  that difference."
-  [source [identity materialized?] limits]
+(defn- load-with-identity
+  "Load `source` while an identity descriptor is owned by the calling scope."
+  [source {:keys [identity-file]} limits]
   (let [descriptor (source/descriptor source)]
-    (with-identity identity
-      (fn [path]
-        (validate-load-identity! descriptor path materialized?)
-        (let [[file cleanup!] (source/acquire! source descriptor
-                                               (:max-source-bytes limits))]
-          (decrypt-and-read! path file
-                             {:limits limits
-                              :source descriptor
-                              :materialized-identity? materialized?}
-                             cleanup!))))))
+    (validate-load-identity! descriptor identity-file)
+    (let [[file cleanup!] (source/acquire! source descriptor
+                                           (:max-source-bytes limits))]
+      (decrypt-and-read! identity-file file
+                         {:limits limits :source descriptor}
+                         cleanup!))))
+
+(defn- load-from
+  "Load `source` in an operation-owned identity scope."
+  [source identity-or-opts limits]
+  (with-identity identity-or-opts
+    #(load-with-identity source % limits)))
 
 (defn load-secrets
   "Decrypt an age-encrypted EDN source and return its value.
@@ -648,17 +410,12 @@
   Every failure about a source carries `:source`, allowlisted metadata naming
   which source failed — a locator's scheme, host, port, and path, a file's path,
   or a rejected object's class — and never the source value, whose userinfo,
-  query, or `toString` can be a credential. An identity path is named only when
-  the caller supplied it.
-
-  The identity is held with [[with-identity]] for the whole call, so a
-  `reset-identity-cache!` cannot delete an injected identity while `age` is
-  reading it. That covers the reader literals and the Aero readers, which load
-  through here."
+  query, or `toString` can be a credential. Injected identities are kept in a
+  private temporary file only for the duration of this operation."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
    (let [limits (resolve-limits (when (map? identity-or-opts) (:limits identity-or-opts)))]
-     (load-from source (load-identity identity-or-opts) limits))))
+     (load-from source identity-or-opts limits))))
 
 (defn get-secret
   "Read a secret from a loaded map. `key-path` is a single key (`:database/url`)
@@ -673,14 +430,9 @@
 ;;;; EDN reader literals
 
 (defn- reader-loaded-state
-  "Resolve and load one readers map's source under its resolved `:limits`, or
-  describe why it is unavailable.
-
-  `identity` is a delay over `[path materialized?]`, and it is loaded through
-  [[load-from]] rather than [[load-secrets]] for that pair's sake: passing the
-  path back in as an explicit `:identity-file` would relabel a path this library
-  materialized as one the caller supplied, and diagnostics would then name it."
-  [{:keys [resource file limits]} identity]
+  "Load one readers map's source in an operation-owned identity scope, or
+  describe why it is unavailable."
+  [{:keys [resource file] :as opts} limits]
   (let [source (cond
                  file (when (.exists (io/file (str file)))
                         (io/file (str file)))
@@ -689,11 +441,12 @@
       (nil? source)
       {:present? false :reason :no-file}
 
-      (not (identity-file-exists? (first @identity)))
-      {:present? false :reason :no-identity}
-
       :else
-      {:present? true :secrets (load-from source @identity limits)})))
+      (with-identity opts
+        (fn [{:keys [identity-file] :as identity}]
+          (if-not (identity-file-exists? identity-file)
+            {:present? false :reason :no-identity}
+            {:present? true :secrets (load-with-identity source identity limits)}))))))
 
 (defn- required-secret-handler
   "Build the required-secret reader around a shared delayed loaded state.
@@ -752,12 +505,9 @@
                     from the decrypted map.
     #secret/opt k → optional: nil in all three of those cases.
   If the identity exists but decryption fails, both tags throw."
-  [{:keys [app identity-file] :as opts}]
+  [opts]
   (let [limits (resolve-limits (:limits opts))
-        identity (delay (if identity-file
-                          [identity-file false]
-                          (conventional-identity app)))
-        loaded (delay (reader-loaded-state (assoc opts :limits limits) identity))
+        loaded (delay (reader-loaded-state opts limits))
         describe (or (:file opts) (:resource opts) "secrets")]
     {'secret/req (required-secret-handler loaded describe)
      'secret/opt (optional-secret-handler loaded)}))

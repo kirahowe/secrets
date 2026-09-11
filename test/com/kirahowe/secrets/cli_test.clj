@@ -15,6 +15,7 @@
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
+            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.manifest :as manifest]))
 
 (def ^:private ^:dynamic *dir* nil)
@@ -115,6 +116,65 @@
 (defn- cli-private [sym]
   (ns-resolve 'com.kirahowe.secrets.cli sym))
 
+(defn- secrets-private [sym]
+  (or (ns-resolve 'com.kirahowe.secrets sym)
+      (throw (ex-info "Missing runtime test seam" {:symbol sym}))))
+
+(defn- with-identity-environment
+  "Run `f` with exactly `environment` as the runtime's identity environment.
+  This keeps tests independent from an operator's process environment without
+  materializing an identity while config is being normalized."
+  [environment f]
+  (with-redefs-fn {(secrets-private 'identity-env) #(get environment %)} f))
+
+(defn- observe-injected-identities
+  "Run `f`, recording only temp files allocated for raw/base64 age identities.
+  The wrapper delegates the actual owner-only creation to `fs`; it observes no
+  plaintext and ignores the CLI's unrelated plaintext scratch files."
+  ([f] (observe-injected-identities (atom []) f))
+  ([created f]
+   (let [real-owner-only-temp-file! fs/owner-only-temp-file!]
+     (with-redefs [fs/owner-only-temp-file!
+                   (fn [prefix suffix]
+                     (let [file (real-owner-only-temp-file! prefix suffix)]
+                       (when (= "age-identity-" prefix)
+                         (swap! created conj (.getAbsolutePath file)))
+                       file))]
+       {:result (f) :paths @created}))))
+
+(defn- capture-injected-identity-outcome
+  "Like `observe-injected-identities`, but retain an operation failure so a
+  cleanup failure can be examined without losing the temp path it left behind."
+  [f]
+  (let [created (atom [])
+        real-owner-only-temp-file! fs/owner-only-temp-file!]
+    (with-redefs [fs/owner-only-temp-file!
+                  (fn [prefix suffix]
+                    (let [file (real-owner-only-temp-file! prefix suffix)]
+                      (when (= "age-identity-" prefix)
+                        (swap! created conj (.getAbsolutePath file)))
+                      file))]
+      (let [outcome (try
+                      {:value (f)}
+                      (catch Throwable e {:failure e}))]
+        (assoc outcome :paths @created)))))
+
+(defn- identity-environment
+  "The one identity environment variable represented by `source`, carrying the
+  fixture's real private key without ever putting it in an assertion."
+  [source]
+  (let [identity (slurp *key*)]
+    (case source
+      :raw {"SECRETS_AGE_IDENTITY" identity}
+      :b64 {"SECRETS_AGE_IDENTITY_B64"
+            (.encodeToString (java.util.Base64/getEncoder)
+                             (.getBytes identity "UTF-8"))})))
+
+(defn- assert-cleaned-identity! [paths]
+  (is (= 1 (count paths)) "each operation gets one temporary identity")
+  (is (every? #(not (.exists (io/file %))) paths)
+      "the operation removes its temporary identity before returning"))
+
 (defn- under-default-key-file
   [path f]
   (with-redefs-fn {(cli-private 'default-key-file) (constantly path)} f))
@@ -131,14 +191,14 @@
 (defn- doctor-under
   "Run doctor with process boundaries replaced, including the app default key
   path so tests do not depend on the developer's home or environment."
-  [config env-arg {:keys [environment identity-path version] :as opts}]
+  [config env-arg {:keys [environment version] :as opts}]
   (with-redefs-fn {(cli-private 'getenv) (or environment {})
                    (cli-private 'default-key-file) (fn [_] *key*)
-                   #'secrets/identity-from-env (fn [] identity-path)
                    #'age/version (fn [] (if (contains? opts :version)
                                           version
                                           "age test-version"))}
-    #(capture-doctor config env-arg)))
+    #(with-identity-environment (or environment {})
+       (fn [] (capture-doctor config env-arg)))))
 
 (defn- complete-doctor-config
   ([] (complete-doctor-config {}))
@@ -171,10 +231,8 @@
            (:key-file env)))
     (is (= :prod (:name env)))
     (is (= "myapp" (:app env)))
-    (if (age-env-set?)
-      (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-      (is (= (:key-file env) (:identity-file env))
-          ":identity-file falls back to :key-file without SECRETS_AGE_IDENTITY*"))))
+    (is (nil? (:identity-file env))
+        "normalization leaves fallback identity resolution to the operation")))
 
 (deftest normalize-config-explicit-values-respected-test
   (let [cfg (cli/normalize-config
@@ -185,6 +243,33 @@
         env (get-in cfg [:environments :dev])]
     (is (= "tpl.edn" (:template env)))
     (is (false? (:manifest env)) ":manifest false survives normalization")))
+
+(deftest normalize-config-does-not-materialize-or-resolve-injected-identities-test
+  (doseq [source [:raw :b64]]
+    (testing (name source)
+      (let [{:keys [result paths]}
+            (observe-injected-identities
+             #(with-identity-environment (identity-environment source)
+                (fn [] (cli/normalize-config (test-config)))))]
+        (is (nil? (get-in result [:environments :dev :identity-file])))
+        (is (empty? paths)
+            "resolving config neither reads injected contents nor writes a temp file")))))
+
+(deftest explicit-cli-identity-wins-over-every-injected-environment-source-test
+  (let [config (cli/normalize-config (test-config {:identity-file *key*}))]
+    (doseq [environment [{"SECRETS_AGE_IDENTITY_FILE" (str *dir* "/not-a-key")}
+                         {"SECRETS_AGE_IDENTITY" "not the fixture identity"}
+                         {"SECRETS_AGE_IDENTITY_B64" "bm90IHRoZSBmaXh0dXJlIGlkZW50aXR5"}]]
+      (let [{:keys [paths]}
+            (observe-injected-identities
+             #(with-identity-environment environment
+                (fn []
+                  (with-out-str
+                    (with-in-str "chosen-explicitly"
+                      (cli/set-secret! config "dev" ":identity/precedence" false))))))]
+        (is (empty? paths) "an explicit path is caller-owned and needs no temp file")
+        (is (= {:identity/precedence "chosen-explicitly"}
+               (edn/read-string (age/decrypt *key* (str *dir* "/secrets.edn.age")))))))))
 
 (deftest normalize-config-validation-test
   (testing "no :environments"
@@ -271,11 +356,10 @@
 
 (deftest doctor-identifies-every-identity-source-without-disclosure-test
   (let [raw-value "RAW-IDENTITY-SENTINEL"
-        b64-value "B64-IDENTITY-SENTINEL"
+        b64-value (.encodeToString (java.util.Base64/getEncoder)
+                                   (.getBytes "B64-IDENTITY-SENTINEL" "UTF-8"))
         file-value (str *dir* "/FILE-IDENTITY-SENTINEL")
-        raw-path (str *dir* "/RAW-MATERIALIZED-PATH-SENTINEL")
-        b64-path (str *dir* "/B64-MATERIALIZED-PATH-SENTINEL")
-        _ (doseq [path [file-value raw-path b64-path]] (spit path "identity fixture"))
+        _ (spit file-value "identity fixture")
         base (test-config)
         specs [{:source :secrets-age-identity-file
                 :label "SECRETS_AGE_IDENTITY_FILE"
@@ -285,13 +369,11 @@
                {:source :secrets-age-identity
                 :label "SECRETS_AGE_IDENTITY"
                 :environment {"SECRETS_AGE_IDENTITY" raw-value}
-                :identity-path raw-path
-                :sentinels [raw-value raw-path]}
+                :sentinels [raw-value]}
                {:source :secrets-age-identity-b64
                 :label "SECRETS_AGE_IDENTITY_B64"
                 :environment {"SECRETS_AGE_IDENTITY_B64" b64-value}
-                :identity-path b64-path
-                :sentinels [b64-value b64-path]}
+                :sentinels [b64-value]}
                {:source :identity-file
                 :label ":identity-file"
                 :config (test-config {:identity-file *key*})}
@@ -559,6 +641,130 @@
         (is (= manifest-before (slurp manifest-path)))))))
 
 ;;;; Re-encrypt and verify
+
+(deftest injected-cli-identities-live-for-one-real-command-test
+  (doseq [source [:raw :b64]]
+    (testing (name source)
+      (let [config (cli/normalize-config (test-config))
+            env (identity-environment source)
+            ciphertext (str *dir* "/secrets.edn.age")]
+        (encrypt-edn! {:value "before"})
+        (doseq [[label invoke]
+                [["set"
+                  #(with-in-str "after-set"
+                     (cli/set-secret! config "dev" ":value" false))]
+                 ["edit"
+                  #(with-redefs-fn {(cli-private 'run-editor!)
+                                    (fn [path] (spit path "{:value \"after-edit\"}"))}
+                     (fn [] (cli/edit! config "dev")))]
+                 ["reencrypt" #(cli/reencrypt! config "dev")]
+                 ["verify" #(verify config "dev")]]]
+          (let [{:keys [result paths]}
+                (observe-injected-identities
+                 #(with-identity-environment env
+                    (fn [] (with-out-str (invoke)))))]
+            (is (some? result) (str label " completes with an injected identity"))
+            (assert-cleaned-identity! paths)))
+        (is (= {:value "after-edit"}
+               (edn/read-string (age/decrypt *key* ciphertext))))))))
+
+(deftest injected-cli-identity-remains-through-manifest-hashing-test
+  (let [value {:database/url "jdbc:test" :service/token "manifest-value"}
+        expected-config (cli/normalize-config (test-config {:identity-file *key*}))
+        actual-config (cli/normalize-config (test-config))
+        manifest-path (str *dir* "/secrets.edn.manifest")]
+    (encrypt-edn! value)
+    (with-out-str (cli/reencrypt! expected-config "dev"))
+    (let [expected-keys (:keys (edn/read-string (slurp manifest-path)))]
+      (encrypt-edn! value)
+      (let [present-during-hash? (atom false)
+            created (atom [])
+            real-hmac-key manifest/hmac-key
+            hash-with-live-identity
+            (fn [identity]
+              (reset! present-during-hash?
+                      (and (seq @created)
+                           (every? #(.exists (io/file %)) @created)))
+              (real-hmac-key identity))
+            {:keys [paths]}
+            (observe-injected-identities
+             created
+             #(with-identity-environment (identity-environment :raw)
+                (fn []
+                  (with-redefs [manifest/hmac-key hash-with-live-identity]
+                    (with-out-str (cli/reencrypt! actual-config "dev"))))))]
+        (is @present-during-hash?
+            "the identity temp file exists while the manifest HMAC is derived")
+        (is (= expected-keys (:keys (edn/read-string (slurp manifest-path))))
+            "an operation-scoped raw identity produces the same keyed manifest entries")
+        (assert-cleaned-identity! paths)))))
+
+(deftest caller-owned-cli-identity-files-survive-operations-test
+  (let [ciphertext (str *dir* "/secrets.edn.age")
+        explicit (cli/normalize-config (test-config {:identity-file *key*}))
+        from-environment (cli/normalize-config (test-config))]
+    (encrypt-edn! {:caller-owned true})
+    (doseq [[label config environment]
+            [["explicit :identity-file" explicit {"SECRETS_AGE_IDENTITY" "wrong"}]
+             ["SECRETS_AGE_IDENTITY_FILE" from-environment
+              {"SECRETS_AGE_IDENTITY_FILE" *key*}]]]
+      (let [{:keys [paths]}
+            (observe-injected-identities
+             #(with-identity-environment environment
+                (fn [] (with-out-str (cli/reencrypt! config "dev")))))]
+        (is (.exists (io/file *key*)) (str label " leaves the caller's key file alone"))
+        (is (empty? paths) (str label " does not materialize a copy"))))
+    (is (= {:caller-owned true}
+           (edn/read-string (age/decrypt *key* ciphertext))))))
+
+(deftest failed-cli-operation-cleans-its-injected-identity-test
+  (doseq [source [:raw :b64]]
+    (let [config (cli/normalize-config (test-config))
+          {:keys [failure paths]}
+          (capture-injected-identity-outcome
+           #(with-identity-environment (identity-environment source)
+              (fn [] (with-out-str (cli/reencrypt! config "dev")))))]
+      (is (instance? clojure.lang.ExceptionInfo failure))
+      (is (str/includes? (ex-message failure) "No secrets file"))
+      (assert-cleaned-identity! paths))))
+
+(deftest cleanup-failure-is-actionable-after-cli-success-or-failure-test
+  (let [config (cli/normalize-config (test-config))
+        failure-config (cli/normalize-config
+                        (test-config {:secrets-file (str *dir* "/missing.age")}))
+        delete-var (secrets-private 'try-delete-identity-file!)
+        environment (identity-environment :raw)
+        success
+        (capture-injected-identity-outcome
+         #(with-identity-environment environment
+            (fn []
+              (with-redefs-fn {delete-var (constantly false)}
+                (fn []
+                  (with-out-str
+                    (with-in-str "written-before-cleanup-failure"
+                      (cli/set-secret! config "dev" ":cleanup/test" false))))))))
+        success-error (:failure success)
+        remaining (first (:paths success))
+        rendered (str/join " " (mapcat rest ((cli-private 'error-lines) success-error)))
+        failure
+        (capture-injected-identity-outcome
+         #(with-identity-environment environment
+            (fn []
+              (with-redefs-fn {delete-var (constantly false)}
+                (fn [] (with-out-str (cli/reencrypt! failure-config "dev")))))))]
+    (is (= :identity-cleanup-failed (:reason (ex-data success-error))))
+    (is (.exists (io/file (str *dir* "/secrets.edn.age")))
+        "the command committed its ciphertext before cleanup reported failure")
+    (is (and remaining (.exists (io/file remaining)))
+        "a failed cleanup leaves a concrete file for the operator to remove")
+    (is (str/includes? rendered remaining))
+    (is (not (str/includes? rendered (slurp *key*)))
+        "the remediation reports only the temp path, never identity contents")
+    (is (= :identity-cleanup-failed (get-in (ex-data (:failure failure)) [:cleanup :reason])))
+    (is (str/includes? (ex-message (:failure failure)) "No secrets file"))
+    (doseq [path (:paths failure)]
+      (when (.exists (io/file path)) (.delete (io/file path))))
+    (when (.exists (io/file remaining)) (.delete (io/file remaining)))))
 
 (deftest reencrypt-writes-manifest-and-verify-passes-test
   (if (age-env-set?)
@@ -2302,12 +2508,11 @@
 ;;; because one of them needs the subprocess recorder defined further up.
 
 (defn- normalize-without-env-identity
-  "`normalize-config` with SECRETS_AGE_IDENTITY* neutralized, so an
-  environment's resolved identity is its configured one and these tests do not
-  depend on the developer's environment."
+  "`normalize-config` is pure with respect to identity environment variables.
+  Keep this helper at the call sites that used to need environment neutralizing:
+  their purpose is now to describe static artifact collisions only."
   [config]
-  (with-redefs-fn {#'secrets/identity-from-env (constantly nil)}
-    #(cli/normalize-config config)))
+  (cli/normalize-config config))
 
 (defn- normalize-failure
   "The ex-info `normalize-without-env-identity` throws for `config`, or nil when
@@ -2482,3 +2687,30 @@
              "the diagnostic names the environment's offending role")
          (is (= {:environment :dev :role :manifest}
                 (select-keys (ex-data e) [:environment :role])))))))
+
+(deftest injected-identity-cannot-overlap-another-environments-artifact-test
+  (let [other (str *dir* "/other.age")
+        config (cli/normalize-config
+                (assoc-in (test-config) [:environments :prod]
+                          {:secrets-file other :key-file *key*}))
+        identity (slurp *key*)]
+    (spit other identity)
+    (with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" other}
+      #(is (thrown-with-msg? clojure.lang.ExceptionInfo #"incompatible artifact roles"
+                             (with-in-str "value"
+                               (cli/set-secret! config "dev" ":test" false)))))
+    (is (= identity (slurp other)))
+    (is (not (.exists (io/file (str *dir* "/secrets.edn.age")))))))
+
+(deftest doctor-does-not-hide-identity-cleanup-failure-test
+  (let [{:keys [failure paths]}
+        (capture-injected-identity-outcome
+         #(with-identity-environment (identity-environment :raw)
+            (fn []
+              (with-redefs-fn {(secrets-private 'try-delete-identity-file!) (constantly false)}
+                (fn [] (with-out-str (cli/doctor! (complete-doctor-config) "dev")))))))]
+    (try
+      (is (= :identity-cleanup-failed (:reason (ex-data failure))))
+      (is (= (first paths) (:identity-file (ex-data failure))))
+      (finally
+        (doseq [path paths] (.delete (io/file path)))))))

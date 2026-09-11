@@ -235,20 +235,42 @@ and distinguish approved requirements, design proposals, and verified guarantees
 The review also identified candidates beyond the manifest. These are bounded
 work items to evaluate individually, not instructions to implement them all:
 
-- Replace global identity caching, generations, and leases with operation-owned
-  temporary identities where possible.
-- Scope Aero loading to a configuration read or application-owned lifecycle,
-  instead of a global cache keyed by configuration equality.
-- Make normalization pure and use one identity precedence rule. The reviewed
-  runtime favored explicit identity options while the CLI favored environment
-  variables; normalization could also materialize a private file.
 - Evaluate a common recipient-based encryption path for solo and team use.
 - Keep setup ergonomic while reducing the initializer's responsibility for
   modifying existing projects and proving filesystem ancestry.
 - Narrow overlapping source/argument forms and general-purpose file commands;
   put store operations beneath prompts and CLI rendering.
+- Scope Aero loading to a configuration read or application-owned lifecycle,
+  instead of a global cache keyed by configuration equality.
+- Make normalization pure. Canonical path checks still use the filesystem, so
+  this remains a separate simplification from the identity contract.
 - Reduce duplicated build/documentation policy and verification. Moving code to
   another package does not by itself remove maintenance cost.
+
+## Chosen identity contract
+
+Identity resolution is scoped to one operation. `with-identity` accepts an
+identity path or options and calls its function with
+`{:identity-file path :identity-source source}`. Resolution uses an explicit
+path or `:identity-file` first, then `SECRETS_AGE_IDENTITY_FILE`,
+`SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then the CLI's
+configured `:key-file` or its app default.
+
+Raw and base64 identities are materialized for each operation in an exclusive
+0600 temporary file. The operation checks deletion on both success and failure.
+Caller-owned paths are never deleted. A cleanup failure carries structured
+error data with the temporary path so an operator can remove the remaining file.
+Paths are permitted diagnostic metadata; identity contents are never included. A process
+crash can leave a temporary file behind, and deletion is not secure erasure on
+every filesystem. The extra temporary-file write per operation is the accepted
+cost of removing shared identity state.
+
+`load-secrets` owns this scope automatically. CLI normalization validates and
+canonicalizes configured paths without selecting an environment identity or
+materializing one. A CLI command selects its environment, resolves its
+identity, validates that resolved path against the configured artifact roles,
+and then owns the operation scope. There is no identity cache or reset
+lifecycle. Aero's separate reader cache and `reset-cache!` remain unchanged.
 
 ## How to decide what to change
 

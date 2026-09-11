@@ -12,8 +12,8 @@
 
 ;; ## Injecting the key
 
-;; You can provide the key through one of three environment variables. They
-;; are checked in this order:
+;; When no explicit identity path is supplied, you can provide the key through
+;; one of three environment variables. They are checked in this order:
 
 ;; | Variable | Contents | Use it when |
 ;; |----------|----------|-------------|
@@ -25,13 +25,11 @@
 ;; `SECRETS_AGE_IDENTITY_B64` is always decoded; invalid base64 is an error
 ;; rather than a reason to fall back silently. Using separate variables means
 ;; the library doesn't have to guess whether a value is encoded. Because this
-;; wrapper passes identities to `age` as file paths, it writes the contents to
-;; an owner-only temporary file once per distinct value.
-
-;; A long-running process can call `secrets/reset-identity-cache!` after its
-;; configuration has loaded so that the temporary copy doesn't stay on disk.
-;; The [runtime chapter](secrets_book.runtime.html#retiring-injected-identities)
-;; describes what it deletes and what it leaves alone.
+;; wrapper passes identities to `age` as file paths, each operation writes raw
+;; or decoded contents to an exclusive owner-only temporary file and checks its
+;; deletion when the operation finishes. Caller-owned paths are never deleted.
+;; A cleanup failure includes the temporary path in structured error data so it
+;; can be removed. A process crash can leave a temporary file behind.
 
 ;; If one of these variables is **set but empty**, the library throws an error
 ;; that names it instead of treating it as unset. This matters in CI. The
@@ -123,10 +121,10 @@
 
 ;; Application code can pass `{:app "myapp"}`, as the
 ;; [runtime chapter](secrets_book.runtime.html#reading-values) shows for an
-;; Integrant component, and let environment variables take precedence when
-;; they are present. On a laptop, this resolves to
-;; `~/.config/myapp/key.txt`. In the container, `SECRETS_AGE_IDENTITY`
-;; overrides that path, so the application code stays the same in both places.
+;; Integrant component. An explicit identity path wins, followed by the
+;; environment variables, then `~/.config/myapp/key.txt`. The application code
+;; can stay the same in a laptop and a container while the deployment supplies
+;; an injected identity.
 
 ;; The component decrypts the secrets during startup. `load-secrets` has no
 ;; global cache or hot reload, so changing a secret normally requires a commit,

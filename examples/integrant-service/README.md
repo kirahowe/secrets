@@ -47,8 +47,8 @@ clojure -T:build uber
 SECRETS_AGE_IDENTITY_FILE=.demo/age-key.txt java -jar target/integrant-service-standalone.jar
 ```
 
-The service reads identity configuration from the library's normal resolution
-chain. Mount a key as a read-only container secret and pass its path through
+The service reads identity configuration for each load operation. Mount a key as
+a read-only container secret and pass its path through
 `SECRETS_AGE_IDENTITY_FILE`; never copy a private identity into the image or
 put its contents in a shell command's arguments:
 

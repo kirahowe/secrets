@@ -125,11 +125,11 @@
 ;; a file *requires* them: `decrypt-to-file!` stages the plaintext in an
 ;; owner-only sibling file and fails if it cannot establish and verify that
 ;; mode. It will not fall back to the platform's default permissions. In-memory
-;; decryption (`decrypt`, `decrypt-bytes`, `load-secrets`) does not need file
-;; permissions and still works. On Windows, owner-only permissions for
-;; temporary files are best effort, and secure deletion is not available. The
-;; library targets POSIX systems, so treat Windows as unsupported for anything
-;; beyond reading.
+;; decryption with a caller-owned identity file does not need private temporary
+;; file creation. Raw or base64 injected identities do need it, so those
+;; operations fail closed when owner-only permissions cannot be established.
+;; Secure deletion is not available on every filesystem. The library targets
+;; POSIX systems, so treat Windows as unsupported for anything beyond reading.
 
 ;; If you find a vulnerability in the library itself, follow the project's
 ;; [security policy](https://github.com/kirahowe/secrets/blob/main/SECURITY.md)
