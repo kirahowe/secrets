@@ -61,9 +61,16 @@
 (def ^:private owner-only-names #{"OWNER_READ" "OWNER_WRITE"})
 
 (deftest expand-home-test
-  (is (= (str (System/getProperty "user.home") "/.config/x")
-         (secrets/expand-home "~/.config/x")))
-  (is (= "/abs/path" (secrets/expand-home "/abs/path"))))
+  (let [home (System/getProperty "user.home")]
+    (testing "only ~ and a leading ~/ name the home directory"
+      (is (= home (secrets/expand-home "~")))
+      (is (= (str home "/x") (secrets/expand-home "~/x")))
+      (is (= (str home "/.config/x") (secrets/expand-home "~/.config/x"))))
+    (testing "every other string is returned unchanged"
+      (doseq [path ["~bob/x" "~~" "a~/x" "/abs/path" "" " "]]
+        (is (= path (secrets/expand-home path)) (pr-str path))))
+    (testing "nil becomes the empty string"
+      (is (= "" (secrets/expand-home nil))))))
 
 (deftest age-version-test
   (testing "successful stdout is trimmed"

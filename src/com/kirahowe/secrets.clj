@@ -60,10 +60,12 @@
   (System/getProperty "user.home"))
 
 (defn expand-home
-  "Expand a leading ~ to the user's home directory."
+  "Return `path` as a string, with the user's home directory in place of the
+  `~` when it is exactly `~` or begins with `~/`. Every other string, such as
+  `~bob/x`, is returned unchanged."
   [path]
   (let [s (str path)]
-    (if (str/starts-with? s "~")
+    (if (or (= s "~") (str/starts-with? s "~/"))
       (str (user-home) (subs s 1))
       s)))
 
