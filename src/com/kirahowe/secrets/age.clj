@@ -472,15 +472,17 @@
   content is preserved). Returns `out`.
 
   Plaintext reaches the filesystem only through an owner-only (0600) staging
-  file beside `out`, which is then atomically moved over it. So the published
-  file is 0600 whatever the umask and whatever mode `out` had before, and no
-  permissive or partial plaintext is ever observable at `out`. The destination's
-  final component is validated without following links, so a symlink or other
-  non-regular destination is refused rather than written through. Decryption
-  runs before any staging file exists — a wrong key, or a plaintext past the
-  `:max-plaintext-bytes` bound in `opts`, therefore never creates one — and any
-  later failure removes the staging plaintext and leaves the previous `out`
-  intact.
+  file beside `out`, which [[com.kirahowe.secrets.fs/atomic-move!]] then moves
+  over it. So the published file is 0600 whatever the umask and whatever mode
+  `out` had before, and no permissive or partial plaintext is ever observable
+  at `out`. The destination's final component is validated without following
+  links, so a symlink or other non-regular destination is refused rather than
+  written through. Decryption runs before any staging file exists, so a wrong
+  key, or a plaintext past the `:max-plaintext-bytes` bound in `opts`, never
+  creates one. Any later failure, an `Error` included, deletes the staging
+  plaintext and leaves the previous `out` intact. If that delete fails and the
+  staging file is still there, the failure carries a suppressed
+  `:staging-cleanup-failed` error whose `:staging-file` names it.
 
   A filesystem without POSIX permissions fails closed instead of writing
   plaintext with default permissions: use `decrypt-bytes` or `decrypt`, which
@@ -497,7 +499,11 @@
        ;; staging name were swapped for a link between creation and write.
        (java.nio.file.Files/write (.toPath staging) ^bytes plaintext staging-write-options)
        (fs/atomic-move! staging dest)
-       (catch Exception e
+       (catch Throwable t
          (try (.delete staging) (catch Exception _ nil))
-         (throw e)))
+         (when (.exists staging)
+           (.addSuppressed t (ex-info "Could not delete the plaintext staging file."
+                                      {:reason :staging-cleanup-failed
+                                       :staging-file (str staging)})))
+         (throw t)))
      out)))

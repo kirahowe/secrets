@@ -168,7 +168,8 @@
             :identity-source source}))
 
 (defn- delete-materialized-identity!
-  "Delete a temporary identity, returning nil or a safe cleanup exception."
+  "Delete a temporary identity, returning nil or a safe cleanup exception.
+  A delete that throws is reported the same way and never propagates."
   [path source]
   (let [file (io/file path)]
     (try
@@ -177,25 +178,33 @@
         (try-delete-identity-file! file) nil
         (not (.exists file)) nil
         :else (cleanup-failure path source))
-      (catch SecurityException _
+      (catch Exception _
         (cleanup-failure path source)))))
 
 (defn- write-identity!
-  "Materialize injected contents in a private temp file for one operation."
+  "Materialize injected contents in a private temp file for one operation.
+
+  A failed write attempts to delete the file before anything propagates. An
+  `Exception` is reported as `:identity-not-materialized` without its cause or
+  message, with a failed delete under `:cleanup`. An `Error` is rethrown as it
+  is, with a failed delete attached as a suppressed `:identity-cleanup-failed`
+  error. Either way a file that could not be deleted is named."
   [contents source]
   (let [file (fs/owner-only-temp-file! "age-identity-" ".txt")
         path (.getAbsolutePath file)]
     (try
       (spit file contents)
       path
-      (catch Exception e
+      (catch Throwable t
         (let [cleanup (delete-materialized-identity! path source)]
-          (throw (ex-info (str "Could not write the injected age identity to a temp file ("
-                               (.getName (class e)) "). Check the temp directory is writable.")
-                          (cond-> {:reason :identity-not-materialized
-                                   :identity-file path
-                                   :identity-source source}
-                            cleanup (assoc :cleanup (ex-data cleanup))))))))))
+          (throw (if-not (instance? Exception t)
+                   (cond-> t cleanup (doto (.addSuppressed cleanup)))
+                   (ex-info (str "Could not write the injected age identity to a temp file ("
+                                 (.getName (class t)) "). Check the temp directory is writable.")
+                            (cond-> {:reason :identity-not-materialized
+                                     :identity-file path
+                                     :identity-source source}
+                              cleanup (assoc :cleanup (ex-data cleanup)))))))))))
 
 (defn with-identity
   "Call `f` with an operation-owned identity descriptor.

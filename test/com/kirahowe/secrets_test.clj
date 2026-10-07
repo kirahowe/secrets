@@ -552,6 +552,57 @@
               (is (nil? (ex-cause e)))
               (is (not (str/includes? (pr-str e) write-sentinel))))))
         (is (not (.exists ^java.io.File @created)))))
+    (testing "an Error during the write removes the file and propagates as itself"
+      (let [created (atom nil)
+            real-temp fs/owner-only-temp-file!
+            real-spit spit
+            failure (Error. "forced write error")]
+        (with-redefs-fn
+          {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY") contents)
+           #'fs/owner-only-temp-file! (fn [& args]
+                                        (reset! created (apply real-temp args)))
+           #'clojure.core/spit (fn [file _]
+                                 (real-spit file "partial identity")
+                                 (throw failure))}
+          (fn []
+            (is (identical? failure (try (secrets/with-identity nil identity)
+                                         (catch Throwable t t))))))
+        (is (some? @created))
+        (is (not (.exists ^java.io.File @created)))))
+    (testing "a write failure names a file its cleanup could not delete"
+      (doseq [[label failure delete!]
+              [["an Error carries the cleanup failure as suppressed"
+                (Error. "forced write error") (constantly false)]
+               ["a delete that throws cannot replace the write failure"
+                (java.io.IOException. "forced write failure")
+                (fn [_] (throw (IllegalStateException. "forced delete failure")))]]]
+        (testing label
+          (let [created (atom nil)
+                real-temp fs/owner-only-temp-file!]
+            (try
+              (let [thrown (with-redefs-fn
+                             {#'secrets/identity-env
+                              #(when (= % "SECRETS_AGE_IDENTITY") contents)
+                              #'fs/owner-only-temp-file!
+                              (fn [& args] (reset! created (apply real-temp args)))
+                              #'clojure.core/spit (fn [_ _] (throw failure))
+                              #'secrets/try-delete-identity-file! delete!}
+                             (fn []
+                               (try (secrets/with-identity nil identity)
+                                    (catch Throwable t t))))
+                    leftover (.getAbsolutePath ^java.io.File @created)
+                    cleanup (if (instance? Error failure)
+                              (some-> ^Throwable thrown .getSuppressed first ex-data)
+                              (:cleanup (ex-data thrown)))]
+                (if (instance? Error failure)
+                  (is (identical? failure thrown))
+                  (is (= :identity-not-materialized (:reason (ex-data thrown)))))
+                (is (= {:reason :identity-cleanup-failed
+                        :identity-file leftover
+                        :identity-source :secrets-age-identity}
+                       cleanup)))
+              (finally
+                (some-> ^java.io.File @created .delete)))))))
     (testing "deletion failures report each leftover, including when the callback fails"
       (doseq [body-fails? [false true]]
         (with-redefs-fn
@@ -977,21 +1028,54 @@
   ;; Every other failure case fails before a staging file exists, so this is
   ;; the only test that reaches the cleanup path: forcing the publish step to
   ;; throw means the real staging file was created and really holds plaintext.
+  ;; An `Error` is not an `Exception`, and it has to release the file as well.
   (let [enc (encrypt-edn! {:v :fresh})
         out (io/file *dir* "kept-on-publish-failure.edn")]
     (spit out "{:v :previous}")
     (.setReadable out true false)
     (let [before (permission-names out)]
-      (with-redefs [fs/atomic-move!
-                    (fn [_ _] (throw (ex-info "forced publish failure" {})))]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"forced publish failure"
-                              (age/decrypt-to-file! *key* enc out))
-            "the original failure is rethrown, not swallowed or replaced"))
-      (is (= {:v :previous} (edn/read-string (slurp out)))
-          "the destination keeps its previous contents")
-      (is (= before (permission-names out)) "with its original permissions")
-      (is (empty? (staging-leftovers *dir*))
-          "the written staging plaintext is deleted rather than left on disk"))))
+      (doseq [failure [(ex-info "forced publish failure" {})
+                       (Error. "forced publish failure")]]
+        (testing (.getName (class failure))
+          (let [staged (atom nil)
+                thrown (with-redefs [fs/atomic-move!
+                                     (fn [staging _]
+                                       (reset! staged (slurp staging))
+                                       (throw failure))]
+                         (try (age/decrypt-to-file! *key* enc out)
+                              (catch Throwable t t)))]
+            (is (identical? failure thrown)
+                "the original failure is rethrown, not swallowed or replaced")
+            (is (= {:v :fresh} (edn/read-string @staged))
+                "the staging file held plaintext when publishing failed"))
+          (is (= {:v :previous} (edn/read-string (slurp out)))
+              "the destination keeps its previous contents")
+          (is (= before (permission-names out)) "with its original permissions")
+          (is (empty? (staging-leftovers *dir*))
+              "the written staging plaintext is deleted rather than left on disk"))))))
+
+(deftest decrypt-to-file-names-staging-plaintext-it-could-not-delete-test
+  ;; A directory without write permission refuses the unlink, so the staging
+  ;; file outlives the failure and the failure has to say where it is.
+  (let [enc (encrypt-edn! {:v :fresh})
+        dir (io/file *dir* "locked-after-staging")
+        out (io/file dir "plain.edn")
+        failure (ex-info "forced publish failure" {})]
+    (.mkdirs dir)
+    (try
+      (let [thrown (with-redefs [fs/atomic-move! (fn [_ _]
+                                                   (.setWritable dir false false)
+                                                   (throw failure))]
+                     (try (age/decrypt-to-file! *key* enc out)
+                          (catch Throwable t t)))
+            leftovers (staging-leftovers dir)]
+        (is (identical? failure thrown))
+        (if (empty? leftovers)
+          (is true "skipped: this process deletes from a mode 0500 directory anyway (root)")
+          (is (= [{:reason :staging-cleanup-failed
+                   :staging-file (str (io/file dir (first leftovers)))}]
+                 (mapv ex-data (.getSuppressed ^Throwable thrown))))))
+      (finally (.setWritable dir true true)))))
 
 ;;;; Atomic moves
 
@@ -1495,6 +1579,27 @@
         (is (= :disallowed-source (:reason data)))
         (is (= {:kind :object :class "java.lang.StringBuilder"} (:source data)))
         (is (str/includes? (ex-message e) "an instance of java.lang.StringBuilder"))))))
+
+(deftest source-copy-is-deleted-on-any-failure-test
+  (let [enc (encrypt-edn! {:k "v"})
+        jar-uri (jar-source! enc "copy-failure.jar" "store.age")
+        real-temp fs/owner-only-temp-file!]
+    (doseq [failure [(java.io.IOException. "forced copy failure")
+                     (Error. "forced copy failure")]]
+      (testing (.getName (class failure))
+        (let [created (atom nil)]
+          (with-redefs-fn
+            {#'fs/owner-only-temp-file! (fn [& args]
+                                          (reset! created (apply real-temp args)))
+             #'source/copy-source! (fn [_ _ ^java.io.OutputStream out _]
+                                     (.write out (.getBytes "partial ciphertext"))
+                                     (throw failure))}
+            (fn []
+              (is (some? (try (secrets/load-secrets jar-uri *key*)
+                              nil
+                              (catch Throwable t t))))))
+          (is (some? @created) "the copy was started")
+          (is (not (.exists ^java.io.File @created))))))))
 
 ;;;; Manifest
 

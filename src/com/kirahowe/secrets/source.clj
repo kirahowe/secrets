@@ -227,7 +227,8 @@
       (throw (java.io.FileNotFoundException. "Classpath jar resource not found.")))))
 
 (defn- copy-local-source!
-  "Copy a local source spec to an owner-only temp file under `limit`."
+  "Copy a local source spec to an owner-only temp file under `limit`. Any
+  failure, an `Error` included, deletes the temp file before it propagates."
   [source-descriptor {:keys [file] :as source} limit]
   (let [tmp (fs/owner-only-temp-file! "secrets-" ".age")]
     (try
@@ -237,9 +238,9 @@
             (copy-source! source-descriptor in out limit))
           (copy-jar-source! source-descriptor source out limit)))
       [tmp #(.delete tmp)]
-      (catch Exception e
+      (catch Throwable t
         (.delete tmp)
-        (throw e)))))
+        (throw t)))))
 
 (defn- source->file
   "Resolve `source` under local-only policy to a `[file cleanup!]` pair."
