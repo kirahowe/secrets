@@ -177,7 +177,7 @@
 
 (defn- under-default-key-file
   [path f]
-  (with-redefs-fn {(cli-private 'default-key-file) (constantly path)} f))
+  (with-redefs-fn {#'secrets/default-key-file (constantly path)} f))
 
 (defn- capture-doctor
   [config env-arg]
@@ -193,7 +193,7 @@
   path so tests do not depend on the developer's home or environment."
   [config env-arg {:keys [environment version] :as opts}]
   (with-redefs-fn {(cli-private 'getenv) (or environment {})
-                   (cli-private 'default-key-file) (fn [_] *key*)
+                   #'secrets/default-key-file (fn [_] *key*)
                    #'age/version (fn [] (if (contains? opts :version)
                                           version
                                           "age test-version"))}
@@ -2195,6 +2195,13 @@
                (select-keys (ex-data e) [:environment :field :reason :scheme])))
         (is (not (str/includes? rendered sentinel)))
         (is (not (contains? (ex-data e) :path)))))
+    (testing "whitespace before the scheme does not hide it"
+      (let [e (try
+                (cli/normalize-config (config {:secrets-file " https://127.0.0.1/store.age"}))
+                nil
+                (catch clojure.lang.ExceptionInfo e e))]
+        (is (= {:reason :disallowed-source-location :scheme "https"}
+               (select-keys (ex-data e) [:reason :scheme])))))
     (testing "a Windows drive path is not mistaken for a one-letter scheme"
       (is (= "C:\\secrets\\store.age"
              (get-in (cli/normalize-config

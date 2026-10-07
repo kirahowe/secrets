@@ -68,7 +68,8 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.manifest :as manifest]
-            [com.kirahowe.secrets.safe-edn :as safe-edn]))
+            [com.kirahowe.secrets.safe-edn :as safe-edn]
+            [com.kirahowe.secrets.source :as source]))
 
 ;;;; Generated shell commands
 
@@ -183,13 +184,6 @@
   [path]
   (.getCanonicalPath (io/file (str path))))
 
-(defn- default-key-file
-  "The app-wide default key path an environment falls back to when it has no
-  explicit :key-file. One path per app, not one per environment: the common
-  case is a single key per developer."
-  [app]
-  (secrets/expand-home (str "~/.config/" app "/key.txt")))
-
 (def ^:private identity-source-display-label
   "How a message or a `doctor` report names where an identity came from."
   {:secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
@@ -207,14 +201,6 @@
   [env]
   {:limits (select-keys (:limits env) [:max-plaintext-bytes])})
 
-(def ^:private artifact-uri-scheme
-  "A URI scheme at the start of a configured artifact location."
-  #"^([A-Za-z][A-Za-z0-9+.\-]*):")
-
-(def ^:private windows-absolute-path
-  "A Windows drive path, which is not a URI locator."
-  #"(?i)^[a-z]:[\\/]")
-
 (defn- require-path!
   "Reject blank or URI-like artifact locations, returning `path` otherwise.
 
@@ -227,14 +213,12 @@
     (fail! (str "Environment " env " has a blank " kind " (a path string must not be empty).\n"
                 "    An empty path resolves to the working directory, not a file.")
            {:environment env :field kind :path path}))
-  (when-let [scheme (and (string? path)
-                         (not (re-find windows-absolute-path path))
-                         (second (re-find artifact-uri-scheme path)))]
+  (when-let [scheme (and (string? path) (source/locator-scheme path))]
     (fail! (str "Environment " env " " kind " must be a filesystem path, not a URI locator.")
            {:environment env
             :field kind
             :reason :disallowed-source-location
-            :scheme (str/lower-case scheme)}))
+            :scheme scheme}))
   path)
 
 (def ^:private artifact-roles
@@ -365,10 +349,10 @@
                                        (some? identity-file))
         key-file (if configured-key-file?
                    (secrets/expand-home key-file)
-                   (default-key-file app))
+                   (secrets/default-key-file app))
         explicit-identity (when configured-identity-file?
                             (secrets/expand-home identity-file))
-        key-file-source (if (= key-file (default-key-file app)) :default :configured)
+        key-file-source (if (= key-file (secrets/default-key-file app)) :default :configured)
         template (if (contains? env-config :template)
                    template
                    (str/replace secrets-file #"\.age$" ".example"))
@@ -447,7 +431,6 @@
   (secrets/with-identity env
     (fn [identity]
       (let [resolved (merge env identity)]
-        (require-path! (:name env) :identity-file (:identity-file resolved))
         (validate-artifact-roles!
          (assoc (:environments config) (:name env) resolved))
         (f resolved)))))
@@ -1060,7 +1043,7 @@
         (let [pub (age/keygen! key-file)
               sharing (sharing-environments (:environments config) key-file)
               app-default? (= (canonical-path key-file)
-                              (canonical-path (default-key-file (:app config))))]
+                              (canonical-path (secrets/default-key-file (:app config))))]
           (say! (keygen-lines environment-name key-file recipients-file
                               sharing app-default? pub))
           key-file)))))
