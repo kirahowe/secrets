@@ -16,7 +16,8 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.fs :as fs]
-            [com.kirahowe.secrets.manifest :as manifest]))
+            [com.kirahowe.secrets.manifest :as manifest]
+            [com.kirahowe.secrets.test-env :as test-env]))
 
 (def ^:private ^:dynamic *dir* nil)
 (def ^:private ^:dynamic *key* nil)
@@ -125,7 +126,7 @@
   This keeps tests independent from an operator's process environment without
   materializing an identity while config is being normalized."
   [environment f]
-  (with-redefs-fn {(secrets-private 'identity-env) #(get environment %)} f))
+  (with-redefs-fn (test-env/getenv-redefs environment) f))
 
 (defn- observe-injected-identities
   "Run `f`, recording only temp files allocated for raw/base64 age identities.
@@ -2795,9 +2796,8 @@
 
 (deftest doctor-reports-an-identity-variable-error-test
   (let [run (fn [variable value]
-              (with-redefs-fn
-                {(secrets-private 'identity-env)
-                 #((secrets-private 'identity-env-value) % (get {variable value} %))}
+              (with-identity-environment
+                {variable value}
                 #(capture-doctor (cli/normalize-config (test-config)) "dev")))]
     (testing "a blank variable"
       (let [{:keys [result out]} (run "SECRETS_AGE_IDENTITY" "")]

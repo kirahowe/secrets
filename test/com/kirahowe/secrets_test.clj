@@ -14,7 +14,8 @@
             [com.kirahowe.secrets.generators :as g]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
-            [com.kirahowe.secrets.source :as source]))
+            [com.kirahowe.secrets.source :as source]
+            [com.kirahowe.secrets.test-env :as test-env]))
 
 (def ^:dynamic ^:private *dir* nil)
 (def ^:dynamic ^:private *key* nil)
@@ -498,12 +499,11 @@
         real-decrypt age/decrypt]
     (testing "raw injected identity decrypts and is private only while used"
       (with-redefs-fn
-        {#'secrets/identity-env (fn [k]
-                                  (when (= k "SECRETS_AGE_IDENTITY") contents))
-         #'age/decrypt (fn [identity & args]
-                         (swap! paths conj identity)
-                         (is (= owner-only-names (permission-names identity)))
-                         (apply real-decrypt identity args))}
+        (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+               {#'age/decrypt (fn [identity & args]
+                                (swap! paths conj identity)
+                                (is (= owner-only-names (permission-names identity)))
+                                (apply real-decrypt identity args))})
         (fn []
           (is (= {:k "v"} (secrets/load-secrets enc nil)))))
       (is (= 1 (count @paths)))
@@ -513,8 +513,7 @@
                                      (.getBytes contents "UTF-8"))
             path (atom nil)]
         (with-redefs-fn
-          {#'secrets/identity-env (fn [k]
-                                    (when (= k "SECRETS_AGE_IDENTITY_B64") encoded))}
+          (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_B64" encoded})
           (fn []
             (is (= {:k "v"}
                    (secrets/with-identity nil
@@ -528,8 +527,7 @@
         path (atom nil)]
     (testing "callback failures still delete the temporary identity"
       (with-redefs-fn
-        {#'secrets/identity-env (fn [k]
-                                  (when (= k "SECRETS_AGE_IDENTITY") contents))}
+        (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
         (fn []
           (let [e (try
                     (secrets/with-identity nil
@@ -545,15 +543,14 @@
             real-spit spit
             write-sentinel "SENSITIVE-IDENTITY-WRITE-FAILURE"]
         (with-redefs-fn
-          {#'secrets/identity-env (fn [k]
-                                    (when (= k "SECRETS_AGE_IDENTITY") contents))
-           #'fs/owner-only-temp-file! (fn [& args]
-                                        (let [file (apply real-temp args)]
-                                          (reset! created file)
-                                          file))
-           #'clojure.core/spit (fn [file _]
-                                 (real-spit file "partial identity")
-                                 (throw (java.io.IOException. write-sentinel)))}
+          (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+                 {#'fs/owner-only-temp-file! (fn [& args]
+                                               (let [file (apply real-temp args)]
+                                                 (reset! created file)
+                                                 file))
+                  #'clojure.core/spit (fn [file _]
+                                        (real-spit file "partial identity")
+                                        (throw (java.io.IOException. write-sentinel)))})
           (fn []
             (let [e (try (secrets/with-identity nil identity)
                          (catch clojure.lang.ExceptionInfo e e))]
@@ -567,12 +564,12 @@
             real-spit spit
             failure (Error. "forced write error")]
         (with-redefs-fn
-          {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY") contents)
-           #'fs/owner-only-temp-file! (fn [& args]
-                                        (reset! created (apply real-temp args)))
-           #'clojure.core/spit (fn [file _]
-                                 (real-spit file "partial identity")
-                                 (throw failure))}
+          (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+                 {#'fs/owner-only-temp-file! (fn [& args]
+                                               (reset! created (apply real-temp args)))
+                  #'clojure.core/spit (fn [file _]
+                                        (real-spit file "partial identity")
+                                        (throw failure))})
           (fn []
             (is (identical? failure (try (secrets/with-identity nil identity)
                                          (catch Throwable t t))))))
@@ -590,12 +587,11 @@
                 real-temp fs/owner-only-temp-file!]
             (try
               (let [thrown (with-redefs-fn
-                             {#'secrets/identity-env
-                              #(when (= % "SECRETS_AGE_IDENTITY") contents)
-                              #'fs/owner-only-temp-file!
-                              (fn [& args] (reset! created (apply real-temp args)))
-                              #'clojure.core/spit (fn [_ _] (throw failure))
-                              #'secrets/try-delete-identity-file! delete!}
+                             (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+                                    {#'fs/owner-only-temp-file!
+                                     (fn [& args] (reset! created (apply real-temp args)))
+                                     #'clojure.core/spit (fn [_ _] (throw failure))
+                                     #'secrets/try-delete-identity-file! delete!})
                              (fn []
                                (try (secrets/with-identity nil identity)
                                     (catch Throwable t t))))
@@ -615,8 +611,8 @@
     (testing "deletion failures report each leftover, including when the callback fails"
       (doseq [body-fails? [false true]]
         (with-redefs-fn
-          {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY") contents)
-           #'secrets/try-delete-identity-file! (constantly false)}
+          (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+                 {#'secrets/try-delete-identity-file! (constantly false)})
           (fn []
             (try
               (let [e (try
@@ -647,8 +643,7 @@
                    (deliver entered identity-file)
                    (deref release 10000 :timed-out))))]
     (with-redefs-fn
-      {#'secrets/identity-env (fn [k]
-                                (when (= k "SECRETS_AGE_IDENTITY") contents))}
+      (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
       (fn []
         (let [one (future (work))
               first-path (deref entered 10000 nil)
@@ -717,13 +712,11 @@
   (let [invalid "QUJD%%%identity-token-sentinel"
         materializations (atom 0)]
     (with-redefs-fn
-      {#'secrets/identity-env
-       (fn [k]
-         (when (= k "SECRETS_AGE_IDENTITY_B64") invalid))
-       #'fs/owner-only-temp-file!
-       (fn [& _]
-         (swap! materializations inc)
-         "unreachable")}
+      (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_B64" invalid})
+             {#'fs/owner-only-temp-file!
+              (fn [& _]
+                (swap! materializations inc)
+                "unreachable")})
       (fn []
         (let [e (try (secrets/with-identity nil identity)
                      nil
@@ -1692,7 +1685,7 @@
   (is (= (str (System/getProperty "user.home") "/.config/myapp/key.txt")
          (secrets/default-key-file "myapp")))
   (testing "an :app option resolves to it when no identity variable is set"
-    (with-redefs-fn {#'secrets/identity-env (constantly nil)}
+    (with-redefs-fn (test-env/getenv-redefs {})
       (fn []
         (is (= {:identity-file (secrets/default-key-file "myapp")
                 :identity-source :default-key-file}
@@ -1709,7 +1702,7 @@
                     e))
         with-env (fn [value thunk]
                    (with-redefs-fn
-                     {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY_FILE") value)}
+                     (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_FILE" value})
                      thunk))]
     (doseq [[prefix prefix-name] [["" "no"] [" " "a space"] ["\t" "a tab"] ["\n" "a newline"]]
             :let [locator (str prefix locator)]]
@@ -1784,7 +1777,7 @@
         file-text (gen/generate (g/decorated-identity key-line))
         with-env (fn [value thunk]
                    (with-redefs-fn
-                     {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY_FILE") value)}
+                     (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_FILE" value})
                      thunk))]
     (doseq [[shape contents] [["a bare key line" key-line]
                               ["age-keygen file text" file-text]
@@ -1970,6 +1963,27 @@
           b (manifest/entries {:token "new"} hk)]
       (is (= [[:token]] (:changed (manifest/diff a b)))))))
 
+(deftest blank-identity-variable-fails-through-with-identity-test
+  (let [resolve-under (fn [environment identity-or-opts]
+                        (with-redefs-fn (test-env/getenv-redefs environment)
+                          (fn []
+                            (try
+                              (secrets/with-identity identity-or-opts identity)
+                              (catch clojure.lang.ExceptionInfo e e)))))]
+    (doseq [variable ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY" "SECRETS_AGE_IDENTITY_B64"]
+            blank ["" " \n"]
+            :let [environment {variable blank}]]
+      (testing (str variable " " (pr-str blank))
+        (testing "with no explicit path, resolution stops at the blank variable"
+          (doseq [identity-or-opts [nil {:app "myapp"} {:key-file *key*}]]
+            (let [e (resolve-under environment identity-or-opts)]
+              (is (re-find #"is set but empty" (str (ex-message e))))
+              (is (= {:env variable} (ex-data e))))))
+        (testing "an explicit path is chosen before any variable is read"
+          (doseq [identity-or-opts [*key* {:identity-file *key*}]]
+            (is (= {:identity-file *key* :identity-source :identity-file}
+                   (resolve-under environment identity-or-opts)))))))))
+
 (deftest blank-identity-env-var-throws-test
   (let [check @#'secrets/identity-env-value]
     (testing "an unset variable is nil, and falls through to the next source"
@@ -1998,7 +2012,7 @@
             secret-line (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
                                        (str/split-lines contents)))
             failure (with-redefs-fn
-                      {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY") contents)}
+                      (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
                       (fn [] (load-failure enc opts)))
             data (ex-data failure)
             path (:identity-file data)]

@@ -135,10 +135,16 @@
                     {:env k})))
   v)
 
+(defn- getenv
+  "Read environment variable `k`. This is the only raw environment read in the
+  namespace, and the seam tests redefine."
+  [k]
+  (System/getenv k))
+
 (defn- identity-env
   "`identity-env-value` applied to the live environment."
   [k]
-  (identity-env-value k (System/getenv k)))
+  (identity-env-value k (getenv k)))
 
 (defn- identity-candidate
   "Choose an identity without materializing injected contents.
