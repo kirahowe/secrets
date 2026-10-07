@@ -117,6 +117,38 @@ With `~/.config/<app>/key.txt` temporarily moved away, each must decrypt:
 And each must fail loudly, naming itself: a set-but-empty variable; a
 `_B64` value that isn't canonical base64.
 
+Precedence and cleanup, with a second key (`age-keygen -o other.txt`) that is
+not a recipient of the store under test:
+
+- An explicit `:identity-file` wins over a set variable. With
+  `SECRETS_AGE_IDENTITY="$(cat other.txt)"` exported, `load-secrets` with
+  `{:identity-file "<good key>"}` must succeed. The same call without
+  `:identity-file` must fail with `age decryption failed`, which shows the
+  variable was the identity in use.
+- A blank `SECRETS_AGE_IDENTITY=""` must fail with "is set but empty", even
+  when `~/.config/<app>/key.txt` would have decrypted the store. It must not
+  fall through to the key file.
+- No `age-identity-*` temp file survives the operation. Check it inside the
+  process: the files are registered for delete-on-exit, so a count taken after
+  `bb` exits is 0 even if the library never deleted them. Save this as `c.bb`
+  and run it once with `SECRETS_AGE_IDENTITY="$(cat <good key>)"` (success) and
+  once with `SECRETS_AGE_IDENTITY_B64="$(base64 < other.txt)"` (the load
+  throws), both with `bb -cp <checkout>/src c.bb`:
+
+  ```clojure
+  (require '[com.kirahowe.secrets :as s])
+  (defn strays []
+    (count (filter #(.startsWith ^String % "age-identity-")
+                   (.list (java.io.File. (System/getProperty "java.io.tmpdir"))))))
+  (let [before (strays)
+        inside (s/with-identity {} (fn [_] (- (strays) before)))
+        result (try (s/load-secrets "s.age" {}) (catch Exception _ :threw))]
+    (println "inside callback:" inside "after load:" (- (strays) before) result))
+  ```
+
+  `inside callback` must be 1, which shows the counter can see the file, and
+  `after load` must be 0 in both runs.
+
 ## Phase 6 — library's own gates
 
 In the checkout: `bb test`, `clojure -M:test`, `bb lint`, `bb format:check`.
