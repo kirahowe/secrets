@@ -22,6 +22,23 @@
   (gen/frequency [[3 gen/string]
                   [1 (gen/fmap str/join (gen/vector wide-char 0 12))]]))
 
+(def encodable-text
+  "A string every charset encoder keeps: Latin-1, or any run of code units that
+  holds no lone surrogate. Text that must survive a file written as UTF-8
+  draws from here rather than from `text`."
+  (gen/frequency [[3 gen/string]
+                  [1 (gen/fmap str/join
+                               (gen/vector (gen/fmap char
+                                                     (gen/one-of [(gen/choose 0 0xD7FF)
+                                                                  (gen/choose 0xE000 0xFFFF)]))
+                                           0 12))]]))
+
+(def marker
+  "A distinctive alphanumeric string to plant in an input and then look for in
+  everything a failure says. Upper-case, so no generated host or path (which
+  are lower-case) and no fixed message can contain it by chance."
+  (gen/fmap #(str "PLANTED" (str/join %)) (gen/vector gen/char-alphanumeric 6 16)))
+
 (def delimiter-text
   "A string made of the characters a depth scanner must ignore inside a
   literal: every EDN delimiter, the comment marker, the escape character, the
@@ -32,18 +49,24 @@
 
 ;;;; EDN values
 
-(def scalar
-  "A scalar EDN value that prints and reads back to itself."
+(defn scalar-of
+  "Generator of scalar EDN values that print and read back to themselves, with
+  strings drawn from `string-gen`."
+  [string-gen]
   (gen/one-of [(gen/return nil)
                gen/boolean
                gen/large-integer
                (gen/double* {:NaN? false :infinite? false})
-               text
+               string-gen
                delimiter-text
                gen/keyword
                gen/keyword-ns
                gen/symbol
                gen/symbol-ns]))
+
+(def scalar
+  "A scalar EDN value that prints and reads back to itself."
+  (scalar-of text))
 
 (def value
   "Any EDN value: scalars nested in vectors, lists, sets, and maps, including
@@ -59,20 +82,30 @@
   "A map key as a secrets file would use one."
   (gen/one-of [gen/keyword gen/keyword-ns gen/string-alphanumeric gen/small-integer]))
 
+(defn secrets-of
+  "Generator of a secrets value whose leaves are built from `scalar-gen`."
+  [scalar-gen]
+  (gen/recursive-gen (fn [inner]
+                       (gen/map secret-key inner {:max-elements 5}))
+                     (gen/one-of [scalar-gen
+                                  (gen/vector scalar-gen)
+                                  (gen/set scalar-gen)
+                                  (gen/list scalar-gen)])))
+
 (def secrets
   "A secrets value: maps under `secret-key` keys whose leaves are scalars or
   collections of scalars, or such a leaf on its own. An empty map is a leaf
   of the manifest, so it appears here too."
-  (gen/recursive-gen (fn [inner]
-                       (gen/map secret-key inner {:max-elements 5}))
-                     (gen/one-of [scalar
-                                  (gen/vector scalar)
-                                  (gen/set scalar)
-                                  (gen/list scalar)])))
+  (secrets-of scalar))
 
 (def secrets-map
   "A secrets file's top-level map."
   (gen/map secret-key secrets {:max-elements 5}))
+
+(def encodable-secrets-map
+  "A secrets file's top-level map whose strings survive a UTF-8 file, for
+  properties that write the printed map to disk."
+  (gen/map secret-key (secrets-of (scalar-of encodable-text)) {:max-elements 5}))
 
 ;;;; age keys and identity files
 

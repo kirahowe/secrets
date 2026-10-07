@@ -7,10 +7,16 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 - Property-based tests with test.check, run by both `bb test` and
-  `clojure -M:test`. Generated inputs now cover the untrusted-EDN parser, the
-  manifest encoding and diff, the CLI's shell quoting, argv handling, key
-  paths, and limits, and the initializer's preview redaction and file
-  merging, alongside the hand-picked examples those suites already had.
+  `clojure -M:test`. Generated inputs cover the EDN parser, the manifest
+  encoding and diff, the CLI's shell quoting, argv handling, key paths, and
+  limits, and the initializer's preview redaction and file merging. They also
+  cover the runtime: the order in which identity sources resolve, blank and
+  malformed identity variables, injected identity files, and path settings
+  that hold key contents or a locator. Failures from loading (base64, EDN,
+  rejected identities, and source locators with credentials) are checked never
+  to repeat the text they rejected. The `age` wrapper's path arguments and
+  recipient check, owner-only temporary files, and a real encrypt and load of
+  generated secrets complete the set.
 - The initializer declares this library's coordinate in one file per project.
   When a `deps.edn` exists it owns the coordinate and `bb.edn` gets a
   `{:local/root "."}` dependency on the project, so the Babashka task and the

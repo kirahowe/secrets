@@ -19,15 +19,19 @@
    :requires ([clojure.test :as t]
               [com.kirahowe.secrets-test]
               [com.kirahowe.secrets.aero-test]
+              [com.kirahowe.secrets.age-property-test]
               [com.kirahowe.secrets.cli-property-test]
               [com.kirahowe.secrets.cli-test]
               [com.kirahowe.secrets.coordinate-test]
+              [com.kirahowe.secrets.fs-property-test]
               [com.kirahowe.secrets.init-property-test]
               [com.kirahowe.secrets.init-test]
               [com.kirahowe.secrets.manifest-property-test]
               [com.kirahowe.secrets.release-test]
               [com.kirahowe.secrets.safe-edn-property-test]
+              [com.kirahowe.secrets.secrets-property-test]
               [com.kirahowe.secrets.site-policy-test]
+              [com.kirahowe.secrets.source-property-test]
               [com.kirahowe.secrets.workflow-policy-test])
    :task (let [{:keys [fail error]} (t/run-tests 'com.kirahowe.secrets-test
                                                  'com.kirahowe.secrets.cli-test
@@ -40,7 +44,11 @@
                                                  'com.kirahowe.secrets.safe-edn-property-test
                                                  'com.kirahowe.secrets.manifest-property-test
                                                  'com.kirahowe.secrets.cli-property-test
-                                                 'com.kirahowe.secrets.init-property-test)]
+                                                 'com.kirahowe.secrets.init-property-test
+                                                 'com.kirahowe.secrets.secrets-property-test
+                                                 'com.kirahowe.secrets.source-property-test
+                                                 'com.kirahowe.secrets.age-property-test
+                                                 'com.kirahowe.secrets.fs-property-test)]
            (System/exit (if (pos? (+ fail error)) 1 0)))}
 
   ;;;; Code quality
