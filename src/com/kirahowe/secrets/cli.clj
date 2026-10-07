@@ -41,9 +41,10 @@
     :manifest false   disable the manifest for this environment.
 
   Optional top-level key:
-    :limits           bounds applied to untrusted inputs before any subprocess
-                      starts, merged over `default-limits` and resolved onto
-                      every environment.
+    :limits           size and nesting bounds that catch accidental input (a
+                      wrong or runaway file) before any subprocess starts,
+                      merged over `default-limits` and resolved onto every
+                      environment.
 
   Commands: keygen · new · edit · set · rm · verify · doctor · show-key ·
   add-recipient · recipients · reencrypt · encrypt · decrypt · help.
@@ -308,12 +309,12 @@
 
 (defn- validate-artifact-roles!
   "Reject any canonical path carrying an incompatible combination of artifact
-  roles, over every environment at once: checking environments independently
-  accepted one environment's ciphertext path as another's key path.
+  roles, over every environment at once, so one environment's ciphertext path
+  cannot also be another's key path.
 
-  Canonicalization resolves the configuration as it reads now. This is a
-  configuration check, not a defence against the filesystem changing
-  afterwards — race-safe operation is a separate concern."
+  Canonicalization resolves the configuration as it reads now. This is a check
+  against configuration mistakes, not against the filesystem changing
+  afterwards."
   [environments]
   (let [groups (->> (vals environments)
                     (mapcat artifact-entries)
@@ -328,9 +329,9 @@
                {:canonical-path canonical :path-collision entries})))))
 
 (def ^:private default-limits
-  "Bounds applied to untrusted inputs before parsing or starting a subprocess,
-  overridable through the top-level `:limits` config key. Runtime plaintext and
-  EDN depth policy is shared rather than independently redefined here."
+  "Bounds that catch accidental oversized or deeply nested input before parsing
+  or starting a subprocess, overridable through the top-level `:limits` config
+  key. The plaintext and EDN depth bounds are the runtime's."
   (merge (select-keys secrets/default-limits
                       [:max-plaintext-bytes :max-edn-depth])
          {:max-recipients 256
@@ -752,12 +753,11 @@
   vector of validated recipients to encrypt to, deduplicated in first-seen
   order.
 
-  Reading once is the point. A pathname handed to age is read again inside age,
-  and between a validating read and that one an editor session can run for
-  minutes — long enough for anyone who can write the worktree to swap the list
-  and choose the recipients (CWE-367). So everything the file says is decided
-  here, before the sensitive work starts, and the resulting *values* are what
-  gets encrypted to.
+  The file is read once so one operation uses one consistent set. A pathname
+  handed to age would be read again inside age, after an editor session that can
+  run for minutes and during which the file may have been edited. Everything the
+  file says is decided here, before the sensitive work starts, and the resulting
+  *values* are what gets encrypted to.
 
   Fails closed while streaming a file larger than `:max-recipients-bytes`, more
   entries than `:max-recipients`, an entry longer than
@@ -778,14 +778,13 @@
 
 (defn- encrypt-target!
   "The immutable age recipient spec to encrypt with, resolved once before any
-  sensitive work begins — before an editor opens, before stdin is read, before
-  anything is decrypted — and threaded down to `age/encrypt-file!` from there.
+  sensitive work begins (before an editor opens, before stdin is read, before
+  anything is decrypted) and threaded down to `age/encrypt-file!` from there.
 
   Multi-recipient mode returns the validated `{:recipients [\"age1…\" …]}`
-  snapshot, so age receives repeated `-r` values and no pathname the worktree
-  could redirect after validation. Single-key mode returns the environment's
-  resolved `{:identity-file …}` (so SECRETS_AGE_IDENTITY* works in CI too); it
-  has no separate file to race."
+  snapshot, so age receives repeated `-r` values and no pathname to re-read.
+  Single-key mode returns the environment's resolved `{:identity-file …}` (so
+  SECRETS_AGE_IDENTITY* works in CI too)."
   [{:keys [recipients-file identity-file] :as env}]
   (if recipients-file
     {:recipients (recipient-snapshot env)}
@@ -1744,13 +1743,14 @@
   Keyless verification compares the ciphertext hash and does not require age;
   full verification decrypts and compares manifest entries.
 
-  A pass means the ciphertext and the manifest agree, not that either is
-  authentic: age does not sign, so no run of this can identify who wrote them.
-  In single-key mode the `:vhash`es do make a changed value fail a keyed run,
-  because they are keyed by the private identity; team manifests carry no
-  `:vhash`, so a same-shape value change there is invisible to `verify` by
-  design. Sender authenticity rests on the repository and deployment channel —
-  see the README's authenticity contract and threat model."
+  A pass means the ciphertext and the manifest agree, which detects drift and
+  a manifest from the wrong store. It does not establish authorship, even when
+  run with an identity: age does not sign, so no run of this can say who wrote
+  either artifact. In single-key mode the `:vhash`es make a changed value fail
+  a keyed run, because they are keyed by the private identity; team manifests
+  carry no `:vhash`, so a same-shape value change there is invisible to
+  `verify`. Authenticity rests on the repository and deployment channel; see
+  `doc/threat-model.md`."
   [config env-arg]
   (let [envs (if env-arg
                [(resolve-env config env-arg)]
