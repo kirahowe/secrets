@@ -557,9 +557,7 @@
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse (slurp file))]
     (when-not ok?
       (throw (ex-info "Existing secrets template is not valid EDN"
-                      (merge {:path path}
-                             (select-keys parsed
-                                          [:reason :line :column :depth :limit])))))
+                      (merge {:path path} (safe-edn/failure-data parsed)))))
     (when-not (map? value)
       (throw (ex-info "Existing secrets template must contain an EDN map"
                       {:path path})))

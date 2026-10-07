@@ -774,14 +774,6 @@
   (when (and (not recipients-file) (.exists (io/file identity-file)))
     (manifest/hmac-key (slurp identity-file))))
 
-(defn- edn-location-message
-  [{:keys [line column]}]
-  (cond
-    (and line column) (str " at line " line ", column " column)
-    line (str " at line " line)
-    column (str " at column " column)
-    :else ""))
-
 (defn- edn-failure-message
   [{:keys [reason depth limit] :as failure}]
   (case reason
@@ -789,11 +781,7 @@
     :edn-extra-values "expected one EDN value, found another"
     :edn-too-deep (str "EDN nesting depth " depth
                        " exceeds the configured :max-edn-depth of " limit)
-    :edn-malformed (str "malformed EDN syntax" (edn-location-message failure))))
-
-(defn- edn-failure-data
-  [failure]
-  (select-keys failure [:reason :line :column :depth :limit]))
+    :edn-malformed (str "malformed EDN syntax" (safe-edn/failure-location failure))))
 
 (defn- validate-plaintext!
   "Parse all of `plaintext`, returning its EDN value. Fail before encryption
@@ -806,7 +794,7 @@
       (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").\n"
                   "    Ciphertext and manifest were left unchanged.")
              (merge {:secrets-file (str secrets-file)}
-                    (edn-failure-data parsed))))))
+                    (safe-edn/failure-data parsed))))))
 
 (defn- decrypt-and-parse
   "Decrypt the environment's store and parse it under its limits, returning
@@ -821,7 +809,7 @@
     (if ok?
       value
       (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
-             (merge {:secrets-file secrets-file} (edn-failure-data parsed))))))
+             (merge {:secrets-file secrets-file} (safe-edn/failure-data parsed))))))
 
 (def ^:private set-usage
   (str "`set` takes [env] <key>; the value is read from the prompt or stdin, "
@@ -851,7 +839,7 @@
       (fail! (str "Invalid key: " problem ".\n"
                   "    Accepted forms: a keyword (:some/key) or a vector path "
                   "([:a :b]).")
-             (when-not ok? (edn-failure-data parsed))))
+             (when-not ok? (safe-edn/failure-data parsed))))
     (if (keyword? value) [value] value)))
 
 (defn- render-secrets
@@ -1202,7 +1190,7 @@
                           value
                           (fail! (str "Value on stdin is not valid EDN ("
                                       (edn-failure-message parsed) ").")
-                                 (merge {:key path} (edn-failure-data parsed)))))
+                                 (merge {:key path} (safe-edn/failure-data parsed)))))
                       raw)
               tmp (temp-plaintext!)]
           (try
@@ -1530,7 +1518,7 @@
       (enforce-manifest-entry-limit! manifest-path value limits))
     (cond
       (not (:ok? parsed))
-      {:problem {:reason :manifest-invalid-edn :failure (edn-failure-data parsed)}}
+      {:problem {:reason :manifest-invalid-edn :failure (safe-edn/failure-data parsed)}}
 
       (or (not (map? value))
           (and (contains? value :keys) (not (map? (:keys value)))))
@@ -1612,7 +1600,7 @@
                            (sha256 secrets-file))
             {:status :drift
              :reason :secrets-invalid-edn
-             :failure (edn-failure-data parsed)}))))))
+             :failure (safe-edn/failure-data parsed)}))))))
 
 (defn- diff-lines
   "One line per key path that moved between the manifest and the store."
