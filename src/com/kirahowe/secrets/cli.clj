@@ -760,91 +760,59 @@
     (str/ends-with? s "\n") (subs s 0 (- (count s) 1))
     :else s))
 
-(defn- backup-target!
-  "Copy an existing replacement target to a sibling temp file for rollback."
-  [{:keys [target] :as replacement}]
-  (let [target (io/file target)]
-    (if-not (.exists target)
-      (assoc replacement :existed? false)
-      (let [backup (fs/staging-file target)]
-        (try
-          (java.nio.file.Files/copy
-           (.toPath target) (.toPath backup)
-           (into-array java.nio.file.CopyOption
-                       [java.nio.file.StandardCopyOption/REPLACE_EXISTING
-                        java.nio.file.StandardCopyOption/COPY_ATTRIBUTES]))
-          (assoc replacement :existed? true :backup backup)
-          (catch Exception e
-            (.delete backup)
-            (throw e)))))))
-
-(defn- commit-replacements!
-  "Commit staged sibling files with atomic moves. Existing targets are first
-  copied to sibling rollback files so a later move failure restores every
-  target already replaced during this commit."
-  [replacements]
-  (let [prepared (atom [])
-        committed (atom [])]
+(defn- replace-file!
+  "Atomically replace public artifact `target` with the text `content`,
+  staged beside it. The staging file is deleted on any failure."
+  [target content]
+  (let [staging (fs/staging-file target)]
     (try
-      (doseq [replacement replacements]
-        (swap! prepared conj (backup-target! replacement)))
-      (try
-        (doseq [{:keys [staged target] :as replacement} @prepared]
-          (fs/atomic-move! staged target)
-          (swap! committed conj replacement))
-        (catch Exception commit-error
-          (let [rollback-errors
-                (reduce (fn [errors {:keys [target backup existed?]}]
-                          (try
-                            (if existed?
-                              (fs/atomic-move! backup target)
-                              (java.nio.file.Files/deleteIfExists
-                               (.toPath (io/file target))))
-                            errors
-                            (catch Exception rollback-error
-                              (conj errors (ex-message rollback-error)))))
-                        [] (reverse @committed))]
-            (throw (ex-info (if (seq rollback-errors)
-                              "Could not commit the secrets update, and rollback also failed."
-                              "Could not commit the secrets update; restored the previous files.")
-                            (cond-> {:targets (mapv (comp str :target) replacements)}
-                              (seq rollback-errors) (assoc :rollback-errors rollback-errors))
-                            commit-error)))))
-      (finally
-        (doseq [{:keys [staged backup]} @prepared
-                f [staged backup]
-                :when f]
-          (.delete (io/file f)))))))
+      (spit staging content)
+      (fs/atomic-move! staging target)
+      (finally (.delete staging)))))
 
 (defn- write-secrets!
-  "Validate `plaintext-file`, then stage its ciphertext — encrypted to the
-  already-resolved `target` recipient spec, never to a pathname re-read here —
-  and optional manifest beside their destinations, and commit both through
-  atomic replacements."
-  [{:keys [manifest app secrets-file] :as env} target plaintext-file]
+  "Validate `plaintext-file`, encrypt it to the already-resolved `target`
+  recipient spec, and replace the ciphertext and then the manifest, each
+  atomically.
+
+  Validation, encryption, and manifest rendering all finish before anything is
+  replaced, so a failure there leaves both files as they were. The pair is not
+  one transaction: the ciphertext is authoritative and the manifest is derived
+  from it. If the manifest cannot be replaced after the ciphertext was, the
+  failure has `:reason :manifest-stale` and says how to regenerate it."
+  [{:keys [manifest app secrets-file] environment-name :name :as env} target plaintext-file]
   (let [f (io/file (str plaintext-file))
         _ (when (> (.length f) age/max-plaintext-bytes)
             (input-too-large! (str "The plaintext for " secrets-file)
                               age/max-plaintext-bytes (.length f)
                               {:secrets-file (str secrets-file)}))
         value (validate-plaintext! secrets-file (slurp f :encoding "UTF-8"))
-        ciphertext-temp (fs/staging-file secrets-file)]
+        staging (fs/staging-file secrets-file)]
     (try
-      (let [manifest-temp (when (string? manifest)
-                            (fs/staging-file manifest))]
-        (try
-          (age/encrypt-file! target plaintext-file ciphertext-temp)
-          (when manifest-temp
-            (spit manifest-temp
-                  (manifest/render {:app app :ciphertext-sha (sha256 ciphertext-temp)}
-                                   (manifest/entries value (manifest-hmac-key env)))))
-          (commit-replacements!
-           (cond-> [{:staged ciphertext-temp :target (io/file secrets-file)}]
-             manifest-temp (conj {:staged manifest-temp :target (io/file manifest)})))
-          (finally
-            (when manifest-temp (.delete manifest-temp)))))
+      (age/encrypt-file! target plaintext-file staging)
+      (let [manifest-text (when (string? manifest)
+                            (manifest/render {:app app :ciphertext-sha (sha256 staging)}
+                                             (manifest/entries value (manifest-hmac-key env))))]
+        (fs/atomic-move! staging secrets-file)
+        (when manifest-text
+          (try
+            (replace-file! manifest manifest-text)
+            (catch Exception e
+              (throw (ex-info
+                      (str "The ciphertext " secrets-file " was updated, but its manifest "
+                           manifest " could not be replaced (" (.getName (class e))
+                           "), so the manifest is stale.\n"
+                           "    `bb secrets verify` will report it. Regenerate it with:"
+                           "  bb secrets reencrypt "
+                           (shell-quote (name environment-name)))
+                      {:reason :manifest-stale
+                       :secrets-file (str secrets-file)
+                       :manifest manifest
+                       :environment environment-name
+                       :secrets/exit 1}
+                      e))))))
       (finally
-        (.delete ciphertext-temp)))))
+        (.delete staging)))))
 
 (defn- report-written!
   "Report `outcome` for the ciphertext and, when the environment keeps a
@@ -853,15 +821,6 @@
   (apply ok outcome)
   (when (string? manifest)
     (info "Manifest updated:" manifest)))
-
-(defn- append-recipient!
-  "Atomically replace recipients file `f` with already-bounded `content`."
-  [f content]
-  (let [tmp (fs/staging-file f)]
-    (try
-      (spit tmp content)
-      (fs/atomic-move! tmp f)
-      (finally (.delete tmp)))))
 
 ;;;; Commands
 
@@ -1226,8 +1185,7 @@
             (do
               (info "Already a recipient of" (str environment-label ":") pub)
               pub)
-            (let [f (io/file (str recipients-file))
-                  current (:content snapshot)
+            (let [current (:content snapshot)
                   content (str current
                                (when (and (seq current)
                                           (not (str/ends-with? current "\n")))
@@ -1239,7 +1197,7 @@
                  max-recipients-bytes (utf8-length content)
                  {:recipients-file (str recipients-file)
                   :environment environment-name}))
-              (append-recipient! f content)
+              (replace-file! recipients-file content)
               (say! (recipient-added-lines environment-label recipients-file pub
                                            (.exists (io/file secrets-file))))
               pub)))))))

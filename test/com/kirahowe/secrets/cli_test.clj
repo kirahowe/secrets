@@ -612,6 +612,45 @@
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
 
+(deftest a-failed-manifest-replace-leaves-a-detectably-stale-manifest-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")]
+      (encrypt-edn! {:version :old})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (let [manifest-before (slurp manifest-path)
+            real-move fs/atomic-move!
+            moves (atom [])
+            e (try
+                (with-out-str
+                  (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:version :new}")
+                                   #'fs/atomic-move!
+                                   (fn [source target]
+                                     (swap! moves conj (str target))
+                                     (if (= manifest-path (str target))
+                                       (throw (java.io.IOException. "simulated move failure"))
+                                       (real-move source target)))}
+                    #(cli/edit! config "dev")))
+                nil
+                (catch clojure.lang.ExceptionInfo e e))]
+        (is (= [encrypted manifest-path] @moves)
+            "the ciphertext is replaced, then the manifest; nothing is rolled back")
+        (is (= {:version :new} (edn/read-string (age/decrypt *key* encrypted)))
+            "the ciphertext is authoritative and holds the edit")
+        (is (= manifest-before (slurp manifest-path)) "the manifest is the old one")
+        (is (= :manifest-stale (:reason (ex-data e))))
+        (doseq [fragment [encrypted manifest-path "was updated" "stale"
+                          "bb secrets verify" "bb secrets reencrypt 'dev'"]]
+          (is (str/includes? (ex-message e) fragment) fragment))
+        (is (= ["key.txt" "secrets.edn.age" "secrets.edn.manifest"]
+               (sort (.list (io/file *dir*))))
+            "no staging or backup file remains")
+        (is (= 1 (:exit (verify config "dev"))) "verify reports the stale manifest")
+        (with-out-str (cli/reencrypt! config "dev"))
+        (is (= 0 (:exit (verify config "dev"))) "and reencrypt regenerates it")))))
+
 (defn- mode
   "POSIX permission names of `path`."
   [path]
@@ -2495,25 +2534,42 @@
 
 ;;;; Release-hardening checks: cleanup, disclosure, and error paths
 
-(deftest write-secrets-releases-staging-when-a-later-acquisition-fails-test
-  (let [plaintext (str *dir* "/plain.edn")
-        env (get-in (cli/normalize-config (test-config)) [:environments :dev])
-        real-staging-file fs/staging-file
-        calls (atom 0)
-        leftovers #(->> (.listFiles (io/file *dir*))
-                        (map (fn [f] (.getName f)))
-                        (filter (fn [n] (str/ends-with? n ".tmp")))
-                        vec)]
-    (spit plaintext "{:a 1}")
-    (with-redefs-fn {#'fs/staging-file
-                     (fn [target]
-                       (if (= 2 (swap! calls inc))
-                         (throw (java.io.IOException. "no space"))
-                         (real-staging-file target)))}
-      #(is (thrown? java.io.IOException
-                    ((cli-private 'write-secrets!) env {:identity-file *key*} plaintext))))
-    (is (= 2 @calls) "the manifest staging file was the failing acquisition")
-    (is (= [] (leftovers)) "the ciphertext staging file was released")))
+(deftest write-secrets-releases-staging-on-every-failure-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [plaintext (str *dir* "/plain.edn")
+          env (assoc (get-in (cli/normalize-config (test-config)) [:environments :dev])
+                     :identity-file *key*)
+          write! #((cli-private 'write-secrets!) env {:identity-file *key*} plaintext)
+          entries #(sort (.list (io/file *dir*)))
+          real-encrypt age/encrypt-file!
+          real-move fs/atomic-move!]
+      (spit plaintext "{:a 1}")
+      (write!)
+      (let [settled (entries)
+            ciphertext (file-bytes (:secrets-file env))
+            manifest-text (slurp (:manifest env))]
+        (doseq [[label redefs]
+                [["encryption fails after writing its output"
+                  {#'age/encrypt-file! (fn [& args]
+                                         (apply real-encrypt args)
+                                         (throw (ex-info "forced encryption failure" {})))}]
+                 ["rendering the manifest fails"
+                  {#'manifest/render (fn [& _] (throw (ex-info "forced render failure" {})))}]
+                 ["the ciphertext move fails"
+                  {#'fs/atomic-move! (fn [& _] (throw (java.io.IOException. "forced")))}]
+                 ["the manifest move fails"
+                  {#'fs/atomic-move! (fn [source target]
+                                       (if (= (:manifest env) (str target))
+                                         (throw (java.io.IOException. "forced"))
+                                         (real-move source target)))}]]]
+          (testing label
+            (is (thrown? Exception (with-redefs-fn redefs write!)))
+            (is (= settled (entries)) "no staging file remains")
+            (is (= manifest-text (slurp (:manifest env))))
+            (when-not (= label "the manifest move fails")
+              (is (= ciphertext (file-bytes (:secrets-file env)))
+                  "a failure before the first replace leaves the ciphertext as it was"))))))))
 
 (deftest key-file-source-is-derived-and-stable-under-renormalizing-test
   (let [normalized (fn [env-config]
