@@ -124,8 +124,10 @@ single-recipient mode, a value-only change appears as a changed `:vhash`:
 + [:service/api-key] {:type :string, :vhash "new-hash"}
 ```
 
-The hashes expose no value. Multi-recipient manifests intentionally remain
-structure-only, so they cannot expose that value-only signal.
+The hashes do not reveal the value, but they do reveal equality and change:
+equal values hashed with the same identity have equal hashes, at any path, and a value that returns to
+an earlier one is visible in history. Multi-recipient manifests intentionally
+remain structure-only, so they carry no hashes and expose no value-only signal.
 
 The nested `.github/workflows/verify-secrets.yml` is a copyable CI gate for this
 starter. GitHub only loads workflows from a repository's root `.github/workflows`
