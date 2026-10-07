@@ -911,6 +911,34 @@
                    (fs/atomic-move! source (str *dir* "/no-such-dir/target"))))
       (is (= "kept" (slurp source))))))
 
+(deftest owner-only-temp-file-test
+  (testing "the file is new, empty, and owner-only from creation"
+    (let [file (fs/owner-only-temp-file! "secrets-test-" ".tmp")]
+      (try
+        (is (zero? (.length file)))
+        (is (= owner-only-names (permission-names file)))
+        (is (= (.getCanonicalFile (io/file (System/getProperty "java.io.tmpdir")))
+               (.getCanonicalFile (.getParentFile file))))
+        (finally (.delete file)))))
+  (testing "a directory argument places it there, under an exclusive name"
+    (let [planted (io/file *dir* "sibling-.tmp")
+          _ (spit planted "planted")
+          file (fs/owner-only-temp-file! *dir* "sibling-" ".tmp")]
+      (is (= (.getCanonicalFile (io/file *dir*)) (.getCanonicalFile (.getParentFile file))))
+      (is (= owner-only-names (permission-names file)))
+      (is (not= (.getName planted) (.getName file)))
+      (is (= "planted" (slurp planted)))))
+  (testing "no file is registered for deletion at exit"
+    ;; A file registered with deleteOnExit is removed when the process ends.
+    ;; This one must outlive a short process that only creates it.
+    (let [out (:out (shell/sh "bb" "-cp" "src" "-e"
+                              (str "(require '[com.kirahowe.secrets.fs :as fs])"
+                                   "(print (str (fs/owner-only-temp-file! "
+                                   (pr-str *dir*) " \"exit-\" \".tmp\")))")))
+          file (io/file out)]
+      (is (str/includes? out "exit-"))
+      (is (.exists file) "the caller owns deletion; nothing deletes it at exit"))))
+
 (deftest keygen-replaces-an-existing-key-through-the-atomic-move-test
   (let [key-file (io/file *dir* "replaced-key.txt")
         _ (age/keygen! key-file)
@@ -922,7 +950,8 @@
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"forced move failure"
                               (age/keygen! key-file))))
       (is (= before (slurp key-file)))
-      (is (empty? (filter #(str/includes? % ".keygen") (seq (.list (io/file *dir*)))))))
+      (is (= ["replaced-key.txt"]
+             (filter #(str/includes? % "replaced-key.txt") (seq (.list (io/file *dir*)))))))
     (testing "the new key reaches its path by one atomic move from inside its directory"
       (with-redefs [fs/atomic-move! (fn [source target]
                                       (swap! moves conj [(io/file (str source))
@@ -933,7 +962,7 @@
       (let [[[source target]] @moves]
         (is (= 1 (count @moves)))
         (is (= (.getAbsoluteFile key-file) target))
-        (is (= (.getParentFile target) (.getParentFile (.getParentFile source)))))
+        (is (= (.getParentFile target) (.getParentFile source))))
       (is (not= before (slurp key-file)))
       (is (= owner-only-names (permission-names key-file))))))
 

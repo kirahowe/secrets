@@ -1,34 +1,47 @@
 (ns com.kirahowe.secrets.fs
-  "Owner-only filesystem primitives for materialized secret data.")
-
-(defn owner-only-temp-file!
-  "Create an owner-only delete-on-exit temporary file.
-
-  The file is created with mode 0600 atomically via NIO POSIX attributes, so
-  sensitive bytes are never exposed through a default-umask permission window.
-  A filesystem which cannot make that guarantee is refused. The generated name
-  uses `prefix` and `suffix`. Returns a `java.io.File`; `.deleteOnExit` is a
-  backstop, not a substitute for the caller's prompt cleanup."
-  [prefix suffix]
-  (doto (try
-          (.toFile
-           (java.nio.file.Files/createTempFile
-            prefix suffix
-            (into-array java.nio.file.attribute.FileAttribute
-                        [(java.nio.file.attribute.PosixFilePermissions/asFileAttribute
-                          #{java.nio.file.attribute.PosixFilePermission/OWNER_READ
-                            java.nio.file.attribute.PosixFilePermission/OWNER_WRITE})])))
-          (catch UnsupportedOperationException e
-            (throw (ex-info "Cannot create a private temporary file on this filesystem."
-                            {:reason :owner-only-temp-file-unavailable}
-                            e))))
-    (.deleteOnExit)))
+  "Filesystem primitives: private temporary files and atomic replacement.")
 
 (defn- ->path
   ^java.nio.file.Path [x]
   (if (instance? java.nio.file.Path x)
     x
     (.toPath (java.io.File. (str x)))))
+
+(def ^:private owner-only
+  (into-array java.nio.file.attribute.FileAttribute
+              [(java.nio.file.attribute.PosixFilePermissions/asFileAttribute
+                #{java.nio.file.attribute.PosixFilePermission/OWNER_READ
+                  java.nio.file.attribute.PosixFilePermission/OWNER_WRITE})]))
+
+(defn- create-owner-only
+  [create]
+  (try
+    (.toFile ^java.nio.file.Path (create))
+    (catch UnsupportedOperationException e
+      (throw (ex-info "Cannot create a private temporary file on this filesystem."
+                      {:reason :owner-only-temp-file-unavailable}
+                      e)))))
+
+(defn owner-only-temp-file!
+  "Create a new, empty private file and return it as a `java.io.File`.
+
+  The file is created exclusively, under a generated name that uses `prefix`
+  and `suffix`, with mode 0600 as a creation attribute, so its bytes are never
+  readable by another user. It lives in `dir` when one is given and in the
+  system temporary directory otherwise. A filesystem that cannot create an
+  owner-only file throws `ex-info` with
+  `:reason :owner-only-temp-file-unavailable`. The caller deletes the file."
+  ([prefix suffix]
+   (create-owner-only #(java.nio.file.Files/createTempFile prefix suffix owner-only)))
+  ([dir prefix suffix]
+   (create-owner-only
+    #(java.nio.file.Files/createTempFile (->path dir) prefix suffix owner-only))))
+
+(defn- atomic-move-unsupported?
+  "True when `e` is NIO's AtomicMoveNotSupportedException. The class is
+  recognized by name because babashka cannot resolve it."
+  [e]
+  (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e))))
 
 (defn atomic-move!
   "Atomically move the file `source` to `target` and return `target`.
@@ -49,12 +62,10 @@
                   java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
     target
     (catch Exception e
-      ;; Babashka cannot resolve AtomicMoveNotSupportedException as a class, so
-      ;; the exception is recognized by name.
-      (if (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e)))
-        (throw (ex-info (str "This filesystem cannot atomically move a file to " target)
+      (throw (if (atomic-move-unsupported? e)
+               (ex-info (str "This filesystem cannot atomically move a file to " target)
                         {:reason :atomic-move-unsupported
                          :source (str source)
                          :target (str target)}
-                        e))
-        (throw e)))))
+                        e)
+               e)))))

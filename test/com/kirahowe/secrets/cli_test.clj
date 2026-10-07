@@ -136,9 +136,9 @@
   ([created f]
    (let [real-owner-only-temp-file! fs/owner-only-temp-file!]
      (with-redefs [fs/owner-only-temp-file!
-                   (fn [prefix suffix]
-                     (let [file (real-owner-only-temp-file! prefix suffix)]
-                       (when (= "age-identity-" prefix)
+                   (fn [& args]
+                     (let [file (apply real-owner-only-temp-file! args)]
+                       (when (= "age-identity-" (first args))
                          (swap! created conj (.getAbsolutePath file)))
                        file))]
        {:result (f) :paths @created}))))
@@ -150,9 +150,9 @@
   (let [created (atom [])
         real-owner-only-temp-file! fs/owner-only-temp-file!]
     (with-redefs [fs/owner-only-temp-file!
-                  (fn [prefix suffix]
-                    (let [file (real-owner-only-temp-file! prefix suffix)]
-                      (when (= "age-identity-" prefix)
+                  (fn [& args]
+                    (let [file (apply real-owner-only-temp-file! args)]
+                      (when (= "age-identity-" (first args))
                         (swap! created conj (.getAbsolutePath file)))
                       file))]
       (let [outcome (try
@@ -1785,7 +1785,7 @@
 ;;;; Regressions
 
 (deftest keygen-overwrites-a-confirmed-existing-key-test
-  (testing "age-keygen refuses an existing -o file, so keygen! stages and moves"
+  (testing "keygen! stages the new key beside the old one and moves it over"
     (let [path (str *dir* "/regen.txt")
           pub1 (age/keygen! path)
           pub2 (age/keygen! path)]
@@ -1793,11 +1793,9 @@
       (is (some? pub2))
       (is (not= pub1 pub2) "the second call really did replace the key")
       (is (= pub2 (age/public-key path)) "and the file on disk is the new one")
-      (is (= #{"regen.txt"}
-             (->> (.list (io/file *dir*)) (filter #(= "regen.txt" %)) set))
-          "no staging leftovers beside the key")
-      (is (empty? (filter #(re-find #"\.regen\.txt\.keygen" %) (.list (io/file *dir*))))
-          "the temp staging directory is cleaned up"))))
+      (is (= ["regen.txt"]
+             (filter #(str/includes? % "regen.txt") (.list (io/file *dir*))))
+          "no staging leftovers beside the key"))))
 
 (deftest keygen-reports-sharing-environments-and-app-default-clause-test
   (testing "environments without :key-file share the app default"
