@@ -1361,6 +1361,20 @@
       (is (= 1 (depth "{:a 1")))
       (is (thrown? Exception (read-edn "{:a 1"))))))
 
+(deftest edn-failure-helpers-test
+  (testing "failure-data keeps the allowlisted fields and nothing else"
+    (is (= {:reason :edn-too-deep :depth 3 :limit 2}
+           (safe-edn/failure-data (safe-edn/parse "[[[1]]]" {:max-edn-depth 2}))))
+    (is (= {:reason :edn-malformed :line 2 :column 1}
+           (safe-edn/failure-data {:ok? false :reason :edn-malformed :line 2 :column 1
+                                   :value "SECRET" :message "SECRET"}))))
+  (testing "failure-location renders whatever position is known"
+    (are [failure fragment] (= fragment (safe-edn/failure-location failure))
+      {:line 3 :column 7} " at line 3, column 7"
+      {:line 3} " at line 3"
+      {:column 7} " at column 7"
+      {} "")))
+
 (deftest edn-parse-failures-are-content-free-test
   (let [sentinel "123SENTINELSECRET"
         rendered (fn [e]
@@ -1613,6 +1627,8 @@
         (is (= :edn-too-deep (:reason data)))
         (is (= 1 (:limit data)))
         (is (= descriptor (:source data)))
+        (is (= #{:reason :depth :limit :source} (set (keys data)))
+            "only the allowlisted parse fields and the source reach the error")
         (is (str/includes? (ex-message e) ":max-edn-depth"))))
     (testing "a rejected object says its class, never its toString"
       (let [e (failure (StringBuilder. (:to-string source-sentinels)) nil)

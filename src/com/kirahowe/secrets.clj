@@ -300,18 +300,6 @@
                         descriptor (assoc :source descriptor)
                         nameable (assoc :identity nameable)))))))
 
-(defn- edn-location-message
-  [{:keys [line column]}]
-  (cond
-    (and line column) (str " at line " line ", column " column)
-    line (str " at line " line)
-    column (str " at column " column)
-    :else ""))
-
-(defn- edn-failure-data
-  [failure]
-  (select-keys failure [:reason :line :column :depth :limit]))
-
 (defn- edn-failure-message
   [{:keys [reason depth limit] :as failure}]
   (case reason
@@ -321,7 +309,7 @@
     :edn-too-deep (str "The decrypted secrets nest " depth " collections deep, past the"
                        " configured :max-edn-depth limit of " limit ".")
     :edn-malformed (str "The decrypted secrets contain malformed EDN syntax"
-                        (edn-location-message failure) ".")))
+                        (safe-edn/failure-location failure) ".")))
 
 (def ^:private edn-failure-reasons
   #{:edn-empty :edn-extra-values :edn-too-deep :edn-malformed})
@@ -333,7 +321,7 @@
     (if ok?
       value
       (throw (ex-info (edn-failure-message parsed)
-                      (edn-failure-data parsed))))))
+                      (safe-edn/failure-data parsed))))))
 
 (defn- decrypt-and-read!
   "Decrypt and read `file` under `opts` — `:limits` and the `:source`

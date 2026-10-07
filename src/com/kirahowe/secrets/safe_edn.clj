@@ -116,3 +116,20 @@
          (catch Exception e
            (merge {:ok? false :reason :edn-malformed}
                   (parser-location e))))))))
+
+(defn failure-data
+  "Return the fields of a failed [[parse]] result that may enter exception
+  data: `:reason` and the numeric `:line`, `:column`, `:depth`, and `:limit`."
+  [failure]
+  (select-keys failure [:reason :line :column :depth :limit]))
+
+(defn failure-location
+  "Render where a failed [[parse]] result points as a message fragment such as
+  \" at line 3, column 7\", or \"\" when the parser gave no position. The
+  fragment fits after a clause or before a sentence's full stop."
+  [{:keys [line column]}]
+  (cond
+    (and line column) (str " at line " line ", column " column)
+    line (str " at line " line)
+    column (str " at column " column)
+    :else ""))
