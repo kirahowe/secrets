@@ -34,11 +34,17 @@
   "One-line remediation appended to no-secrets-file errors."
   "Create it with `bb secrets new`.")
 
-(defn- locator-string?
-  "True when `s` begins with a URI scheme and is not a Windows drive path."
+(defn locator-scheme
+  "Return the lower-case URI scheme that string `s` begins with after
+  surrounding whitespace is trimmed, or nil when `s` is a plain filesystem
+  path. A Windows drive path such as `C:\\keys` is a path. A bare relative
+  name with a colon, such as `key:txt`, has the scheme `key`; `./key:txt` is a
+  path. A string with a scheme is a locator: its remainder may hold a
+  credential, so a diagnostic names the scheme and never the string."
   [s]
-  (and (not (re-find windows-absolute-path s))
-       (boolean (re-find uri-scheme s))))
+  (let [s (str/trim s)]
+    (when-not (re-find windows-absolute-path s)
+      (some-> (second (re-find uri-scheme s)) str/lower-case))))
 
 (defn- parse-uri
   "Return `s` as a `java.net.URI`, or nil when it does not parse.
@@ -91,7 +97,7 @@
   can hold a token too, but retaining it is necessary to identify a failing
   resource; that residual diagnostic risk is explicit."
   [s]
-  (let [[schemes uri] (locator-parts s)
+  (let [[schemes uri] (locator-parts (str/trim s))
         host (some-> uri .getHost not-empty)
         path (some-> uri .getPath not-empty)
         port (or (some-> uri .getPort) -1)]
@@ -113,7 +119,7 @@
     (nil? source) nil
     (instance? java.io.File source) {:kind :file :path (str source)}
     (instance? java.nio.file.Path source) {:kind :file :path (str source)}
-    (string? source) (if (locator-string? source)
+    (string? source) (if (locator-scheme source)
                        (locator-descriptor source)
                        {:kind :file :path source})
     (instance? java.net.URL source)
@@ -187,7 +193,7 @@
    (cond
      (instance? java.io.File source) {:file source}
      (instance? java.nio.file.Path source) {:file (.toFile ^java.nio.file.Path source)}
-     (string? source) (if (locator-string? source)
+     (string? source) (if (locator-scheme source)
                         (some-> source parse-uri locator-source)
                         {:file (io/file source)})
      (instance? java.net.URI source) (locator-source source)

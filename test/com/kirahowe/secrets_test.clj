@@ -7,9 +7,11 @@
             [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [are deftest is testing use-fixtures]]
+            [clojure.test.check.generators :as gen]
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.generators :as g]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]))
@@ -1658,6 +1660,27 @@
           (is (some? @created) "the copy was started")
           (is (not (.exists ^java.io.File @created))))))))
 
+(deftest locator-scheme-test
+  (are [s scheme] (= scheme (source/locator-scheme s))
+    "https://user:pw@host/key" "https"
+    "HTTPS://host/key" "https"
+    "jar:file:/app.jar!/store.age" "jar"
+    "file:/keys/id.txt" "file"
+    "/keys/id.txt" nil
+    "keys/id.txt" nil
+    "~/.config/app/key.txt" nil
+    "C:\\keys\\id.txt" nil
+    "c:/keys/id.txt" nil
+    "" nil
+    " https://host/key" "https"
+    "\thttps://host/key" "https"
+    "\nhttps://host/key\n" "https"
+    "key:txt" "key"
+    "prod:key.txt" "prod"
+    "./key:txt" nil
+    "/keys/a:b/id.txt" nil
+    "  /keys/id.txt" nil))
+
 (deftest default-key-file-test
   (is (= (str (System/getProperty "user.home") "/.config/myapp/key.txt")
          (secrets/default-key-file "myapp")))
@@ -1667,6 +1690,117 @@
         (is (= {:identity-file (secrets/default-key-file "myapp")
                 :identity-source :default-key-file}
                (secrets/with-identity {:app "myapp"} identity)))))))
+
+(deftest identity-and-file-locators-are-refused-by-scheme-test
+  (let [enc (encrypt-edn! {:k "v"})
+        locator (str "https://user:" (:userinfo source-sentinels) "@host.example/key.txt"
+                     "?token=" (:query source-sentinels)
+                     "#" (:fragment source-sentinels))
+        failure (fn [thunk]
+                  (let [e (try (thunk) nil (catch Exception e e))]
+                    (is (some? e) "the case under test really failed")
+                    e))
+        with-env (fn [value thunk]
+                   (with-redefs-fn
+                     {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY_FILE") value)}
+                     thunk))]
+    (doseq [[prefix prefix-name] [["" "no"] [" " "a space"] ["\t" "a tab"] ["\n" "a newline"]]
+            :let [locator (str prefix locator)]]
+      (testing (str "with " prefix-name " prefix")
+        (doseq [[label identity-source thunk]
+                [["an :identity-file option" :identity-file
+                  #(secrets/load-secrets enc {:identity-file locator})]
+                 ["a bare identity argument" :identity-file
+                  #(secrets/load-secrets enc locator)]
+                 ["SECRETS_AGE_IDENTITY_FILE" :secrets-age-identity-file
+                  #(with-env locator (fn [] (secrets/load-secrets enc nil)))]
+                 ["a :key-file option" :configured-key-file
+                  #(secrets/with-identity {:key-file locator} identity)]
+                 ["a reader identity, at the first tag read" :identity-file
+                  #(edn/read-string
+                    {:readers (secrets/reader-literals {:file enc :identity-file locator})}
+                    "#secret/req :k")]]]
+          (testing label
+            (when-let [e (failure thunk)]
+              (is (= {:reason :disallowed-identity :scheme "https"
+                      :identity-source identity-source}
+                     (ex-data e)))
+              (is (str/includes? (ex-message e) "URI scheme https:."))
+              (is (str/includes? (ex-message e) "with ./"))
+              (is (not (str/includes? (rendered-chain e) "host.example")))
+              (is (= [] (leaked (rendered-chain e)))))))
+        (doseq [[option expected] [[:file "local filesystem path"]
+                                   [:resource "classpath resource name"]]]
+          (testing (str "a reader " option)
+            (when-let [e (failure #(secrets/reader-literals {option locator
+                                                             :identity-file *key*}))]
+              (is (= {:reason :disallowed-source
+                      :source {:kind :url :scheme "https" :host "host.example"
+                               :path "/key.txt"}}
+                     (ex-data e))
+                  "the same descriptor shape a load failure carries")
+              (is (str/includes? (ex-message e) (str "The secrets " option " must be a " expected)))
+              (is (str/includes? (ex-message e) "URI scheme https:."))
+              (is (= [] (leaked (rendered-chain e)))))))))
+    (testing "a File built from a locator is refused the same way"
+      (is (= :disallowed-identity
+             (:reason (ex-data (failure #(secrets/load-secrets enc (io/file locator))))))))
+    (testing "a bare relative name with a colon is refused, with the way to name it"
+      (let [e (failure #(secrets/load-secrets enc "key:txt"))]
+        (is (= {:reason :disallowed-identity :scheme "key" :identity-source :identity-file}
+               (ex-data e)))
+        (is (str/includes? (ex-message e) "Prefix a relative path that contains a colon with ./"))))
+    (testing "a ./ prefix or an absolute path makes a name with a colon a path"
+      (is (= {:identity-file "./key:txt" :identity-source :identity-file}
+             (secrets/with-identity "./key:txt" identity)))
+      (let [colon-dir (io/file *dir* "a:b")
+            colon-key (io/file colon-dir "key:txt")]
+        (.mkdirs colon-dir)
+        (spit colon-key (slurp *key*))
+        (is (= {:k "v"} (secrets/load-secrets enc (str colon-key))))
+        (is (= {:k "v"} (secrets/load-secrets enc {:identity-file (str colon-key)})))))
+    (testing "a local identity path that does not exist is still named"
+      (let [missing (str *dir* "/no-such-key.txt")
+            e (load-failure enc {:identity-file missing})]
+        (is (= :no-identity (:reason (ex-data e))))
+        (is (str/includes? (ex-message e) missing))))
+    (testing "a missing :file is described before :resource"
+      (let [missing (str *dir* "/absent.edn.age")
+            readers (secrets/reader-literals {:file missing :resource "other.edn.age"
+                                              :identity-file *key*})
+            e (failure #(edn/read-string {:readers readers} "#secret/req :k"))]
+        (is (= missing (:store (ex-data e))))))))
+
+(deftest key-contents-in-a-path-setting-are-never-echoed-test
+  (let [enc (encrypt-edn! {:k "v"})
+        key-line (gen/generate g/age-secret-key)
+        file-text (gen/generate (g/decorated-identity key-line))
+        with-env (fn [value thunk]
+                   (with-redefs-fn
+                     {#'secrets/identity-env #(when (= % "SECRETS_AGE_IDENTITY_FILE") value)}
+                     thunk))]
+    (doseq [[shape contents] [["a bare key line" key-line]
+                              ["age-keygen file text" file-text]
+                              ["a key line after whitespace" (str " \n" key-line)]]
+            [label identity-source thunk]
+            [["a bare identity argument" :identity-file
+              #(secrets/load-secrets enc contents)]
+             ["an :identity-file option" :identity-file
+              #(secrets/load-secrets enc {:identity-file contents})]
+             ["SECRETS_AGE_IDENTITY_FILE" :secrets-age-identity-file
+              #(with-env contents (fn [] (secrets/load-secrets enc nil)))]
+             ["a :key-file option" :configured-key-file
+              #(secrets/with-identity {:key-file contents} identity)]]]
+      (testing (str shape " in " label)
+        (let [e (try (thunk) nil (catch Exception e e))]
+          (is (some? e) "the case under test really failed")
+          (when e
+            (is (= {:reason :disallowed-identity :identity-source identity-source}
+                   (ex-data e)))
+            (is (str/includes? (ex-message e) "holds key contents"))
+            (is (str/includes? (ex-message e) "SECRETS_AGE_IDENTITY."))
+            (is (not (str/includes? (rendered-chain e) key-line)))
+            (is (not (str/includes? (rendered-chain e) (subs key-line 16 40))))))))))
 
 ;;;; Manifest
 

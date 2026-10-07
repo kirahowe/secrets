@@ -37,6 +37,12 @@
   When none of these yields an identity, resolution returns nil and loading
   throws with the options above rather than guessing a path.
 
+  An identity path is a local filesystem path. A URI-shaped value, which
+  includes a bare relative name with a colon such as `key:txt`, fails with
+  `:disallowed-identity` and the error names only its scheme; write
+  `./key:txt` for such a file. Key contents in a path setting fail the same
+  way and are never echoed.
+
   Sources 2 and 3 are materialized into a private temporary file only while an
   operation needs them, then deleted before that operation returns."
   (:require [clojure.java.io :as io]
@@ -212,6 +218,32 @@
                                      :identity-source source}
                               cleanup (assoc :cleanup (ex-data cleanup)))))))))))
 
+(def ^:private colon-path-hint
+  " Prefix a relative path that contains a colon with ./")
+
+(defn- validate-identity-path!
+  "Throw `:disallowed-identity` when `path` cannot name a local identity file.
+
+  A value containing `AGE-SECRET-KEY-` is key contents in a path setting, and
+  its error carries only `:identity-source`. A URI-shaped value is a locator
+  that can hold a credential, and its error adds only the `:scheme`. Neither
+  error renders the value."
+  [path identity-source]
+  (when-let [s (some-> path str)]
+    (let [refuse! (fn [message data]
+                    (throw (ex-info message
+                                    (assoc data
+                                           :reason :disallowed-identity
+                                           :identity-source identity-source))))]
+      (when (str/includes? s "AGE-SECRET-KEY-")
+        (refuse! (str "The age identity setting holds key contents where a file path was"
+                      " expected. Key contents belong in SECRETS_AGE_IDENTITY.")
+                 {}))
+      (when-let [scheme (source/locator-scheme s)]
+        (refuse! (str "The age identity must be a local filesystem path, but the value starts"
+                      " with the URI scheme " scheme ":." colon-path-hint)
+                 {:scheme scheme})))))
+
 (defn with-identity
   "Call `f` with an operation-owned identity descriptor.
 
@@ -219,7 +251,9 @@
   `{:identity-file path-or-nil :identity-source source}`. Resolution is an
   explicit path, then SECRETS_AGE_IDENTITY_FILE/raw/base64, then `:key-file`,
   then an `:app` default; no configured identity gives a nil path for keyless
-  operations. Paths owned by callers pass through untouched. Raw and base64
+  operations. Paths owned by callers pass through untouched, except that a
+  URI-shaped path or one holding key contents throws `:disallowed-identity`
+  before `f` runs. Raw and base64
   identities are materialized only for this callback and deleted when it
   returns. If both the callback and cleanup fail, the callback error keeps its
   reason and message and carries the safe cleanup diagnostic in `:cleanup`."
@@ -249,7 +283,9 @@
                                    :cleanup (ex-data cleanup)}
                                   failure)))
                 (throw cleanup))))))
-      (f (select-keys candidate [:identity-file :identity-source])))))
+      (do
+        (validate-identity-path! (:identity-file candidate) identity-source)
+        (f (select-keys candidate [:identity-file :identity-source]))))))
 
 (defn- identity-file-exists?
   "True when `path` names an identity file that exists."
@@ -385,6 +421,8 @@
 
   Missing or invalid inputs throw ex-info with a :reason:
     :no-identity        no identity resolves, or the resolved file does not exist.
+    :disallowed-identity  the identity path is URI-shaped or holds key
+                        contents, so it is not a local path.
     :no-file            `source` is nil, an allowed local file is absent, or an
                         allowed local source cannot be read.
     :disallowed-source  `source` is outside the local-only provenance contract.
@@ -435,6 +473,20 @@
             {:present? false :reason :no-identity}
             {:present? true :secrets (load-with-identity source identity limits)}))))))
 
+(defn- validate-reader-source!
+  "Throw `:disallowed-source` when the readers' `:file` or `:resource` is
+  URI-shaped. `:source` is its descriptor, which drops userinfo, query, and
+  fragment, and the message names only the scheme."
+  [{:keys [file resource]}]
+  (doseq [[option value expected hint]
+          [[:file file "a local filesystem path" colon-path-hint]
+           [:resource resource "a classpath resource name" ""]]]
+    (when-let [scheme (some-> value str source/locator-scheme)]
+      (throw (ex-info (str "The secrets " option " must be " expected ", but the value starts"
+                           " with the URI scheme " scheme ":." hint)
+                      {:reason :disallowed-source
+                       :source (source/descriptor (str value))})))))
+
 (defn- required-secret-handler
   "Build the required-secret reader around a shared delayed loaded state.
 
@@ -475,7 +527,10 @@
   Options:
     :resource      classpath resource name to decrypt, e.g. \"secrets.edn.age\"
                    (resolved lazily with io/resource; nil/absent ⇒ no secrets).
-    :file          an explicit file path, used instead of :resource.
+    :file          an explicit local file path, used instead of :resource.
+                   A URI-shaped :file or :resource throws `:disallowed-source`
+                   here, with the same credential-free `:source` descriptor a
+                   load failure carries.
     :app           app name for the default key path ~/.config/<app>/key.txt.
     :identity-file explicit identity path (overrides resolution).
     :limits        resource bounds merged over `default-limits`, validated here
@@ -495,6 +550,7 @@
   [opts]
   (let [limits (resolve-limits (:limits opts))
         loaded (delay (reader-loaded-state opts limits))
+        _ (validate-reader-source! opts)
         describe (or (:file opts) (:resource opts) "secrets")]
     {'secret/req (required-secret-handler loaded describe)
      'secret/opt (optional-secret-handler loaded)}))
