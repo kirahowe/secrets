@@ -998,6 +998,21 @@
                    (fs/atomic-move! source (str *dir* "/no-such-dir/target"))))
       (is (= "kept" (slurp source))))))
 
+(deftest atomic-move-unsupported-is-reported-test
+  (let [unsupported? @#'fs/atomic-move-unsupported?
+        source (str *dir* "/unmovable")
+        target (str *dir* "/unmoved")]
+    (is (false? (unsupported? (java.io.IOException. "other"))))
+    (when-let [c (try (Class/forName "java.nio.file.AtomicMoveNotSupportedException")
+                      (catch Exception _ nil))]
+      (is (true? (unsupported?
+                  (.newInstance (.getConstructor ^Class c (into-array Class [String String String]))
+                                (object-array [source target "no"]))))))
+    (let [e (with-redefs-fn {#'fs/atomic-move-unsupported? (constantly true)}
+              #(try (fs/atomic-move! source target) (catch clojure.lang.ExceptionInfo e e)))]
+      (is (= {:reason :atomic-move-unsupported :source source :target target} (ex-data e)))
+      (is (instance? java.io.IOException (ex-cause e))))))
+
 (deftest owner-only-temp-file-test
   (testing "the file is new, empty, and owner-only from creation"
     (let [file (fs/owner-only-temp-file! "secrets-test-" ".tmp")]
