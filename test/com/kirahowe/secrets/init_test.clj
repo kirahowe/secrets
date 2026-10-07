@@ -753,3 +753,22 @@
         (is (str/includes? out "secrets/secrets.edn.example: create")
             "the preview itself still runs")
         (is (not (.exists (io/file project "bb.edn"))))))))
+
+(deftest unparseable-config-files-report-no-parser-text-test
+  (let [marker "CREDENTIAL-MARKER-5e1c"
+        sources [(str "{:token " marker "/a/b}")
+                 (str "{:token \"" marker "\"")
+                 (str "{:token \"" marker "\" ^}")
+                 (str "#=(" marker ")")]]
+    (doseq [source sources
+            merge! [#(init/merge-bb-edn % (init/proposed-config {:app "reader"}))
+                    init/merge-deps-edn]]
+      (let [e (try (merge! source) nil (catch Exception e e))]
+        (is (instance? clojure.lang.ExceptionInfo e))
+        (is (re-find #"(bb|deps)\.edn" (ex-message e))
+            "the message names the file")
+        (is (nil? (ex-cause e)) "the parser's exception is not kept as a cause")
+        (when (str/includes? source "\"")
+          (is (re-find #"at line 1, column \d+" (ex-message e)) "the location is kept"))
+        (is (not (contains? (ex-data e) :cause)))
+        (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) marker)))))))

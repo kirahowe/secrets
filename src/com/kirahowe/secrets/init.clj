@@ -169,16 +169,23 @@
 
 ;;;; bb.edn and deps.edn Integration
 
-(defn- parse-edn-map [source file]
-  (try
-    (let [loc (z/of-string source)]
-      (when-not (z/map? loc)
-        (throw (ex-info (str file " must be a top-level map") {:file file})))
-      [loc (z/sexpr loc)])
-    (catch clojure.lang.ExceptionInfo e
-      (throw e))
-    (catch Exception e
-      (throw (ex-info (str "Could not read " file) {:file file :cause (.getMessage e)} e)))))
+(defn- parse-edn-map
+  "Zipper location and value of the top-level map in `source`. These files may
+  hold a credential, so a parse failure names the file, a fixed reason and the
+  parser's line and column when it gives them; the parser's own message is not
+  kept."
+  [source file]
+  (let [parsed (try
+                 (let [loc (z/of-string source)]
+                   (when (z/map? loc) [loc (z/sexpr loc)]))
+                 (catch Exception e
+                   (let [{:keys [row col]} (ex-data e)]
+                     (throw (ex-info (str "Could not read " file ": it is not valid EDN"
+                                          (when (and row col)
+                                            (str " at line " row ", column " col)))
+                                     {:file file})))))]
+    (or parsed
+        (throw (ex-info (str file " must be a top-level map") {:file file})))))
 
 (defn- append-entry [map-loc k v]
   ;; Node-level editing keeps every existing comment and reader form intact.
@@ -918,8 +925,8 @@
                              StandardCopyOption/REPLACE_EXISTING]))
     (catch Exception e
       ;; Babashka cannot resolve AtomicMoveNotSupportedException, so identify
-      ;; that one exception by name. The previous copy-and-delete fallback is
-      ;; gone: it would follow a symlink planted at `target`.
+      ;; that one exception by name. There is no copy-and-delete fallback,
+      ;; which would follow a symlink planted at `target`.
       (if (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e)))
         (throw (ex-info (str "This filesystem cannot atomically publish " target)
                         {:path (str target) :reason :atomic-move-unsupported}
