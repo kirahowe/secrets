@@ -42,7 +42,8 @@
              #'secrets/merge-readers
              #'secrets/default-limits
              #'secrets/with-identity
-             #'secrets/expand-home)
+             #'secrets/expand-home
+             #'secrets/default-key-file)
 
 ;; `load-secrets` accepts local filesystem sources, local `file:` locators, and
 ;; `jar:file:` classpath resources. It rejects HTTP(S), remote or nested jars,
@@ -51,9 +52,11 @@
 ;; ## com.kirahowe.secrets.fs
 
 ;; This namespace creates temporary files with owner-only permissions from the
-;; moment they're created, so you can write sensitive data to them safely.
+;; moment they're created, so you can write sensitive data to them safely. It
+;; also holds the atomic move the library uses to replace a file.
 
-(doc-section #'fs/owner-only-temp-file!)
+(doc-section #'fs/owner-only-temp-file!
+             #'fs/atomic-move!)
 
 ;; ## com.kirahowe.secrets.aero
 
@@ -91,7 +94,8 @@
              #'age/decrypt-bytes
              #'age/decrypt-to-stream!
              #'age/decrypt-to-file!
-             #'age/default-max-plaintext-bytes)
+             #'age/default-max-plaintext-bytes
+             #'age/resolve-limits)
 
 ;; ## com.kirahowe.secrets.manifest
 

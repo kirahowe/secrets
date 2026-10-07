@@ -204,6 +204,10 @@ environments, and one shared template. Anything else, such as two environments
 writing one ciphertext or one manifest, an identity path doubling as a
 manifest, or a key file doubling as ciphertext, is a configuration error.
 
+In `:key-file`, `:identity-file`, and `:recipients-file`, a path that is exactly
+`~` or begins with `~/` is expanded to your home directory. Any other path,
+including `~bob/x`, is used as written.
+
 An optional top-level `:limits` map bounds accidentally large or malformed
 inputs. The recipient bounds are checked before any `age` subprocess starts. The
 map is merged over the defaults and resolved onto every environment:
@@ -223,7 +227,7 @@ The last two have the same defaults as the runtime limits of the same name (see
 configuration key. Supply only the keys you want to change. Every supplied value
 must be a positive integer, and an unknown key inside `:limits` is rejected
 rather than ignored, because a typo in a limit must not read as "leave it at the
-default".
+default". These failures carry `:reason :invalid-limits`, like the runtime's.
 
 To create a store through an editor instead of the stdin-based three-command
 flow:
@@ -290,7 +294,9 @@ storing that silently is worse than failing loudly; pass `--edn` with `""` if
 you genuinely want an empty string. `rm` fails, rather than quietly doing
 nothing, when the key or the file doesn't exist. `<key>` is a keyword
 (`:some/key`) or a vector path (`[:a :b]`) for both commands, and both
-refresh the manifest like every other write.
+refresh the manifest like every other write. Neither command echoes a key it
+cannot read, and `set` does not echo a surplus argument, because either may be
+a value typed in the wrong place.
 
 Two things can still expose the value. If you type the value itself into a
 `printf` command at an interactive shell, the shell saves that command, value
@@ -498,6 +504,14 @@ for the operation and removed before it returns. Passing `{:app "myapp"}`
 provides the local fallback while still allowing an injected identity when no
 explicit path was supplied.
 
+An identity path is a local filesystem path, whichever source it comes from. A
+value that starts with a URI scheme, after surrounding whitespace is trimmed,
+is refused with `:reason :disallowed-identity`, and the error names only the
+scheme. A bare relative name containing a colon, such as `key:txt`, reads as a
+scheme too, so write `./key:txt` for such a file. A path setting that holds key
+contents (`AGE-SECRET-KEY-`) is refused with the same reason and the value is
+not echoed. Key contents belong in `SECRETS_AGE_IDENTITY`.
+
 An Integrant `init-key` is two lines. Both the resource name and the app name
 come from the component's config, so the code holds no literal of its own:
 
@@ -515,7 +529,9 @@ accepts filesystem path strings, `File`/`Path` values, local `file:` locators,
 and `jar:file:` classpath resources such as the URL returned by `io/resource`
 inside an uberjar. `reader-literals` and `merge-readers` resolve `:file` as a
 filesystem path and `:resource` on the classpath, then pass the result through
-that same boundary. `bb secrets` configuration is stricter still: every
+that same boundary. They refuse a URI-shaped `:file` or `:resource` with
+`:disallowed-source` when the readers are built, before any tag is read.
+`bb secrets` configuration is stricter still: every
 artifact location is a filesystem path string, not a URL.
 
 HTTP(S), other nonlocal schemes, remote or multiply nested `jar:` locators,
@@ -577,7 +593,10 @@ all — ever sees the text.
 A malformed `:limits` is refused rather than read as the defaults: a non-map, an
 unknown key, or a value that is not a positive integer throws with
 `:invalid-limits`, because a typo in a limit must not read as "leave it at the
-default". (The management CLI's `:limits` config key is separate. It shares the
+default". The error names the limit with the bad value, or the unknown keys that
+are keywords, and never a supplied value. The `age` functions that take
+`:limits` fail the same way. (The management CLI's `:limits` config key is
+separate. It shares the
 defaults of `:max-plaintext-bytes` and `:max-edn-depth` and adds the recipient
 and manifest keys listed in the [quick start](#quick-start).)
 
@@ -830,7 +849,8 @@ Bounds and validation are applied to that one read: a file over
 `:max-recipients-bytes`, more entries than `:max-recipients`, an entry over
 `:max-recipient-chars`, a line that is not an age recipient, and an empty list
 each fail the command before `age` starts. `bb secrets recipients` stays a
-read-only listing and marks any line encryption would refuse.
+read-only listing and marks any line encryption would refuse, showing only an
+escaped prefix of at most 16 characters of that line.
 
 ### First owner: no ciphertext yet
 
@@ -998,7 +1018,8 @@ of the gating, because it holds nothing to take; the production chapter under
 `verify` reads the manifest's `:version` and treats anything but 2, including a
 legacy v1 manifest, as drift, never as a shape to diff. A manifest whose `:app`
 is not this project's, or that records none, is reported as drift the same way,
-and so is a manifest that is not valid EDN. No ciphertext is bound to an
+and so is a manifest that is not valid EDN, is not a map, or holds something
+other than a map under `:keys`. No ciphertext is bound to an
 environment name, so a wrong environment is only a misconfigured path, which
 `bb secrets doctor` reports per environment. Disable the manifest for an environment with `:manifest false`.
 
@@ -1032,7 +1053,8 @@ manifest is reported as `skipped`.
   cannot run.
 - **2 — invalid configuration:** normalization fails, the environment cannot be
   selected, or a configured recipients file is empty or contains invalid
-  recipients.
+  recipients. When an identity variable is blank or is not valid base64,
+  `doctor` prints a `Reason:` line under `Configuration: invalid`.
 
 ### What a failure carries
 
@@ -1067,7 +1089,8 @@ bound that trips carries the byte count and the limit, never content.
 - `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
 - `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
 - `(with-identity identity-or-opts f)` — resolve an identity for one operation and call `f` with `{:identity-file path :identity-source source}`. Explicit paths are left untouched; raw and base64 environment values are materialized to an owner-only temporary file and cleaned up when the callback returns or throws. A cleanup failure includes the temporary path in structured error data.
-- `(expand-home path)`.
+- `(expand-home path)`: expands a path that is exactly `~` or begins with `~/`. Every other string is returned unchanged.
+- `(default-key-file app)`: the default identity path, `~/.config/<app>/key.txt` with the home directory expanded.
 
 `com.kirahowe.secrets.age` — `version`, `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte). The positional input is passed behind an option terminator (`--`), and every path-valued argument — that input, the `-o` output, the `-i` identity, the `-R` recipients file — is normalized so a dash-leading path becomes `./-name`, so filenames beginning with `-` (including names identical to age options) work like any other file; a blank or nil path throws `ex-info` instead of falling back to stdin. `:recipients` strings are recipient *values*, not paths, and are passed through as given. `decrypt-to-file!` publishes plaintext only through an owner-only (0600) sibling staging file that is then atomically moved over the destination: the published file is 0600 whatever the umask and whatever mode the destination had before, the destination's final component is validated without following links so a symlink or other non-regular destination is refused, and a decryption, write, or move failure removes the staging plaintext and leaves the previous destination intact. On a filesystem without POSIX permissions it fails closed rather than writing plaintext with default permissions — use `decrypt-bytes` or `decrypt`, which never write plaintext to disk.
 

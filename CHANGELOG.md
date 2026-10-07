@@ -42,7 +42,8 @@ All notable changes to this project are documented here. The format follows
   (8 MiB and 100). Supplied values are merged over those defaults and resolved
   onto every environment; each must be a positive integer, and an unknown key
   inside `:limits` is rejected rather than ignored, because a typo in a limit
-  must not read as "leave it at the default".
+  must not read as "leave it at the default". A rejected `:limits` fails with
+  `:reason :invalid-limits`.
 - Runtime loading takes a `:limits` map — `secrets/default-limits`, overridable
   through the opts of `load-secrets`, `reader-literals`, and `merge-readers` —
   bounding ciphertext read from accepted local files or local classpath-jar
@@ -57,7 +58,10 @@ All notable changes to this project are documented here. The format follows
   or staging file at once, and throws with `:source-too-large`,
   `:plaintext-too-large`, or `:edn-too-deep` carrying the byte count and the
   limit but no content; a malformed `:limits` throws `:invalid-limits` rather
-  than reading as the defaults. Previously an attacker-influenced source could
+  than reading as the defaults, and the `age` functions that take `:limits`
+  use that same reason. The error names the limit with the bad value, or the
+  unknown keys that are keywords, and never a supplied value. Previously an
+  attacker-influenced source could
   exhaust disk or heap (CWE-400). The EDN policy is documented where it is
   enforced: `:max-plaintext-bytes` bounds graph size because EDN cannot expand,
   a linear depth pre-scan bounds parser recursion (a `StackOverflowError` no
@@ -73,6 +77,8 @@ All notable changes to this project are documented here. The format follows
   filesystem paths/Files/Paths, local `file:` locators, and `jar:file:`
   classpath resources; reader `:file`/`:resource` configuration reaches the same
   boundary, while CLI artifact configuration accepts filesystem paths only.
+  `reader-literals` and `merge-readers` refuse a URI-shaped `:file` or
+  `:resource` with `:disallowed-source` when the readers are built.
   HTTP(S), every other nonlocal scheme, remote or nested `jar:` sources,
   arbitrary `io/input-stream` dispatch, and malformed local locators fail with
   content-free `:disallowed-source` diagnostics before DNS, connection,
@@ -81,6 +87,8 @@ All notable changes to this project are documented here. The format follows
   an allowed-looking scheme into network access. This clean local/remote
   contract deliberately exposes no HTTP operation and therefore has no network
   timeout or redirect-policy settings to misconfigure.
+- `com.kirahowe.secrets/default-key-file` returns the default identity path
+  for an app: `~/.config/<app>/key.txt` with the home directory expanded.
 - A root [security policy](SECURITY.md) naming the sole supported alpha, the
   maintainer-controlled private email route and safe fallback, sanitized triage
   inputs, realistic response targets, and the coordinated disclosure deadline.
@@ -154,6 +162,13 @@ All notable changes to this project are documented here. The format follows
   callback. Removed the shared cache, `reset-identity-cache!`, and the
   materializing `identity-from-env`, `resolve-identity-file`, and
   `identity-available?` APIs.
+- An identity path must be a local filesystem path. A value that starts with a
+  URI scheme, after surrounding whitespace is trimmed, is refused with
+  `:disallowed-identity`, and the error names only the scheme. A bare relative
+  name containing a colon, such as `key:txt`, reads as a scheme, so write
+  `./key:txt` for such a file. A path setting that holds key contents
+  (`AGE-SECRET-KEY-`) is refused without echoing it. Key contents belong in
+  `SECRETS_AGE_IDENTITY`.
 - The library's coordinates are written in one file,
   `src/com/kirahowe/secrets/coordinate.edn`: the release version, the Maven
   coordinate, and the name the library is declared under as a git dependency.
@@ -355,7 +370,9 @@ All notable changes to this project are documented here. The format follows
   plaintext, stdin `--edn`, manifests, and initializer templates. One shared
   parser boundary retains only a stable allowlisted reason and safe numeric
   depth or location metadata, never the parser message, source fragment, or
-  cause.
+  cause. A `bb.edn` or `deps.edn` the initializer cannot parse is reported by
+  file name, with the parser's line and column when it gives them and without
+  its message.
 - CLI editor/plaintext files, stdin, manifests, and read-only recipient paths
   are bounded while read, and every CLI EDN route runs the same linear depth
   pre-scan as the runtime before recursive parsing. Arbitrary binary decrypt
@@ -432,7 +449,8 @@ All notable changes to this project are documented here. The format follows
   command with a diagnostic naming the file line number and quoting only a
   truncated prefix of the offending line. `bb secrets recipients` remains an
   unvalidated read-only listing, but now marks any line encryption would
-  refuse instead of presenting it as a recipient.
+  refuse instead of presenting it as a recipient, and shows only an escaped
+  prefix of at most 16 characters of that line.
 - Every `age` invocation that takes an input pathname now ends its options with
   an explicit `--` terminator, and every path-valued argument — the positional
   input, `-o`, `-i`, and `-R` — is normalized (a leading `-` is prefixed with
@@ -527,6 +545,19 @@ All notable changes to this project are documented here. The format follows
   opts map, which can hold a resolver, a database password, or an entire
   configuration. A `#secret/req` failure names the configured store under
   `:store` rather than `:source`, so one key never means two shapes on one read.
+- `expand-home` expands only a path that is exactly `~` or begins with `~/`.
+  It used to replace any leading `~`, so `~bob/x` became `<home>bob/x`, and
+  `keygen` could write a private key there from a `:key-file` spelled that
+  way.
+- `set` no longer echoes a surplus argument, and `set` and `rm` no longer echo
+  a key they cannot read. Either may be a secret value typed in the wrong
+  place. The error states what the command expects and, for a bad key, the
+  type it got or the EDN line and column.
+- `doctor` prints a `Reason:` line under `Configuration: invalid` when an
+  identity variable is blank or is not valid base64. It still exits 2.
+- `verify` reports a manifest that is not a map, or that holds something
+  other than a map under `:keys`, as drift and exits 1. A manifest holding a
+  top-level list used to throw.
 - A set-but-blank `VISUAL` or `EDITOR` no longer counts as an editor. The empty
   string is truthy, so `VISUAL=""` shadowed a correctly set `EDITOR` and the
   `vim` default, and the shell command word became the decrypted plaintext temp
