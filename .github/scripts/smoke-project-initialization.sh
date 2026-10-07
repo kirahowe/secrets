@@ -89,7 +89,33 @@ run_case() {
   esac
 }
 
+# The initializer creates missing files only. A project that already has a
+# bb.edn keeps it byte for byte and is told what to add to it.
+run_existing_case() {
+  local consumer="${work_dir}/existing-consumer"
+  local isolated_home="${work_dir}/existing-home"
+  local output
+
+  mkdir -p "${consumer}" "${isolated_home}"
+  printf '%s\n' ';; mine' '{:tasks {hello {:task (println "hello")}}}' > "${consumer}/bb.edn"
+  cp "${consumer}/bb.edn" "${work_dir}/existing-bb.edn"
+
+  output="$(cd "${consumer}" && bb "-Duser.home=${isolated_home}" -cp "${repo_root}/src" \
+    -m com.kirahowe.secrets.init --app initializer-smoke-existing --apply)"
+
+  cmp "${consumer}/bb.edn" "${work_dir}/existing-bb.edn"
+  test -f "${consumer}/secrets/secrets.edn.example"
+  for expected in "bb.edn, under :deps:" "bb.edn, under :tasks:" ":git/sha \"${head_commit}\""; do
+    if ! grep -q -F -- "${expected}" <<< "${output}"; then
+      echo "Expected the initializer to print '${expected}', got:" >&2
+      printf '%s\n' "${output}" >&2
+      exit 1
+    fi
+  done
+}
+
 run_case tracked
 run_case disposable
+run_existing_case
 
 echo "Project initialization smoke passed."
