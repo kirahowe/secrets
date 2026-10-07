@@ -937,7 +937,12 @@
       (is (not= before (slurp key-file)))
       (is (= owner-only-names (permission-names key-file))))))
 
-;;;; Resource limits
+;;;; Fixed bounds
+
+(defn- with-bound
+  "Run `f` with the private bound constant held by var `v` set to `n`."
+  [v n f]
+  (with-redefs-fn {v n} f))
 
 (defn- temp-source-copies
   "The ciphertext temp copies `source/acquire!` may have left behind, by name."
@@ -946,15 +951,14 @@
                 (seq (.list (io/file (System/getProperty "java.io.tmpdir")))))))
 
 (defn- acquire-source
-  "Run `source/acquire!` against `limit`, running any cleanup, and return
-  `[:ok byte-count]` or the failure `:reason`. The owning namespace's public
-  seam is used deliberately: these boundaries are about bytes, not identities
-  or EDN."
+  "Run `source/acquire!` with the source bound set to `limit`, running any
+  cleanup, and return `[:ok byte-count]` or the failure `:reason`."
   [source limit]
-  (try
-    (let [[f cleanup!] (source/acquire! source (source/descriptor source) limit)]
-      (try [:ok (.length f)] (finally (cleanup!))))
-    (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))
+  (with-bound #'source/max-source-bytes limit
+    #(try
+       (let [[f cleanup!] (source/acquire! source (source/descriptor source))]
+         (try [:ok (.length f)] (finally (cleanup!))))
+       (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
 
 (defn- source-policy-failure
   "Return the policy exception for `source`, asserting the load did not proceed."
@@ -1013,14 +1017,19 @@
       (is (= [:ok size] (acquire-source jar-uri size)))
       (is (= :source-too-large (acquire-source jar-uri (dec size)))))
     (testing "load-secrets reports the bound it refused, and no source content"
-      (is (= {:k "v"} (secrets/load-secrets jar-uri {:identity-file *key*
-                                                     :limits {:max-source-bytes size}})))
-      (let [e (try (secrets/load-secrets jar-uri {:identity-file *key*
-                                                  :limits {:max-source-bytes (dec size)}})
-                   (catch clojure.lang.ExceptionInfo e e))]
+      (is (= {:k "v"} (with-bound #'source/max-source-bytes size
+                        #(secrets/load-secrets jar-uri {:identity-file *key*}))))
+      (let [e (with-bound #'source/max-source-bytes (dec size)
+                #(try (secrets/load-secrets jar-uri {:identity-file *key*})
+                      (catch clojure.lang.ExceptionInfo e e)))]
         (is (= :source-too-large (:reason (ex-data e))))
         (is (= (dec size) (:limit (ex-data e))))
-        (is (= size (:bytes (ex-data e))))))
+        (is (= size (:observed (ex-data e))))
+        (is (= #{:reason :limit :observed :source} (set (keys (ex-data e))))
+            "one shape: the reason, the bound, the observed size, and the source")
+        (is (str/includes? (ex-message e) "bounded.jar") "the message names the source")))
+    (testing "the bound is 16 MiB"
+      (is (= 16777216 @#'source/max-source-bytes)))
     (is (= before (temp-source-copies))
         "no completed or partial ciphertext copy survives cleanup")))
 
@@ -1064,28 +1073,32 @@
 
 (deftest plaintext-size-boundary-test
   (let [limit 4096
-        opts {:limits {:max-plaintext-bytes limit}}
+        bounded (fn [f] (with-bound #'age/max-plaintext-bytes limit f))
         exact (encrypt-sized! limit "plaintext-exact")
         over (encrypt-sized! (inc limit) "plaintext-over")]
+    (testing "the bound is 8 MiB"
+      (is (= 8388608 age/max-plaintext-bytes)))
     (testing "a plaintext exactly at the bound decrypts and loads"
-      (is (= limit (alength (age/decrypt-bytes *key* exact opts))))
-      (is (string? (:pad (secrets/load-secrets exact (assoc opts :identity-file *key*))))))
+      (is (= limit (alength (bounded #(age/decrypt-bytes *key* exact)))))
+      (is (string? (:pad (bounded #(secrets/load-secrets exact {:identity-file *key*}))))))
     (testing "one byte over is refused without disclosing any plaintext"
-      (let [e (try (age/decrypt-bytes *key* over opts)
-                   (catch clojure.lang.ExceptionInfo e e))
+      (let [e (bounded #(try (age/decrypt-bytes *key* over)
+                             (catch clojure.lang.ExceptionInfo e e)))
             data (ex-data e)]
-        (is (= :plaintext-too-large (:reason data)))
-        (is (= limit (:limit data)))
-        (is (= (inc limit) (:bytes data)) "the count is bytes read, not a declared size")
+        (is (= {:reason :plaintext-too-large
+                :limit limit
+                :observed (inc limit)
+                :encrypted-file over
+                :identity-file *key*}
+               data)
+            "one shape: the reason, the bound, the bytes read, and the paths")
+        (is (str/includes? (ex-message e) over) "the message names the file")
         (is (not (re-find #"aaa" (ex-message e))) "the message carries no plaintext")
         (is (not (re-find #"aaa" (pr-str data))) "and neither does the ex-data")))
-    (testing "the largest bound a long can hold reads to the end without overflow"
-      (let [unbounded {:limits {:max-plaintext-bytes Long/MAX_VALUE}}]
-        (is (= limit (alength (age/decrypt-bytes *key* exact unbounded))))
-        (is (string? (:pad (secrets/load-secrets exact (assoc unbounded :identity-file *key*)))))))
     (testing "load-secrets refuses it for the same reason"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #":max-plaintext-bytes"
-                            (secrets/load-secrets over (assoc opts :identity-file *key*)))))))
+      (is (= :plaintext-too-large
+             (:reason (ex-data (bounded #(try (secrets/load-secrets over {:identity-file *key*})
+                                              (catch clojure.lang.ExceptionInfo e e))))))))))
 
 (deftest oversized-plaintext-terminates-the-subprocess-test
   ;; A controlled process standing in for age: it emits forever and ignores
@@ -1099,15 +1112,16 @@
         limit 4096
         out (java.io.ByteArrayOutputStream.)
         call (future
-               (try (#'age/stream-bounded-stdout! ["/bin/sh" "-c" script] out limit {})
-                    (catch clojure.lang.ExceptionInfo e e)))
+               (with-bound #'age/max-plaintext-bytes limit
+                 #(try (#'age/stream-bounded-stdout! ["/bin/sh" "-c" script] out {})
+                       (catch clojure.lang.ExceptionInfo e e))))
         e (deref call 15000 :timed-out)
         pid (str/trim (slurp pid-file))
         alive? (fn [] (zero? (:exit (shell/sh "kill" "-0" pid))))]
     (try
       (is (not= :timed-out e) "the capture returns promptly and does not read forever")
       (is (= :plaintext-too-large (:reason (ex-data e))))
-      (is (= (inc limit) (:bytes (ex-data e)))
+      (is (= (inc limit) (:observed (ex-data e)))
           "nothing beyond one byte past the bound was ever read")
       (is (<= (.size out) limit) "and nothing past the bound was written")
       (is (not (re-find #"AAA" (str (ex-message e) (pr-str (ex-data e)))))
@@ -1119,8 +1133,8 @@
         (when (alive?) (shell/sh "kill" "-9" pid))))))
 
 (deftest edn-depth-scan-test
-  (let [depth #(#'safe-edn/max-depth %)
-        read-edn #(#'secrets/read-secrets-edn % secrets/default-limits)
+  (let [depth #(#'safe-edn/nesting-depth %)
+        read-edn #(#'secrets/read-secrets-edn %)
         nested (fn [n] (str (apply str (repeat n \[)) (apply str (repeat n \]))))]
     (testing "only delimiters that are structure count as depth"
       (are [expected s] (= expected (depth s))
@@ -1141,12 +1155,12 @@
       (is (= 100 (depth (nested 100))))
       (is (= 101 (depth (nested 101))))
       (is (vector? (read-edn (nested 100))))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #":max-edn-depth"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"past the limit of 100"
                             (read-edn (nested 101)))))
     (testing "nesting deep enough to overflow a real parse is refused without parsing"
       (let [bomb (apply str (repeat 200000 \[))]
         (is (= 200000 (depth bomb)))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #":max-edn-depth" (read-edn bomb))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"past the limit of 100" (read-edn bomb))
             "clojure.edn never sees it, so no StackOverflowError can happen")))
     (testing "balance is the parser's business, not the scanner's"
       (is (= 1 (depth "{:a 1")))
@@ -1155,7 +1169,8 @@
 (deftest edn-failure-helpers-test
   (testing "failure-data keeps the allowlisted fields and nothing else"
     (is (= {:reason :edn-too-deep :depth 3 :limit 2}
-           (safe-edn/failure-data (safe-edn/parse "[[[1]]]" {:max-edn-depth 2}))))
+           (safe-edn/failure-data (with-bound #'safe-edn/max-depth 2
+                                    #(safe-edn/parse "[[[1]]]")))))
     (is (= {:reason :edn-malformed :line 2 :column 1}
            (safe-edn/failure-data {:ok? false :reason :edn-malformed :line 2 :column 1
                                    :value "SECRET" :message "SECRET"}))))
@@ -1214,70 +1229,27 @@
           (is (not (str/includes? diagnostic "Invalid number")))
           (is (str/includes? (ex-message e) "malformed EDN syntax")))))))
 
-(deftest ordinary-trusted-resources-are-unaffected-test
-  (testing "the defaults let a documented store through with no :limits at all"
-    (let [store {:database/url "jdbc:x" :r2 {:account-id "acct-123"}
-                 :auth/admins #{"a@b.com"}}
-          enc (encrypt-edn! store)]
-      (is (= store (secrets/load-secrets enc *key*)))
-      (is (= store (secrets/load-secrets enc {:identity-file *key*})))
-      (is (= "jdbc:x"
-             (edn/read-string {:readers (secrets/reader-literals {:file enc
-                                                                  :identity-file *key*})}
-                              "#secret/req :database/url")))
-      (is (= secrets/default-limits (#'secrets/resolve-limits nil))
-          "and an absent :limits resolves to exactly the documented defaults"))))
-
-(deftest invalid-runtime-limits-fail-closed-test
-  (let [enc (encrypt-edn! {:k "v"})
-        load (fn [limits] (secrets/load-secrets enc {:identity-file *key* :limits limits}))]
-    (testing "a limit that is not a positive integer is refused, never defaulted"
-      (are [limits] (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer" (load limits))
-        {:max-source-bytes 0}
-        {:max-source-bytes -1}
-        {:max-plaintext-bytes 1.5}
-        {:max-edn-depth "100"}
-        {:max-edn-depth nil}))
-    (testing "an unknown key is a typo in a security limit, not an unset one"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown key"
-                            (load {:max-sauce-bytes 1024})))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown key"
-                            (load {"max-source-bytes" 1024}))))
-    (testing "a :limits that is not a map at all is refused"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a map" (load "16777216"))))
-    (testing "a failure names the limit and never renders the supplied value"
-      (let [sentinel "SENTINELlimitvalueMUSTNEVERAPPEAR"
-            failure (fn [limits]
-                      (try (load limits) nil (catch clojure.lang.ExceptionInfo e e)))
-            bad-value (failure {:max-edn-depth sentinel})
-            unknown (failure {:zeta 1 :alpha 2 sentinel 3 [sentinel] 4})
-            only-unnamed (failure {sentinel 1})
-            not-a-map (failure sentinel)]
-        (is (= {:reason :invalid-limits :limit :max-edn-depth} (ex-data bad-value)))
-        (is (= {:reason :invalid-limits :unknown-keys [:alpha :zeta]} (ex-data unknown))
-            "only keyword keys are named, in order")
-        (is (str/includes? (ex-message unknown) ":alpha, :zeta, and 2 that are not keywords."))
-        (is (= {:reason :invalid-limits :unknown-keys []} (ex-data only-unnamed)))
-        (is (str/includes? (ex-message only-unnamed) "key(s): 1 that are not keywords."))
-        (is (= {:reason :invalid-limits} (ex-data not-a-map)))
-        (doseq [e [bad-value unknown only-unnamed not-a-map]]
-          (is (str/starts-with? (ex-message e) "secrets :limits ")
-              "the message says whose option it is")
-          (is (not (str/includes? (str (ex-message e) (pr-str e)) sentinel))))))
-    (testing "the age wrapper reports its own bound the same way and ignores other limits"
-      (let [e (try (age/decrypt-bytes *key* enc {:limits {:max-plaintext-bytes 0}})
-                   (catch clojure.lang.ExceptionInfo e e))]
-        (is (= {:reason :invalid-limits :limit :max-plaintext-bytes} (ex-data e)))
-        (is (str/starts-with? (ex-message e) "age :limits ")))
-      (is (= :invalid-limits
-             (:reason (ex-data (try (age/decrypt-bytes *key* enc {:limits [1]})
-                                    (catch clojure.lang.ExceptionInfo e e))))))
-      (is (= "{:k \"v\"}"
-             (str/trim (age/decrypt *key* enc {:limits {:max-source-bytes 1}})))))
-    (testing "reader-literals validates when the readers map is built"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
-                            (secrets/reader-literals {:file enc :identity-file *key*
-                                                      :limits {:max-edn-depth 0}}))))))
+(deftest limits-are-not-an-option-test
+  (let [enc (encrypt-edn! {:k "v"})]
+    (testing "a :limits option changes nothing: the bounds are fixed"
+      (is (= {:k "v"}
+             (secrets/load-secrets enc {:identity-file *key*
+                                        :limits {:max-plaintext-bytes 1
+                                                 :max-source-bytes 1
+                                                 :max-edn-depth 0}})))
+      (is (= "v"
+             (edn/read-string
+              {:readers (secrets/reader-literals {:file enc
+                                                  :identity-file *key*
+                                                  :limits {:max-edn-depth 0}})}
+              "#secret/req :k"))))
+    (testing "the limit configuration surface is gone"
+      (doseq [[ns-sym var-sym] [['com.kirahowe.secrets 'default-limits]
+                                ['com.kirahowe.secrets 'resolve-limits]
+                                ['com.kirahowe.secrets.age 'resolve-limits]
+                                ['com.kirahowe.secrets.age 'default-max-plaintext-bytes]
+                                ['com.kirahowe.secrets.safe-edn 'default-max-depth]]]
+        (is (nil? (ns-resolve ns-sym var-sym)) (str ns-sym "/" var-sym))))))
 
 ;;;; Redacted source diagnostics
 
@@ -1398,13 +1370,13 @@
                (:source data)))
         (is (str/includes? (ex-message e) "local-only"))))
     (testing "an oversized local resource names the bound and safe descriptor"
-      (let [e (failure jar-uri {:limits {:max-source-bytes 1}})
+      (let [e (with-bound #'source/max-source-bytes 1 #(failure jar-uri nil))
             data (ex-data e)]
         (is (= :source-too-large (:reason data)))
         (is (= 1 (:limit data)))
-        (is (pos? (:bytes data)))
+        (is (pos? (:observed data)))
         (is (= descriptor (:source data)))
-        (is (str/includes? (ex-message e) ":max-source-bytes"))))
+        (is (str/includes? (ex-message e) "larger than the 1 byte limit"))))
     (testing "a wrong key still says so and names the local resource"
       (let [e (failure jar-uri {:identity-file wrong-key})
             data (ex-data e)]
@@ -1413,14 +1385,14 @@
         (is (seq (:error data)) "the captured stderr is still there")
         (is (= descriptor (:source data)))))
     (testing "an EDN plaintext past its depth bound keeps its reason and source"
-      (let [e (failure jar-uri {:limits {:max-edn-depth 1}})
+      (let [e (with-bound #'safe-edn/max-depth 1 #(failure jar-uri nil))
             data (ex-data e)]
         (is (= :edn-too-deep (:reason data)))
         (is (= 1 (:limit data)))
         (is (= descriptor (:source data)))
         (is (= #{:reason :depth :limit :source} (set (keys data)))
             "only the allowlisted parse fields and the source reach the error")
-        (is (str/includes? (ex-message e) ":max-edn-depth"))))
+        (is (str/includes? (ex-message e) "past the limit of 1"))))
     (testing "a rejected object says its class, never its toString"
       (let [e (failure (StringBuilder. (:to-string source-sentinels)) nil)
             data (ex-data e)]
@@ -1439,7 +1411,7 @@
           (with-redefs-fn
             {#'fs/owner-only-temp-file! (fn [& args]
                                           (reset! created (apply real-temp args)))
-             #'source/copy-source! (fn [_ _ ^java.io.OutputStream out _]
+             #'source/copy-source! (fn [_ _ ^java.io.OutputStream out]
                                      (.write out (.getBytes "partial ciphertext"))
                                      (throw failure))}
             (fn []
@@ -1795,14 +1767,15 @@
   (let [wrong-key (str *dir* "/wrong-key.txt")
         enc (encrypt-edn! {:pad (apply str (repeat 2048 \a))})]
     (age/keygen! wrong-key)
-    (doseq [[key opts reason] [[wrong-key nil nil]
-                               [*key* {:limits {:max-plaintext-bytes 16}} :plaintext-too-large]]]
+    (doseq [[key bound reason] [[wrong-key age/max-plaintext-bytes nil]
+                                [*key* 16 :plaintext-too-large]]]
       (let [contents (slurp key)
             secret-line (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
                                        (str/split-lines contents)))
             failure (with-redefs-fn
-                      (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-                      (fn [] (load-failure enc opts)))
+                      (assoc (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+                             #'age/max-plaintext-bytes bound)
+                      (fn [] (load-failure enc nil)))
             data (ex-data failure)
             path (:identity-file data)]
         (is (string? path))

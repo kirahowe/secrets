@@ -40,12 +40,6 @@
                       Absent ⇒ single-key mode (encrypt to own key).
     :manifest false   disable the manifest for this environment.
 
-  Optional top-level key:
-    :limits           size and nesting bounds that catch accidental input (a
-                      wrong or runaway file) before any subprocess starts,
-                      merged over `default-limits` and resolved onto every
-                      environment.
-
   Commands: keygen · new · edit · set · rm · verify · doctor · show-key ·
   add-recipient · recipients · reencrypt · help.
 
@@ -196,11 +190,6 @@
 (defn- getenv [variable-name]
   (System/getenv variable-name))
 
-(defn- decrypt-opts
-  "The plaintext bound for decrypting this environment's store."
-  [env]
-  {:limits (select-keys (:limits env) [:max-plaintext-bytes])})
-
 (defn- require-path!
   "Reject blank or URI-like artifact locations, returning `path` otherwise.
 
@@ -312,20 +301,18 @@
         (fail! (role-collision-message canonical entries)
                {:canonical-path canonical :path-collision entries})))))
 
-(def ^:private default-limits
-  "Bounds that catch accidental oversized or deeply nested input before parsing
-  or starting a subprocess, overridable through the top-level `:limits` config
-  key. The plaintext and EDN depth bounds are the runtime's."
-  (merge (select-keys secrets/default-limits
-                      [:max-plaintext-bytes :max-edn-depth])
-         {:max-recipients 256
-          :max-recipient-chars 1024
-          :max-recipients-bytes 262144
-          :max-manifest-bytes 1048576
-          :max-manifest-entries 10000}))
+(def ^:private max-recipients-bytes
+  "The most bytes a recipients file may hold (256 KiB). It catches an
+  accidental huge input, such as a path that names the wrong file."
+  262144)
+
+(def ^:private max-manifest-bytes
+  "The most bytes a manifest may hold (1 MiB). It catches an accidental huge
+  input, such as a path that names the wrong file."
+  1048576)
 
 (defn- normalize-environment
-  [{:keys [app limits]} environment-name
+  [app environment-name
    {:keys [secrets-file key-file identity-file template manifest recipients-file]
     :as env-config}]
   (when-not (string? secrets-file)
@@ -369,7 +356,6 @@
     (assoc env-config
            :name environment-name
            :app app
-           :limits limits
            :secrets-file secrets-file
            :key-file key-file
            :identity-file explicit-identity
@@ -382,8 +368,8 @@
 
 (defn normalize-config
   "Apply per-environment defaults (:key-file, :template, :manifest), preserve
-  explicit :identity-file options, resolve input :limits, validate, and stamp
-  each env with its :name and the resolved limits. Requires a non-blank :app,
+  explicit :identity-file options, validate, and stamp each env with its :name
+  and :app. Requires a non-blank :app,
   at least one environment, and a non-blank :secrets-file string per
   environment. A secrets path not ending in `.age` requires explicit :template
   and :manifest values. Every resolved artifact path is checked for role
@@ -399,17 +385,14 @@
                 "    so there is deliberately no default — projects must not share a key "
                 "path\n"
                 "    by accident.")))
-  (let [limits (age/resolve-limits default-limits (:limits config) "secrets config")
-        normalized (reduce-kv (fn [normalized environment-name env-config]
+  (let [normalized (reduce-kv (fn [normalized environment-name env-config]
                                 (assoc normalized
                                        environment-name
-                                       (normalize-environment {:app app :limits limits}
-                                                              environment-name
-                                                              env-config)))
+                                       (normalize-environment app environment-name env-config)))
                               {}
                               environments)]
     (validate-artifact-roles! normalized)
-    (assoc config :limits limits :environments normalized)))
+    (assoc config :environments normalized)))
 
 (defn- resolve-env
   "Resolve an environment argument string to its (defaulted) config map.
@@ -438,74 +421,42 @@
 ;;;; Utilities
 
 (defn- input-too-large!
-  [kind limit-key configured observed context]
-  (fail! (str kind " is larger than the configured " limit-key " limit of "
-              configured " bytes.")
-         (merge context
-                {:reason :input-too-large
-                 :limit limit-key
-                 :configured configured
-                 :observed observed
-                 :bytes observed})))
+  "Fail because `what`, a short description that names the file where there is
+  one, holds `observed` bytes against a bound of `limit`."
+  [what limit observed context]
+  (fail! (str what " is larger than the " limit " byte limit.")
+         (merge context {:reason :input-too-large :limit limit :observed observed})))
 
-(defn- read-bounded-bytes!
-  "Read `in` under `max-bytes`, retaining at most the configured number of
-  bytes. The read that detects overflow asks for only one byte beyond the
-  remaining allowance, so `:observed` is stable and no oversized value is
-  accumulated."
-  [^java.io.InputStream in max-bytes kind limit-key context]
-  (let [captured (java.io.ByteArrayOutputStream.)
-        chunk (byte-array 8192)]
-    (loop [total 0]
-      (let [remaining (- max-bytes total)
-            requested (int (min (alength chunk) (inc remaining)))
-            n (.read in chunk 0 requested)]
-        (if (neg? n)
-          (.toByteArray captured)
-          (let [observed (+ total n)]
-            (when (> observed max-bytes)
-              (.reset captured)
-              (input-too-large! kind limit-key max-bytes observed context))
-            (.write captured chunk 0 n)
-            (recur observed)))))))
+(defn- utf8-length [^String s]
+  (alength (.getBytes s java.nio.charset.StandardCharsets/UTF_8)))
 
 (defn- read-file-bounded!
-  [path max-bytes kind limit-key context]
-  (with-open [in (io/input-stream (io/file (str path)))]
-    (String. ^bytes (read-bounded-bytes! in max-bytes kind limit-key context)
-             java.nio.charset.StandardCharsets/UTF_8)))
+  "Read the file at `path` as UTF-8 text, failing when it holds more than
+  `limit` bytes. `kind` and `context` describe it in the failure."
+  [path limit kind context]
+  (let [f (io/file (str path))]
+    (when (> (.length f) limit)
+      (input-too-large! (str kind " " path) limit (.length f) context))
+    (slurp f :encoding "UTF-8")))
 
 (defn- read-reader-bounded!
-  "Read character `reader` while bounding its UTF-8 representation. Counting is
-  delegated to the JDK encoder, so multibyte characters and surrogate pairs use
-  the same byte semantics as the resulting string."
-  [^java.io.Reader reader max-bytes kind limit-key context]
-  (let [total (volatile! 0)
-        count-bytes! (fn [n]
-                       (let [observed (+ @total n)]
-                         (when (> observed max-bytes)
-                           (input-too-large!
-                            kind limit-key max-bytes observed context))
-                         (vreset! total observed)))
-        counter (proxy [java.io.OutputStream] []
-                  (write
-                    ([_b] (count-bytes! 1))
-                    ([_bs _offset length] (count-bytes! length))))
-        encoder (java.io.OutputStreamWriter.
-                 counter java.nio.charset.StandardCharsets/UTF_8)
-        captured (StringBuilder.)
+  "Read all of character `reader`, failing when its UTF-8 form passes `limit`
+  bytes. A character is at least one byte, so reading stops one chunk past the
+  bound and never accumulates an unbounded value."
+  [^java.io.Reader reader limit what context]
+  (let [captured (StringBuilder.)
         chunk (char-array 8192)]
     (loop []
       (let [n (.read reader chunk 0 (alength chunk))]
-        (if (neg? n)
-          (do
-            (.close encoder)
-            (.toString captured))
-          (do
-            (.write encoder chunk 0 n)
-            (.flush encoder)
-            (.append captured chunk 0 n)
-            (recur)))))))
+        (when-not (neg? n)
+          (.append captured chunk 0 n)
+          (when (<= (.length captured) limit)
+            (recur)))))
+    (let [text (.toString captured)
+          observed (utf8-length text)]
+      (when (> observed limit)
+        (input-too-large! what limit observed context))
+      text)))
 
 (defn- editor-value
   "The editor command to run, from the `VISUAL` value `visual` and the `EDITOR`
@@ -604,12 +555,10 @@
        "{:example/api-key \"replace-me\"\n"
        " :example/allowed #{}}\n"))
 
-(defn- template-content [{:keys [template limits]}]
+(defn- template-content [{:keys [template]}]
   (let [f (io/file (str template))]
     (if (.exists f)
-      (read-file-bounded! f (:max-plaintext-bytes limits)
-                          "Template plaintext" :max-plaintext-bytes
-                          {:template (str template)})
+      (read-file-bounded! f age/max-plaintext-bytes "Template" {:template (str template)})
       default-template)))
 
 (defn- require-age! []
@@ -650,31 +599,17 @@
                  (or (str/blank? line) (str/starts-with? line "#"))))))
 
 (defn- recipient-file-snapshot
-  "Read one recipients file under the same byte and entry limits for every
-  command. Returns its exact text plus numbered entries and recipient values,
-  or nil when the file is absent."
-  [{:keys [recipients-file limits] environment-name :name}]
-  (let [{:keys [max-recipients max-recipients-bytes]} limits
-        f (io/file (str recipients-file))]
+  "Read one recipients file under the same byte bound for every command.
+  Returns its exact text plus numbered entries and recipient values, or nil
+  when the file is absent."
+  [{:keys [recipients-file] environment-name :name}]
+  (let [f (io/file (str recipients-file))]
     (when (.exists f)
       (let [content (read-file-bounded!
                      f max-recipients-bytes "Recipients file"
-                     :max-recipients-bytes
                      {:recipients-file (str recipients-file)
                       :environment environment-name})
-            entries (vec (recipient-entries content))
-            observed (count entries)]
-        (when (> observed max-recipients)
-          (fail! (str "Recipients file " recipients-file " lists " observed
-                      " recipients, exceeding the configured :max-recipients of "
-                      max-recipients ".")
-                 {:reason :too-many-recipients
-                  :recipients-file (str recipients-file)
-                  :environment environment-name
-                  :count observed
-                  :observed observed
-                  :limit :max-recipients
-                  :configured max-recipients}))
+            entries (vec (recipient-entries content))]
         {:content content
          :entries entries
          :recipients (mapv second entries)}))))
@@ -683,19 +618,12 @@
   (:recipients (recipient-file-snapshot env)))
 
 (defn- validate-recipient-entries!
-  "Reject any entry age could not use: one longer than `:max-recipient-chars`,
-  or one `age/valid-recipient?` refuses. Both name the 1-based line number and
-  quote only a truncated prefix — a hand-edited line may hold anything, and a
-  diagnostic is not the place to echo it."
-  [{:keys [recipients-file] environment-name :name} entries max-recipient-chars]
+  "Reject any entry `age/valid-recipient?` refuses, naming the 1-based line
+  number and quoting only a truncated prefix. A hand-edited line may hold
+  anything, and a diagnostic is not the place to echo it."
+  [{:keys [recipients-file] environment-name :name} entries]
   (let [label (clojure.core/name environment-name)]
     (doseq [[n line] entries]
-      (when (> (count line) max-recipient-chars)
-        (fail! (str "Recipient on line " n " of " recipients-file " (" label ") is "
-                    (count line) " characters, exceeding the configured "
-                    ":max-recipient-chars of " max-recipient-chars ".")
-               {:recipients-file (str recipients-file) :line n
-                :limit :max-recipient-chars :configured max-recipient-chars}))
       (when-not (age/valid-recipient? line)
         (fail! (str "Not a valid age recipient on line " n " of " recipients-file
                     " (" label "): " (pr-str (line-prefix line)) "\n"
@@ -713,15 +641,12 @@
   handed to age would be read again inside age, after an editor session that can
   run for minutes and during which the file may have been edited. Everything the
   file says is decided here, before the sensitive work starts, and the resulting
-  *values* are what gets encrypted to.
+  values are what gets encrypted to.
 
-  Fails closed while streaming a file larger than `:max-recipients-bytes`, more
-  entries than `:max-recipients`, an entry longer than
-  `:max-recipient-chars`, an entry `age/valid-recipient?` rejects, or an empty
-  result."
-  [{:keys [recipients-file limits] environment-name :name :as env}]
-  (let [{:keys [max-recipient-chars]} limits
-        label (clojure.core/name environment-name)
+  Fails on a file larger than `max-recipients-bytes`, an entry
+  `age/valid-recipient?` rejects, or an empty result."
+  [{:keys [recipients-file] environment-name :name :as env}]
+  (let [label (clojure.core/name environment-name)
         entries (or (:entries (recipient-file-snapshot env)) [])]
     (when (empty? entries)
       (fail! (str "No recipients yet for " label " in " recipients-file "\n"
@@ -729,7 +654,7 @@
                   (shell-quote label))
              {:recipients-file (str recipients-file)
               :environment environment-name}))
-    (validate-recipient-entries! env entries max-recipient-chars)
+    (validate-recipient-entries! env entries)
     (vec (distinct (map second entries)))))
 
 (defn- encrypt-target!
@@ -762,16 +687,15 @@
   (case reason
     :edn-empty "expected one EDN value, found empty input"
     :edn-extra-values "expected one EDN value, found another"
-    :edn-too-deep (str "EDN nesting depth " depth
-                       " exceeds the configured :max-edn-depth of " limit)
+    :edn-too-deep (str "EDN nesting depth " depth " exceeds the limit of " limit)
     :edn-malformed (str "malformed EDN syntax" (safe-edn/failure-location failure))))
 
 (defn- validate-plaintext!
   "Parse all of `plaintext`, returning its EDN value. Fail before encryption
-  when it is empty, malformed, contains more than one value, or exceeds the
-  configured nesting depth."
-  [secrets-file plaintext limits]
-  (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext limits)]
+  when it is empty, malformed, contains more than one value, or nests too
+  deeply."
+  [secrets-file plaintext]
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
     (if ok?
       value
       (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").\n"
@@ -780,10 +704,10 @@
                     (safe-edn/failure-data parsed))))))
 
 (defn- decrypt-and-parse
-  "Decrypt the environment's store and parse it under its limits, returning
-  `safe-edn/parse`'s result map."
-  [{:keys [secrets-file identity-file limits] :as env}]
-  (safe-edn/parse (age/decrypt identity-file secrets-file (decrypt-opts env)) limits))
+  "Decrypt the environment's store and parse it, returning `safe-edn/parse`'s
+  result map."
+  [{:keys [secrets-file identity-file]}]
+  (safe-edn/parse (age/decrypt identity-file secrets-file)))
 
 (defn- decrypt-secrets!
   "The environment's store as one EDN value, or a failure naming why it is not."
@@ -797,9 +721,9 @@
 (defn- decrypt-to-temp!
   "Write the environment's decrypted store, byte for byte, into the private
   temp file `tmp`."
-  [{:keys [secrets-file identity-file] :as env} tmp]
+  [{:keys [secrets-file identity-file]} tmp]
   (with-open [out (io/output-stream tmp)]
-    (.write out (age/decrypt-bytes identity-file secrets-file (decrypt-opts env)))))
+    (.write out (age/decrypt-bytes identity-file secrets-file))))
 
 (def ^:private set-usage
   (str "`set` takes [env] <key>; the value is read from the prompt or stdin, "
@@ -813,11 +737,11 @@
   a typo'd path is caught before any file is touched. The failure names the
   rejected value's type and never the value: `set` receives the key where a
   mistyped command line may have put the secret."
-  [s limits]
+  [s]
   (when (str/blank? (str s))
     (fail! (str "Missing key. Accepted forms: a keyword (:some/key) or a vector path "
                 "([:a :b]).")))
-  (let [{:keys [ok? value] :as parsed} (safe-edn/parse (str s) limits)
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse (str s))
         problem (cond
                   (not ok?) (edn-failure-message parsed)
                   (keyword? value) nil
@@ -929,12 +853,13 @@
   already-resolved `target` recipient spec, never to a pathname re-read here —
   and optional manifest beside their destinations, and commit both through
   atomic replacements."
-  [{:keys [manifest app secrets-file limits] :as env} target plaintext-file]
-  (let [plaintext (read-file-bounded!
-                   plaintext-file (:max-plaintext-bytes limits)
-                   "Secrets plaintext" :max-plaintext-bytes
-                   {:secrets-file (str secrets-file)})
-        value (validate-plaintext! secrets-file plaintext limits)
+  [{:keys [manifest app secrets-file] :as env} target plaintext-file]
+  (let [f (io/file (str plaintext-file))
+        _ (when (> (.length f) age/max-plaintext-bytes)
+            (input-too-large! (str "The plaintext for " secrets-file)
+                              age/max-plaintext-bytes (.length f)
+                              {:secrets-file (str secrets-file)}))
+        value (validate-plaintext! secrets-file (slurp f :encoding "UTF-8"))
         ciphertext-temp (sibling-temp-file! secrets-file ".age.tmp")]
     (try
       (let [manifest-temp (when (string? manifest)
@@ -1122,20 +1047,19 @@
 (defn- read-set-value!
   "The value for `set`: one line typed at a hidden terminal prompt when
   `interactive?`, otherwise everything on stdin minus one trailing newline.
-  Both are bounded by `:max-plaintext-bytes`."
+  Both are bounded by `age/max-plaintext-bytes`."
   [env path interactive?]
-  (let [max-bytes (get-in env [:limits :max-plaintext-bytes])
+  (let [limit age/max-plaintext-bytes
         context {:environment (:name env) :key path}]
     (if interactive?
       (let [value (or (prompt-hidden! (str (question-marker) " Value for " (pr-str path)
                                            " (input hidden): "))
-                      "")
-            observed (alength (.getBytes ^String value "UTF-8"))]
-        (when (> observed max-bytes)
-          (input-too-large! "Typed value" :max-plaintext-bytes max-bytes observed context))
+                      "")]
+        (when (> (utf8-length value) limit)
+          (input-too-large! "The typed value" limit (utf8-length value) context))
         value)
       (strip-trailing-newline
-       (read-reader-bounded! *in* max-bytes "Standard input" :max-plaintext-bytes context)))))
+       (read-reader-bounded! *in* limit "Standard input" context)))))
 
 (defn set-secret!
   "Set a value typed at a hidden terminal prompt, or read from stdin when
@@ -1152,7 +1076,7 @@
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [path (try (parse-key-path key-arg (:limits env))
+      (let [path (try (parse-key-path key-arg)
                       (catch clojure.lang.ExceptionInfo e
                         (throw (ex-info (ex-message e) (assoc (ex-data e) :hint set-usage) e))))
             {:keys [secrets-file]} env
@@ -1175,7 +1099,7 @@
                          {:key path}))
               value (if edn?
                       (let [{:keys [ok? value] :as parsed}
-                            (safe-edn/parse raw (:limits env))]
+                            (safe-edn/parse raw)]
                         (if ok?
                           value
                           (fail! (str "Value on stdin is not valid EDN ("
@@ -1205,7 +1129,7 @@
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [path (parse-key-path key-arg (:limits env))
+      (let [path (parse-key-path key-arg)
             {:keys [secrets-file] environment-name :name} env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
@@ -1315,7 +1239,7 @@
   recipient added (or already present)."
   [config env-arg pubkey]
   (require-age!)
-  (let [{:keys [recipients-file key-file secrets-file limits]
+  (let [{:keys [recipients-file key-file secrets-file]
          environment-name :name :as env}
         (resolve-env config env-arg)
         environment-label (clojure.core/name environment-name)]
@@ -1331,17 +1255,7 @@
                     (shell-quote environment-label))
                {:key-file key-file
                 :environment environment-name}))
-      (let [pub (str/trim pub)
-            pub-chars (count pub)]
-        (when (> pub-chars (:max-recipient-chars limits))
-          (fail! (str "Recipient argument is " pub-chars
-                      " characters, exceeding the configured "
-                      ":max-recipient-chars of " (:max-recipient-chars limits) ".")
-                 {:reason :recipient-too-long
-                  :environment environment-name
-                  :observed pub-chars
-                  :limit :max-recipient-chars
-                  :configured (:max-recipient-chars limits)}))
+      (let [pub (str/trim pub)]
         (when-not (age/valid-recipient? pub)
           (fail! "Not a valid age public key." {:reason :invalid-recipient}))
         (let [snapshot (recipient-file-snapshot env)
@@ -1351,29 +1265,16 @@
               (info "Already a recipient of" (str environment-label ":") pub)
               pub)
             (let [f (io/file (str recipients-file))
-                  observed (inc (count existing))
                   current (:content snapshot)
                   content (str current
                                (when (and (seq current)
                                           (not (str/ends-with? current "\n")))
                                  "\n")
-                               pub "\n")
-                  bytes (alength (.getBytes content
-                                            java.nio.charset.StandardCharsets/UTF_8))]
-              (when (> observed (:max-recipients limits))
-                (fail! (str "Adding a recipient would exceed the configured "
-                            ":max-recipients of " (:max-recipients limits) ".")
-                       {:reason :too-many-recipients
-                        :recipients-file (str recipients-file)
-                        :environment environment-name
-                        :count observed
-                        :observed observed
-                        :limit :max-recipients
-                        :configured (:max-recipients limits)}))
-              (when (> bytes (:max-recipients-bytes limits))
+                               pub "\n")]
+              (when (> (utf8-length content) max-recipients-bytes)
                 (input-too-large!
-                 "Updated recipients file" :max-recipients-bytes
-                 (:max-recipients-bytes limits) bytes
+                 (str "The updated recipients file " recipients-file)
+                 max-recipients-bytes (utf8-length content)
                  {:recipients-file (str recipients-file)
                   :environment environment-name}))
               (append-recipient! f content)
@@ -1413,35 +1314,17 @@
         (say! (recipients-lines environment-label recipients-file recipients))
         recipients))))
 
-(defn- enforce-manifest-entry-limit!
-  [manifest-path value {:keys [max-manifest-entries]}]
-  (let [observed (if (map? (:keys value)) (count (:keys value)) 0)]
-    (when (> observed max-manifest-entries)
-      (fail! (str "Manifest " manifest-path " contains " observed
-                  " entries, exceeding the configured :max-manifest-entries of "
-                  max-manifest-entries ".")
-             {:reason :too-many-manifest-entries
-              :manifest (str manifest-path)
-              :count observed
-              :observed observed
-              :limit :max-manifest-entries
-              :configured max-manifest-entries}))))
-
 (defn- read-manifest-bounded!
-  [manifest-path {:keys [max-manifest-bytes]}]
-  (read-file-bounded! manifest-path max-manifest-bytes
-                      "Manifest" :max-manifest-bytes
+  [manifest-path]
+  (read-file-bounded! manifest-path max-manifest-bytes "Manifest"
                       {:manifest (str manifest-path)}))
 
 (defn- bounded-state
+  "The doctor state for a tripped size bound, or nil for any other failure."
   [e]
   (let [data (ex-data e)]
-    (when (contains? #{:input-too-large :too-many-recipients
-                       :too-many-manifest-entries}
-                     (:reason data))
-      (merge {:state :bounded}
-             (select-keys data
-                          [:reason :limit :configured :observed :bytes :count])))))
+    (when (= :input-too-large (:reason data))
+      (merge {:state :bounded} (select-keys data [:reason :limit :observed])))))
 
 (defn- read-supported-manifest
   "The committed manifest at `manifest-path` as `{:committed value}`, or a
@@ -1456,11 +1339,9 @@
   shape. Team manifests carry no `:vhash`, so a refreshed `:ciphertext-sha`
   would otherwise verify clean. This detects an operator's wrong-file mistake,
   not a forged manifest (see `doc/threat-model.md`, B1)."
-  [expected-app manifest-path limits]
-  (let [parsed (safe-edn/parse (read-manifest-bounded! manifest-path limits) limits)
+  [expected-app manifest-path]
+  (let [parsed (safe-edn/parse (read-manifest-bounded! manifest-path))
         value (:value parsed)]
-    (when (and (:ok? parsed) (map? value))
-      (enforce-manifest-entry-limit! manifest-path value limits))
     (cond
       (not (:ok? parsed))
       {:problem {:reason :manifest-invalid-edn :failure (safe-edn/failure-data parsed)}}
@@ -1517,7 +1398,7 @@
 
   This establishes *agreement* between the two committed artifacts — drift
   detection — and never who authored either of them; see [[verify!]]."
-  [{:keys [app secrets-file manifest identity-file limits] :as env}]
+  [{:keys [app secrets-file manifest identity-file] :as env}]
   (cond
     (not (string? manifest))
     {:status :ok :reason :manifest-disabled}
@@ -1529,23 +1410,30 @@
     {:status :missing :reason :no-manifest}
 
     :else
-    (let [{:keys [committed problem]} (read-supported-manifest app manifest limits)]
-      (cond
-        problem
-        (assoc problem :status :drift)
+    (try
+      (let [{:keys [committed problem]} (read-supported-manifest app manifest)]
+        (cond
+          problem
+          (assoc problem :status :drift)
 
-        (not (.exists (io/file identity-file)))
-        (keyless-finding committed (sha256 secrets-file))
+          (not (.exists (io/file identity-file)))
+          (keyless-finding committed (sha256 secrets-file))
 
-        :else
-        (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
-          (if ok?
-            (keyed-finding committed
-                           (manifest/entries value (manifest-hmac-key env))
-                           (sha256 secrets-file))
-            {:status :drift
-             :reason :secrets-invalid-edn
-             :failure (safe-edn/failure-data parsed)}))))))
+          :else
+          (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
+            (if ok?
+              (keyed-finding committed
+                             (manifest/entries value (manifest-hmac-key env))
+                             (sha256 secrets-file))
+              {:status :drift
+               :reason :secrets-invalid-edn
+               :failure (safe-edn/failure-data parsed)}))))
+      (catch clojure.lang.ExceptionInfo e
+        ;; A manifest or store past its size bound is a problem with this
+        ;; environment, so the other environments are still verified.
+        (if (#{:input-too-large :plaintext-too-large} (:reason (ex-data e)))
+          {:status :drift :reason :too-large :message (ex-message e)}
+          (throw e))))))
 
 (defn- diff-lines
   "One line per key path that moved between the manifest and the store."
@@ -1602,6 +1490,9 @@
       [[:oops label "— ciphertext changed since the manifest was written"
         (str "(" manifest ").")]
        [:line (str "    Regenerate with:  " reencrypt)]]
+
+      :too-large
+      [[:oops label "—" (:message finding)]]
 
       :secrets-invalid-edn
       [[:oops label "— encrypted secrets are not valid EDN:"
@@ -1718,25 +1609,21 @@
 (defn- manifest-state
   "Report whether a configured manifest supports a keyless freshness check.
   Manifest contents and parse errors are deliberately omitted."
-  [manifest artifact limits]
+  [manifest artifact]
   (cond
     (not (string? manifest)) {:state :disabled}
     (not (:exists? artifact)) {:state :missing}
     :else
     (try
-      (let [{:keys [ok? value]}
-            (safe-edn/parse (read-manifest-bounded! manifest limits) limits)]
-        (if-not ok?
-          {:state :invalid}
-          (do
-            (enforce-manifest-entry-limit! manifest value limits)
-            (cond
-              (not (map? value)) {:state :invalid}
-              (not= 2 (:version value)) {:state :unsupported}
-              (not (and (string? (:ciphertext-sha value))
-                        (not (str/blank? (:ciphertext-sha value)))))
-              {:state :missing-ciphertext-sha}
-              :else {:state :ready}))))
+      (let [{:keys [ok? value]} (safe-edn/parse (read-manifest-bounded! manifest))]
+        (cond
+          (not ok?) {:state :invalid}
+          (not (map? value)) {:state :invalid}
+          (not= 2 (:version value)) {:state :unsupported}
+          (not (and (string? (:ciphertext-sha value))
+                    (not (str/blank? (:ciphertext-sha value)))))
+          {:state :missing-ciphertext-sha}
+          :else {:state :ready}))
       (catch clojure.lang.ExceptionInfo e
         (or (bounded-state e) {:state :invalid}))
       (catch Exception _ {:state :invalid}))))
@@ -1802,7 +1689,7 @@
               age (age-state)
               recipients (recipient-state env (:recipients artifacts))
               mode (if recipients-file :multi-recipient :single-key)
-              manifest-capability (manifest-state manifest (:manifest artifacts) (:limits env))
+              manifest-capability (manifest-state manifest (:manifest artifacts))
               verify (doctor-verification-capability
                       age identity artifacts manifest-capability)
               status (doctor-status

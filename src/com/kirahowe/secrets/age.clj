@@ -176,60 +176,17 @@
         (throw (ex-info "age encryption failed" {:out (str out) :error err})))
       out)))
 
-(def default-max-plaintext-bytes
-  "Default bound, in bytes, on the plaintext one decryption may produce (8 MiB).
-
-  It makes an accidentally large ciphertext, such as the wrong file, fail fast.
-  The bound is checked while `age` is still writing, before a complete
-  plaintext has been allocated. Override it per call with
-  `{:limits {:max-plaintext-bytes n}}`; `com.kirahowe.secrets` carries the same
-  value as one of its runtime `:limits`."
+(def max-plaintext-bytes
+  "The most plaintext bytes one decryption may produce (8 MiB). It catches an
+  accidental huge input, such as the wrong file, while `age` is still writing.
+  The CLI refuses to write a store past the same bound, so every store it
+  writes can be read back."
   8388608)
 
 (def ^:private capture-chunk-bytes
   "Plaintext is drained in fixed 64 KiB chunks so the running total is checked
-  before every further read rather than after the whole output exists."
+  before every further read."
   65536)
-
-(defn resolve-limits
-  "Merge the `limits` map over `defaults` and return the result.
-
-  `limits` is nil or a map whose keys all appear in `defaults` and whose values
-  are positive integers. Anything else throws `ex-info` with
-  `:reason :invalid-limits`, so a misspelled limit is reported and never read
-  as unset. Unknown keyword keys are listed under `:unknown-keys`, and a
-  rejected value is named by its known key under `:limit`. `label` names the
-  owner of the option in the message. The message and data render keywords
-  only: an unknown key of any other type is counted, and no supplied value
-  appears."
-  [defaults limits label]
-  (let [invalid! (fn [problem data]
-                   (throw (ex-info (str label " :limits " problem)
-                                   (assoc data :reason :invalid-limits))))]
-    (when-not (or (nil? limits) (map? limits))
-      (invalid! "must be a map of limit name → positive integer." {}))
-    (when-let [unknown (seq (remove (set (keys defaults)) (keys limits)))]
-      (let [named (sort-by str (filter keyword? unknown))
-            unnamed (- (count unknown) (count named))]
-        (invalid! (str "has unknown key(s): " (str/join ", " named)
-                       (when (pos? unnamed)
-                         (str (when (seq named) ", and ") unnamed " that are not keywords"))
-                       ". Known limits: " (str/join ", " (sort (keys defaults))) ".")
-                  {:unknown-keys (vec named)})))
-    (doseq [[limit value] limits]
-      (when-not (and (integer? value) (pos? value))
-        (invalid! (str limit " must be a positive integer.") {:limit limit})))
-    (merge defaults limits)))
-
-(defn- plaintext-limit
-  "Resolve the plaintext byte bound from the optional trailing options map
-  `opts`. Other keys in its `:limits` belong to the caller and are ignored."
-  [opts]
-  (let [limits (:limits opts)]
-    (:max-plaintext-bytes
-     (resolve-limits {:max-plaintext-bytes default-max-plaintext-bytes}
-                     (cond-> limits (map? limits) (select-keys [:max-plaintext-bytes]))
-                     "age"))))
 
 (defn- destroy-process!
   "Terminate `process`, escalating to a forcible kill when it does not exit
@@ -245,13 +202,13 @@
 (defn- stream-bounded-stdout!
   "Run `argv`, copying its stdout to `out`, and return `{:exit n :err s}`.
 
-  At most `max-bytes` are written. Each read asks for no more than one byte
-  past the bound, and the read that crosses it throws `ex-info` with
-  `:reason :plaintext-too-large`, `context`, the byte count, and the limit,
-  never a captured byte. The process is destroyed on the way out if it is
+  At most `max-plaintext-bytes` are written. Each read asks for no more than
+  one byte past the bound, and the read that crosses it throws `ex-info` with
+  `:reason :plaintext-too-large`, `context`, the numeric `:limit` and
+  `:observed`, and never a captured byte. The process is destroyed on the way out if it is
   still running. stderr is drained on its own thread, because a process that
   fills an unread stderr pipe blocks forever."
-  [argv ^java.io.OutputStream out max-bytes context]
+  [argv ^java.io.OutputStream out context]
   (let [process (.start (java.lang.ProcessBuilder. ^java.util.List (vec argv)))
         stderr (future (slurp (.getErrorStream process)))
         chunk (byte-array capture-chunk-bytes)]
@@ -261,7 +218,8 @@
       (.close (.getOutputStream process))
       (with-open [stdout (.getInputStream process)]
         (loop [total 0]
-          (let [remaining (- max-bytes total)
+          (let [max-bytes max-plaintext-bytes
+                remaining (- max-bytes total)
                 requested (int (if (< remaining capture-chunk-bytes)
                                  (inc remaining)
                                  capture-chunk-bytes))
@@ -269,13 +227,12 @@
             (when-not (neg? n)
               (let [observed (+ total n)]
                 (when (> observed max-bytes)
-                  (throw (ex-info (str "Decrypted plaintext is larger than the configured "
-                                       ":max-plaintext-bytes limit of " max-bytes " bytes.")
+                  (throw (ex-info (str "The decrypted plaintext of "
+                                       (:encrypted-file context) " is larger than the "
+                                       max-bytes " byte limit.")
                                   (assoc context
-                                         :bytes observed
                                          :observed observed
                                          :limit max-bytes
-                                         :configured max-bytes
                                          :reason :plaintext-too-large))))
                 (.write out chunk 0 n)
                 (recur observed))))))
@@ -300,36 +257,32 @@
   matches one of its recipients. It does not identify who encrypted it: age
   does not sign, so this is payload integrity, never sender authenticity.
 
-  `opts` may carry `{:limits {:max-plaintext-bytes n}}`, defaulting to
-  `default-max-plaintext-bytes`. Plaintext is copied in fixed-size chunks; the
-  chunk that would cross the bound kills `age` and throws with
+  Plaintext is copied in fixed-size chunks. The chunk that would cross
+  [[max-plaintext-bytes]] kills `age` and throws with
   `:reason :plaintext-too-large`.
 
   A failure names `:encrypted-file` and `:identity-file`, which are filesystem
   paths and never key contents. A non-zero exit also carries the captured
   stderr and a wrong-key `:hint`. A failed decryption returns no partial
   plaintext."
-  (^bytes [identity-file encrypted-file] (decrypt-bytes identity-file encrypted-file nil))
-  (^bytes [identity-file encrypted-file opts]
-   (let [argv (decrypt-argv identity-file encrypted-file)
-         max-bytes (plaintext-limit opts)
-         context {:encrypted-file (str encrypted-file)
-                  :identity-file (str identity-file)}
-         out (java.io.ByteArrayOutputStream.)]
-     (ensure-installed!)
-     (let [{:keys [exit err]} (stream-bounded-stdout! argv out max-bytes context)]
-       (when-not (zero? exit)
-         (throw (ex-info "age decryption failed"
-                         (assoc context
-                                :error err
-                                :hint (str "Wrong key, or you are not a recipient of "
-                                           "this file.")))))
-       (.toByteArray out)))))
+  ^bytes [identity-file encrypted-file]
+  (let [argv (decrypt-argv identity-file encrypted-file)
+        context {:encrypted-file (str encrypted-file)
+                 :identity-file (str identity-file)}
+        out (java.io.ByteArrayOutputStream.)]
+    (ensure-installed!)
+    (let [{:keys [exit err]} (stream-bounded-stdout! argv out context)]
+      (when-not (zero? exit)
+        (throw (ex-info "age decryption failed"
+                        (assoc context
+                               :error err
+                               :hint (str "Wrong key, or you are not a recipient of "
+                                          "this file.")))))
+      (.toByteArray out))))
 
 (defn decrypt
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
-  UTF-8 string. Use `decrypt-bytes` for binary plaintexts. `opts`, the
-  plaintext bound, and failures are those of [[decrypt-bytes]]."
-  ([identity-file encrypted-file] (decrypt identity-file encrypted-file nil))
-  ([identity-file encrypted-file opts]
-   (String. (decrypt-bytes identity-file encrypted-file opts) "UTF-8")))
+  UTF-8 string. Use `decrypt-bytes` for binary plaintexts. The plaintext bound
+  and failures are those of [[decrypt-bytes]]."
+  [identity-file encrypted-file]
+  (String. (decrypt-bytes identity-file encrypted-file) "UTF-8"))

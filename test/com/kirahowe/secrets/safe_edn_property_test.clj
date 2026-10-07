@@ -55,7 +55,8 @@
     (= (if (<= depth limit)
          {:ok? true :value value}
          {:ok? false :reason :edn-too-deep :depth depth :limit limit})
-       (safe-edn/parse text {:max-edn-depth limit}))))
+       (with-redefs-fn {#'safe-edn/max-depth limit}
+         #(safe-edn/parse text)))))
 
 ;;;; Exactly one value
 

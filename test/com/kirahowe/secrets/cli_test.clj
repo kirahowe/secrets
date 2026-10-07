@@ -497,8 +497,7 @@
            (render {:reason :edn-empty})))
     (is (= "expected one EDN value, found another"
            (render {:reason :edn-extra-values})))
-    (is (= (str "EDN nesting depth 101 exceeds the configured "
-                ":max-edn-depth of 100")
+    (is (= "EDN nesting depth 101 exceeds the limit of 100"
            (render {:reason :edn-too-deep :depth 101 :limit 100})))))
 
 (deftest cli-depth-bomb-is-rejected-before-recursive-parse-test
@@ -2082,7 +2081,12 @@
           (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))
               "the recipient substituted during the editor interval cannot"))))))
 
-(deftest recipient-limits-fail-closed-test
+(defn- with-bound
+  "Run `f` with the private bound constant held by var `v` set to `n`."
+  [v n f]
+  (with-redefs-fn {v n} f))
+
+(deftest recipients-file-byte-bound-test
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [recipients (str *dir* "/recipients.txt")
@@ -2090,38 +2094,31 @@
           bob-key (str *dir* "/bob-key.txt")
           bob-public (age/keygen! bob-key)
           alice-public (age/public-key *key*)
-          limited (fn [limits]
-                    (cli/normalize-config
-                     (assoc (test-config {:recipients-file recipients}) :limits limits)))]
-      (testing "each bound fails closed, naming the limit and its configured value"
-        (doseq [[label limits contents pattern]
-                [["more entries than :max-recipients"
-                  {:max-recipients 2}
-                  (str/join "\n" (map #(fake-recipient 24 %) ["q" "r" "s"]))
-                  #":max-recipients of 2"]
-                 ["an entry longer than :max-recipient-chars"
-                  {:max-recipient-chars 32}
-                  (fake-recipient 64 "q")
-                  #":max-recipient-chars of 32"]
-                 ["a file larger than :max-recipients-bytes"
-                  {:max-recipients-bytes 16}
-                  (fake-recipient 24 "q")
-                  #":max-recipients-bytes limit of 16"]]]
-          (testing label
-            (spit recipients (str contents "\n"))
-            (is (thrown-with-msg? clojure.lang.ExceptionInfo pattern
-                                  (store-through-stdin! (limited limits))))
-            (is (not (.exists (io/file ciphertext)))
-                "a refused recipient list never produces ciphertext"))))
-      (testing "a list sitting exactly on every limit encrypts"
+          config (cli/normalize-config (test-config {:recipients-file recipients}))]
+      (testing "the bound is 256 KiB"
+        (is (= 262144 @(cli-private 'max-recipients-bytes))))
+      (testing "a file past the byte bound never produces ciphertext"
+        (spit recipients (str (fake-recipient 24 "q") "\n"))
+        (let [e (with-bound (cli-private 'max-recipients-bytes) 16
+                  #(try (store-through-stdin! config)
+                        (catch clojure.lang.ExceptionInfo e e)))]
+          (is (= :input-too-large (:reason (ex-data e))))
+          (is (= 16 (:limit (ex-data e))))
+          (is (= (.length (io/file recipients)) (:observed (ex-data e))))
+          (is (str/includes? (ex-message e) recipients) "the message names the file"))
+        (is (not (.exists (io/file ciphertext)))))
+      (testing "a list sitting exactly on the bound encrypts"
         (spit recipients (str alice-public "\n" bob-public "\n"))
-        (store-through-stdin!
-         (limited {:max-recipients 2
-                   :max-recipient-chars (count alice-public)
-                   :max-recipients-bytes (.length (io/file recipients))}))
+        (with-bound (cli-private 'max-recipients-bytes) (.length (io/file recipients))
+          #(store-through-stdin! config))
         (let [expected {:a "snapshot-value"}]
           (is (= expected (edn/read-string (age/decrypt *key* ciphertext))))
-          (is (= expected (edn/read-string (age/decrypt bob-key ciphertext)))))))))
+          (is (= expected (edn/read-string (age/decrypt bob-key ciphertext))))))
+      (testing "no count or line-length bound sits beside the byte bound"
+        (spit recipients (str/join "\n" (repeat 300 alice-public)))
+        (let [listed (atom nil)]
+          (with-out-str (reset! listed (cli/recipients! config "dev")))
+          (is (= 300 (count @listed))))))))
 
 (deftest malformed-recipients-fail-closed-test
   (let [recipients (str *dir* "/recipients.txt")
@@ -2157,46 +2154,33 @@
 (deftest read-only-recipient-boundaries-test
   (let [recipients-file (str *dir* "/read-only-recipients.txt")
         first-recipient (fake-recipient 24 "q")
-        second-recipient (fake-recipient 24 "r")
         exact-content (str first-recipient "\n")
-        config-for (fn [limits]
-                     (cli/normalize-config
-                      (assoc (test-config {:recipients-file recipients-file})
-                             :limits limits)))]
-    (testing "listing accepts the exact byte and entry limits"
+        config (cli/normalize-config (test-config {:recipients-file recipients-file}))
+        bounded (fn [f] (with-bound (cli-private 'max-recipients-bytes) (count exact-content) f))]
+    (testing "listing accepts the exact byte bound"
       (spit recipients-file exact-content)
-      (let [config (config-for {:max-recipients 1
-                                :max-recipients-bytes (count exact-content)})
-            listed (atom nil)]
-        (with-out-str (reset! listed (cli/recipients! config "dev")))
+      (let [listed (atom nil)]
+        (bounded #(with-out-str (reset! listed (cli/recipients! config "dev"))))
         (is (= [first-recipient] @listed))))
-    (testing "listing rejects the first byte over without retaining its content"
-      (let [sentinel "#"
-            config (config-for {:max-recipients-bytes (count exact-content)})]
+    (testing "listing rejects the first byte over and doctor reports only the bound"
+      (let [sentinel "#"]
         (spit recipients-file (str exact-content sentinel))
-        (let [e (try
-                  (with-out-str (cli/recipients! config "dev"))
-                  (catch clojure.lang.ExceptionInfo e e))
-              rendered (str (ex-message e) (pr-str (ex-data e)))]
-          (is (= :input-too-large (:reason (ex-data e))))
-          (is (= (count exact-content) (:configured (ex-data e))))
-          (is (= (inc (count exact-content)) (:observed (ex-data e))))
-          (is (not (str/includes? rendered sentinel))))))
-    (testing "listing rejects one entry over and doctor reports only bounds"
-      (spit recipients-file (str first-recipient "\n" second-recipient "\n"))
-      (let [config (config-for {:max-recipients 1})
-            e (try
-                (with-out-str (cli/recipients! config "dev"))
-                (catch clojure.lang.ExceptionInfo e e))
-            doctor (:result
-                    (doctor-under config "dev"
-                                  {:identity-path *key* :version "age test-version"}))
-            state (get-in doctor [:encryption :recipients])]
-        (is (= :too-many-recipients (:reason (ex-data e))))
-        (is (= 2 (:observed (ex-data e))))
-        (is (= :bounded (:state state)))
-        (is (= :too-many-recipients (:reason state)))
-        (is (not (contains? state :recipients)))))))
+        (let [e (bounded #(try
+                            (with-out-str (cli/recipients! config "dev"))
+                            (catch clojure.lang.ExceptionInfo e e)))
+              rendered (pr-str (ex-data e))
+              doctor (bounded #(:result (doctor-under config "dev" {})))
+              state (get-in doctor [:encryption :recipients])]
+          (is (= {:reason :input-too-large
+                  :limit (count exact-content)
+                  :observed (inc (count exact-content))}
+                 (select-keys (ex-data e) [:reason :limit :observed])))
+          (is (not (str/includes? rendered sentinel)))
+          (is (= {:state :bounded
+                  :reason :input-too-large
+                  :limit (count exact-content)
+                  :observed (inc (count exact-content))}
+                 state)))))))
 
 (deftest plaintext-file-and-stdin-byte-boundaries-test
   (if (age-env-set?)
@@ -2204,48 +2188,46 @@
     (let [plaintext-file (str *dir* "/bounded-plain.edn")
           exact-plaintext (str "{:a 1}" (apply str (repeat 26 " ")))
           limit (count exact-plaintext)
-          config (cli/normalize-config
-                  (assoc (test-config {:manifest false})
-                         :limits {:max-plaintext-bytes limit}))
+          bounded (fn [n f] (with-bound #'age/max-plaintext-bytes n f))
+          config (cli/normalize-config (test-config {:manifest false}))
           env (get-in config [:environments :dev])
           write-secrets! (cli-private 'write-secrets!)
           ciphertext (:secrets-file env)]
-      (testing "an editor plaintext at the exact byte limit is accepted"
+      (testing "an editor plaintext at the exact byte bound is accepted"
         (spit plaintext-file exact-plaintext)
-        (write-secrets! env {:identity-file *key*} plaintext-file)
+        (bounded limit #(write-secrets! env {:identity-file *key*} plaintext-file))
         (is (= {:a 1} (edn/read-string (age/decrypt *key* ciphertext)))))
       (testing "the first byte over is rejected before parsing or encryption"
         (let [sentinel "~"
               before (file-bytes ciphertext)]
           (spit plaintext-file (str exact-plaintext sentinel))
-          (let [e (try
-                    (write-secrets! env {:identity-file *key*} plaintext-file)
-                    (catch clojure.lang.ExceptionInfo e e))
+          (let [e (bounded limit #(try
+                                    (write-secrets! env {:identity-file *key*} plaintext-file)
+                                    (catch clojure.lang.ExceptionInfo e e)))
                 rendered (str (ex-message e) (pr-str (ex-data e)))]
-            (is (= :input-too-large (:reason (ex-data e))))
-            (is (= (inc limit) (:observed (ex-data e))))
+            (is (= {:reason :input-too-large :limit limit :observed (inc limit)}
+                   (select-keys (ex-data e) [:reason :limit :observed])))
+            (is (str/includes? (ex-message e) ciphertext) "the message names the store")
             (is (not (str/includes? rendered sentinel)))
             (is (= before (file-bytes ciphertext))))))
       (testing "stdin accepts exact UTF-8 bytes and rejects one byte over"
         (let [stdin-limit 64
-              exact-stdin (str "42" (apply str (repeat (- stdin-limit 2) " ")))
-              stdin-config (cli/normalize-config
-                            (assoc (test-config {:manifest false})
-                                   :limits {:max-plaintext-bytes stdin-limit}))]
+              exact-stdin (str "\"é\"" (apply str (repeat (- stdin-limit 4) " ")))]
+          (is (= stdin-limit (alength (.getBytes exact-stdin "UTF-8")))
+              "the fixture is at the bound in bytes, not characters")
           (with-out-str
             (with-in-str exact-stdin
-              (cli/set-secret! stdin-config "dev" ":n" true)))
-          (is (= 42 (:n (edn/read-string (age/decrypt *key* ciphertext)))))
+              (bounded stdin-limit #(cli/set-secret! config "dev" ":n" true))))
+          (is (= "é" (:n (edn/read-string (age/decrypt *key* ciphertext)))))
           (let [e (try
                     (with-out-str
                       (with-in-str (str exact-stdin " ")
-                        (cli/set-secret! stdin-config "dev" ":n" true)))
+                        (bounded stdin-limit #(cli/set-secret! config "dev" ":n" true))))
                     (catch clojure.lang.ExceptionInfo e e))]
-            (is (= :input-too-large (:reason (ex-data e))))
-            (is (= stdin-limit (:configured (ex-data e))))
-            (is (= (inc stdin-limit) (:observed (ex-data e))))))))))
+            (is (= {:reason :input-too-large :limit stdin-limit :observed (inc stdin-limit)}
+                   (select-keys (ex-data e) [:reason :limit :observed])))))))))
 
-(deftest manifest-byte-and-entry-boundaries-test
+(deftest manifest-byte-bound-test
   (let [manifest-file (str *dir* "/bounded.manifest")
         read-supported (cli-private 'read-supported-manifest)
         value {:version 2
@@ -2253,65 +2235,50 @@
                :keys {[:a] {:type :string}
                       [:b] {:type :integer}}}
         exact-content (pr-str value)
-        base-limits (get-in (cli/normalize-config (test-config))
-                            [:environments :dev :limits])]
-    (testing "exact manifest byte and entry limits are accepted"
+        bounded (fn [f] (with-bound (cli-private 'max-manifest-bytes) (count exact-content) f))]
+    (testing "the bound is 1 MiB"
+      (is (= 1048576 @(cli-private 'max-manifest-bytes))))
+    (testing "a manifest exactly at the byte bound is accepted"
       (spit manifest-file exact-content)
-      (let [limits (assoc base-limits
-                          :max-manifest-bytes (count exact-content)
-                          :max-manifest-entries 2)]
-        (is (= value
-               (:committed
-                (read-supported "cli-test" manifest-file limits))))))
-    (testing "the first byte over is rejected with content-free bounds"
+      (is (= value (:committed (bounded #(read-supported "cli-test" manifest-file))))))
+    (testing "the first byte over is rejected, naming the file and the bound"
       (spit manifest-file (str exact-content " "))
-      (let [e (try
-                (read-supported
-                 "cli-test" manifest-file
-                 (assoc base-limits :max-manifest-bytes (count exact-content)))
-                (catch clojure.lang.ExceptionInfo e e))]
-        (is (= :input-too-large (:reason (ex-data e))))
-        (is (= (inc (count exact-content)) (:observed (ex-data e))))))
-    (testing "one manifest entry over is rejected after the bounded safe parse"
-      (spit manifest-file exact-content)
-      (let [e (try
-                (read-supported
-                 "cli-test" manifest-file
-                 (assoc base-limits
-                        :max-manifest-bytes (count exact-content)
-                        :max-manifest-entries 1))
-                (catch clojure.lang.ExceptionInfo e e))]
-        (is (= :too-many-manifest-entries (:reason (ex-data e))))
-        (is (= 2 (:observed (ex-data e))))))))
+      (let [e (bounded #(try
+                          (read-supported "cli-test" manifest-file)
+                          (catch clojure.lang.ExceptionInfo e e)))]
+        (is (= {:reason :input-too-large
+                :limit (count exact-content)
+                :observed (inc (count exact-content))
+                :manifest manifest-file}
+               (dissoc (ex-data e) :secrets/exit)))
+        (is (str/includes? (ex-message e) manifest-file))))))
 
-(deftest invalid-limits-config-fails-closed-test
-  (testing "resolved limits land on every normalized environment"
-    (is (= (merge (select-keys secrets/default-limits
-                               [:max-plaintext-bytes :max-edn-depth])
-                  {:max-recipients 256
-                   :max-recipient-chars 1024
-                   :max-recipients-bytes 262144
-                   :max-manifest-bytes 1048576
-                   :max-manifest-entries 10000})
-           (get-in (cli/normalize-config (test-config)) [:environments :dev :limits]))))
-  (testing "a supplied limit overrides only itself"
-    (is (= 4
-           (get-in (cli/normalize-config
-                    (assoc (test-config) :limits {:max-recipients 4}))
-                   [:environments :dev :limits :max-recipients]))))
-  (testing "a value that is not a positive integer is rejected"
-    (doseq [value [0 -1 2.5 "8" nil]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
-                            (cli/normalize-config
-                             (assoc (test-config) :limits {:max-recipients value})))
-          (str "limit value " (pr-str value)))))
-  (testing "an unknown limit key is rejected rather than silently read as a default"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown key"
-                          (cli/normalize-config
-                           (assoc (test-config) :limits {:max-recipient 8})))))
-  (testing "a :limits value that is not a map is rejected"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #":limits must be a map"
-                          (cli/normalize-config (assoc (test-config) :limits [8]))))))
+(deftest verify-reports-a-tripped-bound-per-environment-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config
+                  {:app "cli-test"
+                   :environments
+                   {:dev {:secrets-file (str *dir* "/dev.edn.age") :key-file *key*}
+                    :prod {:secrets-file (str *dir* "/prod.edn.age") :key-file *key*}}})
+          big-manifest (str *dir* "/dev.edn.manifest")]
+      (doseq [env ["dev" "prod"]]
+        (with-out-str (with-in-str "v" (cli/set-secret! config env ":k" false))))
+      (spit big-manifest (str (slurp big-manifest) (apply str (repeat 4096 " "))))
+      (let [{:keys [result err]}
+            (with-bound (cli-private 'max-manifest-bytes) 4096
+              #(capture-verify config nil))]
+        (is (= {:dev :drift :prod :ok} (:results result))
+            "the oversized manifest is one environment's problem; the other is verified")
+        (is (= 1 (:exit result)))
+        (is (str/includes? err big-manifest) "the report names the file")))))
+
+(deftest a-limits-key-configures-nothing-test
+  (let [normalized (cli/normalize-config
+                    (assoc (test-config) :limits {:max-plaintext-bytes 1}))]
+    (is (not (contains? (get-in normalized [:environments :dev]) :limits))
+        "environments carry no limits")
+    (is (nil? (cli-private 'default-limits)))))
 
 (deftest age-receives-repeated-r-arguments-test
   (if (age-env-set?)
@@ -2586,30 +2553,13 @@
   (let [marker "CONFIG-MARKER-9d31"
         failure (fn [config]
                   (try (cli/normalize-config config)
-                       (catch clojure.lang.ExceptionInfo e e)))
-        base {:app "a" :environments {:dev {:secrets-file "s.age"}}}]
+                       (catch clojure.lang.ExceptionInfo e e)))]
     (are [config] (let [e (failure config)]
                     (and (instance? clojure.lang.ExceptionInfo e)
                          (not (str/includes? (pr-str [(ex-message e) (ex-data e)]) marker))))
       {:app "a" :environments {:dev {:note marker}}}
       {:app "a" :note marker :environments {}}
-      {:app " " :note marker :environments {:dev {:secrets-file "s.age"}}}
-      (assoc base :limits marker)
-      (assoc base :limits {:max-plaintext-bytes marker})
-      (assoc base :limits {:max-plaintext-bytes [marker]})
-      (assoc base :limits {marker 1})
-      (assoc base :limits {:unknown-limit 1 marker 1 [marker] 2}))))
-
-(deftest unknown-limit-keys-of-mixed-types-are-reported-test
-  (let [e (try (cli/normalize-config
-                (assoc (test-config) :limits {:zzz 1 "b" 2 :a 3}))
-               (catch Throwable e e))]
-    (is (instance? clojure.lang.ExceptionInfo e))
-    (is (re-find #"unknown key" (ex-message e)))
-    (is (= [:a :zzz] (:unknown-keys (ex-data e))))
-    (is (re-find #"1 that are not keywords" (ex-message e)))
-    (is (= :invalid-limits (:reason (ex-data e)))
-        "the CLI reports limits through the runtime's resolver")))
+      {:app " " :note marker :environments {:dev {:secrets-file "s.age"}}})))
 
 (deftest doctor-reports-an-identity-variable-error-test
   (let [run (fn [variable value]

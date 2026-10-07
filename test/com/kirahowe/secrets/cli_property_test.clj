@@ -1,7 +1,7 @@
 (ns com.kirahowe.secrets.cli-property-test
   "Properties of the management CLI's pure edges: the quoting every suggested
   command goes through, the argv adapter, the key-path parser, the recipients
-  reader, the limits resolvers, and the plaintext renderer."
+  reader, and the plaintext renderer."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
@@ -9,8 +9,6 @@
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
-            [com.kirahowe.secrets :as secrets]
-            [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.generators :as g]
             [com.kirahowe.secrets.safe-edn :as safe-edn]))
@@ -23,11 +21,6 @@
 (def ^:private operand-token? @#'cli/operand-token?)
 (def ^:private recipient-entries @#'cli/recipient-entries)
 (def ^:private render-secrets @#'cli/render-secrets)
-(def ^:private cli-limits @#'cli/default-limits)
-(def ^:private cli-resolve-limits
-  #(age/resolve-limits cli-limits % "secrets config"))
-(def ^:private runtime-resolve-limits @#'secrets/resolve-limits)
-
 ;;;; Fixtures
 
 (def ^:private ^:dynamic *dir* nil)
@@ -126,11 +119,11 @@
 
 (defspec key-paths-parse-from-their-printed-form 200
   (prop/for-all [path key-path]
-    (= path (parse-key-path (pr-str path) cli-limits))))
+    (= path (parse-key-path (pr-str path)))))
 
 (defspec a-bare-keyword-is-a-one-element-path 100
   (prop/for-all [k (gen/one-of [gen/keyword gen/keyword-ns])]
-    (= [k] (parse-key-path (pr-str k) cli-limits))))
+    (= [k] (parse-key-path (pr-str k)))))
 
 (def ^:private not-a-path-element
   (gen/one-of [gen/small-integer (gen/return nil) gen/boolean (gen/vector gen/keyword)]))
@@ -156,7 +149,7 @@
   "True when `s` is rejected as a user-facing failure rather than parsed."
   [s]
   (try
-    (parse-key-path s cli-limits)
+    (parse-key-path s)
     false
     (catch clojure.lang.ExceptionInfo e
       (= 1 (:secrets/exit (ex-data e))))))
@@ -227,61 +220,6 @@
                      lines)
        (recipient-entries (str/join newline (map second lines))))))
 
-;;;; Limits
-
-(defn- limits-over [defaults]
-  (gen/map (gen/elements (vec (keys defaults))) (gen/large-integer* {:min 1})))
-
-(def ^:private bad-limit-value
-  (gen/elements [0 -1 1.5 "10" nil :ten [1] true]))
-
-(defn- unknown-limit-over [example]
-  (gen/one-of [(gen/return example) gen/keyword-ns]))
-
-(defn- invalid-under?
-  "True when `resolve` refuses `limits` with an `ex-info` that `invalid?`
-  recognizes."
-  [resolve invalid? limits]
-  (try
-    (resolve limits)
-    false
-    (catch clojure.lang.ExceptionInfo e
-      (boolean (invalid? (ex-data e))))))
-
-(defn- resolves-only-known-positive-integers?
-  [resolve defaults invalid? {:keys [limits bad-key bad-value unknown]}]
-  (and (= defaults (resolve nil))
-       (= (merge defaults limits) (resolve limits))
-       (invalid-under? resolve invalid? (assoc limits bad-key bad-value))
-       (invalid-under? resolve invalid? (assoc limits unknown 1))
-       (invalid-under? resolve invalid? (vec limits))))
-
-(defn- limits-case [defaults unknown-example]
-  (gen/let [limits (limits-over defaults)
-            bad-key (gen/elements (vec (keys defaults)))
-            bad-value bad-limit-value
-            unknown (unknown-limit-over unknown-example)]
-    {:limits limits :bad-key bad-key :bad-value bad-value :unknown unknown}))
-
-(defn- invalid-limits-naming-only-keys?
-  "True for `:invalid-limits` failure data that holds limit names and nothing
-  else, so no supplied value can appear in it."
-  [data]
-  (and (= :invalid-limits (:reason data))
-       (empty? (dissoc data :reason :limit :unknown-keys))
-       (every? keyword? (concat (vals (select-keys data [:limit]))
-                                (:unknown-keys data)))))
-
-(defspec cli-limits-resolve-only-known-positive-integers 200
-  (prop/for-all [case (limits-case cli-limits :max-source-bytes)]
-    (resolves-only-known-positive-integers?
-     cli-resolve-limits cli-limits invalid-limits-naming-only-keys? case)))
-
-(defspec runtime-limits-resolve-only-known-positive-integers 200
-  (prop/for-all [case (limits-case secrets/default-limits :max-recipients)]
-    (resolves-only-known-positive-integers?
-     runtime-resolve-limits secrets/default-limits invalid-limits-naming-only-keys? case)))
-
 ;;;; Rendering plaintext
 
 (def ^:private print-bound
@@ -293,5 +231,4 @@
                  level print-bound]
     (= {:ok? true :value m}
        (safe-edn/parse (binding [*print-length* length *print-level* level]
-                         (render-secrets m))
-                       cli-limits))))
+                         (render-secrets m))))))

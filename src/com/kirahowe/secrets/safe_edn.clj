@@ -8,8 +8,9 @@
   exactly one value, and returns only allowlisted failure metadata."
   (:require [clojure.edn :as edn]))
 
-(def default-max-depth
-  "The default maximum collection nesting accepted by [[parse]]."
+(def ^:private max-depth
+  "The deepest collection nesting [[parse]] accepts. It catches an accidental
+  deeply nested input before the recursive reader can overflow the stack."
   100)
 
 (defn- skip-string
@@ -34,15 +35,15 @@
         i
         (recur (inc i))))))
 
-(defn- max-depth
+(defn- nesting-depth
   "Return the deepest collection nesting the EDN text `s` reaches, scanning it
   once without parsing it.
 
   Only delimiters that are structure count: string literals (including their
   `\\` escapes), character literals such as `\\[`, and `;` comments are skipped,
   so a delimiter inside any of them is text rather than depth. `#{` needs no
-  special case — its `{` is the opener. Surplus closing delimiters clamp at
-  zero: balance is `clojure.edn`'s job, not this scanner's."
+  special case because its `{` is the opener. Surplus closing delimiters clamp
+  at zero: balance is `clojure.edn`'s job, not this scanner's."
   [^String s]
   (let [n (.length s)]
     (loop [i 0 depth 0 deepest 0]
@@ -79,7 +80,7 @@
                  (and column (not (contains? location :column))) (assoc :column column)))))))
 
 (defn parse
-  "Parse exactly one EDN value from string `s` under `limits`.
+  "Parse exactly one EDN value from string `s`.
 
   The collection depth is scanned before parsing, the text is read once for the
   value and once for EOF, and parser exceptions, messages, nonnumeric data, and
@@ -89,30 +90,24 @@
   with one stable `:reason`: `:edn-empty`, `:edn-extra-values`,
   `:edn-too-deep`, or `:edn-malformed`. Depth failures also carry numeric
   `:depth` and `:limit`; malformed failures carry only numeric `:line` and
-  `:column` when the parser provides them.
-
-  The one-argument arity uses [[default-max-depth]]. The two-argument arity
-  reads only `:max-edn-depth`, so callers may pass a larger resolved limits map."
-  ([s]
-   (parse s {:max-edn-depth default-max-depth}))
-  ([s limits]
-   (let [limit (get limits :max-edn-depth default-max-depth)
-         depth (max-depth s)]
-     (if (> depth limit)
-       {:ok? false :reason :edn-too-deep :depth depth :limit limit}
-       (try
-         (let [eof (Object.)
-               reader (clojure.lang.LineNumberingPushbackReader.
-                       (java.io.StringReader. s))
-               value (edn/read {:eof eof} reader)
-               extra (edn/read {:eof eof} reader)]
-           (cond
-             (identical? eof value) {:ok? false :reason :edn-empty}
-             (not (identical? eof extra)) {:ok? false :reason :edn-extra-values}
-             :else {:ok? true :value value}))
-         (catch Exception e
-           (merge {:ok? false :reason :edn-malformed}
-                  (parser-location e))))))))
+  `:column` when the parser provides them."
+  [s]
+  (let [depth (nesting-depth s)]
+    (if (> depth max-depth)
+      {:ok? false :reason :edn-too-deep :depth depth :limit max-depth}
+      (try
+        (let [eof (Object.)
+              reader (clojure.lang.LineNumberingPushbackReader.
+                      (java.io.StringReader. s))
+              value (edn/read {:eof eof} reader)
+              extra (edn/read {:eof eof} reader)]
+          (cond
+            (identical? eof value) {:ok? false :reason :edn-empty}
+            (not (identical? eof extra)) {:ok? false :reason :edn-extra-values}
+            :else {:ok? true :value value}))
+        (catch Exception e
+          (merge {:ok? false :reason :edn-malformed}
+                 (parser-location e)))))))
 
 (defn failure-data
   "Return the fields of a failed [[parse]] result that may enter exception

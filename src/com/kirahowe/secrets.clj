@@ -309,35 +309,6 @@
        "{:app \"myapp\"} (→ ~/.config/myapp/key.txt); or create the key with "
        "`bb secrets keygen`."))
 
-;;;; Resource limits
-
-(def default-limits
-  "Bounds applied while a secrets source is streamed, decrypted, and parsed.
-
-  They make an accidentally large or malformed source, such as the wrong file
-  or a broken template, fail fast before it exhausts the process. Each is
-  checked during the work, not after it:
-
-    :max-source-bytes     ciphertext bytes read from a local file or classpath
-                          jar resource (16 MiB).
-    :max-plaintext-bytes  plaintext bytes `age` may produce before the
-                          subprocess is killed (8 MiB).
-    :max-edn-depth        collection nesting depth the decrypted EDN may reach,
-                          checked before it is parsed (100).
-
-  Pass `{:limits {…}}` to `load-secrets`, `reader-literals`, or `merge-readers`
-  to override any of them; the supplied map is merged over these defaults. The
-  defaults sit far above every documented example: a real store is kilobytes."
-  {:max-source-bytes 16777216
-   :max-plaintext-bytes age/default-max-plaintext-bytes
-   :max-edn-depth safe-edn/default-max-depth})
-
-(defn- resolve-limits
-  "Merge a supplied `:limits` map over `default-limits`, or throw
-  `:invalid-limits`. See [[com.kirahowe.secrets.age/resolve-limits]]."
-  [limits]
-  (age/resolve-limits default-limits limits "secrets"))
-
 ;;;; Loading
 
 (defn- validate-load-identity!
@@ -359,7 +330,7 @@
     :edn-extra-values (str "The decrypted secrets contain more than one EDN value;"
                            " expected exactly one.")
     :edn-too-deep (str "The decrypted secrets nest " depth " collections deep, past the"
-                       " configured :max-edn-depth limit of " limit ".")
+                       " limit of " limit ".")
     :edn-malformed (str "The decrypted secrets contain malformed EDN syntax"
                         (safe-edn/failure-location failure) ".")))
 
@@ -368,26 +339,23 @@
 
 (defn- read-secrets-edn
   "Parse decrypted `plaintext` under the shared, content-free EDN policy."
-  [plaintext limits]
-  (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext limits)]
+  [plaintext]
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
     (if ok?
       value
       (throw (ex-info (edn-failure-message parsed)
                       (safe-edn/failure-data parsed))))))
 
 (defn- decrypt-and-read!
-  "Decrypt and read `file` under `opts` — `:limits` and the `:source`
-  descriptor — always running its source cleanup function.
+  "Decrypt and read `file`, always running its source cleanup function.
 
   A failure below here knows the file `age` was handed, which for a copied
   source is a temp file the caller never named, so it is re-thrown with the
-  source descriptor added. Content-free EDN failures deliberately drop their
-  intermediate exception; other failures retain their cause."
-  [identity file {:keys [limits source]} cleanup!]
+  `source` descriptor added. Content-free EDN failures drop their intermediate
+  exception; other failures retain their cause."
+  [identity file source cleanup!]
   (try
-    (read-secrets-edn (age/decrypt identity (.getAbsolutePath ^java.io.File file)
-                                   {:limits limits})
-                      limits)
+    (read-secrets-edn (age/decrypt identity (.getAbsolutePath ^java.io.File file)))
     (catch clojure.lang.ExceptionInfo e
       (let [data (assoc (ex-data e) :source source)]
         (throw (if (contains? edn-failure-reasons (:reason data))
@@ -398,20 +366,17 @@
 
 (defn- load-with-identity
   "Load `source` while an identity descriptor is owned by the calling scope."
-  [source {:keys [identity-file]} limits]
+  [source {:keys [identity-file]}]
   (let [descriptor (source/descriptor source)]
     (validate-load-identity! descriptor identity-file)
-    (let [[file cleanup!] (source/acquire! source descriptor
-                                           (:max-source-bytes limits))]
-      (decrypt-and-read! identity-file file
-                         {:limits limits :source descriptor}
-                         cleanup!))))
+    (let [[file cleanup!] (source/acquire! source descriptor)]
+      (decrypt-and-read! identity-file file descriptor cleanup!))))
 
 (defn- load-from
   "Load `source` in an operation-owned identity scope."
-  [source identity-or-opts limits]
+  [source identity-or-opts]
   (with-identity identity-or-opts
-    #(load-with-identity source % limits)))
+    #(load-with-identity source %)))
 
 (defn load-secrets
   "Decrypt an age-encrypted EDN source and return its value.
@@ -425,7 +390,6 @@
   timeout contract. `identity-or-opts` is an identity path or an options map:
     :identity-file  explicit identity path (wins over :app and the env vars)
     :app            app name for the default ~/.config/<app>/key.txt
-    :limits         resource bounds merged over `default-limits`
   Without an explicit identity or app, only the SECRETS_AGE_IDENTITY*
   environment variables are used.
 
@@ -436,11 +400,12 @@
     :no-file            `source` is nil, an allowed local file is absent, or an
                         allowed local source cannot be read.
     :disallowed-source  `source` is outside the local-only provenance contract.
-  An input past one of the `:limits` throws with `:source-too-large`,
-  `:plaintext-too-large`, or `:edn-too-deep`, and `:invalid-limits` rejects a
-  `:limits` map that is malformed rather than reading it as the defaults.
-  Limits are resolved first, then the identity, then source policy and opening.
-  The plaintext is read with `clojure.edn`, not `eval`.
+  Fixed bounds catch an accidental huge or deeply nested input: a source past
+  16 MiB throws `:source-too-large`, plaintext past 8 MiB throws
+  `:plaintext-too-large`, and EDN nested past 100 collections throws
+  `:edn-too-deep`. Each carries the numeric `:limit`. The identity is resolved
+  first, then source policy and opening. The plaintext is read with
+  `clojure.edn`, not `eval`.
 
   Every failure about a source carries `:source`, allowlisted metadata naming
   which source failed — a locator's scheme, host, port, and path, a file's path,
@@ -449,8 +414,7 @@
   private temporary file only for the duration of this operation."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
-   (let [limits (resolve-limits (when (map? identity-or-opts) (:limits identity-or-opts)))]
-     (load-from source identity-or-opts limits))))
+   (load-from source identity-or-opts)))
 
 (defn get-secret
   "Read a secret from a loaded map. `key-path` is a single key (`:database/url`)
@@ -467,7 +431,7 @@
 (defn- reader-loaded-state
   "Load one readers map's source in an operation-owned identity scope, or
   describe why it is unavailable."
-  [{:keys [resource file] :as opts} limits]
+  [{:keys [resource file] :as opts}]
   (let [source (cond
                  file (when (.exists (io/file (str file)))
                         (io/file (str file)))
@@ -481,7 +445,7 @@
         (fn [{:keys [identity-file] :as identity}]
           (if-not (identity-file-exists? identity-file)
             {:present? false :reason :no-identity}
-            {:present? true :secrets (load-with-identity source identity limits)}))))))
+            {:present? true :secrets (load-with-identity source identity)}))))))
 
 (defn- validate-reader-source!
   "Throw `:disallowed-source` when the readers' `:file` or `:resource` is
@@ -543,8 +507,6 @@
                    load failure carries.
     :app           app name for the default key path ~/.config/<app>/key.txt.
     :identity-file explicit identity path (overrides resolution).
-    :limits        resource bounds merged over `default-limits`, validated here
-                   rather than at the first tag read.
 
   The source is resolved and decrypted at most once, when the first tag is
   read. That first successful load or decryption failure is cached for the
@@ -558,8 +520,7 @@
     #secret/opt k → optional: nil in all three of those cases.
   If the identity exists but decryption fails, both tags throw."
   [opts]
-  (let [limits (resolve-limits (:limits opts))
-        loaded (delay (reader-loaded-state opts limits))
+  (let [loaded (delay (reader-loaded-state opts))
         _ (validate-reader-source! opts)
         describe (or (:file opts) (:resource opts) "secrets")]
     {'secret/req (required-secret-handler loaded describe)

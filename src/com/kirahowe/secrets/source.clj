@@ -25,6 +25,12 @@
   "A Windows drive path, which is a path rather than a one-letter URI scheme."
   #"(?i)^[a-z]:[\\/]")
 
+(def ^:private max-source-bytes
+  "The most ciphertext bytes one source may hold (16 MiB). It catches an
+  accidental huge input, such as the wrong file, before it is copied or
+  decrypted."
+  16777216)
+
 (def ^:private source-chunk-bytes
   "Sources are copied in fixed 64 KiB chunks so the running total is checked
   before every further read rather than after the source is exhausted."
@@ -202,47 +208,48 @@
 
 (defn- source-too-large!
   "Throw a content-free source-size failure."
-  [source-descriptor read-bytes limit]
-  (throw (ex-info (str "The secrets source is larger than the configured :max-source-bytes"
-                       " limit of " limit " bytes.")
+  [source-descriptor observed]
+  (throw (ex-info (str "The secrets source " (source-description source-descriptor)
+                       " is larger than the " max-source-bytes " byte limit.")
                   {:source source-descriptor
-                   :bytes read-bytes
-                   :limit limit
+                   :observed observed
+                   :limit max-source-bytes
                    :reason :source-too-large})))
 
 (defn- copy-source!
-  "Copy `in` to `out` in fixed chunks without writing beyond `limit` bytes."
-  [source-descriptor ^java.io.InputStream in ^java.io.OutputStream out limit]
+  "Copy `in` to `out` in fixed chunks without writing beyond
+  `max-source-bytes`."
+  [source-descriptor ^java.io.InputStream in ^java.io.OutputStream out]
   (let [chunk (byte-array source-chunk-bytes)]
     (loop [total 0]
       (let [n (.read in chunk 0 source-chunk-bytes)]
         (when-not (neg? n)
           (let [total (+ total n)]
-            (when (> total limit)
-              (source-too-large! source-descriptor total limit))
+            (when (> total max-source-bytes)
+              (source-too-large! source-descriptor total))
             (.write out chunk 0 n)
             (recur total)))))))
 
 (defn- copy-jar-source!
-  "Copy one local jar `source` entry to `out` under `limit`."
-  [source-descriptor {:keys [archive entry]} ^java.io.OutputStream out limit]
+  "Copy one local jar `source` entry to `out`."
+  [source-descriptor {:keys [archive entry]} ^java.io.OutputStream out]
   (with-open [jar (java.util.jar.JarFile. ^java.io.File archive)]
     (if-let [jar-entry (.getJarEntry jar entry)]
       (with-open [in (.getInputStream jar jar-entry)]
-        (copy-source! source-descriptor in out limit))
+        (copy-source! source-descriptor in out))
       (throw (java.io.FileNotFoundException. "Classpath jar resource not found.")))))
 
 (defn- copy-local-source!
-  "Copy a local source spec to an owner-only temp file under `limit`. Any
-  failure, an `Error` included, deletes the temp file before it propagates."
-  [source-descriptor {:keys [file] :as source} limit]
+  "Copy a local source spec to an owner-only temp file. Any failure, an
+  `Error` included, deletes the temp file before it propagates."
+  [source-descriptor {:keys [file] :as source}]
   (let [tmp (fs/owner-only-temp-file! "secrets-" ".age")]
     (try
       (with-open [out (io/output-stream tmp)]
         (if file
           (with-open [in (io/input-stream file)]
-            (copy-source! source-descriptor in out limit))
-          (copy-jar-source! source-descriptor source out limit)))
+            (copy-source! source-descriptor in out))
+          (copy-jar-source! source-descriptor source out)))
       [tmp #(.delete tmp)]
       (catch Throwable t
         (.delete tmp)
@@ -250,14 +257,14 @@
 
 (defn- source->file
   "Resolve `source` under local-only policy to a `[file cleanup!]` pair."
-  [source source-descriptor limit]
+  [source source-descriptor]
   (let [{:keys [file] :as local} (local-source source source-descriptor)]
     (if (and file (.exists ^java.io.File file))
       (do
-        (when (> (.length ^java.io.File file) limit)
-          (source-too-large! source-descriptor (.length ^java.io.File file) limit))
+        (when (> (.length ^java.io.File file) max-source-bytes)
+          (source-too-large! source-descriptor (.length ^java.io.File file)))
         [file (fn [])])
-      (copy-local-source! source-descriptor local limit))))
+      (copy-local-source! source-descriptor local))))
 
 (defn- unreadable-source!
   "Throw a source-safe `:no-file` failure for unreadable allowed local input."
@@ -277,16 +284,17 @@
                 {:source source-descriptor :reason :no-file})))))
 
 (defn acquire!
-  "Acquire local `source` under `limit` bytes as `[file cleanup!]`.
+  "Acquire local `source` as `[file cleanup!]`.
 
   `source-descriptor` must be the value returned by [[descriptor]] for `source`;
   it is the only source representation admitted to failures. Existing files are
   checked in place. Strict local `jar:file:` entries are streamed to an
-  owner-only temporary file while the byte count is enforced, and the returned
-  cleanup function removes that copy. Nil, remote, malformed, and arbitrary
+  owner-only temporary file, and the returned cleanup function removes that
+  copy. A source past `max-source-bytes` throws `:source-too-large` with the
+  numeric `:limit` and `:observed`. Nil, remote, malformed, and arbitrary
   object sources fail without invoking caller-provided URL handlers or rendering
   source data."
-  [source source-descriptor limit]
+  [source source-descriptor]
   (when (nil? source)
     (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
                          " (io/resource \"secrets.edn.age\") found nothing on the classpath"
@@ -294,6 +302,6 @@
                          no-store-hint)
                     {:reason :no-file})))
   (try
-    (source->file source source-descriptor limit)
+    (source->file source source-descriptor)
     (catch java.io.IOException e (unreadable-source! source-descriptor e))
     (catch IllegalArgumentException e (unreadable-source! source-descriptor e))))
