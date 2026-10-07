@@ -246,15 +246,15 @@
                        (first @calls))
         decrypt-argv (fn [identity-file in]
                        (reset! calls [])
-                       ;; Decryption no longer goes through `sh`, which cannot
-                       ;; bound the plaintext it captures, so the argv is
-                       ;; recorded at the bounded-capture seam instead. `sh`
-                       ;; still answers the `age --version` probe.
+                       ;; `sh` cannot bound the plaintext it captures, so
+                       ;; decryption runs at the bounded-stream seam and the
+                       ;; argv is recorded there. `sh` answers only the
+                       ;; `age --version` probe.
                        (with-redefs [shell/sh (recording {:exit 0 :out (byte-array 0) :err ""})
-                                     age/capture-bounded-stdout!
+                                     age/stream-bounded-stdout!
                                      (fn [argv & _]
                                        (swap! calls conj (vec argv))
-                                       {:exit 0 :out (byte-array 0) :err ""})]
+                                       {:exit 0 :err ""})]
                          (age/decrypt-bytes identity-file in))
                        (first @calls))]
     (testing "the encrypt terminator sits immediately before the input operand"
@@ -341,9 +341,9 @@
     (with-redefs [shell/sh (fn [& _]
                              (swap! shell-calls inc)
                              (throw (ex-info "subprocess ran" {})))
-                  age/capture-bounded-stdout! (fn [& _]
-                                                (swap! shell-calls inc)
-                                                (throw (ex-info "subprocess ran" {})))]
+                  age/stream-bounded-stdout! (fn [& _]
+                                               (swap! shell-calls inc)
+                                               (throw (ex-info "subprocess ran" {})))]
       (doseq [[label invoke] invalid-calls]
         (reset! shell-calls 0)
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (invoke)) label)
@@ -1275,32 +1275,44 @@
         (is (= (inc limit) (:bytes data)) "the count is bytes read, not a declared size")
         (is (not (re-find #"aaa" (ex-message e))) "the message carries no plaintext")
         (is (not (re-find #"aaa" (pr-str data))) "and neither does the ex-data")))
+    (testing "the largest bound a long can hold reads to the end without overflow"
+      (let [unbounded {:limits {:max-plaintext-bytes Long/MAX_VALUE}}]
+        (is (= limit (alength (age/decrypt-bytes *key* exact unbounded))))
+        (is (string? (:pad (secrets/load-secrets exact (assoc unbounded :identity-file *key*)))))))
     (testing "load-secrets refuses it for the same reason"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #":max-plaintext-bytes"
                             (secrets/load-secrets over (assoc opts :identity-file *key*)))))))
 
 (deftest oversized-plaintext-terminates-the-subprocess-test
-  ;; A controlled process standing in for age: it emits forever, so only the
-  ;; consumer's bound can end the call. What is observed is the whole contract —
-  ;; prompt return, at most one chunk read past the bound, and the emitter dead
-  ;; (it publishes its own pid, and `kill -0` answers for it afterwards).
+  ;; A controlled process standing in for age: it emits forever and ignores
+  ;; SIGPIPE, so closing its stdout does not end it and only an explicit
+  ;; destroy can. It publishes its own pid, and `kill -0` answers for it
+  ;; afterwards. The call runs under a timeout so a bound that stops working
+  ;; fails the test and does not hang it.
   (let [pid-file (str *dir* "/emitter.pid")
-        script (str "echo $$ > " pid-file "; while :; do printf 'AAAAAAAAAAAAAAAA'; done")
+        script (str "trap '' PIPE; echo $$ > " pid-file
+                    "; while :; do printf 'AAAAAAAAAAAAAAAA' 2>/dev/null; done")
         limit 4096
-        started (System/nanoTime)
-        e (try (#'age/capture-bounded-stdout! ["/bin/sh" "-c" script] limit {})
-               (catch clojure.lang.ExceptionInfo e e))
-        elapsed-ms (quot (- (System/nanoTime) started) 1000000)
+        out (java.io.ByteArrayOutputStream.)
+        call (future
+               (try (#'age/stream-bounded-stdout! ["/bin/sh" "-c" script] out limit {})
+                    (catch clojure.lang.ExceptionInfo e e)))
+        e (deref call 15000 :timed-out)
         pid (str/trim (slurp pid-file))
         alive? (fn [] (zero? (:exit (shell/sh "kill" "-0" pid))))]
-    (is (= :plaintext-too-large (:reason (ex-data e))))
-    (is (< elapsed-ms 15000) "the capture returns promptly rather than reading forever")
-    (is (<= (inc limit) (:bytes (ex-data e)) (+ limit 65536))
-        "nothing beyond one buffered chunk past the bound was ever read")
-    (is (not (re-find #"AAA" (str (ex-message e) (pr-str (ex-data e)))))
-        "no captured output reaches the failure")
-    (is (not (alive?))
-        "the emitter is gone: it was destroyed, not left writing to a dead pipe")))
+    (try
+      (is (not= :timed-out e) "the capture returns promptly and does not read forever")
+      (is (= :plaintext-too-large (:reason (ex-data e))))
+      (is (= (inc limit) (:bytes (ex-data e)))
+          "nothing beyond one byte past the bound was ever read")
+      (is (<= (.size out) limit) "and nothing past the bound was written")
+      (is (not (re-find #"AAA" (str (ex-message e) (pr-str (ex-data e)))))
+          "no captured output reaches the failure")
+      (is (not (alive?))
+          "the emitter is gone: it was destroyed, not left writing to a closed pipe")
+      (finally
+        (future-cancel call)
+        (when (alive?) (shell/sh "kill" "-9" pid))))))
 
 (deftest decrypt-to-file-plaintext-bound-test
   (let [limit 2048

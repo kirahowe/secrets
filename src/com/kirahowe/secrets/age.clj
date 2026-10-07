@@ -242,58 +242,44 @@
     (.waitFor process 2 java.util.concurrent.TimeUnit/SECONDS))
   nil)
 
-(defn- read-bounded!
-  "Read `in` to its end and return the bytes, refusing an input larger than
-  `max-bytes`.
+(defn- stream-bounded-stdout!
+  "Run `argv`, copying its stdout to `out`, and return `{:exit n :err s}`.
 
-  The running total is checked before every further read, so an oversized input
-  is refused while it is still arriving rather than after all of it has been
-  allocated. On refusal the partial buffer is discarded and the thrown ex-info
-  carries `context`, the byte count, and the limit, never a captured byte."
-  ^bytes [^java.io.InputStream in max-bytes context]
-  (let [captured (java.io.ByteArrayOutputStream.)
-        chunk (byte-array capture-chunk-bytes)]
-    (loop [total 0]
-      (let [n (.read in chunk 0 capture-chunk-bytes)]
-        (if (neg? n)
-          (.toByteArray captured)
-          (let [total (+ total n)]
-            (when (> total max-bytes)
-              ;; Discard what was captured before unwinding: the partial
-              ;; plaintext stays unreachable through the stream, the buffer is
-              ;; garbage the moment this frame goes, and nothing captured is
-              ;; attached to the exception.
-              (.reset captured)
-              (throw (ex-info (str "Decrypted plaintext is larger than the configured "
-                                   ":max-plaintext-bytes limit of " max-bytes " bytes.")
-                              (assoc context
-                                     :bytes total
-                                     :observed total
-                                     :limit max-bytes
-                                     :configured max-bytes
-                                     :reason :plaintext-too-large))))
-            (.write captured chunk 0 n)
-            (recur total)))))))
-
-(defn- capture-bounded-stdout!
-  "Run `argv`, returning `{:exit n :out bytes :err s}` the way
-  `clojure.java.shell/sh` does, but refusing an output larger than `max-bytes`.
-
-  `sh` cannot express that bound: it materializes the complete output before any
-  caller can look at its size. Here stdout is drained through [[read-bounded!]]
-  instead, and passing the bound kills the process on the way out. stderr is
-  drained on its own thread because a process that fills the stderr pipe while
-  nobody reads it deadlocks."
-  [argv max-bytes context]
+  At most `max-bytes` are written. Each read asks for no more than one byte
+  past the bound, and the read that crosses it throws `ex-info` with
+  `:reason :plaintext-too-large`, `context`, the byte count, and the limit,
+  never a captured byte. The process is destroyed on the way out if it is
+  still running. stderr is drained on its own thread, because a process that
+  fills an unread stderr pipe blocks forever."
+  [argv ^java.io.OutputStream out max-bytes context]
   (let [process (.start (java.lang.ProcessBuilder. ^java.util.List (vec argv)))
-        stderr (future (slurp (.getErrorStream process)))]
+        stderr (future (slurp (.getErrorStream process)))
+        chunk (byte-array capture-chunk-bytes)]
     (try
-      ;; Nothing here writes to the child, so give it EOF on stdin at once
-      ;; rather than leaving it able to block on a pipe no one will fill.
+      ;; Nothing here writes to the child, so it gets EOF on stdin at once and
+      ;; cannot block on a pipe no one will fill.
       (.close (.getOutputStream process))
-      (let [out (with-open [stdout (.getInputStream process)]
-                  (read-bounded! stdout max-bytes context))]
-        {:exit (.waitFor process) :out out :err @stderr})
+      (with-open [stdout (.getInputStream process)]
+        (loop [total 0]
+          (let [remaining (- max-bytes total)
+                requested (int (if (< remaining capture-chunk-bytes)
+                                 (inc remaining)
+                                 capture-chunk-bytes))
+                n (.read stdout chunk 0 requested)]
+            (when-not (neg? n)
+              (let [observed (+ total n)]
+                (when (> observed max-bytes)
+                  (throw (ex-info (str "Decrypted plaintext is larger than the configured "
+                                       ":max-plaintext-bytes limit of " max-bytes " bytes.")
+                                  (assoc context
+                                         :bytes observed
+                                         :observed observed
+                                         :limit max-bytes
+                                         :configured max-bytes
+                                         :reason :plaintext-too-large))))
+                (.write out chunk 0 n)
+                (recur observed))))))
+      {:exit (.waitFor process) :err @stderr}
       (finally
         (when (.isAlive process)
           (destroy-process! process))))))
@@ -306,102 +292,55 @@
   ["age" "-d" "-i" (path-arg :identity identity-file)
    "--" (path-arg :input encrypted-file)])
 
-(defn- decrypt-context
-  "Filesystem paths are permitted diagnostic metadata; key contents are not."
-  [identity-file encrypted-file]
-  {:encrypted-file (str encrypted-file)
-   :identity-file (str identity-file)})
-
-(defn decrypt-bytes
-  "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
-  byte array (binary-safe — age encrypts arbitrary files, not just text).
-  Throws an ex-info (with the captured stderr) on failure.
+(defn decrypt-to-stream!
+  "Decrypt `encrypted-file` with `identity-file`, streaming binary plaintext to
+  `out`. Returns `out` after a successful decrypt.
 
   Success establishes that the ciphertext is intact and that `identity-file`
   matches one of its recipients. It does not identify who encrypted it: age
   does not sign, so this is payload integrity, never sender authenticity.
 
   `opts` may carry `{:limits {:max-plaintext-bytes n}}`, defaulting to
-  `default-max-plaintext-bytes`. The bound is enforced while `age` is writing:
-  an oversized plaintext kills the subprocess and throws with
-  `:reason :plaintext-too-large` instead of being allocated in full first.
+  `default-max-plaintext-bytes`. Plaintext is copied in fixed-size chunks and
+  at most that many bytes are written; the chunk that would cross the bound
+  kills `age` and throws with `:reason :plaintext-too-large`.
 
-  A failure names `:encrypted-file` and `:identity-file`, carries captured
-  stderr, and includes a wrong-key `:hint` for a non-zero exit."
-  (^bytes [identity-file encrypted-file] (decrypt-bytes identity-file encrypted-file nil))
-  (^bytes [identity-file encrypted-file opts]
+  A failure names `:encrypted-file` and `:identity-file`, which are filesystem
+  paths and never key contents. A non-zero exit also carries the captured
+  stderr and a wrong-key `:hint`, and may leave partial plaintext in `out`."
+  ([identity-file encrypted-file out]
+   (decrypt-to-stream! identity-file encrypted-file out nil))
+  ([identity-file encrypted-file out opts]
    (let [argv (decrypt-argv identity-file encrypted-file)
          max-bytes (plaintext-limit opts)
-         context (decrypt-context identity-file encrypted-file)]
+         context {:encrypted-file (str encrypted-file)
+                  :identity-file (str identity-file)}]
      (ensure-installed!)
-     (let [{:keys [exit out err]} (capture-bounded-stdout! argv max-bytes context)]
-       (if (zero? exit)
-         out
+     (let [{:keys [exit err]} (stream-bounded-stdout! argv out max-bytes context)]
+       (when-not (zero? exit)
          (throw (ex-info "age decryption failed"
                          (assoc context
                                 :error err
                                 :hint (str "Wrong key, or you are not a recipient of "
-                                           "this file.")))))))))
+                                           "this file.")))))
+       out))))
 
-(defn decrypt-to-stream!
-  "Decrypt `encrypted-file` with `identity-file`, streaming binary plaintext to
-  `out`. Returns `out` after a successful decrypt.
+(defn decrypt-bytes
+  "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
+  byte array (binary-safe: age encrypts arbitrary files, not just text).
 
-  `opts`, limit enforcement, and secret-safe identity diagnostics have the same
-  meaning as in [[decrypt-bytes]], but plaintext is copied in fixed-size chunks
-  instead of accumulated in one process-sized byte array. At most the configured
-  `:max-plaintext-bytes` are written; the first chunk that would cross the bound
-  kills age and throws with `:reason :plaintext-too-large`."
-  ([identity-file encrypted-file out]
-   (decrypt-to-stream! identity-file encrypted-file out nil))
-  ([identity-file encrypted-file ^java.io.OutputStream out opts]
-   (let [argv (decrypt-argv identity-file encrypted-file)
-         max-bytes (plaintext-limit opts)
-         context (decrypt-context identity-file encrypted-file)]
-     (ensure-installed!)
-     (let [process (.start (java.lang.ProcessBuilder. ^java.util.List (vec argv)))
-           stderr (future (slurp (.getErrorStream process)))
-           chunk (byte-array capture-chunk-bytes)]
-       (try
-         (.close (.getOutputStream process))
-         (with-open [stdout (.getInputStream process)]
-           (loop [total 0]
-             (let [remaining (- max-bytes total)
-                   requested (int (min capture-chunk-bytes (inc remaining)))
-                   n (.read stdout chunk 0 requested)]
-               (when-not (neg? n)
-                 (let [observed (+ total n)]
-                   (when (> observed max-bytes)
-                     (throw
-                      (ex-info
-                       (str "Decrypted plaintext is larger than the configured "
-                            ":max-plaintext-bytes limit of " max-bytes " bytes.")
-                       (assoc context
-                              :bytes observed
-                              :observed observed
-                              :limit max-bytes
-                              :configured max-bytes
-                              :reason :plaintext-too-large))))
-                   (.write out chunk 0 n)
-                   (recur observed))))))
-         (let [exit (.waitFor process)
-               err @stderr]
-           (if (zero? exit)
-             out
-             (throw (ex-info "age decryption failed"
-                             (assoc context
-                                    :error err
-                                    :hint (str "Wrong key, or you are not a recipient of "
-                                               "this file."))))))
-         (finally
-           (when (.isAlive process)
-             (destroy-process! process))))))))
+  `opts`, the plaintext bound, and failures are those of
+  [[decrypt-to-stream!]]. A failed decryption returns no partial plaintext."
+  (^bytes [identity-file encrypted-file] (decrypt-bytes identity-file encrypted-file nil))
+  (^bytes [identity-file encrypted-file opts]
+   (let [out (java.io.ByteArrayOutputStream.)]
+     (decrypt-to-stream! identity-file encrypted-file out opts)
+     (.toByteArray out))))
 
 (defn decrypt
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
-  UTF-8 string. Use `decrypt-bytes` for binary plaintexts. Throws an ex-info
-  (with the captured stderr) on failure. `opts` carries `:limits` as in
-  `decrypt-bytes`; failures name the encrypted and identity file paths."
+  UTF-8 string. Use `decrypt-bytes` for binary plaintexts. `opts`, the
+  plaintext bound, and failures are those of [[decrypt-to-stream!]]."
   ([identity-file encrypted-file] (decrypt identity-file encrypted-file nil))
   ([identity-file encrypted-file opts]
    (String. (decrypt-bytes identity-file encrypted-file opts) "UTF-8")))
