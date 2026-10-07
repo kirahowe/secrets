@@ -179,9 +179,9 @@
 (def default-max-plaintext-bytes
   "Default bound, in bytes, on the plaintext one decryption may produce (8 MiB).
 
-  It exists so a hostile or accidentally enormous ciphertext fails fast instead
-  of exhausting the process: the bound is checked while `age` is still writing,
-  not after a complete plaintext has been allocated. Override it per call with
+  It makes an accidentally large ciphertext, such as the wrong file, fail fast.
+  The bound is checked while `age` is still writing, before a complete
+  plaintext has been allocated. Override it per call with
   `{:limits {:max-plaintext-bytes n}}`; `com.kirahowe.secrets` carries the same
   value as one of its runtime `:limits`."
   8388608)
@@ -366,8 +366,8 @@
   following links. A symlinked parent is legitimate — macOS temp directories
   live under `/var`, itself a link to `/private/var`, so rejecting parent links
   would reject every ordinary caller — while a linked or otherwise non-regular
-  final component would redirect plaintext outside the selected directory
-  (CWE-59). The path is deliberately never canonicalized: `getCanonicalPath`
+  final component would redirect plaintext outside the selected directory.
+  The path is deliberately never canonicalized: `getCanonicalPath`
   and `toRealPath` resolve a final link *away*, which would defeat exactly the
   check being made. `Files/exists` with NOFOLLOW_LINKS is true of a dangling
   link, so those fail closed too. `path-arg` gives a blank or nil `out` the

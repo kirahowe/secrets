@@ -1,8 +1,7 @@
 (ns com.kirahowe.secrets.aero
   "Optional `aero.core` integration: installs the `#secret/req` / `#secret/opt`
   reader literals as `aero.core/reader` methods, so an aero config can
-  reference this library's encrypted secrets directly instead of every
-  consumer copying a `defmethod` snippet into their own code.
+  reference this library's encrypted secrets directly.
 
   `aero` is NOT a dependency of this library — `deps.edn`'s `:deps` stays
   clean. This namespace only compiles and loads for consumers who already
@@ -13,17 +12,13 @@
   — installs the integration. Consumers can then pass a secrets configuration
   with each `aero.core/read-config` call.
 
-  Why a namespace instead of the README snippet it replaces: a bare
-  `(defmethod aero.core/reader 'secret/req …)` needs `aero.core` resolvable at
-  *compile* time, which breaks under a babashka project that adds `aero` as a
-  runtime dep (`babashka.deps/add-deps`) — a normal arrangement, and the one
-  this fix grew out of. And wherever the snippet lives becomes the tag's only
-  registration point: a second namespace that reads the same config without
-  going through that code never registers the tag, and hits aero's generic
-  \"no method in multimethod\" error, which points nowhere near this library.
-  Putting the `defmethod` here means requiring the namespace *is* the
-  registration, and it happens exactly once no matter how many call sites read
-  configs with these tags.
+  Requiring this namespace is the registration. The `defmethod`s live here,
+  so `aero.core` only has to be resolvable when this namespace loads. That
+  also works in a babashka project that adds `aero` as a runtime dep with
+  `babashka.deps/add-deps`. The tags are registered once for the process,
+  however many call sites read configs with them. A config read before this
+  namespace is loaded fails with aero's generic \"no method in multimethod\"
+  error, which does not mention this library.
 
   The preferred way to supply the secrets config is per read, through aero's
   own opts. `aero.core/read-config` passes its entire opts map to readers as the
@@ -33,8 +28,7 @@
         {:profile :evals
          :secrets {:app \"myapp\" :resource \"secrets.edn.age\"}})
 
-  `register!` remains available as a compatibility and convenience path for
-  applications with one process-wide config:
+  `register!` sets a process-wide default for applications with one config:
 
       (register! {:app \"myapp\" :resource \"secrets.edn.age\"})
 
@@ -55,12 +49,11 @@
 ;;;
 ;;;     {:generation 0 :config nil :cache {}}
 ;;;
-;;; One atom rather than two, because a registration and the plaintext
-;;; decrypted under it have to move together. Held separately, clearing or
-;;; replacing the registration left matching cached plaintext — and cached
-;;; decryption failures — reachable, so a later registration whose config map
-;;; merely compared equal to a retired one inherited the retired lifecycle's
-;;; secrets.
+;;; One atom holds both because a registration and the plaintext decrypted
+;;; under it move together. Clearing or replacing the registration retires its
+;;; cached plaintext and cached decryption failures in the same swap, so a
+;;; later registration whose config map compares equal to a retired one starts
+;;; with an empty cache.
 ;;;
 ;;; `:cache` maps each secrets config to a delay that realizes
 ;;; `secrets/reader-literals`, so a config file with several `#secret/…` tags
@@ -78,10 +71,9 @@
 ;;; sensitive half, in the value beside it; retiring the value is what
 ;;; `register!` and `reset-cache!` are for.
 ;;;
-;;; `:generation` gives a lifecycle an identity that tests and diagnostics can
-;;; name. It is deliberately NOT part of the cache key: replacing `:cache`
-;;; wholesale is the single mechanism that retires entries, and putting the
-;;; generation in the key would be a second mechanism doing that one job.
+;;; `:generation` counts lifecycles so tests and diagnostics can name one. It
+;;; is not part of the cache key: replacing `:cache` wholesale is the one
+;;; mechanism that retires entries.
 
 (defonce ^:private state
   (atom {:generation 0 :config nil :cache {}}))
@@ -89,9 +81,9 @@
 (defn register!
   "Set the process-wide default secrets config used by `#secret/req` /
   `#secret/opt` when an `aero.core/read-config` call doesn't supply its own
-  `:secrets` opt. Prefer passing `:secrets` per read; registration is a
-  compatibility and convenience path for applications with an explicit
-  process-wide lifecycle. `config` is the same opts map
+  `:secrets` opt. Prefer passing `:secrets` per read; registration suits an
+  application with one config and an explicit process-wide lifecycle. `config`
+  is the same opts map
   `com.kirahowe.secrets/reader-literals` takes (`:app`/`:resource`, `:file`,
   `:identity-file`).
 

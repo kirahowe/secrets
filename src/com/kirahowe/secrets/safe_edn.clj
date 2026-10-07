@@ -1,11 +1,11 @@
 (ns com.kirahowe.secrets.safe-edn
-  "Exact-one, depth-safe, content-free parsing for untrusted EDN.
+  "Exact-one, depth-bounded, content-free parsing for EDN that may hold secrets.
 
-  `clojure.edn/read-string` alone is insufficient at this security boundary:
-  parser messages can echo secret tokens, it accepts only the first value while
-  ignoring trailing values, and deeply nested input can overflow the stack
-  before a catch can sanitize the failure. This namespace scans depth first,
-  reads exactly one value, and returns only allowlisted failure metadata."
+  `clojure.edn/read-string` alone does not fit: parser messages can echo secret
+  tokens, it accepts the first value and ignores trailing ones, and a mistaken
+  or malformed input that nests very deeply can overflow the stack before a
+  catch can sanitize the failure. This namespace scans depth first, reads
+  exactly one value, and returns only allowlisted failure metadata."
   (:require [clojure.edn :as edn]))
 
 (def default-max-depth
@@ -79,14 +79,11 @@
                  (and column (not (contains? location :column))) (assoc :column column)))))))
 
 (defn parse
-  "Parse exactly one untrusted EDN value from string `s` under `limits`.
+  "Parse exactly one EDN value from string `s` under `limits`.
 
-  Ordinary `clojure.edn/read-string` is insufficient here: its parser messages
-  can echo secret tokens, it accepts only the first value and ignores trailing
-  values, and deeply nested input can overflow before a catch can sanitize the
-  error. This function scans collection depth before parsing, reads once for the
-  value and once for EOF, and never retains parser exceptions, messages,
-  nonnumeric data, or causes.
+  The collection depth is scanned before parsing, the text is read once for the
+  value and once for EOF, and parser exceptions, messages, nonnumeric data, and
+  causes are never retained.
 
   Returns `{:ok? true :value value}` on success. Failures are content-free maps
   with one stable `:reason`: `:edn-empty`, `:edn-extra-values`,

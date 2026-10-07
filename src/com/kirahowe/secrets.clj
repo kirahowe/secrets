@@ -9,8 +9,8 @@
   A successful decryption proves the ciphertext was readable with your
   identity, not who wrote it: age encrypts to recipients and does not sign. The
   loaded map is therefore only as trustworthy as the commit and deployment
-  channel that delivered the ciphertext — see the README's authenticity
-  contract and threat model.
+  channel that delivered the ciphertext. See `doc/threat-model.md` in the
+  repository.
 
   Two ways to consume secrets:
 
@@ -255,8 +255,10 @@
   URI-shaped path or one holding key contents throws `:disallowed-identity`
   before `f` runs. Raw and base64
   identities are materialized only for this callback and deleted when it
-  returns. If both the callback and cleanup fail, the callback error keeps its
-  reason and message and carries the safe cleanup diagnostic in `:cleanup`."
+  returns. If both the callback and cleanup fail, an `ex-info` from the
+  callback is rethrown with its message and data plus the cleanup diagnostic
+  under `:cleanup`. Any other throwable becomes the cause of an
+  `:identity-cleanup-failed` error that carries the same diagnostic."
   [identity-or-opts f]
   (let [{:keys [contents identity-source] :as candidate}
         (identity-candidate identity-or-opts)]
@@ -304,9 +306,9 @@
 (def default-limits
   "Bounds applied while a secrets source is streamed, decrypted, and parsed.
 
-  They exist so a hostile or accidentally enormous source fails fast rather than
-  exhausting the process (CWE-400), and each is checked *during* the work rather
-  than after it:
+  They make an accidentally large or malformed source, such as the wrong file
+  or a broken template, fail fast before it exhausts the process. Each is
+  checked during the work, not after it:
 
     :max-source-bytes     ciphertext bytes read from a local file or classpath
                           jar resource (16 MiB).
@@ -317,7 +319,7 @@
 
   Pass `{:limits {…}}` to `load-secrets`, `reader-literals`, or `merge-readers`
   to override any of them; the supplied map is merged over these defaults. The
-  defaults sit far above every documented example — a real store is kilobytes."
+  defaults sit far above every documented example: a real store is kilobytes."
   {:max-source-bytes 16777216
    :max-plaintext-bytes age/default-max-plaintext-bytes
    :max-edn-depth safe-edn/default-max-depth})
