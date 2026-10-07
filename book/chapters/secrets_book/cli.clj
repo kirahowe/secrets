@@ -132,9 +132,12 @@
 ;; the EDN, so plaintext comments don't survive a `set` or `rm`.
 
 ;; Every command that writes secrets validates the complete EDN and encrypts to
-;; staged sibling files. It then replaces the ciphertext and manifest together,
-;; atomically, with rollback. An invalid edit or a failed manifest write leaves
-;; the previous pair in place. In team mode, the recipients file is read,
+;; staged sibling files. It then replaces each file with an atomic rename. The
+;; two renames are not one transaction. An invalid edit is rejected before
+;; anything is staged. If a rename fails while the process is still running, the
+;; library tries to restore the files it had already replaced and reports it if
+;; that restore fails. If the process is interrupted between the two renames,
+;; the manifest can be left stale, and `verify` reports it. In team mode, the recipients file is read,
 ;; bounded, and validated once before editing or decryption begins. That exact
 ;; list is then passed to age.
 

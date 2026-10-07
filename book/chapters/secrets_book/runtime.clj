@@ -138,8 +138,9 @@
 ;; ## Resource limits
 
 ;; Secret stores are generally small, so the runtime limits each stage while
-;; the bytes are moving. This stops a hostile or accidentally enormous file
-;; before it can exhaust the process's memory:
+;; the bytes are moving. These bounds guard against an accidentally enormous or
+;; malformed file exhausting the process's memory. They are not a defence
+;; against a hostile source:
 
 ;; | Limit | Default | What it bounds |
 ;; |-------|---------|----------------|

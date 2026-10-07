@@ -11,8 +11,9 @@
 ;; ## What the encryption actually protects
 
 ;; As long as the private identities are kept somewhere else, access to the
-;; repository alone does not reveal the encrypted values. The manifest may
-;; still reveal key names, types, and collection sizes.
+;; repository alone does not reveal the encrypted values. The manifest still
+;; reveals key names, types, and collection sizes, and in single-key mode it
+;; also reveals which values are equal and when a value changes.
 
 ;; This doesn't protect a running process. Once decrypted, the map sits in
 ;; memory like any other config, and code running in your app can read it as
@@ -60,11 +61,11 @@
 ;; ## Plaintext touches disk during edits
 
 ;; `bb secrets edit` decrypts to an owner-only (0600) temporary file, opens
-;; your editor, re-encrypts the result, and then makes a best effort to delete
-;; the temporary file securely. Your editor may write its own swap or undo
-;; files, which the library cannot control. On a copy-on-write filesystem such
-;; as APFS, secure deletion is mostly symbolic because old blocks may remain
-;; below the filesystem's view. The temporary file also remains as plaintext
+;; your editor, re-encrypts the result, and then deletes the temporary file on
+;; a best-effort basis. This is not secure erasure. Your editor may write its
+;; own swap or undo files, which the library cannot control. On a copy-on-write
+;; filesystem such as APFS, overwriting before deletion is mostly symbolic
+;; because old blocks may remain below the filesystem's view. The temporary file also remains as plaintext
 ;; for as long as the editor is open.
 
 ;; ## The manifest leaks structure
@@ -72,6 +73,15 @@
 ;; The committed manifest lists key names, types, and collection sizes. For
 ;; example, someone reading it can see that you have a `:stripe/api-key` and
 ;; that `:auth/admins` has three members, although they cannot see the values.
+;; Key paths through nested maps are public at every depth, so never use a secret value as
+;; a map key.
+
+;; In single-key mode the manifest also carries a keyed `:vhash` for each leaf.
+;; The hash does not reveal the value, but it does reveal equality and change.
+;; Equal values at different paths, or in different environments that share a
+;; key, have equal hashes, and a value that returns to an earlier one is visible
+;; in the file's history. Team manifests carry no hashes.
+
 ;; If even a key name is sensitive, set `:manifest false` for that environment.
 ;; Its ciphertext diffs will then be opaque.
 
@@ -99,13 +109,14 @@
 ;; the ciphertext.
 
 ;; `verify` reports drift between a manifest and its ciphertext, but it doesn't
-;; not authenticate the author of either file. In single-key mode, the
-;; `:vhash`es make a forged value fail a keyed run because someone with only a
-;; public recipient cannot key the HMAC. Team mode has no `:vhash`es, so a
-;; forgery that preserves the same shape passes verification and appears only
-;; as a change to the committed files. The README's authenticity contract and
-;; threat model describe this in full, including who may hold a public
-;; recipient and who may replace a deployed artifact.
+;; authenticate the author of either file. A keyed run compares the decrypted
+;; store with the manifest, so it catches a manifest that no longer matches the
+;; ciphertext. Anyone who can replace both files can make them agree. Team
+;; manifests carry no `:vhash`es, so a keyed run there compares structure only.
+;; The
+;; [threat model](https://github.com/kirahowe/secrets/blob/main/doc/threat-model.md)
+;; describes this in full, including why sender authenticity and replay
+;; prevention are left to the deployment channel.
 
 ;; ## Operational dependencies
 

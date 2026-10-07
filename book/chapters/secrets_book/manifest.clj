@@ -208,7 +208,12 @@
 ;; ## What the manifest leaks, and how to turn it off
 
 ;; Anyone with repository access can see key names, value types, and collection
-;; counts. If even the existence of a key is sensitive, disable the manifest
+;; counts. In single-key mode they can also see which values are equal and when
+;; a value changes: equal values at different paths, or in different
+;; environments that share a key, have equal hashes, and a value that returns to
+;; an earlier one shows up in the history. Team manifests carry no hashes. Key
+;; paths through nested maps are public at every depth, so secret values must
+;; not be used as map keys. If even the existence of a key is sensitive, disable the manifest
 ;; for that environment with `:manifest false`. Its ciphertext diff will then
 ;; be opaque.
 
