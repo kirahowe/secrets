@@ -1,11 +1,10 @@
 (ns com.kirahowe.secrets.init-test
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
-            [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer [are deftest is testing use-fixtures]]
+            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.cli :as cli]
-            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.init :as init])
   (:import [java.nio.file Files LinkOption]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
@@ -14,778 +13,293 @@
 
 (def ^:dynamic ^:private *dir* nil)
 
-(defn- delete-tree! [file]
-  (doseq [child (reverse (file-seq (io/file (str file))))]
-    (.delete child)))
-
 (defn- with-temp-dir [test-fn]
-  (let [dir (str (Files/createTempDirectory
-                  "secrets-init-test"
-                  (make-array FileAttribute 0)))]
+  (let [dir (str (Files/createTempDirectory "secrets-init-test" (make-array FileAttribute 0)))]
     (binding [*dir* dir]
       (try
         (test-fn)
         (finally
-          (delete-tree! dir))))))
+          (run! #(.delete ^java.io.File %) (reverse (file-seq (io/file dir)))))))))
 
 (use-fixtures :each with-temp-dir)
 
-(def ^:private no-link-options (make-array LinkOption 0))
+(def ^:private default-dependency @@#'init/default-dependency)
+(def ^:private coordinates
+  (edn/read-string (slurp (io/resource "com/kirahowe/secrets/coordinate.edn"))))
 
-(defn- running-as-root? []
-  (= "root" (System/getProperty "user.name")))
+(defn- file [path] (io/file *dir* path))
 
-(defn- real-path [file]
-  (str (.toRealPath (.toPath (io/file (str file))) no-link-options)))
+(defn- files
+  "Every file under the test directory, as sorted relative paths."
+  []
+  (let [root (.toPath (io/file *dir*))]
+    (sort (for [^java.io.File f (file-seq (io/file *dir*))
+                :when (.isFile f)]
+            (str (.relativize root (.toPath f)))))))
 
-(defn- unix-mode [file]
-  (get (Files/readAttributes (.toPath (io/file (str file))) "unix:mode" no-link-options)
-       "mode"))
+(defn- permissions [path]
+  (PosixFilePermissions/toString
+   (Files/getPosixFilePermissions (.toPath (file path)) (make-array LinkOption 0))))
 
-(defn- set-permissions! [file rwx]
-  (Files/setPosixFilePermissions (.toPath (io/file (str file)))
-                                 (PosixFilePermissions/fromString rwx)))
+(defn- run!!
+  "Run the initializer in the test directory, returning its result under
+  `:result` and what it printed under `:out`."
+  [opts]
+  (let [result (atom nil)
+        out (with-out-str (reset! result (init/init! (merge {:root *dir* :app "reader"} opts))))]
+    {:result @result :out out}))
 
-(def ^:private public-directory
-  (into-array FileAttribute
-              [(PosixFilePermissions/asFileAttribute
-                (PosixFilePermissions/fromString "rwxr-xr-x"))]))
+(def ^:private reader-task (init/task-spec (init/proposed-config {:app "reader"})))
 
-(defn- mkdirs!
-  "Create `file` and its missing parents at an explicit 0755, so no test depends
-  on the umask the suite happens to run under."
-  [file]
-  (let [f (io/file (str file))]
-    (when-not (.isDirectory f)
-      (mkdirs! (.getParentFile f))
-      (Files/createDirectory (.toPath f) public-directory))
-    f))
-
-(defn- make-sticky! [file]
-  ;; `PosixFilePermission` covers only the nine rwx bits, so the POSIX
-  ;; permission API cannot express the sticky bit at all; chmod can.
-  (let [{:keys [exit err]} (sh/sh "chmod" "+t" (str file))]
-    (when-not (zero? exit)
-      (throw (ex-info (str "chmod +t failed: " err) {:path (str file)})))))
-
-(defn- symlink! [link target]
-  (Files/createSymbolicLink (.toPath (io/file (str link)))
-                            (.toPath (io/file (str target)))
-                            (make-array FileAttribute 0)))
-
-(defn- ancestry-refusal
-  "Return the `:reason`/`:path` of the ancestry refusal for `root`, or nil."
-  [root]
-  (try
-    (init/trusted-ancestry! (str root))
-    nil
-    (catch clojure.lang.ExceptionInfo e
-      (select-keys (ex-data e) [:reason :path]))))
-
-;;;; Argument Parsing and Configuration
+;;;; Options
 
 (deftest parses-required-options-and-defaults-test
   (testing "default and explicit options"
     (is (= {:app "reader" :env "dev" :layout :tracked}
            (init/parse-args ["--app" "reader"])))
-    (is (= {:app "reader"
-            :env "prod"
-            :layout :disposable
-            :team? true
-            :keygen? true
-            :apply? true
-            :show-contents? true}
-           (init/parse-args ["--app" "reader"
-                             "--env" "prod"
-                             "--layout" "disposable"
-                             "--team"
-                             "--keygen"
-                             "--apply"
-                             "--show-contents"]))))
+    (is (= {:app "reader" :env "prod" :layout :disposable
+            :team? true :keygen? true :apply? true}
+           (init/parse-args ["--app" "reader" "--env" "prod" "--layout" "disposable"
+                             "--team" "--keygen" "--apply"]))))
   (testing "unknown options"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                          #"Unknown option: --show-content"
-                          (init/parse-args ["--app" "reader" "--show-content"]))
-        "a near miss for the content opt-in is refused, never ignored"))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown option: --aply"
+                          (init/parse-args ["--app" "reader" "--aply"]))
+        "a near miss for --apply is refused, never ignored"))
   (testing "required values"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                          #"required"
-                          (init/parse-args [])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"required" (init/parse-args [])))
     (are [option following]
-         (thrown-with-msg? clojure.lang.ExceptionInfo
-                           #"Missing value"
+         (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing value"
                            (init/parse-args [option following]))
       "--app" "--team"
       "--env" "--keygen"
       "--layout" "--apply"))
   (testing "positional arguments are rejected"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                          #"Unexpected argument: extra"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected argument: extra"
                           (init/parse-args ["--app" "reader" "extra"]))))
   (testing "standalone help aliases"
     (doseq [flag ["-h" "--help"]]
-      (is (= {:env "dev" :layout :tracked :help? true}
-             (init/parse-args [flag]))
+      (is (= {:env "dev" :layout :tracked :help? true} (init/parse-args [flag]))
           "help must not demand an app name")
       (let [out (with-out-str (init/-main flag))]
-        (is (str/includes? out
-                           "Usage: -m com.kirahowe.secrets.init --app NAME [options]"))
-        (is (str/includes? out "Options:"))
+        (is (str/includes? out "Usage: -m com.kirahowe.secrets.init --app NAME [options]"))
         (is (str/includes? out "--apply"))
-        (is (not (str/includes? out "<coordinate>"))
-            "help describes initializer arguments without prescribing a launcher")))))
+        (is (str/includes? out "never modifies a file that already exists"))))))
+
+(deftest names-must-be-plain-test
+  (testing "the self dependency is keyed by the app name as is"
+    (is (= {'my-app.v2/my-app.v2 {:local/root "."}} (init/self-dependency "my-app.v2"))))
+  (testing "a name that would not read back as written is refused"
+    (doseq [bad ["my app" "1app" "-app" "app/name" "app\"" "ap\u001b[31mp" ""]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"plain name"
+                            (init/self-dependency bad)))
+      ;; The option parser already takes a blank or dash-leading value itself.
+      (when-not (or (empty? bad) (str/starts-with? bad "-"))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"--app must be a plain name"
+                              (init/parse-args ["--app" bad])))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"--env must be a plain name"
+                              (init/parse-args ["--app" "reader" "--env" bad]))))))
+  (testing "the refusal does not echo the rejected value"
+    (let [message (try (init/parse-args ["--app" "ap\u001b[31mp"])
+                       (catch clojure.lang.ExceptionInfo e (ex-message e)))]
+      (is (not (str/includes? message "\u001b"))))))
 
 (deftest initializer-failures-print-help-guidance-test
-  (let [err (java.io.StringWriter.)
-        print-init-error! (ns-resolve 'com.kirahowe.secrets.init 'print-init-error!)]
+  (let [err (java.io.StringWriter.)]
     (binding [*err* err]
-      (print-init-error! (ex-info "--app <name> is required" {})))
+      (#'init/print-init-error! (ex-info "--app <name> is required" {})))
     (is (str/includes? (str err) "secrets init: --app <name> is required"))
     (is (str/includes? (str err) "Run with --help for usage and options."))))
 
-(deftest layouts-are-safe-and-normalizable-test
-  (let [tracked (init/proposed-config {:app "reader"})
-        disposable (init/proposed-config
-                    {:app "reader" :layout :disposable :team? true})]
-    (testing "tracked layout"
-      (is (= "secrets/secrets.edn.age"
-             (get-in tracked [:environments :dev :secrets-file])))
-      (is (nil? (get-in tracked [:environments :dev :key-file]))
-          "tracked stores keep the default private identity external"))
-    (testing "disposable team layout"
-      (is (= ".local/secrets/key.txt"
-             (get-in disposable [:environments :dev :key-file])))
-      (is (= ".local/secrets/recipients.txt"
-             (get-in disposable [:environments :dev :recipients-file])))
-      (is (= "secrets/secrets.edn.example"
-             (get-in disposable [:environments :dev :template])))
-      (is (map? (cli/normalize-config disposable))))))
+;;;; The proposed configuration
 
-;;;; bb.edn Integration
+(deftest proposed-layouts-are-accepted-by-the-cli-test
+  (doseq [layout [:tracked :disposable]
+          team? [false true]]
+    (let [opts {:root *dir* :app "reader" :layout layout :team? team? :keygen? true}
+          {:keys [config key-file]} (init/plan opts)
+          environment (get-in (cli/normalize-config config) [:environments :dev])]
+      (is (= key-file (:key-file environment))
+          "the identity the initializer generates is the one the task reads")
+      (is (= team? (some? (:recipients-file environment))))
+      (is (= (= layout :disposable) (str/starts-with? (:secrets-file environment) ".local/"))))))
 
-(deftest merge-preserves-comments-and-unrelated-forms-test
-  (let [source (str "; keep me\n"
-                    "{:paths [\"src\"]\n"
-                    " :deps {acme/lib {:mvn/version \"1\"}}\n"
-                    " :tasks {lint {:task (println :lint)}}}\n")
-        result (init/merge-bb-edn source (init/proposed-config {:app "reader"}))]
-    (is (re-find #"; keep me" (:content result)))
-    (is (re-find #"acme/lib" (:content result)))
-    (is (re-find #"lint" (:content result)))
-    (is (re-find #"io.github.kirahowe/secrets" (:content result)))
-    (is (re-find #"secrets" (:content result))))
-  (testing "new dependencies precede new tasks"
-    (let [content (:content
-                   (init/merge-bb-edn
-                    "{}\n"
-                    (init/proposed-config {:app "reader"})))]
-      (is (< (str/index-of content ":deps")
-             (str/index-of content ":tasks"))))))
+;;;; Preview
 
-(deftest merge-reuses-known-dependency-and-rejects-task-conflict-test
-  (let [config (init/proposed-config {:app "reader"})
-        reused (init/merge-bb-edn
-                "{:deps {com.kirahowe/secrets {:local/root \"../secrets\"}} :tasks {}}"
-                config)]
-    (testing "known dependency coordinates are reused"
-      (is (= 'com.kirahowe/secrets (:dependency reused)))
-      (is (not (:added-dependency? reused))))
-    (testing "an existing conflicting task is rejected"
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"conflicting"
-           (init/merge-bb-edn
-            "{:deps {} :tasks {secrets {:task (println :other)}}}"
-            config))))))
+(deftest preview-writes-nothing-test
+  (let [{:keys [result out]} (run!! {:layout :disposable :team? true :keygen? true})]
+    (is (= {:status :preview} result))
+    (is (empty? (files)))
+    (is (str/includes? out "Nothing is written without --apply."))
+    (is (str/includes? out "Would create:"))
+    (doseq [path ["bb.edn" ".gitignore" "secrets/secrets.edn.example"
+                  ".local/secrets/recipients.txt" ".local/secrets/key.txt"]]
+      (is (str/includes? out (str "\n  " path "\n")) path))
+    (is (str/includes? out "Rerun with --apply"))))
 
-(deftest deps-edn-owns-the-coordinate-when-present-test
-  (let [config (init/proposed-config {:app "reader"})
-        deps-source (str ";; app deps\n"
-                         "{:paths [\"src\"]\n"
-                         " :aliases {:build {:deps {io.github.clojure/tools.build"
-                         " {:mvn/version \"0.10.13\"}}}}\n"
-                         " :deps {org.clojure/clojure {:mvn/version \"1.12.4\"}}}\n")]
-    (testing "deps.edn gains the coordinate at the top level, comments intact"
-      (let [{:keys [content added-dependency?]} (init/merge-deps-edn deps-source)
-            parsed (edn/read-string content)]
-        (is added-dependency?)
-        (is (str/includes? content ";; app deps"))
-        (is (contains? (:deps parsed) 'io.github.kirahowe/secrets))
-        (is (= #{'io.github.clojure/tools.build}
-               (set (keys (get-in parsed [:aliases :build :deps]))))
-            "the alias's own :deps map, which comes first in the file, is left alone")))
-    (testing "a deps.edn that already declares the library is returned unchanged"
-      (let [source "{:deps {com.kirahowe/secrets {:mvn/version \"0.1.0\"}}}\n"
-            result (init/merge-deps-edn source)]
-        (is (= source (:content result)))
-        (is (not (:changed? result)))
-        (is (= 'com.kirahowe/secrets (:dependency result)))))
-    (testing "bb.edn gets a self dependency and the task, and no coordinate"
-      (let [{:keys [content added-self-dependency? added-dependency?]}
-            (init/merge-bb-edn nil config :deps.edn)
-            parsed (edn/read-string content)]
-        (is added-self-dependency?)
-        (is (not added-dependency?))
-        (is (= {'reader/reader {:local/root "."}} (:deps parsed)))
-        (is (contains? (:tasks parsed) 'secrets))
-        (is (not (re-find #"kirahowe/secrets" content)))))
-    (testing "an existing self dependency under any key is reused"
-      (let [result (init/merge-bb-edn "{:deps {acme/app {:local/root \".\"}}}\n"
-                                      config :deps.edn)]
-        (is (not (:added-self-dependency? result)))
-        (is (= {'acme/app {:local/root "."}}
-               (:deps (edn/read-string (:content result)))))))
-    (testing "deps.edn is the owner only when a deps.edn exists"
-      (is (= :bb.edn (:owner (init/integration-plan nil nil config))))
-      (is (= :deps.edn (:owner (init/integration-plan nil deps-source config)))))
-    (testing "a bb.edn that already owns the coordinate keeps it and deps.edn is untouched"
-      (let [plan (init/integration-plan
-                  "{:deps {com.kirahowe/secrets {:local/root \"../secrets\"}}}\n"
-                  deps-source config)]
-        (is (= :bb.edn (:owner plan)))
-        (is (nil? (:deps-edn plan)))))
-    (testing "both files declaring the library is refused with the fix spelled out"
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"both declare.*reader/reader"
-           (init/integration-plan
-            "{:deps {com.kirahowe/secrets {:mvn/version \"0.1.0\"}}}\n"
-            "{:deps {com.kirahowe/secrets {:mvn/version \"0.1.0\"}}}\n"
-            config))))))
+(deftest preview-says-when-no-identity-is-generated-test
+  (is (str/includes? (:out (run!! {}))
+                     (str "Pass --keygen to generate one at "
+                          (secrets/default-key-file "reader") ".")))
+  (is (not (str/includes? (:out (run!! {:layout :disposable :keygen? true})) "Pass --keygen"))))
 
-(deftest app-name-must-read-as-a-symbol-test
-  (testing "the self dependency is keyed by the app name as is"
-    (is (= {'my-app.v2/my-app.v2 {:local/root "."}} (init/self-dependency "my-app.v2"))))
-  (testing "a name that would not read back as a symbol is refused up front"
-    (doseq [app ["my app!" "9lives" "-app" "app/x"]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"plain name"
-                            (init/self-dependency app))))
-    ;; A dash-leading value never reaches the check: babashka.cli reads it as
-    ;; the next option and reports the missing --app value instead.
-    (doseq [app ["my app!" "9lives" "app/x"]]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"plain name"
-                            (init/parse-args ["--app" app]))))))
+;;;; The printed coordinate
 
-(deftest deps-edn-project-previews-and-applies-both-files-test
-  (spit (io/file *dir* "deps.edn") "{:deps {org.clojure/clojure {:mvn/version \"1.12.4\"}}}\n")
-  (let [proposal (init/proposed-changes {:root *dir* :app "reader"})
-        actions (into {} (map (juxt :path :action)) (:actions proposal))]
-    (is (= :deps.edn (:owner proposal)))
-    (is (= :merge (get actions "deps.edn")))
-    (is (= :create (get actions "bb.edn")))
-    (is (= ["deps.edn" "bb.edn"] (map first (:manual proposal))))
-    (testing "applying writes both, and bb.edn carries no coordinate"
-      (with-out-str (init/init! {:root *dir* :app "reader" :tty? false :apply? true}))
-      (let [deps (edn/read-string (slurp (io/file *dir* "deps.edn")))
-            bb (edn/read-string (slurp (io/file *dir* "bb.edn")))]
-        (is (contains? (:deps deps) 'io.github.kirahowe/secrets))
-        (is (= {'reader/reader {:local/root "."}} (:deps bb)))
-        (is (contains? (:tasks bb) 'secrets))))
-    (testing "a second run finds nothing left to write for either file"
-      (let [again (into {} (map (juxt :path :action))
-                        (:actions (init/proposed-changes {:root *dir* :app "reader"})))]
-        (is (= :unchanged (get again "deps.edn")))
-        (is (= :unchanged (get again "bb.edn")))))))
+(deftest the-coordinate-is-the-running-library-test
+  (let [[lib coordinate] (first default-dependency)
+        text (str lib " " (binding [*print-namespace-maps* false] (pr-str coordinate)))
+        note "is not a release tag"]
+    (is (= (:git-lib coordinates) lib) "the tests run from a source checkout")
+    (testing "a new bb.edn declares it"
+      (let [{:keys [out]} (run!! {:apply? true})]
+        (is (= default-dependency (:deps (edn/read-string (slurp (file "bb.edn"))))))
+        (is (= (nil? (:git/tag coordinate)) (str/includes? out note))
+            "an untagged commit is called out, a release tag is not")))
+    (testing "an existing bb.edn gets it as a snippet"
+      (spit (file "bb.edn") "{}\n")
+      (is (str/includes? (:out (run!! {})) text)))
+    (testing "a project that already declares it is told nothing about it"
+      (spit (file "bb.edn") (pr-str {:deps {(:lib coordinates) {:mvn/version "0.0.1"}}}))
+      (let [{:keys [out]} (run!! {})]
+        (is (not (str/includes? out (str lib))))
+        (is (not (str/includes? out note)))))))
 
-(deftest manual-integration-names-each-file-test
-  (spit (io/file *dir* "deps.edn") "{:deps {}}\n")
-  (let [out (with-out-str
-              (init/init! {:root *dir* :app "reader" :tty? true :choice :manual}))]
-    (is (str/includes? out "deps.edn:\n{:deps"))
-    (is (str/includes? out "bb.edn:\n{:deps {reader/reader {:local/root \".\"}}"))
-    (is (str/includes? out "io.github.kirahowe/secrets"))))
+;;;; Apply
 
-;;;; Preview and Interaction
+(deftest apply-creates-exactly-the-planned-files-test
+  (let [{:keys [result out]} (run!! {:layout :disposable :team? true :keygen? true :apply? true})
+        planned ["bb.edn" ".gitignore" "secrets/secrets.edn.example"
+                 ".local/secrets/recipients.txt" ".local/secrets/key.txt"]]
+    (is (= {:status :applied :created planned} result))
+    (is (= (sort planned) (files)))
+    (testing "contents"
+      (is (= {:deps default-dependency
+              :tasks {'secrets (init/task-spec
+                                (init/proposed-config
+                                 {:app "reader" :layout :disposable :team? true}))}}
+             (edn/read-string (slurp (file "bb.edn")))))
+      (is (= "/.local/secrets/\n" (slurp (file ".gitignore"))))
+      (is (= "{:example/api-key \"replace-me\"}\n" (slurp (file "secrets/secrets.edn.example"))))
+      (is (= "# One age recipient per line.\n" (slurp (file ".local/secrets/recipients.txt"))))
+      (is (str/includes? (slurp (file ".local/secrets/key.txt")) "AGE-SECRET-KEY-1")))
+    (testing "permissions"
+      (is (= "rw-------" (permissions ".local/secrets/key.txt")))
+      (spit (file "ordinary") "")
+      (doseq [path (butlast planned)]
+        (is (= (permissions "ordinary") (permissions path)) path)))
+    (testing "output"
+      (is (str/includes? out "Created:"))
+      (is (re-find #"Public key: age1\S+" out))
+      (is (not (str/includes? out "AGE-SECRET-KEY"))))))
 
-(deftest noninteractive-preview-and-manual-cancel-do-not-mutate-test
-  (testing "non-TTY without --apply is strictly preview-only"
-    (let [result (atom nil)
-          out (with-out-str
-                (reset! result (init/init! {:root *dir* :app "reader" :tty? false})))]
-      (is (= :preview (:status @result)))
-      (is (not (.exists (io/file *dir* "bb.edn"))))
-      (is (str/includes? out "Project path is trusted for safe writes."))
-      (is (str/includes? out "No files changed. Rerun with --apply to apply this plan."))))
-  (testing "manual and cancel do not write or generate a key"
-    (let [called (atom false)]
-      (with-redefs [cli/keygen! (fn [& _] (reset! called true))]
-        (is (= :manual
-               (:status
-                (init/init! {:root *dir*
-                             :app "reader"
-                             :tty? true
-                             :choice :manual
-                             :keygen? true}))))
-        (is (= :cancelled
-               (:status
-                (init/init! {:root *dir*
-                             :app "reader"
-                             :tty? true
-                             :choice :cancel
-                             :keygen? true})))))
-      (is (false? @called))
-      (is (not (.exists (io/file *dir* "bb.edn")))))))
+(deftest tracked-apply-creates-the-task-and-template-test
+  (is (= {:status :applied :created ["bb.edn" "secrets/secrets.edn.example"]}
+         (:result (run!! {:apply? true}))))
+  (is (= ["bb.edn" "secrets/secrets.edn.example"] (files)))
+  (is (= {:deps default-dependency :tasks {'secrets reader-task}}
+         (edn/read-string (slurp (file "bb.edn")))))
+  (testing "a second run finds nothing to do"
+    (let [before (slurp (file "bb.edn"))
+          {:keys [result out]} (run!! {:apply? true})]
+      (is (= {:status :applied :created []} result))
+      (is (str/includes? out "There is nothing to create and nothing to add."))
+      (is (= before (slurp (file "bb.edn")))))))
 
-(defn- captured
-  "Run `f`, returning everything it printed on both streams.
+;;;; Existing files
 
-  A preview that moved a credential from stdout to stderr is not a fix, so
-  every output assertion below sees both."
-  [f]
-  (let [err (java.io.StringWriter.)
-        out (with-out-str (binding [*err* err] (f)))]
-    {:out out :err (str err)}))
+(def ^:private existing
+  {"bb.edn" ";; mine\n{:tasks {lint {:task (shell \"lint\")}}}\n"
+   "deps.edn" "{:paths [\"src\"] ; keep\n :deps {}}\n"
+   ".gitignore" "target/\n"
+   "secrets/secrets.edn.example" "{:mine \"placeholder\"}\n"
+   ".local/secrets/recipients.txt" "# team\nage1example\n"})
 
-(defn- bb-edn-with! [entry]
-  (spit (io/file *dir* "bb.edn") (str "{:paths [\"src\"]\n " entry "}\n")))
+(defn- write-existing! []
+  (doseq [[path content] existing]
+    (io/make-parents (file path))
+    (spit (file path) content)))
 
-(defn- interactive-preview [entry]
-  (bb-edn-with! entry)
-  (:out (captured #(init/init! {:root *dir*
-                                :app "reader"
-                                :tty? true
-                                :choice :cancel}))))
+(deftest existing-files-are-never-modified-test
+  (write-existing!)
+  (doseq [apply? [false true]]
+    (let [{:keys [result out]} (run!! {:layout :disposable :team? true :apply? apply?})]
+      (testing "every existing file keeps its bytes"
+        (is (= (sort (keys existing)) (files)))
+        (doseq [[path content] existing]
+          (is (= content (slurp (file path))) path)))
+      (when apply?
+        (is (= {:status :applied :created []} result)))
+      (testing "what each file lacks is printed with where it goes"
+        (is (str/includes? out "The initializer does not edit existing files."))
+        (is (str/includes? out (str "  deps.edn, under :deps:\n      "
+                                    (ffirst default-dependency) " {")))
+        (is (str/includes? out "  bb.edn, under :deps:\n      reader/reader {:local/root \".\"}"))
+        (is (str/includes? out "  bb.edn, under :tasks:\n      secrets\n      {:doc "))
+        (is (re-find #"  \.gitignore, as a new line[^\n]*:\n      /\.local/secrets/\n" out)))
+      (testing "files that need nothing are listed as left alone"
+        (is (str/includes? out (str "Already there, left as they are:\n"
+                                    "  secrets/secrets.edn.example\n"
+                                    "  .local/secrets/recipients.txt\n")))))))
 
-(defn- hidden-from-preview?
-  "Does an interactive preview of `entry` hide `sentinel` while still reporting
-  the change?"
-  [entry sentinel]
-  (let [out (interactive-preview entry)]
-    (and (not (str/includes? out sentinel))
-         (not (str/includes? out "\u001b"))
-         (str/includes? out "bb.edn")
-         (str/includes? out "@@"))))
+(deftest only-missing-parts-are-printed-test
+  (testing "a bb.edn that has the task and the dependency needs nothing"
+    (spit (file "bb.edn") (pr-str {:deps default-dependency :tasks {'secrets reader-task}}))
+    (spit (file ".gitignore") "  /.local/secrets/  \n")
+    (let [{:keys [out]} (run!! {:layout :disposable})]
+      (is (re-find #"Already there, left as they are:\n  bb.edn\n  .gitignore\n" out))
+      (is (not (str/includes? out "Add these yourself")))))
+  (testing "a bb.edn that declares the library keeps declaring it beside a deps.edn"
+    (spit (file "deps.edn") "{}\n")
+    (let [{:keys [out]} (run!! {})]
+      (is (not (str/includes? out "deps.edn")))))
+  (testing "a bb.edn with a self dependency under another name is not asked for one"
+    (spit (file "bb.edn") "{:deps {acme/app {:local/root \".\"}}}\n")
+    (let [{:keys [out]} (run!! {})]
+      (is (str/includes? out "deps.edn, under :deps:"))
+      (is (str/includes? out "bb.edn, under :tasks:"))
+      (is (not (str/includes? out "bb.edn, under :deps:"))))))
 
-(def ^:private long-token "kAT3xQ9pLm2ZbVn7RsW4YtE6uH1jG5dC")
-(def ^:private age-identity
-  (str "AGE-SECRET-KEY-1" "9QY7ZPTX4V2M6KLHW3RUJ8ND5SGAEF0C" "7XQ2VMTHKR"))
-(def ^:private long-line-tail "TAIL-SENTINEL-PAST-THE-LIMIT")
+(deftest a-file-that-does-not-read-as-a-map-gets-every-snippet-test
+  (let [source "{:deps {password \"hunter2\"\n"]
+    (spit (file "deps.edn") source)
+    (let [{:keys [out]} (run!! {:apply? true})]
+      (is (= source (slurp (file "deps.edn"))))
+      (is (str/includes? out "deps.edn, under :deps:"))
+      (is (not (str/includes? out "hunter2")) "nothing from the file is printed"))))
 
-(deftest apply-output-contains-no-file-bodies-test
-  (bb-edn-with! (str ":db-password \"" long-token "\""))
-  (let [{:keys [out err]} (captured #(init/init! {:root *dir*
-                                                  :app "reader"
-                                                  :apply? true
-                                                  :tty? false}))
-        bb (edn/read-string (slurp (io/file *dir* "bb.edn")))]
-    (testing "neither stream carries a body of a file being replaced"
-      (is (not (str/includes? out long-token)))
-      (is (not (str/includes? err long-token))))
-    (testing "every action is still named"
-      (is (str/includes? out "bb.edn: merge into the existing file"))
-      (is (str/includes? out "secrets/secrets.edn.example: create"))
-      (is (str/includes? out "bb.edn: merged")))
-    (testing "the merged file is still correct"
-      (is (= long-token (:db-password bb)))
-      (is (= ["src"] (:paths bb)))
-      (is (contains? (:deps bb) 'io.github.kirahowe/secrets))
-      (is (contains? (:tasks bb) 'secrets)))))
+;;;; Files that appear after the plan
 
-(deftest interactive-preview-redacts-and-escapes-test
-  (testing "a planted sentinel never reaches an interactive preview verbatim"
-    (are [entry sentinel] (hidden-from-preview? entry sentinel)
-      (str ":build-id \"" long-token "\"") long-token
-      (str ":identity \"" age-identity "\"") age-identity
-      ":db-password \"hunter2-plaintext\"" "hunter2-plaintext"
-      ":notes \"\u001b[2J\u001b[1;31mrepainted\"" "\u001b[2J"
-      ":notes \"before\rafter\"" "\r"
-      (str ":notes \"" (apply str (repeat 300 \x)) long-line-tail "\"")
-      long-line-tail))
-  (testing "a control sequence is rendered as text, never emitted"
-    (let [out (interactive-preview ":notes \"\u001b[2Jrepainted\"")]
-      (is (str/includes? out "\\x1b"))
-      (is (str/includes? out "repainted")
-          "escaping the sequence keeps the surrounding line readable")))
-  (testing "a hidden value still says how much it hid"
-    (is (str/includes? (interactive-preview (str ":build-id \"" long-token "\""))
-                       (str "[redacted " (count long-token) " characters]"))))
-  (testing "an over-long line is marked as truncated"
-    (is (str/includes? (interactive-preview
-                        (str ":notes \"" (apply str (repeat 300 \x)) "\""))
-                       "more characters]"))))
-
-(deftest full-contents-require-explicit-opt-in-test
-  (let [entry (str ":db-password \"" long-token "\"")]
-    (testing "the opt-in prints whole bodies, warning first"
-      (bb-edn-with! entry)
-      (let [{:keys [out]} (captured #(init/init! {:root *dir*
-                                                  :app "reader"
-                                                  :tty? true
-                                                  :choice :cancel
-                                                  :show-contents? true}))]
-        (is (str/includes? out "--- a/bb.edn"))
-        (is (str/includes? out "--- /dev/null"))
-        (is (str/includes? out (str "- :db-password \"" long-token "\"}")))
-        (is (str/includes? out "+{:example/api-key \"replace-me\"}"))
-        (is (< (str/index-of out "WARNING") (str/index-of out "--- a/bb.edn"))
-            "the warning precedes the first body line")))
-    (testing "an interactive run without the flag prints no body"
-      (is (not (str/includes? (interactive-preview entry) "--- a/bb.edn"))))
-    (testing "--apply alone does not enable it"
-      (bb-edn-with! entry)
-      (let [{:keys [out]} (captured #(init/init! {:root *dir*
-                                                  :app "reader"
-                                                  :tty? true
-                                                  :apply? true}))]
-        (is (not (str/includes? out long-token))
-            "an interactive apply gets the safe mode, not the interactive one")
-        (is (not (str/includes? out "--- a/bb.edn")))))))
-
-(deftest summaries-remain-auditable-test
-  (testing "the tracked layout names every proposed path and action"
-    (let [{:keys [out]} (captured #(init/init! {:root *dir*
-                                                :app "reader"
-                                                :tty? false}))]
-      (is (str/includes? out "bb.edn: create"))
-      (is (str/includes? out "secrets/secrets.edn.example: create"))
-      (is (str/includes? out "2 files to write, 0 left as is."))))
-  (testing "the disposable team layout names all four"
-    (let [{:keys [out]} (captured #(init/init! {:root *dir*
-                                                :app "reader"
-                                                :layout :disposable
-                                                :team? true
-                                                :tty? false}))]
-      (is (str/includes? out "bb.edn: create"))
-      (is (str/includes? out ".gitignore: create"))
-      (is (str/includes? out ".local/secrets/recipients.txt: create"))
-      (is (str/includes? out "secrets/secrets.edn.example: create"))
-      (is (str/includes? out "4 files to write, 0 left as is."))))
-  (testing "a preserved file is reported rather than silently dropped"
-    (let [template (io/file *dir* "secrets/secrets.edn.example")]
-      (.mkdirs (.getParentFile template))
-      (spit template "{:custom/value 42}\n")
-      (let [{:keys [out]} (captured #(init/init! {:root *dir*
-                                                  :app "reader"
-                                                  :tty? false}))]
-        (is (str/includes?
-             out "secrets/secrets.edn.example: leave as is, existing file preserved"))
-        (is (str/includes? out "1 file to write, 1 left as is."))))))
-
-(deftest status-map-carries-no-file-bodies-test
-  (bb-edn-with! (str ":db-password \"" long-token "\""))
-  (let [applied (binding [*out* (java.io.StringWriter.)]
-                  (init/init! {:root *dir*
-                               :app "reader"
-                               :apply? true
-                               :tty? false}))]
-    (is (not (str/includes? (pr-str applied) long-token))
-        "a caller printing the status map is the same disclosure by another route")
-    (is (= :applied (:status applied)))
-    (is (true? (:trusted? (:trust applied))))
-    (is (= [{:path "bb.edn" :action :merge}
-            {:path "secrets/secrets.edn.example" :action :create}]
-           (:actions applied)))))
-
-(deftest injected-choice-function-is-invoked-test
-  (is (= :manual
-         (:status
-          (init/init! {:root *dir*
-                       :app "reader"
-                       :tty? true
-                       :input (fn [] "m")}))))
-  (is (not (.exists (io/file *dir* "bb.edn")))))
-
-(deftest manual-integration-is-copyable-pretty-edn-test
-  (let [out (with-out-str
-              (init/init! {:root *dir*
-                           :app "reader"
-                           :tty? true
-                           :choice :manual}))]
-    (is (str/includes? out "io.github.kirahowe/secrets")
-        "do not print a namespace-map shorthand coordinate")
-    (is (str/includes? out "\n :tasks\n {secrets")
-        "task configuration is formatted over readable lines")))
-
-;;;; Scaffold Safety and Application
-
-(deftest existing-public-artifacts-are-preserved-when-safe-test
-  (let [template (io/file *dir* "secrets/secrets.edn.example")
-        recipients (io/file *dir* "secrets/recipients.txt")]
-    (.mkdirs (.getParentFile template))
-    (spit template "{:custom/value 42}\n")
-    (spit recipients "# Alice\nage1existing\n")
-    (let [proposal (init/proposed-changes
-                    {:root *dir* :app "reader" :team? true})]
-      (is (not-any? #(= "secrets/secrets.edn.example" (:path %))
-                    (:changes proposal)))
-      (is (not-any? #(= "secrets/recipients.txt" (:path %))
-                    (:changes proposal))))
-    (init/init! {:root *dir*
-                 :app "reader"
-                 :team? true
-                 :apply? true
-                 :tty? false})
-    (is (= "{:custom/value 42}\n" (slurp template)))
-    (is (= "# Alice\nage1existing\n" (slurp recipients)))))
-
-(deftest invalid-existing-template-and-symlinked-ancestor-are-rejected-test
-  (testing "invalid existing templates"
-    (let [template (io/file *dir* "secrets/secrets.edn.example")]
-      (.mkdirs (.getParentFile template))
-      (spit template "not-an-edn-map")
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"must contain an EDN map"
-                            (init/proposed-changes {:root *dir* :app "reader"})))
-      (let [sentinel "123SENTINELSECRET"
-            _ (spit template sentinel)
-            e (try
-                (init/proposed-changes {:root *dir* :app "reader"})
-                nil
-                (catch Exception e e))
-            rendered (pr-str [(ex-message e) (ex-data e) (ex-cause e)])]
+(deftest a-file-that-appears-after-the-plan-is-not-overwritten-test
+  (testing "a public file"
+    (let [proposal (init/plan {:root *dir* :app "reader"})]
+      (io/make-parents (file "secrets/secrets.edn.example"))
+      (spit (file "secrets/secrets.edn.example") "mine")
+      (let [e (try (init/apply-plan! proposal) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
         (is (some? e))
-        (is (re-find #"not valid EDN" (ex-message e)))
-        (is (= :edn-malformed (:reason (ex-data e))))
-        (is (nil? (ex-cause e)))
-        (is (not (str/includes? rendered sentinel))))))
-  (testing "symlinked ancestors"
-    (let [link (.toPath (io/file *dir* "secrets"))]
-      (delete-tree! link)
-      (spit (io/file *dir* "symlink-target") "not a directory")
-      (Files/createSymbolicLink
-       link
-       (.toPath (io/file *dir* "symlink-target"))
-       (make-array FileAttribute 0))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                            #"symbolic link"
-                            (init/proposed-changes {:root *dir* :app "reader"}))))))
+        (is (str/includes? (ex-message e) "secrets/secrets.edn.example already exists"))
+        (is (str/includes? (ex-message e) "Created before stopping: bb.edn."))
+        (is (= {:path "secrets/secrets.edn.example" :created ["bb.edn"]} (ex-data e)))
+        (is (= "mine" (slurp (file "secrets/secrets.edn.example")))))))
+  (testing "a symbolic link is not written through"
+    (let [proposal (init/plan {:root *dir* :app "reader" :team? true})
+          outside (file "outside.txt")]
+      (Files/createSymbolicLink (.toPath (file "secrets/recipients.txt")) (.toPath outside)
+                                (make-array FileAttribute 0))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"secrets/recipients.txt already exists"
+                            (init/apply-plan! proposal)))
+      (is (not (.exists outside)))))
+  (testing "an identity"
+    (let [proposal (init/plan {:root *dir* :app "reader" :layout :disposable :keygen? true})]
+      (io/make-parents (file ".local/secrets/key.txt"))
+      (spit (file ".local/secrets/key.txt") "my key")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #".local/secrets/key.txt already exists"
+                            (init/apply-plan! proposal)))
+      (is (= "my key" (slurp (file ".local/secrets/key.txt")))))))
 
-(deftest apply-writes-public-layout-and-keygen-runs-afterwards-test
-  (let [seen (atom nil)]
-    (with-redefs [cli/keygen!
-                  (fn [config env]
-                    (reset! seen
-                            {:config config
-                             :env env
-                             :template? (.exists
-                                         (io/file
-                                          *dir*
-                                          "secrets/secrets.edn.example"))
-                             :bb? (.exists (io/file *dir* "bb.edn"))})
-                    :key)]
-      (is (= :applied
-             (:status
-              (init/init! {:root *dir*
-                           :app "reader"
-                           :layout :disposable
-                           :team? true
-                           :keygen? true
-                           :apply? true
-                           :tty? false})))))
-    (testing "public scaffold bytes"
-      (is (.exists (io/file *dir* "bb.edn")))
-      (is (.exists (io/file *dir* "secrets/secrets.edn.example")))
-      (is (= "{:example/api-key \"replace-me\"}\n"
-             (slurp (io/file *dir* "secrets/secrets.edn.example"))))
-      (is (.exists (io/file *dir* ".local/secrets/recipients.txt")))
-      (is (= "/.local/secrets/\n"
-             (slurp (io/file *dir* ".gitignore")))))
-    (testing "key generation runs after scaffold writes"
-      (is (and (:template? @seen) (:bb? @seen))
-          "keygen follows successful scaffold writes")
-      (is (= "dev" (:env @seen))))))
-
-(deftest apply-reports-an-unsupported-atomic-move-by-target-test
-  (let [refusal (fn [_ target]
-                  (throw (ex-info "forced" {:reason :atomic-move-unsupported
-                                            :target (str target)})))
-        failure (try
-                  (with-redefs [fs/atomic-move! refusal]
-                    (init/init! {:root *dir* :app "reader" :apply? true :tty? false}))
-                  nil
-                  (catch clojure.lang.ExceptionInfo e e))
-        data (ex-data (ex-cause failure))]
-    (is (re-find #"previous project files were restored" (ex-message failure)))
-    (is (= :atomic-move-unsupported (:reason data)))
-    (is (str/starts-with? (:target data) (real-path *dir*))
-        "the shared move's error names the file that was not published")
-    (is (not (.exists (io/file *dir* "bb.edn"))) "nothing is published by another route")))
-
-;;;; Race Safety
-
-(deftest trusted-ancestry-accepts-a-private-root-test
-  (testing "a root under the system temp directory"
-    (is (= (real-path *dir*) (str (init/trusted-ancestry! *dir*)))))
-  (testing "a root under a sticky world-writable ancestor"
-    ;; /tmp is mode 1777 on macOS and Linux alike, and on macOS it is also a
-    ;; symlink to /private/tmp. A naive "nothing other-writable anywhere" rule
-    ;; would refuse every root beneath it.
-    (let [tmp (real-path "/tmp")
-          mode (unix-mode tmp)
-          root (Files/createTempDirectory (.toPath (io/file tmp))
-                                          "secrets-init-sticky"
-                                          (make-array FileAttribute 0))]
-      (try
-        (is (pos? (bit-and mode 022)) "premise: /tmp is writable by others")
-        (is (pos? (bit-and mode 01000)) "premise: /tmp is sticky")
-        (is (= (real-path root) (str (init/trusted-ancestry! (str root)))))
-        (finally
-          (delete-tree! root))))))
-
-(deftest trusted-ancestry-refuses-an-untrusted-ancestor-test
-  (if (running-as-root?)
-    (is (running-as-root?)
-        "skipped as root: root satisfies every ownership check by definition")
-    (let [open (mkdirs! (io/file *dir* "open"))
-          under-open (mkdirs! (io/file open "project"))
-          private-project (mkdirs! (io/file *dir* "private" "project"))
-          link (io/file open "link")]
-      (set-permissions! open "rwxrwxrwx")
-      (symlink! link private-project)
-      (testing "an ancestor anyone may rename"
-        (are [expected root] (= expected (ancestry-refusal root))
-          {:reason :world-writable :path (str open)} under-open
-          ;; This link resolves into a wholly private tree, so only the walk of
-          ;; the path as written can see that anyone may repoint it.
-          {:reason :world-writable :path (str open)} link))
-      (testing "the same ancestor with the sticky bit set"
-        (make-sticky! open)
-        (are [root] (nil? (ancestry-refusal root))
-          under-open
-          link))
-      (testing "group write"
-        (let [shared (mkdirs! (io/file *dir* "shared"))
-              under-shared (mkdirs! (io/file shared "project"))]
-          (set-permissions! shared "rwxrwxr-x")
-          ;; No portable API creates or chgrps to a group with a chosen name, so
-          ;; both directions of this decision are simulated at the one read that
-          ;; makes it. A fresh directory's real group happens to be user-private
-          ;; on some hosts (e.g. GitHub's ubuntu runners, where a checkout's
-          ;; owner and group are both `runner`) and not on others (macOS's
-          ;; `staff`), so leaving this assertion to the real group would pass or
-          ;; fail depending on the platform instead of the code under test.
-          (with-redefs-fn {#'init/posix-group (constantly "secrets-shared-group")}
-            (fn []
-              (is (= {:reason :shared-group-writable :path (str shared)}
-                     (ancestry-refusal under-shared))
-                  "a group that holds more than the owner can rename the directory")))
-          ;; The user-private group of Fedora, RHEL, and Debian is stood in for
-          ;; the same way.
-          (with-redefs-fn {#'init/posix-group (constantly (System/getProperty "user.name"))}
-            (fn []
-              (is (nil? (ancestry-refusal under-shared))
-                  "a group holding nobody but the owner is not another principal"))))))))
-
-(deftest directory-swap-between-plan-and-apply-changes-nothing-outside-test
-  (let [root (mkdirs! (io/file *dir* "project"))
-        outside (mkdirs! (io/file *dir* "outside"))
-        sentinel (io/file outside "secrets.edn.example")
-        swapped (io/file root "secrets")
-        out (java.io.StringWriter.)]
-    (spit sentinel "sentinel\n")
-    (is (some #(= "secrets/secrets.edn.example" (:path %))
-              (:changes (init/proposed-changes {:root (str root) :app "reader"})))
-        "premise: the plan writes through the directory about to be swapped")
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"symbolic link"
-         (binding [*out* out]
-           (init/init! {:root (str root)
-                        :app "reader"
-                        :tty? true
-                        ;; The plan is complete and every path in it validated by
-                        ;; the time this runs, so the swap lands squarely between
-                        ;; planning and applying without racing a timer.
-                        :input (fn []
-                                 (symlink! swapped outside)
-                                 "a")}))))
-    (is (= "sentinel\n" (slurp sentinel)))
-    (is (= ["secrets.edn.example"]
-           (mapv #(.getName ^java.io.File %) (.listFiles outside))))
-    (is (not (.exists (io/file root "bb.edn")))
-        "the refusal precedes every write, not only the redirected one")))
-
-(deftest unsupported-filesystem-capability-fails-closed-test
-  ;; Injecting at the probe is the deterministic way into this branch: no
-  ;; filesystem here actually lacks the posix and unix attribute views.
-  (let [out (java.io.StringWriter.)]
-    (with-redefs [init/filesystem-capability
-                  (constantly {:views #{"basic"}
-                               :missing ["posix" "unix"]
-                               :supported? false})]
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"cannot report its posix and unix file attributes"
-           (binding [*out* out]
-             (init/init! {:root *dir* :app "reader" :apply? true :tty? false}))))
-      (is (str/includes? (str out) "--apply will be refused")))
-    (is (not (.exists (io/file *dir* "bb.edn"))))))
-
-(deftest staging-write-refuses-an-existing-entry-test
-  ;; The staging name is random by design, so a fixed one is injected here to
-  ;; plant an entry at it on purpose.
-  (let [root (mkdirs! (io/file *dir* "project"))
-        outside (mkdirs! (io/file *dir* "outside"))
-        sentinel (io/file outside "planted")
-        out (java.io.StringWriter.)]
-    (spit sentinel "sentinel\n")
-    (symlink! (io/file root ".secrets-init-fixed.tmp") sentinel)
-    (with-redefs-fn
-      {#'init/staging-path (fn [target]
-                             (.resolve (.getParent target) ".secrets-init-fixed.tmp"))}
-      (fn []
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo
-             #"Initializer failed"
-             (binding [*out* out]
-               (init/init! {:root (str root)
-                            :app "reader"
-                            :apply? true
-                            :tty? false}))))))
-    (is (= "sentinel\n" (slurp sentinel))
-        "CREATE_NEW refuses the planted entry instead of writing through the link")
-    (is (not (.exists (io/file root "bb.edn"))))))
-
-(deftest created-directories-satisfy-the-ancestry-rule-test
-  ;; Directories are created with an explicit `rwxr-xr-x` the umask can only
-  ;; narrow, never widen, so group and other write can never appear and the
-  ;; verification that immediately follows creation cannot fail on the umask the
-  ;; caller happened to have.
-  (let [out (java.io.StringWriter.)]
-    (binding [*out* out]
-      (init/init! {:root *dir* :app "reader" :apply? true :tty? false}))
-    (let [created (io/file *dir* "secrets")]
-      (is (zero? (bit-and (unix-mode created) 022))
-          "no umask can give a created directory group or other write")
-      (is (nil? (ancestry-refusal created))
-          "a directory the initializer created passes the rule it enforces"))))
-
-(deftest preview-reports-whether-apply-would-be-refused-test
-  (if (running-as-root?)
-    (is (running-as-root?)
-        "skipped as root: root satisfies every ownership check by definition")
-    (let [open (mkdirs! (io/file *dir* "open"))
-          project (mkdirs! (io/file open "project"))
-          result (atom nil)]
-      (set-permissions! open "rwxrwxrwx")
-      (let [out (with-out-str
-                  (reset! result (init/init! {:root (str project)
-                                              :app "reader"
-                                              :tty? false})))]
-        (is (= :preview (:status @result)))
-        (is (false? (:trusted? (:trust @result))))
-        (is (= :world-writable (:reason (:trust @result))))
-        (is (str/includes? out "--apply will be refused"))
-        (is (not (str/includes? out "Rerun with --apply"))
-            "an untrusted preview does not imply that applying this plan can succeed")
-        (is (str/includes? out "secrets/secrets.edn.example: create")
-            "the preview itself still runs")
-        (is (not (.exists (io/file project "bb.edn"))))))))
-
-(deftest unparseable-config-files-report-no-parser-text-test
-  (let [marker "CREDENTIAL-MARKER-5e1c"
-        sources [(str "{:token " marker "/a/b}")
-                 (str "{:token \"" marker "\"")
-                 (str "{:token \"" marker "\" ^}")
-                 (str "#=(" marker ")")]]
-    (doseq [source sources
-            merge! [#(init/merge-bb-edn % (init/proposed-config {:app "reader"}))
-                    init/merge-deps-edn]]
-      (let [e (try (merge! source) nil (catch Exception e e))]
-        (is (instance? clojure.lang.ExceptionInfo e))
-        (is (re-find #"(bb|deps)\.edn" (ex-message e))
-            "the message names the file")
-        (is (nil? (ex-cause e)) "the parser's exception is not kept as a cause")
-        (when (str/includes? source "\"")
-          (is (re-find #"at line 1, column \d+" (ex-message e)) "the location is kept"))
-        (is (not (contains? (ex-data e) :cause)))
-        (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) marker)))))))
+(deftest an-existing-identity-is-kept-test
+  (io/make-parents (file ".local/secrets/key.txt"))
+  (spit (file ".local/secrets/key.txt") "my key")
+  (let [{:keys [out]} (run!! {:layout :disposable :keygen? true :apply? true})]
+    (is (= "my key" (slurp (file ".local/secrets/key.txt"))))
+    (is (re-find #"(?s)Already there, left as they are:.*\n  .local/secrets/key.txt\n" out))
+    (is (not (str/includes? out "Public key:")))))
