@@ -1428,6 +1428,35 @@
                             (load {"max-source-bytes" 1024}))))
     (testing "a :limits that is not a map at all is refused"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a map" (load "16777216"))))
+    (testing "a failure names the limit and never renders the supplied value"
+      (let [sentinel "SENTINELlimitvalueMUSTNEVERAPPEAR"
+            failure (fn [limits]
+                      (try (load limits) nil (catch clojure.lang.ExceptionInfo e e)))
+            bad-value (failure {:max-edn-depth sentinel})
+            unknown (failure {:zeta 1 :alpha 2 sentinel 3 [sentinel] 4})
+            only-unnamed (failure {sentinel 1})
+            not-a-map (failure sentinel)]
+        (is (= {:reason :invalid-limits :limit :max-edn-depth} (ex-data bad-value)))
+        (is (= {:reason :invalid-limits :unknown-keys [:alpha :zeta]} (ex-data unknown))
+            "only keyword keys are named, in order")
+        (is (str/includes? (ex-message unknown) ":alpha, :zeta, and 2 that are not keywords."))
+        (is (= {:reason :invalid-limits :unknown-keys []} (ex-data only-unnamed)))
+        (is (str/includes? (ex-message only-unnamed) "key(s): 1 that are not keywords."))
+        (is (= {:reason :invalid-limits} (ex-data not-a-map)))
+        (doseq [e [bad-value unknown only-unnamed not-a-map]]
+          (is (str/starts-with? (ex-message e) "secrets :limits ")
+              "the message says whose option it is")
+          (is (not (str/includes? (str (ex-message e) (pr-str e)) sentinel))))))
+    (testing "the age wrapper reports its own bound the same way and ignores other limits"
+      (let [e (try (age/decrypt-bytes *key* enc {:limits {:max-plaintext-bytes 0}})
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= {:reason :invalid-limits :limit :max-plaintext-bytes} (ex-data e)))
+        (is (str/starts-with? (ex-message e) "age :limits ")))
+      (is (= :invalid-limits
+             (:reason (ex-data (try (age/decrypt-bytes *key* enc {:limits [1]})
+                                    (catch clojure.lang.ExceptionInfo e e))))))
+      (is (= "{:k \"v\"}"
+             (str/trim (age/decrypt *key* enc {:limits {:max-source-bytes 1}})))))
     (testing "reader-literals validates when the readers map is built"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
                             (secrets/reader-literals {:file enc :identity-file *key*

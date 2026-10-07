@@ -281,26 +281,10 @@
    :max-edn-depth safe-edn/default-max-depth})
 
 (defn- resolve-limits
-  "Merge a supplied `:limits` map over `default-limits`. Rejects anything a
-  later read would silently see as a default: a non-map, an unknown key (a typo
-  in a security limit must not read as \"unset\"), or a value that is not a
-  positive integer."
+  "Merge a supplied `:limits` map over `default-limits`, or throw
+  `:invalid-limits`. See [[com.kirahowe.secrets.age/resolve-limits]]."
   [limits]
-  (when-not (or (nil? limits) (map? limits))
-    (throw (ex-info "secrets :limits must be a map of limit name → positive integer."
-                    {:limits limits :reason :invalid-limits})))
-  (let [unknown (vec (sort-by str (remove (set (keys default-limits)) (keys limits))))]
-    (when (seq unknown)
-      (throw (ex-info (str "secrets :limits has unknown key(s): "
-                           (str/join ", " unknown) ". Known limits: "
-                           (str/join ", " (sort (keys default-limits))) ".")
-                      {:limits limits :unknown-keys unknown :reason :invalid-limits}))))
-  (doseq [[limit value] limits]
-    (when-not (and (integer? value) (pos? value))
-      (throw (ex-info (str "secrets :limits " limit " must be a positive integer, got "
-                           (pr-str value) ".")
-                      {:limits limits :limit limit :value value :reason :invalid-limits}))))
-  (merge default-limits limits))
+  (age/resolve-limits default-limits limits "secrets"))
 
 ;;;; Loading
 

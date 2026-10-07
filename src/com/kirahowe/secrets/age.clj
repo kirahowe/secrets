@@ -191,20 +191,45 @@
   before every further read rather than after the whole output exists."
   65536)
 
+(defn resolve-limits
+  "Merge the `limits` map over `defaults` and return the result.
+
+  `limits` is nil or a map whose keys all appear in `defaults` and whose values
+  are positive integers. Anything else throws `ex-info` with
+  `:reason :invalid-limits`, so a misspelled limit is reported and never read
+  as unset. Unknown keyword keys are listed under `:unknown-keys`, and a
+  rejected value is named by its known key under `:limit`. `label` names the
+  owner of the option in the message. The message and data render keywords
+  only: an unknown key of any other type is counted, and no supplied value
+  appears."
+  [defaults limits label]
+  (let [invalid! (fn [problem data]
+                   (throw (ex-info (str label " :limits " problem)
+                                   (assoc data :reason :invalid-limits))))]
+    (when-not (or (nil? limits) (map? limits))
+      (invalid! "must be a map of limit name → positive integer." {}))
+    (when-let [unknown (seq (remove (set (keys defaults)) (keys limits)))]
+      (let [named (sort-by str (filter keyword? unknown))
+            unnamed (- (count unknown) (count named))]
+        (invalid! (str "has unknown key(s): " (str/join ", " named)
+                       (when (pos? unnamed)
+                         (str (when (seq named) ", and ") unnamed " that are not keywords"))
+                       ". Known limits: " (str/join ", " (sort (keys defaults))) ".")
+                  {:unknown-keys (vec named)})))
+    (doseq [[limit value] limits]
+      (when-not (and (integer? value) (pos? value))
+        (invalid! (str limit " must be a positive integer.") {:limit limit})))
+    (merge defaults limits)))
+
 (defn- plaintext-limit
   "Resolve the plaintext byte bound from the optional trailing options map
-  `opts`, rejecting anything a later read would silently see as the default."
+  `opts`. Other keys in its `:limits` belong to the caller and are ignored."
   [opts]
   (let [limits (:limits opts)]
-    (when-not (or (nil? limits) (map? limits))
-      (throw (ex-info "age :limits must be a map of limit name → positive integer."
-                      {:limits limits :reason :invalid-limit})))
-    (let [n (get limits :max-plaintext-bytes default-max-plaintext-bytes)]
-      (when-not (and (integer? n) (pos? n))
-        (throw (ex-info (str "age :limits :max-plaintext-bytes must be a positive integer, got "
-                             (pr-str n) ".")
-                        {:limit :max-plaintext-bytes :value n :reason :invalid-limit})))
-      n)))
+    (:max-plaintext-bytes
+     (resolve-limits {:max-plaintext-bytes default-max-plaintext-bytes}
+                     (cond-> limits (map? limits) (select-keys [:max-plaintext-bytes]))
+                     "age"))))
 
 (defn- destroy-process!
   "Terminate `process`, escalating to a forcible kill when it does not exit
