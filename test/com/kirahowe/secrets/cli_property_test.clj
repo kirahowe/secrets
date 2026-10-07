@@ -10,6 +10,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [com.kirahowe.secrets :as secrets]
+            [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.generators :as g]
             [com.kirahowe.secrets.safe-edn :as safe-edn]))
@@ -23,7 +24,8 @@
 (def ^:private recipient-entries @#'cli/recipient-entries)
 (def ^:private render-secrets @#'cli/render-secrets)
 (def ^:private cli-limits @#'cli/default-limits)
-(def ^:private cli-resolve-limits @#'cli/resolve-limits)
+(def ^:private cli-resolve-limits
+  #(age/resolve-limits cli-limits % "secrets config"))
 (def ^:private runtime-resolve-limits @#'secrets/resolve-limits)
 
 ;;;; Fixtures
@@ -261,15 +263,24 @@
             unknown (unknown-limit-over unknown-example)]
     {:limits limits :bad-key bad-key :bad-value bad-value :unknown unknown}))
 
+(defn- invalid-limits-naming-only-keys?
+  "True for `:invalid-limits` failure data that holds limit names and nothing
+  else, so no supplied value can appear in it."
+  [data]
+  (and (= :invalid-limits (:reason data))
+       (empty? (dissoc data :reason :limit :unknown-keys))
+       (every? keyword? (concat (vals (select-keys data [:limit]))
+                                (:unknown-keys data)))))
+
 (defspec cli-limits-resolve-only-known-positive-integers 200
   (prop/for-all [case (limits-case cli-limits :max-source-bytes)]
     (resolves-only-known-positive-integers?
-     cli-resolve-limits cli-limits #(= 1 (:secrets/exit %)) case)))
+     cli-resolve-limits cli-limits invalid-limits-naming-only-keys? case)))
 
 (defspec runtime-limits-resolve-only-known-positive-integers 200
   (prop/for-all [case (limits-case secrets/default-limits :max-recipients)]
     (resolves-only-known-positive-integers?
-     runtime-resolve-limits secrets/default-limits #(= :invalid-limits (:reason %)) case)))
+     runtime-resolve-limits secrets/default-limits invalid-limits-naming-only-keys? case)))
 
 ;;;; Rendering plaintext
 

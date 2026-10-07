@@ -2782,7 +2782,9 @@
     (is (instance? clojure.lang.ExceptionInfo e))
     (is (re-find #"unknown key" (ex-message e)))
     (is (= [:a :zzz] (:unknown-keys (ex-data e))))
-    (is (re-find #"1 that are not keywords" (ex-message e)))))
+    (is (re-find #"1 that are not keywords" (ex-message e)))
+    (is (= :invalid-limits (:reason (ex-data e)))
+        "the CLI reports limits through the runtime's resolver")))
 
 (deftest doctor-reports-an-identity-variable-error-test
   (let [run (fn [variable value]

@@ -55,9 +55,9 @@
   best-effort basis.
 
   The command fns are a REPL-safe API: they return data (a path, a results
-  map, or :aborted) and signal failures by throwing `ex-info` (carrying
-  :secrets/exit) instead of exiting. `run!` — the CLI entry point — is the
-  only fn here that prints error data and calls System/exit."
+  map, or :aborted) and signal failures by throwing `ex-info` instead of
+  exiting. `run!` — the CLI entry point — is the only fn here that prints
+  error data and calls System/exit."
   (:refer-clojure :exclude [run!])
   (:require [babashka.cli :as bbcli]
             [clojure.java.io :as io]
@@ -340,33 +340,6 @@
           :max-manifest-bytes 1048576
           :max-manifest-entries 10000}))
 
-(defn- resolve-limits
-  "Merge a configured `:limits` map over `default-limits`. Rejects anything a
-  later read would silently see as a default: a non-map, an unknown key (a typo
-  in a limit must not read as \"unset\"), or a value that is not a positive
-  integer. Failures name known limits and types, never the rejected values."
-  [limits]
-  (when-not (or (nil? limits) (map? limits))
-    (fail! "secrets config :limits must be a map of limit name → positive integer."))
-  (let [unknown (remove (set (keys default-limits)) (keys limits))
-        named (sort-by str (filter keyword? unknown))
-        unnamed (- (count unknown) (count named))]
-    (when (seq unknown)
-      (fail! (str "secrets config :limits has unknown key(s): "
-                  (str/join ", " named)
-                  (when (pos? unnamed)
-                    (str (when (seq named) ", and ") unnamed " that are not keywords"))
-                  ".\n"
-                  "    Known limits: "
-                  (str/join ", " (sort (keys default-limits))) ".")
-             {:unknown-keys (vec named)})))
-  (doseq [[limit value] limits]
-    (when-not (and (integer? value) (pos? value))
-      (fail! (str "secrets config :limits " limit " must be a positive integer, got a value "
-                  "of type " (name (manifest/value-type value)) ".")
-             {:limit limit})))
-  (merge default-limits limits))
-
 (defn- normalize-environment
   [{:keys [app limits]} environment-name
    {:keys [secrets-file key-file identity-file template manifest recipients-file]
@@ -442,7 +415,7 @@
                 "    so there is deliberately no default — projects must not share a key "
                 "path\n"
                 "    by accident.")))
-  (let [limits (resolve-limits (:limits config))
+  (let [limits (age/resolve-limits default-limits (:limits config) "secrets config")
         normalized (reduce-kv (fn [normalized environment-name env-config]
                                 (assoc normalized
                                        environment-name
