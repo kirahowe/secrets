@@ -7,13 +7,14 @@
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [com.kirahowe.secrets.cli :as cli]
+            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [rewrite-clj.node :as node]
             [rewrite-clj.zip :as z])
   (:import [java.nio ByteBuffer]
            [java.nio.charset StandardCharsets]
            [java.nio.file FileSystems Files LinkOption OpenOption Path
-            StandardCopyOption StandardOpenOption]
+            StandardOpenOption]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 ;;;; Configuration
@@ -914,25 +915,6 @@
       (Files/createDirectory segment new-directory-attributes))
     (trusted-directory! segment)))
 
-(defn- publish! [^Path staging ^Path target]
-  ;; ATOMIC_MOVE is renameat(2): it replaces whatever entry sits at `target`
-  ;; without following a link there, so the leaf was never the exposure — the
-  ;; ancestors were. A leaf link check here would be redundant.
-  (try
-    (Files/move staging target
-                (into-array StandardCopyOption
-                            [StandardCopyOption/ATOMIC_MOVE
-                             StandardCopyOption/REPLACE_EXISTING]))
-    (catch Exception e
-      ;; Babashka cannot resolve AtomicMoveNotSupportedException, so identify
-      ;; that one exception by name. There is no copy-and-delete fallback,
-      ;; which would follow a symlink planted at `target`.
-      (if (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e)))
-        (throw (ex-info (str "This filesystem cannot atomically publish " target)
-                        {:path (str target) :reason :atomic-move-unsupported}
-                        e))
-        (throw e)))))
-
 (defn- staging-path
   "Name a staging file beside `target`, inside the already-verified parent."
   ^Path [^Path target]
@@ -946,7 +928,9 @@
     (try
       (with-open [channel (Files/newByteChannel staging staging-options)]
         (.write channel (ByteBuffer/wrap (.getBytes content StandardCharsets/UTF_8))))
-      (publish! staging target)
+      ;; The move replaces a link at `target` without following it, and has no
+      ;; copy fallback that would.
+      (fs/atomic-move! staging target)
       (finally
         (Files/deleteIfExists staging)))))
 

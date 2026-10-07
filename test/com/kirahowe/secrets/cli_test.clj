@@ -626,20 +626,22 @@
       (with-out-str (cli/reencrypt! config "dev"))
       (let [ciphertext-before (file-bytes encrypted)
             manifest-before (slurp manifest-path)
-            atomic-var (cli-private 'atomic-replace!)
-            atomic-replace! @atomic-var
-            moves (atom 0)]
+            real-move fs/atomic-move!
+            moves (atom [])]
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"Could not commit"
              (with-out-str
                (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:version :new}")
-                                atomic-var
+                                #'fs/atomic-move!
                                 (fn [source target]
-                                  (if (= 2 (swap! moves inc))
+                                  (swap! moves conj (str target))
+                                  (if (= manifest-path (str target))
                                     (throw (ex-info "simulated manifest move failure" {}))
-                                    (atomic-replace! source target)))}
+                                    (real-move source target)))}
                  #(cli/edit! config "dev")))))
-        (is (= 3 @moves) "ciphertext commit, failed manifest commit, ciphertext rollback")
+        (is (= [encrypted manifest-path encrypted]
+               (filter #{encrypted manifest-path} @moves))
+            "ciphertext commit, failed manifest commit, ciphertext rollback")
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
 

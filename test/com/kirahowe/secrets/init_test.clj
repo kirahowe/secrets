@@ -5,6 +5,7 @@
             [clojure.string :as str]
             [clojure.test :refer [are deftest is testing use-fixtures]]
             [com.kirahowe.secrets.cli :as cli]
+            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.init :as init])
   (:import [java.nio.file Files LinkOption]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
@@ -582,6 +583,22 @@
       (is (and (:template? @seen) (:bb? @seen))
           "keygen follows successful scaffold writes")
       (is (= "dev" (:env @seen))))))
+
+(deftest apply-reports-an-unsupported-atomic-move-by-target-test
+  (let [refusal (fn [_ target]
+                  (throw (ex-info "forced" {:reason :atomic-move-unsupported
+                                            :target (str target)})))
+        failure (try
+                  (with-redefs [fs/atomic-move! refusal]
+                    (init/init! {:root *dir* :app "reader" :apply? true :tty? false}))
+                  nil
+                  (catch clojure.lang.ExceptionInfo e e))
+        data (ex-data (ex-cause failure))]
+    (is (re-find #"previous project files were restored" (ex-message failure)))
+    (is (= :atomic-move-unsupported (:reason data)))
+    (is (str/starts-with? (:target data) (real-path *dir*))
+        "the shared move's error names the file that was not published")
+    (is (not (.exists (io/file *dir* "bb.edn"))) "nothing is published by another route")))
 
 ;;;; Race Safety
 

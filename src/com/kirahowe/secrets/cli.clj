@@ -917,26 +917,6 @@
       (str "." (.getName target) ".") suffix
       (into-array java.nio.file.attribute.FileAttribute [])))))
 
-(defn- atomic-replace!
-  "Atomically replace `target` with the staged sibling file `source`."
-  [source target]
-  (try
-    (java.nio.file.Files/move
-     (.toPath (io/file source)) (.toPath (io/file target))
-     (into-array java.nio.file.CopyOption
-                 [java.nio.file.StandardCopyOption/ATOMIC_MOVE
-                  java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
-    (catch Exception e
-      ;; Babashka does not expose AtomicMoveNotSupportedException as a
-      ;; resolvable class, so identify this one portable NIO exception by name.
-      (if (= "java.nio.file.AtomicMoveNotSupportedException"
-             (.getName (class e)))
-        (throw (ex-info (str "The filesystem does not support an atomic secrets update for "
-                             target)
-                        {:source (str source) :target (str target)}
-                        e))
-        (throw e)))))
-
 (defn- backup-target!
   "Copy an existing replacement target to a sibling temp file for rollback."
   [{:keys [target] :as replacement}]
@@ -967,14 +947,14 @@
         (swap! prepared conj (backup-target! replacement)))
       (try
         (doseq [{:keys [staged target] :as replacement} @prepared]
-          (atomic-replace! staged target)
+          (fs/atomic-move! staged target)
           (swap! committed conj replacement))
         (catch Exception commit-error
           (let [rollback-errors
                 (reduce (fn [errors {:keys [target backup existed?]}]
                           (try
                             (if existed?
-                              (atomic-replace! backup target)
+                              (fs/atomic-move! backup target)
                               (java.nio.file.Files/deleteIfExists
                                (.toPath (io/file target))))
                             errors
@@ -1036,7 +1016,7 @@
   (let [tmp (sibling-temp-file! f ".recipients.tmp")]
     (try
       (spit tmp content)
-      (atomic-replace! tmp f)
+      (fs/atomic-move! tmp f)
       (finally (.delete tmp)))))
 
 ;;;; Commands
