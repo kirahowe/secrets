@@ -979,87 +979,6 @@
     (is (= :missing (:dev results)))
     (is true "and verify! returned instead of killing the process")))
 
-;;;; Encrypt and decrypt (environment-first argument order)
-
-(deftest encrypt-decrypt-arg-order-and-binary-safety-test
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config (test-config)
-          f (str *dir* "/note.txt")
-          g (str *dir* "/other.txt")
-          payload "hello from the cli"]
-      (spit f payload)
-      (spit g payload)
-      (testing "run! dispatches encrypt as [env] <file>"
-        (with-out-str (cli/run! config ["encrypt" "dev" f]))
-        (is (.exists (io/file (str f ".age")))))
-      (testing "run! dispatches encrypt as <file> alone via the default env"
-        (with-out-str (cli/run! config ["encrypt" g]))
-        (is (.exists (io/file (str g ".age")))))
-      (testing "decrypt streams the exact bytes to System/out"
-        (let [baos (java.io.ByteArrayOutputStream.)
-              orig System/out]
-          (with-open [replacement (java.io.PrintStream. baos)]
-            (System/setOut replacement)
-            (try
-              (with-out-str (cli/run! config ["decrypt" "dev" (str f ".age")]))
-              (finally
-                (System/setOut orig))))
-          (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))
-
-(deftest decrypt-is-not-bound-by-the-secrets-store-limit-test
-  ;; `encrypt`/`decrypt` are the general-purpose pair for an arbitrary file, so
-  ;; the 8 MiB bound that protects a *secrets store* must not apply here: a
-  ;; store past it is hostile, an ordinary file past it is Tuesday. Sized just
-  ;; over that bound, which is the only interesting size.
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config (test-config)
-          f (str *dir* "/big.bin")
-          payload (byte-array (inc (:max-plaintext-bytes secrets/default-limits))
-                              (byte 7))]
-      (with-open [out (io/output-stream f)]
-        (.write out payload))
-      (with-out-str (cli/run! config ["encrypt" "dev" f]))
-      (let [baos (java.io.ByteArrayOutputStream.)
-            orig System/out]
-        (with-open [replacement (java.io.PrintStream. baos)]
-          (System/setOut replacement)
-          (try
-            (with-out-str (cli/run! config ["decrypt" "dev" (str f ".age")]))
-            (finally
-              (System/setOut orig))))
-        (is (= (alength payload) (.size baos))
-            "a file larger than the store bound still round-trips")))))
-
-(deftest decrypt-to-stream-boundaries-test
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [plain (str *dir* "/stream.bin")
-          encrypted (str plain ".age")
-          payload (byte-array (map unchecked-byte (take 20001 (cycle (range 256)))))]
-      (with-open [out (io/output-stream plain)]
-        (.write out payload))
-      (age/encrypt-file! *key* plain encrypted)
-      (testing "binary output larger than the copy buffer streams exactly at its limit"
-        (let [out (java.io.ByteArrayOutputStream.)]
-          (is (identical? out
-                          (age/decrypt-to-stream!
-                           *key* encrypted out
-                           {:limits {:max-plaintext-bytes (alength payload)}})))
-          (is (java.util.Arrays/equals payload (.toByteArray out)))))
-      (testing "the first byte over the limit is rejected without being written"
-        (let [out (java.io.ByteArrayOutputStream.)
-              limit (dec (alength payload))
-              e (try
-                  (age/decrypt-to-stream!
-                   *key* encrypted out {:limits {:max-plaintext-bytes limit}})
-                  (catch clojure.lang.ExceptionInfo e e))]
-          (is (= :plaintext-too-large (:reason (ex-data e))))
-          (is (= limit (:limit (ex-data e))))
-          (is (= (inc limit) (:bytes (ex-data e))))
-          (is (<= (.size out) limit)))))))
-
 ;;;; Command-line option boundary
 
 (defn- with-cwd-entry
@@ -1077,33 +996,6 @@
       (f entry)
       (finally
         (doseq [p (reverse (file-seq entry))] (.delete p))))))
-
-(deftest encrypt-decrypt-a-dash-leading-relative-path-test
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (with-cwd-entry "-secrets-cli-boundary"
-      (fn [_]
-        (let [config (cli/normalize-config (test-config))
-              rel "-secrets-cli-boundary/note.txt"
-              payload "hello from a dash-leading path"]
-          (io/make-parents rel)
-          (spit rel payload)
-          ;; The commands are called directly rather than through `run!`: `run!`
-          ;; turns a command failure into System/exit, which would kill the test
-          ;; runner instead of reporting a failing assertion.
-          (testing "encrypt takes a dash-leading path as a file, not as options"
-            (with-out-str (cli/encrypt! config "dev" rel))
-            (is (.exists (io/file (str rel ".age")))))
-          (testing "decrypt streams the exact bytes of a dash-leading ciphertext"
-            (let [baos (java.io.ByteArrayOutputStream.)
-                  orig System/out]
-              (with-open [replacement (java.io.PrintStream. baos)]
-                (System/setOut replacement)
-                (try
-                  (with-out-str (cli/decrypt! config "dev" (str rel ".age")))
-                  (finally
-                    (System/setOut orig))))
-              (is (= payload (String. (.toByteArray baos) "UTF-8"))))))))))
 
 (deftest run-editor-receives-an-absolute-path-test
   (with-cwd-entry "-secrets-cli-boundary-editor"
@@ -1281,20 +1173,6 @@
 ;;; named `--edn` was removed before positional dispatch. `--edn` is `set`'s
 ;;; flag alone now, and `--` ends the options for every command.
 
-(defn- captured-stdout-bytes
-  "The exact bytes `f` writes to `System/out`, where `decrypt` streams
-  plaintext. `with-out-str` cannot see those: it rebinds `*out*` only."
-  [f]
-  (let [captured (java.io.ByteArrayOutputStream.)
-        original System/out]
-    (with-open [replacement (java.io.PrintStream. captured)]
-      (System/setOut replacement)
-      (try
-        (with-out-str (f))
-        (finally
-          (System/setOut original))))
-    (.toByteArray captured)))
-
 (defn- management-invocation [args]
   (shell/sh "bb" "-cp" "src" "-e"
             (str "(require '[com.kirahowe.secrets.cli :as cli]) "
@@ -1321,8 +1199,6 @@
                   cli/add-recipient! record
                   cli/recipients! record
                   cli/reencrypt! record
-                  cli/encrypt! record
-                  cli/decrypt! record
                   cli/doctor! record]
       (with-out-str (cli/run! config args)))
     @seen))
@@ -1359,6 +1235,11 @@
     (is (str/includes? (:err missing) "Required argument: <env-or-key>"))
     (is (str/includes? (:err surplus) "Unexpected argument: extra"))
     (is (str/includes? (:err unknown) "Unknown command: wat"))
+    (testing "the store commands are the whole surface: no general file commands"
+      (doseq [command ["encrypt" "decrypt"]]
+        (let [{:keys [exit err]} (management-invocation [command "dev" "note.txt"])]
+          (is (= 1 exit) command)
+          (is (str/includes? err (str "Unknown command: " command)) command))))
     (is (str/includes? (:err terminated-long-help) "Unknown command: --help"))
     (is (str/includes? (:err terminated-short-help) "Unknown command: -h"))))
 
@@ -1370,59 +1251,6 @@
 
 (deftest command-names-are-case-insensitive-test
   (is (= ["prod"] (dispatched (test-config) ["KEYGEN" "prod"]))))
-
-(deftest a-file-named-like-a-flag-round-trips-test
-  ;; The acceptance criterion, through `run!` rather than the command fns: what
-  ;; the defect broke is dispatch, so dispatch is what has to run. Safe here
-  ;; only because every step is expected to succeed — a failure would exit the
-  ;; test runner, which is exactly what the pre-fix `No such file: ` does.
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (with-cwd-entry "--edn"
-      (fn [entry]
-        (with-cwd-entry "--edn.age"
-          (fn [_]
-            (let [config (test-config)
-                  payload "a file whose name is spelled like a flag"]
-              (spit entry payload)
-              (doseq [[label env-args] [["environment given explicitly" ["dev"]]
-                                        ["environment omitted" []]]]
-                (testing label
-                  (with-out-str
-                    (cli/run! config (into ["encrypt"] (conj env-args "--edn"))))
-                  (is (.exists (io/file "--edn.age"))
-                      "the operand named the file, not a flag")
-                  (is (= payload
-                         (String. (captured-stdout-bytes
-                                   #(cli/run! config (into ["decrypt"]
-                                                           (conj env-args "--edn.age"))))
-                                  "UTF-8"))
-                      "the recovered bytes are the original"))))))))))
-
-(deftest operand-terminator-addresses-a-flag-named-file-test
-  ;; `--` for the CLI's own parser, for the reason 006 gave age one: an operand
-  ;; that looks like an option needs a way to say it is not one. The ciphertext
-  ;; is `--edn.age` because that is what `encrypt` writes; it is dash-leading
-  ;; too, so `decrypt` past the terminator is the interesting half.
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (with-cwd-entry "--edn"
-      (fn [entry]
-        (with-cwd-entry "--edn.age"
-          (fn [_]
-            (let [config (test-config)
-                  payload "addressed from past the terminator"]
-              (spit entry payload)
-              (testing "encrypt dev -- --edn encrypts the file"
-                (with-out-str (cli/run! config ["encrypt" "dev" "--" "--edn"]))
-                (is (.exists (io/file "--edn.age")))
-                (is (not (.exists (io/file "--.age")))
-                    "the terminator was consumed, not taken as the file"))
-              (testing "decrypt dev -- --edn.age recovers the bytes"
-                (is (= payload
-                       (String. (captured-stdout-bytes
-                                 #(cli/run! config ["decrypt" "dev" "--" "--edn.age"]))
-                                "UTF-8")))))))))))
 
 (deftest set-edn-still-works-everywhere-it-did-test
   ;; Every position the dispatch accepts the flag in today: before or after an
@@ -1450,10 +1278,6 @@
   (let [config (test-config)]
     (doseq [[args expected note]
             [;; The two cases the issue confirmed.
-             [["encrypt" "--edn"] [nil "--edn"] "a lone flag-shaped operand is the file"]
-             [["encrypt" "dev" "--edn"] ["dev" "--edn"] "[env] stays positional before it"]
-             [["decrypt" "--edn"] [nil "--edn"] "the same for decrypt"]
-             [["decrypt" "dev" "--edn"] ["dev" "--edn"] "the same for decrypt"]
              [["rm" "--edn"] [nil "--edn"] "rm reads it as the key"]
              [["rm" "dev" "--edn"] ["dev" "--edn"] "rm reads it as the key"]
              [["add-recipient" "--edn"] ["--edn" nil] "add-recipient reads it as [env]"]
@@ -1469,11 +1293,9 @@
              ;; [env] positional and optional, unchanged.
              [["keygen"] [nil] "an omitted [env] is still nil at the boundary"]
              [["keygen" "dev"] ["dev"] "an explicit [env] is still positional"]
-             [["encrypt" "note.txt"] [nil "note.txt"] "an ordinary lone operand is the file"]
-             [["encrypt" "dev" "note.txt"] ["dev" "note.txt"] "an ordinary [env] <file>"]
              ;; The terminator is consumed by every command, not passed on.
-             [["encrypt" "--" "--edn"] [nil "--edn"] "terminated, with [env] omitted"]
-             [["encrypt" "dev" "--" "--edn"] ["dev" "--edn"] "terminated, [env] given"]
+             [["rm" "--" "--edn"] [nil "--edn"] "terminated, with [env] omitted"]
+             [["rm" "dev" "--" "--edn"] ["dev" "--edn"] "terminated, [env] given"]
              [["keygen" "--" "dev"] ["dev"] "terminated single-argument command"]]]
       (testing (str (str/join " " args) " — " note)
         (is (= expected (dispatched config args)))))))
@@ -1485,8 +1307,7 @@
   ;; environment name has to agree.
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config (test-config)
-          plaintext (str *dir* "/default-env.txt")]
+    (let [config (test-config)]
       (testing "recipients resolves the default environment by name"
         (let [omitted (with-out-str (cli/run! config ["recipients"]))]
           (is (= (with-out-str (cli/run! config ["recipients" "dev"])) omitted))
@@ -1497,11 +1318,7 @@
           (is (= "v" (:default-env (edn/read-string (age/decrypt *key* store)))))))
       (testing "verify reports the same result either way"
         (is (= (with-out-str (cli/run! config ["verify" "dev"]))
-               (with-out-str (cli/run! config ["verify"])))))
-      (testing "encrypt uses the default environment's recipients"
-        (spit plaintext "default env payload")
-        (with-out-str (cli/run! config ["encrypt" plaintext]))
-        (is (.exists (io/file (str plaintext ".age"))))))))
+               (with-out-str (cli/run! config ["verify"]))))))))
 
 ;;;; Generated shell commands
 

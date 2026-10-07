@@ -22,7 +22,7 @@
     :key-file      — the durable configured/default path above. `keygen` writes
                      here; `show-key` and `add-recipient` read the public key
                      from it.
-    :identity-file — what decrypt-side operations (edit, decrypt, reencrypt,
+    :identity-file — what decrypt-side operations (edit, set, rm, reencrypt,
                      verify) and single-key encryption use. Resolved in order:
                        1. an explicit :identity-file
                        2. $SECRETS_AGE_IDENTITY_FILE — a path to the key file
@@ -47,7 +47,7 @@
                       environment.
 
   Commands: keygen · new · edit · set · rm · verify · doctor · show-key ·
-  add-recipient · recipients · reencrypt · encrypt · decrypt · help.
+  add-recipient · recipients · reencrypt · help.
 
   By default, each environment commits `secrets.edn.age` (ciphertext) and
   `secrets.edn.manifest` (key paths, types, counts, and optional keyed hashes).
@@ -794,6 +794,13 @@
       (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
              (merge {:secrets-file secrets-file} (safe-edn/failure-data parsed))))))
 
+(defn- decrypt-to-temp!
+  "Write the environment's decrypted store, byte for byte, into the private
+  temp file `tmp`."
+  [{:keys [secrets-file identity-file] :as env} tmp]
+  (with-open [out (io/output-stream tmp)]
+    (.write out (age/decrypt-bytes identity-file secrets-file (decrypt-opts env)))))
+
 (def ^:private set-usage
   (str "`set` takes [env] <key>; the value is read from the prompt or stdin, "
        "never from the command line."))
@@ -1087,7 +1094,7 @@
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [{:keys [secrets-file identity-file] environment-name :name :as env}
+      (let [{:keys [secrets-file] environment-name :name :as env}
             env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
@@ -1100,7 +1107,7 @@
               tmp (temp-plaintext!)]
           (try
             (info "Decrypting" secrets-file "…")
-            (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
+            (decrypt-to-temp! env tmp)
             (let [before (sha256 tmp)]
               (run-editor! tmp)
               (if (= before (sha256 tmp))
@@ -1258,51 +1265,6 @@
                    [environment-name pub])))
           (distinct-by :key-file envs))))
 
-(defn encrypt!
-  "Encrypt an arbitrary plaintext file to <file>.age using an environment's
-  recipients (its recipients file, or its own identity in single-key mode).
-  Returns the ciphertext path."
-  [config env-arg file]
-  (with-environment-identity config (resolve-env config env-arg)
-    (fn [env]
-      (require-age!)
-      (let [target (encrypt-target! env)]
-        (when-not (and file (.exists (io/file file)))
-          (fail! (str "No such file: " file) {:file file}))
-        (let [out (str file ".age")]
-          (age/encrypt-file! target file out)
-          (ok "Encrypted:" out)
-          out)))))
-
-(def ^:private max-arbitrary-plaintext-bytes
-  "Plaintext bound for `decrypt!`, the general-purpose file command (1 GiB).
-
-  Deliberately far above `secrets/default-limits`' 8 MiB, which bounds a
-  secrets store rather than an arbitrary operator-named file. The output is
-  streamed in fixed-size chunks, so this is a deliberate command policy and
-  subprocess bound, not the size of a contiguous heap allocation."
-  1073741824)
-
-(defn decrypt!
-  "Decrypt a <file>.age to stdout, byte-for-byte (binary-safe; plaintext is
-  never written to disk). Returns the input path.
-
-  Bounded by `max-arbitrary-plaintext-bytes`, not by the tighter secrets-store
-  limit: this command decrypts whatever file it is given."
-  [config env-arg file]
-  (with-environment-identity config (resolve-env config env-arg)
-    (fn [env]
-      (require-age!)
-      (require-identity! env)
-      (when-not (and file (.exists (io/file file)))
-        (fail! (str "No such file: " file) {:file file}))
-      (age/decrypt-to-stream!
-       (:identity-file env) file System/out
-       (assoc (decrypt-opts env)
-              :limits {:max-plaintext-bytes max-arbitrary-plaintext-bytes}))
-      (.flush System/out)
-      file)))
-
 (defn reencrypt!
   "Decrypt and immediately re-encrypt to the environment's current recipients —
   use after adding or removing a recipient (an `edit` with no change is a no-op
@@ -1313,7 +1275,7 @@
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [{:keys [secrets-file identity-file] environment-name :name :as env}
+      (let [{:keys [secrets-file] environment-name :name :as env}
             env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
@@ -1326,7 +1288,7 @@
               tmp (temp-plaintext!)]
           (try
             (info "Decrypting" secrets-file "…")
-            (age/decrypt-to-file! identity-file secrets-file tmp (decrypt-opts env))
+            (decrypt-to-temp! env tmp)
             (info "Re-encrypting to current recipients…")
             (write-secrets! env target tmp)
             (report-written! env "Re-encrypted:" secrets-file)
@@ -2154,39 +2116,6 @@
                   :desc "Environment (defaults to configured environment)"}]]
     :exec-fn (fn [{:keys [env]}]
                (reencrypt! (normalize-config config) (operand operands env)))}
-   {:cmds ["encrypt"]
-    :doc (str "Encrypt an arbitrary file to <file>.age. With one argument it is the file in "
-              "the default environment; with two, the first is the environment and "
-              "the second is the file.")
-    :args->opts [:env-or-file :file]
-    :require [:env-or-file]
-    :restrict-args true
-    :spec [[:env-or-file {:positional true :coerce :string :desc "Environment or input file"}]
-           [:file {:positional true
-                   :coerce :string
-                   :desc "Input file when an environment is supplied"}]]
-    :exec-fn (fn [{:keys [env-or-file file]}]
-               (if file
-                 (encrypt! (normalize-config config)
-                           (operand operands env-or-file) (operand operands file))
-                 (encrypt! (normalize-config config)
-                           nil (operand operands env-or-file))))}
-   {:cmds ["decrypt"]
-    :doc (str "Decrypt an age file to stdout. With one argument it is the file in the default "
-              "environment; with two, the first is the environment and the second is the file.")
-    :args->opts [:env-or-file :file]
-    :require [:env-or-file]
-    :restrict-args true
-    :spec [[:env-or-file {:positional true :coerce :string :desc "Environment or encrypted file"}]
-           [:file {:positional true
-                   :coerce :string
-                   :desc "Encrypted file when an environment is supplied"}]]
-    :exec-fn (fn [{:keys [env-or-file file]}]
-               (if file
-                 (decrypt! (normalize-config config)
-                           (operand operands env-or-file) (operand operands file))
-                 (decrypt! (normalize-config config)
-                           nil (operand operands env-or-file))))}
    {:cmds ["help"]
     :doc "Show global or command-specific help."
     :args->opts [:command]

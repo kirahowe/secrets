@@ -202,14 +202,7 @@
         (testing "a dash-leading recipients file encrypts to that recipient"
           (let [out "-secrets-boundary/recipients.age"]
             (age/encrypt-file! {:recipients-file recipients-file} plain out)
-            (is (= payload (age/decrypt *key* out)))))
-        (testing "decrypt-to-file! restores the bytes to a dash-leading path"
-          (let [enc "-secrets-boundary/identity.age"
-                out "-secrets-boundary/plain-again.edn"]
-            (age/decrypt-to-file! identity-file enc out)
-            (is (= (vec (.getBytes payload "UTF-8"))
-                   (vec (java.nio.file.Files/readAllBytes
-                         (.toPath (io/file out))))))))))))
+            (is (= payload (age/decrypt *key* out)))))))))
 
 (deftest a-file-named-dash-is-a-path-for-every-age-path-role-test
   (let [payload "{:option/boundary \"dash-roles\"}"
@@ -878,206 +871,13 @@
                               (str *dir* "/x.age")))))))
 
 (deftest binary-roundtrip-test
-  (testing "decrypt-bytes / decrypt-to-file! preserve binary plaintext exactly"
+  (testing "decrypt-bytes preserves binary plaintext exactly"
     (let [payload (byte-array (mapv unchecked-byte [0 1 2 255 254 10 13]))
           plain (io/file *dir* "bin.dat")
-          enc (str *dir* "/bin.dat.age")
-          out (io/file *dir* "bin.out")]
+          enc (str *dir* "/bin.dat.age")]
       (io/copy payload plain)
       (age/encrypt-file! *key* plain enc)
-      (is (java.util.Arrays/equals payload (age/decrypt-bytes *key* enc)))
-      (age/decrypt-to-file! *key* enc out)
-      (is (java.util.Arrays/equals payload
-                                   (java.nio.file.Files/readAllBytes (.toPath out)))))))
-
-;;;; Plaintext file output
-
-(defn- symlink!
-  "Create the symbolic link `link` pointing at `target`. Babashka does not
-  auto-pack Java varargs, so the trailing FileAttribute array is explicit."
-  [link target]
-  (java.nio.file.Files/createSymbolicLink
-   (.toPath (io/file link)) (.toPath (io/file target))
-   (into-array java.nio.file.attribute.FileAttribute [])))
-
-(defn- staging-leftovers
-  "Names in `dir` that look like an abandoned plaintext staging file. Every
-  failure path has to leave this empty: a surviving staging file is plaintext
-  nobody will clean up."
-  [dir]
-  (filterv #(re-matches #"^\..*\.plaintext$" %) (seq (.list (io/file dir)))))
-
-(deftest decrypt-to-file-publishes-owner-only-plaintext-test
-  (let [control (str *dir* "/umask-control")]
-    (spit control "control")
-    (if-not (contains? (permission-names control) "OTHERS_READ")
-      (is true "skipped: the ambient umask already denies other-read")
-      ;; An ordinary write here is world-readable, so a 0600 result can only
-      ;; come from the staging file's creation attribute, not from the umask.
-      (testing "under umask 022 the published plaintext is still owner-only"
-        (let [payload {:database/url "jdbc:postgresql://h/db"}
-              enc (encrypt-edn! payload)
-              out (str *dir* "/published.edn")]
-          (is (= out (age/decrypt-to-file! *key* enc out)) "returns the path it was given")
-          (is (= payload (edn/read-string (slurp out))) "the plaintext round-trips")
-          (is (= owner-only-names (permission-names out))
-              "published plaintext is owner read+write only"))))))
-
-(deftest decrypt-to-file-replaces-an-existing-destination-test
-  (let [enc (encrypt-edn! {:v :fresh})
-        out (io/file *dir* "existing.edn")]
-    (spit out "{:v :stale}")
-    (.setReadable out true false)
-    (is (contains? (permission-names out) "OTHERS_READ") "the destination starts world-readable")
-    (age/decrypt-to-file! *key* enc out)
-    (is (= {:v :fresh} (edn/read-string (slurp out))) "the stale contents are replaced")
-    (is (= owner-only-names (permission-names out))
-        "the published mode is 0600 whatever mode the destination had before")
-    (is (empty? (staging-leftovers *dir*)) "no staging plaintext survives a success")))
-
-(deftest decrypt-to-file-refuses-link-and-non-regular-destinations-test
-  (let [enc (encrypt-edn! {:v :secret})
-        canary (str *dir* "/canary")
-        link (str *dir* "/linked-destination.edn")]
-    (spit canary "canary")
-    (symlink! link canary)
-    (try
-      (testing "a destination symlink is refused rather than followed"
-        (is (thrown? clojure.lang.ExceptionInfo (age/decrypt-to-file! *key* enc link)))
-        (is (= "canary" (slurp canary)) "the link target never receives plaintext")
-        (is (java.nio.file.Files/isSymbolicLink (.toPath (io/file link)))
-            "the destination is still the link, not a replacement regular file")
-        (is (empty? (staging-leftovers *dir*)) "and nothing was staged"))
-      ;; The fixture deletes *dir* with file-seq, so never leave a link behind.
-      (finally (.delete (io/file link))))
-    (testing "an existing directory destination is refused"
-      (let [sub (io/file *dir* "a-directory")]
-        (.mkdirs sub)
-        (is (thrown? clojure.lang.ExceptionInfo (age/decrypt-to-file! *key* enc sub)))
-        (is (.isDirectory sub) "the directory is untouched")
-        (is (empty? (seq (.list sub))) "and nothing was written inside it")))))
-
-(deftest decrypt-to-file-ignores-planted-staging-names-test
-  (let [enc (encrypt-edn! {:v :published})
-        canary (str *dir* "/canary")
-        dest-name "planted.edn"
-        out (str *dir* "/" dest-name)
-        planted-link (str *dir* "/." dest-name ".plaintext")
-        planted-file (str *dir* "/." dest-name ".decoy.plaintext")]
-    (spit canary "canary")
-    (symlink! planted-link canary)
-    (spit planted-file "decoy")
-    (try
-      ;; createTempFile's random infix plus CREATE_NEW means a guessed staging
-      ;; name can never be the file plaintext is written to.
-      (age/decrypt-to-file! *key* enc out)
-      (is (= {:v :published} (edn/read-string (slurp out))) "the payload lands at the destination")
-      (is (= owner-only-names (permission-names out)) "with owner-only permissions")
-      (is (= "canary" (slurp canary)) "the planted link's target is untouched")
-      (is (java.nio.file.Files/isSymbolicLink (.toPath (io/file planted-link)))
-          "the planted link is still a link, so it was never opened")
-      (is (= "decoy" (slurp planted-file)) "the planted regular file is untouched")
-      (finally (.delete (io/file planted-link))))))
-
-(deftest decrypt-to-file-leaves-the-destination-intact-when-decryption-fails-test
-  (let [other-key (str *dir* "/other-key.txt")
-        _ (age/keygen! other-key)
-        enc (encrypt-edn! {:v :unreadable} other-key)
-        out (io/file *dir* "kept.edn")]
-    (spit out "{:v :previous}")
-    (.setReadable out true false)
-    (let [before (permission-names out)]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"age decryption failed"
-                            (age/decrypt-to-file! *key* enc out)))
-      (is (= {:v :previous} (edn/read-string (slurp out))) "the previous destination survives")
-      (is (= before (permission-names out)) "with its original permissions")
-      (is (empty? (staging-leftovers *dir*))
-          "authentication fails before any staging file exists"))))
-
-(deftest decrypt-to-file-fails-closed-when-staging-cannot-be-created-test
-  (let [enc (encrypt-edn! {:v :secret})
-        locked (io/file *dir* "unwritable")
-        out (io/file locked "plain.edn")]
-    (.mkdirs locked)
-    (.setWritable locked false false)
-    (.setWritable locked false true)
-    (try
-      (if (try (.createNewFile (io/file locked "probe")) (catch Exception _ false))
-        (is true "skipped: this process writes to a mode 0500 directory anyway (root)")
-        (do
-          (is (thrown? Exception (age/decrypt-to-file! *key* enc out)))
-          (is (not (.exists out)) "no plaintext destination is created")
-          (is (empty? (seq (.list locked))) "and no staging plaintext is left behind")))
-      ;; Restore the mode so the fixture's recursive delete can clean up.
-      (finally (.setWritable locked true true)))))
-
-(deftest decrypt-to-file-rejects-unusable-destination-paths-test
-  (let [enc (encrypt-edn! {:v :secret})
-        before (set (seq (.list (io/file *dir*))))]
-    (testing "a blank or nil destination names no file"
-      (doseq [out ["" "   " nil]]
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/decrypt-to-file! *key* enc out))
-            (str "destination " (pr-str out) " is refused"))))
-    (testing "a destination whose parent directory does not exist is refused"
-      (let [out (str *dir* "/no-such-dir/plain.edn")]
-        (is (thrown? clojure.lang.ExceptionInfo (age/decrypt-to-file! *key* enc out)))
-        (is (not (.exists (io/file *dir* "no-such-dir"))) "the directory is not created")))
-    (is (= before (set (seq (.list (io/file *dir*)))))
-        "no rejected destination creates a file")))
-
-(deftest decrypt-to-file-cleans-up-staging-when-publishing-fails-test
-  ;; Every other failure case fails before a staging file exists, so this is
-  ;; the only test that reaches the cleanup path: forcing the publish step to
-  ;; throw means the real staging file was created and really holds plaintext.
-  ;; An `Error` is not an `Exception`, and it has to release the file as well.
-  (let [enc (encrypt-edn! {:v :fresh})
-        out (io/file *dir* "kept-on-publish-failure.edn")]
-    (spit out "{:v :previous}")
-    (.setReadable out true false)
-    (let [before (permission-names out)]
-      (doseq [failure [(ex-info "forced publish failure" {})
-                       (Error. "forced publish failure")]]
-        (testing (.getName (class failure))
-          (let [staged (atom nil)
-                thrown (with-redefs [fs/atomic-move!
-                                     (fn [staging _]
-                                       (reset! staged (slurp staging))
-                                       (throw failure))]
-                         (try (age/decrypt-to-file! *key* enc out)
-                              (catch Throwable t t)))]
-            (is (identical? failure thrown)
-                "the original failure is rethrown, not swallowed or replaced")
-            (is (= {:v :fresh} (edn/read-string @staged))
-                "the staging file held plaintext when publishing failed"))
-          (is (= {:v :previous} (edn/read-string (slurp out)))
-              "the destination keeps its previous contents")
-          (is (= before (permission-names out)) "with its original permissions")
-          (is (empty? (staging-leftovers *dir*))
-              "the written staging plaintext is deleted rather than left on disk"))))))
-
-(deftest decrypt-to-file-names-staging-plaintext-it-could-not-delete-test
-  ;; A directory without write permission refuses the unlink, so the staging
-  ;; file outlives the failure and the failure has to say where it is.
-  (let [enc (encrypt-edn! {:v :fresh})
-        dir (io/file *dir* "locked-after-staging")
-        out (io/file dir "plain.edn")
-        failure (ex-info "forced publish failure" {})]
-    (.mkdirs dir)
-    (try
-      (let [thrown (with-redefs [fs/atomic-move! (fn [_ _]
-                                                   (.setWritable dir false false)
-                                                   (throw failure))]
-                     (try (age/decrypt-to-file! *key* enc out)
-                          (catch Throwable t t)))
-            leftovers (staging-leftovers dir)]
-        (is (identical? failure thrown))
-        (if (empty? leftovers)
-          (is true "skipped: this process deletes from a mode 0500 directory anyway (root)")
-          (is (= [{:reason :staging-cleanup-failed
-                   :staging-file (str (io/file dir (first leftovers)))}]
-                 (mapv ex-data (.getSuppressed ^Throwable thrown))))))
-      (finally (.setWritable dir true true)))))
+      (is (java.util.Arrays/equals payload (age/decrypt-bytes *key* enc))))))
 
 ;;;; Atomic moves
 
@@ -1097,7 +897,9 @@
           link (str *dir* "/move-link")]
       (spit canary "canary")
       (spit source "fresh")
-      (symlink! link canary)
+      (java.nio.file.Files/createSymbolicLink
+       (.toPath (io/file link)) (.toPath (io/file canary))
+       (into-array java.nio.file.attribute.FileAttribute []))
       (fs/atomic-move! source link)
       (is (= "canary" (slurp canary)) "the link's old target is untouched")
       (is (not (java.nio.file.Files/isSymbolicLink (.toPath (io/file link)))))
@@ -1315,19 +1117,6 @@
       (finally
         (future-cancel call)
         (when (alive?) (shell/sh "kill" "-9" pid))))))
-
-(deftest decrypt-to-file-plaintext-bound-test
-  (let [limit 2048
-        over (encrypt-sized! (inc limit) "to-file-over")
-        out (str *dir* "/bounded-destination.edn")]
-    (spit out "{:v :previous}")
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #":max-plaintext-bytes"
-                          (age/decrypt-to-file! *key* over out
-                                                {:limits {:max-plaintext-bytes limit}})))
-    (is (= {:v :previous} (edn/read-string (slurp out)))
-        "the previous destination is left intact")
-    (is (empty? (staging-leftovers *dir*))
-        "and no partial staging plaintext survives — the bound trips before one exists")))
 
 (deftest edn-depth-scan-test
   (let [depth #(#'safe-edn/max-depth %)
