@@ -760,26 +760,13 @@
     (str/ends-with? s "\n") (subs s 0 (- (count s) 1))
     :else s))
 
-(defn- sibling-temp-file!
-  "Create a temporary file beside `target`, ensuring an atomic move to the
-  target is possible whenever the filesystem supports atomic moves."
-  [target suffix]
-  (let [target (.getAbsoluteFile (io/file (str target)))
-        parent (.getParentFile target)]
-    (.mkdirs parent)
-    (.toFile
-     (java.nio.file.Files/createTempFile
-      (.toPath parent)
-      (str "." (.getName target) ".") suffix
-      (into-array java.nio.file.attribute.FileAttribute [])))))
-
 (defn- backup-target!
   "Copy an existing replacement target to a sibling temp file for rollback."
   [{:keys [target] :as replacement}]
   (let [target (io/file target)]
     (if-not (.exists target)
       (assoc replacement :existed? false)
-      (let [backup (sibling-temp-file! target ".backup")]
+      (let [backup (fs/staging-file target)]
         (try
           (java.nio.file.Files/copy
            (.toPath target) (.toPath backup)
@@ -841,10 +828,10 @@
                               age/max-plaintext-bytes (.length f)
                               {:secrets-file (str secrets-file)}))
         value (validate-plaintext! secrets-file (slurp f :encoding "UTF-8"))
-        ciphertext-temp (sibling-temp-file! secrets-file ".age.tmp")]
+        ciphertext-temp (fs/staging-file secrets-file)]
     (try
       (let [manifest-temp (when (string? manifest)
-                            (sibling-temp-file! manifest ".manifest.tmp"))]
+                            (fs/staging-file manifest))]
         (try
           (age/encrypt-file! target plaintext-file ciphertext-temp)
           (when manifest-temp
@@ -870,7 +857,7 @@
 (defn- append-recipient!
   "Atomically replace recipients file `f` with already-bounded `content`."
   [f content]
-  (let [tmp (sibling-temp-file! f ".recipients.tmp")]
+  (let [tmp (fs/staging-file f)]
     (try
       (spit tmp content)
       (fs/atomic-move! tmp f)

@@ -72,6 +72,19 @@
       (throw (ex-info remains {:reason :private-file-remains :remaining-file path})))
     result))
 
+(defn staging-file
+  "Return a `java.io.File` beside `target` under an unpredictable name, for
+  staging a public artifact before [[atomic-move!]] puts it in place. Parent
+  directories are created. The file itself is not: whoever writes it creates
+  it with the ordinary default permissions, so the artifact that replaces
+  `target` is as readable as any other new file. The caller deletes it if the
+  move does not happen."
+  ^java.io.File [target]
+  (let [target (.getAbsoluteFile (java.io.File. (str target)))
+        parent (.getParentFile target)]
+    (.mkdirs parent)
+    (java.io.File. parent (str "." (.getName target) "." (java.util.UUID/randomUUID) ".tmp"))))
+
 (defn- atomic-move-unsupported?
   "True when `e` is NIO's AtomicMoveNotSupportedException. The class is
   recognized by name because babashka cannot resolve it."

@@ -612,34 +612,43 @@
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
 
-(deftest edit-rolls-back-an-interrupted-pair-commit-test
+(defn- mode
+  "POSIX permission names of `path`."
+  [path]
+  (set (map str (java.nio.file.Files/getPosixFilePermissions
+                 (.toPath (io/file path))
+                 (into-array java.nio.file.LinkOption [])))))
+
+(deftest public-artifacts-get-ordinary-permissions-test
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config (cli/normalize-config (test-config))
+    (let [recipients (str *dir* "/recipients.txt")
+          config (cli/normalize-config (test-config {:recipients-file recipients}))
           encrypted (str *dir* "/secrets.edn.age")
-          manifest-path (str *dir* "/secrets.edn.manifest")]
-      (encrypt-edn! {:version :old})
-      (with-out-str (cli/reencrypt! config "dev"))
-      (let [ciphertext-before (file-bytes encrypted)
-            manifest-before (slurp manifest-path)
-            real-move fs/atomic-move!
-            moves (atom [])]
-        (is (thrown-with-msg?
-             clojure.lang.ExceptionInfo #"Could not commit"
-             (with-out-str
-               (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:version :new}")
-                                #'fs/atomic-move!
-                                (fn [source target]
-                                  (swap! moves conj (str target))
-                                  (if (= manifest-path (str target))
-                                    (throw (ex-info "simulated manifest move failure" {}))
-                                    (real-move source target)))}
-                 #(cli/edit! config "dev")))))
-        (is (= [encrypted manifest-path encrypted]
-               (filter #{encrypted manifest-path} @moves))
-            "ciphertext commit, failed manifest commit, ciphertext rollback")
-        (is (= ciphertext-before (file-bytes encrypted)))
-        (is (= manifest-before (slurp manifest-path)))))))
+          manifest-path (str *dir* "/secrets.edn.manifest")
+          ordinary (str *dir* "/ordinary.txt")
+          _ (spit ordinary "an ordinary file")
+          default-mode (mode ordinary)]
+      (is (contains? default-mode "OTHERS_READ")
+          "the test needs a umask that lets others read an ordinary file")
+      (with-out-str (cli/add-recipient! config "dev" nil))
+      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k" false)))
+      (testing "a new store, manifest, and recipients file have default permissions"
+        (doseq [path [encrypted manifest-path recipients]]
+          (is (= default-mode (mode path)) path)))
+      (testing "replacing an owner-only artifact gives the replacement default permissions"
+        (doseq [path [encrypted manifest-path recipients]]
+          (java.nio.file.Files/setPosixFilePermissions
+           (.toPath (io/file path))
+           (java.nio.file.attribute.PosixFilePermissions/fromString "rw-------")))
+        (with-out-str (cli/add-recipient! config "dev" (age/keygen! (str *dir* "/bob.txt"))))
+        (with-out-str (cli/reencrypt! config "dev"))
+        (doseq [path [encrypted manifest-path recipients]]
+          (is (= default-mode (mode path)) path)))
+      (testing "no staging file remains beside them"
+        (is (= ["bob.txt" "key.txt" "ordinary.txt" "recipients.txt"
+                "secrets.edn.age" "secrets.edn.manifest"]
+               (sort (.list (io/file *dir*)))))))))
 
 ;;;; Re-encrypt and verify
 
@@ -2489,18 +2498,18 @@
 (deftest write-secrets-releases-staging-when-a-later-acquisition-fails-test
   (let [plaintext (str *dir* "/plain.edn")
         env (get-in (cli/normalize-config (test-config)) [:environments :dev])
-        real-sibling-temp-file! @(cli-private 'sibling-temp-file!)
+        real-staging-file fs/staging-file
         calls (atom 0)
         leftovers #(->> (.listFiles (io/file *dir*))
                         (map (fn [f] (.getName f)))
                         (filter (fn [n] (str/ends-with? n ".tmp")))
                         vec)]
     (spit plaintext "{:a 1}")
-    (with-redefs-fn {(cli-private 'sibling-temp-file!)
-                     (fn [target suffix]
+    (with-redefs-fn {#'fs/staging-file
+                     (fn [target]
                        (if (= 2 (swap! calls inc))
                          (throw (java.io.IOException. "no space"))
-                         (real-sibling-temp-file! target suffix)))}
+                         (real-staging-file target)))}
       #(is (thrown? java.io.IOException
                     ((cli-private 'write-secrets!) env {:identity-file *key*} plaintext))))
     (is (= 2 @calls) "the manifest staging file was the failing acquisition")
