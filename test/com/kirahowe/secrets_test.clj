@@ -1658,6 +1658,16 @@
           (is (some? @created) "the copy was started")
           (is (not (.exists ^java.io.File @created))))))))
 
+(deftest default-key-file-test
+  (is (= (str (System/getProperty "user.home") "/.config/myapp/key.txt")
+         (secrets/default-key-file "myapp")))
+  (testing "an :app option resolves to it when no identity variable is set"
+    (with-redefs-fn {#'secrets/identity-env (constantly nil)}
+      (fn []
+        (is (= {:identity-file (secrets/default-key-file "myapp")
+                :identity-source :default-key-file}
+               (secrets/with-identity {:app "myapp"} identity)))))))
+
 ;;;; Manifest
 
 (deftest manifest-structure-test

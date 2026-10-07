@@ -61,6 +61,12 @@
       (str (user-home) (subs s 1))
       s)))
 
+(defn default-key-file
+  "Return the default identity path for `app`: `~/.config/<app>/key.txt` with
+  the home directory expanded."
+  [app]
+  (expand-home (str "~/.config/" app "/key.txt")))
+
 ;;;; Identity resolution
 
 (def ^:private identity-b64-whitespace-re
@@ -151,7 +157,7 @@
                               :configured :configured-key-file
                               :configured-key-file)})
         (when-let [app (:app opts)]
-          {:identity-file (expand-home (str "~/.config/" app "/key.txt"))
+          {:identity-file (default-key-file app)
            :identity-source :default-key-file})
         {:identity-file nil :identity-source nil})))
 
