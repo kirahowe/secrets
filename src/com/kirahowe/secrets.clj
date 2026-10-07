@@ -37,11 +37,16 @@
   When none of these yields an identity, resolution returns nil and loading
   throws with the options above rather than guessing a path.
 
-  An identity path is a local filesystem path. A URI-shaped value, which
-  includes a bare relative name with a colon such as `key:txt`, fails with
-  `:disallowed-identity` and the error names only its scheme; write
-  `./key:txt` for such a file. Key contents in a path setting fail the same
-  way and are never echoed.
+  An identity path is a local filesystem path, with a leading `~` expanded. A
+  URI-shaped value, which includes a bare relative name with a colon such as
+  `key:txt`, fails with `:disallowed-identity` and the error names its source
+  and scheme; write `./key:txt` for such a file. Key contents in a path
+  setting fail the same way and are never echoed.
+
+  A path you designate has to exist. An explicit path, `:identity-file`, or
+  $SECRETS_AGE_IDENTITY_FILE that names a missing file fails with
+  `:no-identity`, naming the source and the path. Only the app default in 4
+  may be absent, and then no identity is available.
 
   Sources 2 and 3 are written to a private temporary file only while an
   operation needs them, then deleted before that operation returns. If the
@@ -147,60 +152,72 @@
   [k]
   (identity-env-value k (getenv k)))
 
+(def ^:private identity-source-subject
+  "How an error names the place an identity path came from."
+  {:identity-file "The explicit identity path"
+   :secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
+   :configured-key-file "The configured :key-file"
+   :default-key-file "The default key path"})
+
 (defn- identity-candidate
   "Choose an identity without materializing injected contents.
 
-  The callback scope owns raw and base64 identities. This function only selects
-  a source, which keeps option normalization and availability checks free of
-  private filesystem effects."
+  Every path has `~` expanded here, so one rule covers each source. A path the
+  caller or the environment named is `:designated?`: it has to exist. The app
+  default is not, so its absence means only that no identity is available."
   [identity-or-opts]
   (let [opts (if (map? identity-or-opts) identity-or-opts {})
-        explicit (if (map? identity-or-opts) (:identity-file opts) identity-or-opts)]
+        explicit (if (map? identity-or-opts) (:identity-file opts) identity-or-opts)
+        designated (fn [path source]
+                     {:identity-file (expand-home path)
+                      :identity-source source
+                      :designated? true})]
     (or (when explicit
-          {:identity-file explicit :identity-source :identity-file})
+          (designated explicit :identity-file))
         (when-let [path (identity-env "SECRETS_AGE_IDENTITY_FILE")]
-          {:identity-file path :identity-source :secrets-age-identity-file})
+          (designated path :secrets-age-identity-file))
         (when-let [contents (identity-env "SECRETS_AGE_IDENTITY")]
           {:contents contents :identity-source :secrets-age-identity})
         (when-let [contents (identity-env "SECRETS_AGE_IDENTITY_B64")]
           {:contents (decode-b64-identity contents)
            :identity-source :secrets-age-identity-b64})
         (when-let [path (:key-file opts)]
-          {:identity-file path
-           :identity-source (case (:key-file-source opts)
-                              :default :default-key-file
-                              :configured :configured-key-file
-                              :configured-key-file)})
+          (designated path :configured-key-file))
         (when-let [app (:app opts)]
           {:identity-file (default-key-file app)
            :identity-source :default-key-file})
         {:identity-file nil :identity-source nil})))
 
-(def ^:private colon-path-hint
-  " Prefix a relative path that contains a colon with ./")
-
 (defn- validate-identity-path!
-  "Throw `:disallowed-identity` when `path` cannot name a local identity file.
-
-  A value containing `AGE-SECRET-KEY-` is key contents in a path setting, and
-  its error carries only `:identity-source`. A URI-shaped value is a locator
-  that can hold a credential, and its error adds only the `:scheme`. Neither
-  error renders the value."
+  "Throw `:disallowed-identity` when `path` cannot name a local identity file:
+  it holds key contents, or it is URI-shaped. The error names where the value
+  came from and, for a URI, its `:scheme`. It never renders the value."
   [path identity-source]
-  (when-let [s (some-> path str)]
-    (let [refuse! (fn [message data]
-                    (throw (ex-info message
-                                    (assoc data
-                                           :reason :disallowed-identity
-                                           :identity-source identity-source))))]
-      (when (str/includes? s "AGE-SECRET-KEY-")
-        (refuse! (str "The age identity setting holds key contents where a file path was"
-                      " expected. Key contents belong in SECRETS_AGE_IDENTITY.")
-                 {}))
-      (when-let [scheme (source/locator-scheme s)]
-        (refuse! (str "The age identity must be a local filesystem path, but the value starts"
-                      " with the URI scheme " scheme ":." colon-path-hint)
-                 {:scheme scheme})))))
+  (when-let [problem (some-> path str source/path-problem)]
+    (throw (ex-info (source/path-problem-message (identity-source-subject identity-source)
+                                                 "a local filesystem path"
+                                                 problem)
+                    (cond-> {:reason :disallowed-identity
+                             :identity-source identity-source}
+                      (:scheme problem) (assoc :scheme (:scheme problem)))))))
+
+(defn- identity-file-exists?
+  "True when `path` names an identity file that exists."
+  [path]
+  (boolean (and path (.exists (io/file (str path))))))
+
+(defn- require-designated-identity!
+  "Throw `:no-identity` when the designated identity file at `path` does not
+  exist, naming where the path came from and the path."
+  [path identity-source]
+  (when-not (identity-file-exists? path)
+    (throw (ex-info (str (identity-source-subject identity-source)
+                         " names an age identity file that does not exist: " path)
+                    (cond-> {:reason :no-identity
+                             :identity-file path
+                             :identity-source identity-source}
+                      (= :configured-key-file identity-source)
+                      (assoc :hint "Create it with `bb secrets keygen`."))))))
 
 (defn with-identity
   "Call `f` with an operation-owned identity descriptor.
@@ -208,10 +225,14 @@
   `identity-or-opts` accepts an explicit path or an options map. `f` receives
   `{:identity-file path-or-nil :identity-source source}`. Resolution is an
   explicit path, then SECRETS_AGE_IDENTITY_FILE/raw/base64, then `:key-file`,
-  then an `:app` default; no configured identity gives a nil path for keyless
-  operations. Paths owned by callers pass through untouched, except that a
-  URI-shaped path or one holding key contents throws `:disallowed-identity`
-  before `f` runs.
+  then an `:app` default. Every path has a leading `~` expanded.
+
+  An explicit path, SECRETS_AGE_IDENTITY_FILE, and `:key-file` each designate
+  a file. Before `f` runs, a designated path that is URI-shaped or holds key
+  contents throws `:disallowed-identity`, and one that does not exist throws
+  `:no-identity` naming its source and the path. The `:app` default is not a
+  designation: `f` receives its path whether or not the file exists, and a
+  nil path when there is no app, so keyless operations stay possible.
 
   A raw or base64 identity is written to a private temporary file for this
   call only, through [[com.kirahowe.secrets.fs/with-private-temp-file]], which
@@ -233,14 +254,11 @@
                                :identity-source identity-source}))))
           (f {:identity-file (.getAbsolutePath ^java.io.File file)
               :identity-source identity-source})))
-      (do
-        (validate-identity-path! (:identity-file candidate) identity-source)
-        (f (select-keys candidate [:identity-file :identity-source]))))))
-
-(defn- identity-file-exists?
-  "True when `path` names an identity file that exists."
-  [path]
-  (boolean (and path (.exists (io/file (str path))))))
+      (let [{:keys [identity-file designated?]} candidate]
+        (validate-identity-path! identity-file identity-source)
+        (when designated?
+          (require-designated-identity! identity-file identity-source))
+        (f {:identity-file identity-file :identity-source identity-source})))))
 
 (def ^:private identity-options
   "One-line remediation appended to \"no identity\" errors."
@@ -334,7 +352,8 @@
   environment variables are used.
 
   Missing or invalid inputs throw ex-info with a :reason:
-    :no-identity        no identity resolves, or the resolved file does not exist.
+    :no-identity        no identity resolves, the app default key file is
+                        absent, or a designated identity file does not exist.
     :disallowed-identity  the identity path is URI-shaped or holds key
                         contents, so it is not a local path.
     :no-file            `source` is nil, an allowed local file is absent, or an
@@ -389,17 +408,19 @@
 
 (defn- validate-reader-source!
   "Throw `:disallowed-source` when the readers' `:file` or `:resource` is
-  URI-shaped. `:source` is its descriptor, which drops userinfo, query, and
-  fragment, and the message names only the scheme."
+  URI-shaped or holds key contents. `:source` is its descriptor, which drops
+  userinfo, query, and fragment, and the message names only the scheme."
   [{:keys [file resource]}]
-  (doseq [[option value expected hint]
-          [[:file file "a local filesystem path" colon-path-hint]
-           [:resource resource "a classpath resource name" ""]]]
-    (when-let [scheme (some-> value str source/locator-scheme)]
-      (throw (ex-info (str "The secrets " option " must be " expected ", but the value starts"
-                           " with the URI scheme " scheme ":." hint)
-                      {:reason :disallowed-source
-                       :source (source/descriptor (str value))})))))
+  (doseq [[option value expected]
+          [[:file file "a local filesystem path"]
+           [:resource resource "a classpath resource name"]]]
+    (when-let [problem (some-> value str source/path-problem)]
+      (throw (ex-info (source/path-problem-message
+                       (str "The secrets " option " option") expected
+                       (cond-> problem (= :resource option) (dissoc :bare?)))
+                      (cond-> {:reason :disallowed-source}
+                        (= :locator (:problem problem))
+                        (assoc :source (source/descriptor (str value)))))))))
 
 (defn- required-secret-handler
   "Build the required-secret reader around a shared delayed loaded state.
@@ -458,7 +479,9 @@
                     identity (key) is available, or when the key is missing
                     from the decrypted map.
     #secret/opt k → optional: nil in all three of those cases.
-  If the identity exists but decryption fails, both tags throw."
+  \"No identity is available\" means none was designated and the `:app` default
+  key file is absent. A designated identity file that does not exist makes both
+  tags throw `:no-identity`, as does a decryption that fails."
   [opts]
   (let [loaded (delay (reader-loaded-state opts))
         _ (validate-reader-source! opts)

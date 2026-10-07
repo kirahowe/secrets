@@ -403,15 +403,32 @@
            (edn/read-string {:readers readers} "#secret/req :anything"))))))
 
 (deftest reader-absent-identity-test
-  (testing "present secrets file with missing identity: opt returns nil and req throws"
-    (let [enc (encrypt-edn! {:k "v"})
-          readers (secrets/reader-literals {:file enc
-                                            :identity-file
-                                            (str *dir* "/no-such-key.txt")})]
-      (is (nil? (edn/read-string {:readers readers} "#secret/opt :k")))
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #"identity"
-           (edn/read-string {:readers readers} "#secret/req :k"))))))
+  (let [enc (encrypt-edn! {:k "v"})
+        missing (str *dir* "/no-such-key.txt")
+        read-tag (fn [readers tag] (edn/read-string {:readers readers} (str tag " :k")))]
+    (testing "no identity designated and the app default absent: opt is nil, req throws"
+      (with-redefs-fn (assoc (test-env/getenv-redefs {})
+                             #'secrets/default-key-file (constantly missing))
+        (fn []
+          (let [readers (secrets/reader-literals {:file enc :app "reader-test"})]
+            (is (nil? (read-tag readers "#secret/opt")))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"needs an age identity"
+                                  (read-tag readers "#secret/req")))))))
+    (testing "a designated identity that does not exist fails both tags, naming it"
+      (doseq [[label subject opts environment]
+              [[":identity-file" "The explicit identity path" {:identity-file missing} {}]
+               ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY_FILE" {:app "reader-test"}
+                {"SECRETS_AGE_IDENTITY_FILE" missing}]]
+              tag ["#secret/opt" "#secret/req"]]
+        (testing (str label " " tag)
+          (with-redefs-fn (test-env/getenv-redefs environment)
+            (fn []
+              (let [readers (secrets/reader-literals (assoc opts :file enc))
+                    e (try (read-tag readers tag) nil (catch clojure.lang.ExceptionInfo e e))]
+                (is (= :no-identity (:reason (ex-data e))))
+                (is (= missing (:identity-file (ex-data e))))
+                (is (str/includes? (str (ex-message e)) (str subject " names")))
+                (is (str/includes? (str (ex-message e)) missing))))))))))
 
 (deftest reader-decrypts-once-test
   (testing "many secret tags share a single decryption"
@@ -706,11 +723,26 @@
 
 (deftest load-secrets-opts-map-test
   (let [enc (encrypt-edn! {:k "v"})]
-    (is (= {:k "v"} (secrets/load-secrets enc {:identity-file *key*})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"(?i)no age identity.*SECRETS_AGE_IDENTITY_FILE"
-         (secrets/load-secrets enc {:identity-file (str *dir* "/nope")}))
-        "a nonexistent identity file throws with the remediation options")))
+    (is (= {:k "v"} (secrets/load-secrets enc {:identity-file *key*})))))
+
+(deftest identity-paths-expand-home-test
+  (let [enc (encrypt-edn! {:k "v"})
+        home (io/file *dir* "home")
+        key-in-home (io/file home "keys" "k.txt")]
+    (io/make-parents key-in-home)
+    (spit key-in-home (slurp *key*))
+    (with-redefs-fn {#'secrets/user-home (constantly (str home))}
+      (fn []
+        (testing "every identity path source expands a leading ~"
+          (is (= {:k "v"} (secrets/load-secrets enc "~/keys/k.txt")))
+          (is (= {:k "v"} (secrets/load-secrets enc {:identity-file "~/keys/k.txt"})))
+          (is (= {:k "v"}
+                 (with-redefs-fn
+                   (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_FILE" "~/keys/k.txt"})
+                   #(secrets/load-secrets enc nil))))
+          (is (= {:identity-file (str key-in-home) :identity-source :configured-key-file}
+                 (with-redefs-fn (test-env/getenv-redefs {})
+                   #(secrets/with-identity {:key-file "~/keys/k.txt"} identity)))))))))
 
 ;;;; Load-secrets errors
 
@@ -738,12 +770,41 @@
       (is (re-find #"bb secrets new" (ex-message e))))))
 
 (deftest load-secrets-missing-identity-throws-test
-  (testing "missing identity file: :reason :no-identity, wording unchanged"
-    (let [enc (encrypt-edn! {:k "v"})
-          e (is (thrown-with-msg?
-                 clojure.lang.ExceptionInfo #"(?i)no age identity.*SECRETS_AGE_IDENTITY_FILE"
-                 (secrets/load-secrets enc (str *dir* "/no-such-key.txt"))))]
-      (is (= :no-identity (:reason (ex-data e)))))))
+  (let [enc (encrypt-edn! {:k "v"})
+        missing (str *dir* "/no-such-key.txt")
+        failure (fn [environment identity-or-opts]
+                  (with-redefs-fn (assoc (test-env/getenv-redefs environment)
+                                         #'secrets/default-key-file (constantly missing))
+                    #(try (secrets/load-secrets enc identity-or-opts)
+                          nil
+                          (catch clojure.lang.ExceptionInfo e e))))]
+    (testing "nothing designated and no app default: the remediation options"
+      (doseq [opts [nil {:app "load-test"}]]
+        (let [e (failure {} opts)]
+          (is (= :no-identity (:reason (ex-data e))))
+          (is (re-find #"(?i)no age identity.*SECRETS_AGE_IDENTITY_FILE" (ex-message e))))))
+    (testing "a designated identity that does not exist names its source and path"
+      (doseq [[subject source environment identity-or-opts]
+              [["The explicit identity path" :identity-file {} missing]
+               ["The explicit identity path" :identity-file {} {:identity-file missing}]
+               ["SECRETS_AGE_IDENTITY_FILE" :secrets-age-identity-file
+                {"SECRETS_AGE_IDENTITY_FILE" missing} {:app "load-test"}]]]
+        (let [e (failure environment identity-or-opts)]
+          (is (= {:reason :no-identity :identity-file missing :identity-source source}
+                 (ex-data e)))
+          (is (= (str subject " names an age identity file that does not exist: " missing)
+                 (ex-message e))))))
+    (testing "a configured :key-file is designated too, and the app default is not"
+      (with-redefs-fn (assoc (test-env/getenv-redefs {})
+                             #'secrets/default-key-file (constantly missing))
+        (fn []
+          (let [e (try (secrets/with-identity {:key-file missing :app "load-test"} identity)
+                       (catch clojure.lang.ExceptionInfo e e))]
+            (is (= :no-identity (:reason (ex-data e))))
+            (is (= :configured-key-file (:identity-source (ex-data e))))
+            (is (str/includes? (ex-message e) "The configured :key-file names")))
+          (is (= {:identity-file missing :identity-source :default-key-file}
+                 (secrets/with-identity {:app "load-test"} identity))))))))
 
 (deftest load-secrets-success-unaffected-test
   (testing "a successful load is unaffected by the new error paths"
@@ -1496,8 +1557,16 @@
               (is (= {:reason :disallowed-identity :scheme "https"
                       :identity-source identity-source}
                      (ex-data e)))
-              (is (str/includes? (ex-message e) "URI scheme https:."))
-              (is (str/includes? (ex-message e) "with ./"))
+              (is (str/ends-with? (ex-message e)
+                                  (str " must be a local filesystem path, but its value"
+                                       " starts with the URI scheme \"https\"."))
+                  "a URL gets no ./ hint")
+              (is (str/starts-with? (ex-message e)
+                                    ({:identity-file "The explicit identity path"
+                                      :secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
+                                      :configured-key-file "The configured :key-file"}
+                                     identity-source))
+                  "the message names where the value came from")
               (is (not (str/includes? (rendered-chain e) "host.example")))
               (is (= [] (leaked (rendered-chain e)))))))
         (doseq [[option expected] [[:file "local filesystem path"]
@@ -1510,8 +1579,9 @@
                                :path "/key.txt"}}
                      (ex-data e))
                   "the same descriptor shape a load failure carries")
-              (is (str/includes? (ex-message e) (str "The secrets " option " must be a " expected)))
-              (is (str/includes? (ex-message e) "URI scheme https:."))
+              (is (= (str "The secrets " option " option must be a " expected
+                          ", but its value starts with the URI scheme \"https\".")
+                     (ex-message e)))
               (is (= [] (leaked (rendered-chain e)))))))))
     (testing "a File built from a locator is refused the same way"
       (is (= :disallowed-identity
@@ -1520,10 +1590,18 @@
       (let [e (failure #(secrets/load-secrets enc "key:txt"))]
         (is (= {:reason :disallowed-identity :scheme "key" :identity-source :identity-file}
                (ex-data e)))
-        (is (str/includes? (ex-message e) "Prefix a relative path that contains a colon with ./"))))
+        (is (= (str "The explicit identity path must be a local filesystem path, but its"
+                    " value starts with the URI scheme \"key\". For a relative file whose"
+                    " name contains a colon, write ./ before the name.")
+               (ex-message e))))
+      (let [e (failure #(secrets/reader-literals {:file "store:age"}))]
+        (is (str/includes? (ex-message e) "write ./ before the name")))
+      (let [e (failure #(secrets/reader-literals {:resource "store:age"}))]
+        (is (not (str/includes? (ex-message e) "./")) "a resource name is not a path")))
     (testing "a ./ prefix or an absolute path makes a name with a colon a path"
-      (is (= {:identity-file "./key:txt" :identity-source :identity-file}
-             (secrets/with-identity "./key:txt" identity)))
+      (is (= :no-identity
+             (:reason (ex-data (failure #(secrets/with-identity "./key:txt" identity)))))
+          "it is read as a path, and that file does not exist")
       (let [colon-dir (io/file *dir* "a:b")
             colon-key (io/file colon-dir "key:txt")]
         (.mkdirs colon-dir)
@@ -1568,7 +1646,7 @@
           (when e
             (is (= {:reason :disallowed-identity :identity-source identity-source}
                    (ex-data e)))
-            (is (str/includes? (ex-message e) "holds key contents"))
+            (is (str/includes? (ex-message e) "holds age key contents"))
             (is (str/includes? (ex-message e) "SECRETS_AGE_IDENTITY."))
             (is (not (str/includes? (rendered-chain e) key-line)))
             (is (not (str/includes? (rendered-chain e) (subs key-line 16 40))))))))))

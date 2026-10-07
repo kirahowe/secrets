@@ -178,7 +178,7 @@
   (.getCanonicalPath (io/file (str path))))
 
 (def ^:private identity-source-display-label
-  "How a message or a `doctor` report names where an identity came from."
+  "How a `doctor` report names where an identity came from."
   {:secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
    :secrets-age-identity "SECRETS_AGE_IDENTITY"
    :secrets-age-identity-b64 "SECRETS_AGE_IDENTITY_B64"
@@ -190,23 +190,29 @@
   (System/getenv variable-name))
 
 (defn- require-path!
-  "Reject blank or URI-like artifact locations, returning `path` otherwise.
+  "Reject a blank path, a URI-shaped path, and key contents in a path field,
+  returning `path` otherwise.
 
-  CLI artifacts are filesystem paths only; accepting a locator here would create
-  a second source contract beside `load-secrets`. Documented non-string values
-  such as `:manifest false` retain their meaning, and Windows drive paths are
-  paths rather than one-letter schemes."
+  CLI artifacts are local filesystem paths. The failure names the environment
+  and field and never the value. `:key-file` and `:identity-file` fail with
+  `:reason :disallowed-identity`, as the runtime's identity paths do, and
+  every other field with `:disallowed-source`. Non-string values such as
+  `:manifest false` keep their meaning."
   [env kind path]
   (when (and (string? path) (str/blank? path))
     (fail! (str "Environment " env " has a blank " kind " (a path string must not be empty).\n"
                 "    An empty path resolves to the working directory, not a file.")
            {:environment env :field kind :path path}))
-  (when-let [scheme (and (string? path) (source/locator-scheme path))]
-    (fail! (str "Environment " env " " kind " must be a filesystem path, not a URI locator.")
-           {:environment env
-            :field kind
-            :reason :disallowed-source-location
-            :scheme scheme}))
+  (when-let [problem (and (string? path) (source/path-problem path))]
+    (fail! (source/path-problem-message (str "Environment " env " " kind)
+                                        "a local filesystem path"
+                                        problem)
+           (cond-> {:environment env
+                    :field kind
+                    :reason (if (#{:key-file :identity-file} kind)
+                              :disallowed-identity
+                              :disallowed-source)}
+             (:scheme problem) (assoc :scheme (:scheme problem)))))
   path)
 
 (def ^:private artifact-roles
@@ -338,7 +344,6 @@
                    (secrets/default-key-file app))
         explicit-identity (when configured-identity-file?
                             (secrets/expand-home identity-file))
-        key-file-source (if (= key-file (secrets/default-key-file app)) :default :configured)
         template (if (contains? env-config :template)
                    template
                    (str/replace secrets-file #"\.age$" ".example"))
@@ -358,7 +363,6 @@
            :secrets-file secrets-file
            :key-file key-file
            :identity-file explicit-identity
-           :key-file-source key-file-source
            ;; Explicit values (including :manifest false) are always kept;
            ;; absent values are derived from the secrets file.
            :template template
@@ -408,9 +412,14 @@
                {:environment env-key}))))
 
 (defn- with-environment-identity
-  "Hold one resolved identity through the command's decryption and hashing."
+  "Hold one resolved identity through the command's decryption and hashing.
+
+  A `:key-file` equal to the app default is passed as the default, not as a
+  designated file, so its absence leaves keyless operations possible."
   [config env f]
-  (secrets/with-identity env
+  (secrets/with-identity (cond-> env
+                           (= (:key-file env) (secrets/default-key-file (:app env)))
+                           (dissoc :key-file))
     (fn [identity]
       (let [resolved (merge env identity)]
         (validate-artifact-roles!
@@ -1312,9 +1321,9 @@
 
 (defn- verify-one!
   "Verify one environment's committed manifest against its encrypted secrets,
-  returning its finding. Without an identity, falls back to comparing the
-  manifest's recorded :ciphertext-sha against the actual ciphertext (freshness
-  only).
+  returning its finding. When the environment's identity file does not exist,
+  which can only be the absent app default, it compares the manifest's
+  recorded :ciphertext-sha against the actual ciphertext (freshness only).
 
   This establishes *agreement* between the two committed artifacts — drift
   detection — and never who authored either of them; see [[verify!]]."
@@ -1433,12 +1442,17 @@
 
 (defn verify!
   "Check that each environment's committed manifest matches its encrypted
-  secrets. With no env, verifies all of them. Never exits — returns
+  secrets. With no env, verifies all of them. Never exits: returns
   {:results {env-name status} :exit code}, where each status is :ok,
-  :ok-keyless, :drift, or :missing. The exit code is 1 on drift, 2 on a
-  missing artifact or an unverifiable legacy manifest, and 0 otherwise.
-  Keyless verification compares the ciphertext hash and does not require age;
-  full verification decrypts and compares manifest entries.
+  :ok-keyless, :drift, or :missing. The exit code is 1 on drift and 0 when
+  everything agrees. It is 2 when a secrets file or manifest is missing, or
+  when a keyless run meets a manifest that records no :ciphertext-sha.
+
+  Full verification decrypts and compares manifest entries. Keyless
+  verification compares the ciphertext hash and does not require age. It
+  applies only when no identity was designated and the app's default key file
+  is absent. An identity designated by :identity-file, a configured :key-file,
+  or SECRETS_AGE_IDENTITY_FILE that does not exist throws `:no-identity`.
 
   A pass means the ciphertext and the manifest agree, which detects drift and
   a manifest from the wrong store. It does not establish authorship, even when
@@ -1468,9 +1482,8 @@
 
 ;;;; Doctor
 
-;;; Doctor results intentionally retain nil-valued fields. A fixed schema lets
-;;; callers distinguish unavailable diagnostics from omitted diagnostics without
-;;; inspecting the selected environment or exception path.
+;;; Doctor results keep nil-valued fields. A fixed schema lets callers tell an
+;;; unavailable diagnostic from an omitted one.
 
 (defn- artifact-state
   "Describe a configured artifact without reading it. Disabled and unconfigured
@@ -1485,13 +1498,18 @@
      :path nil
      :exists? false}))
 
-(defn- usable-file?
-  "True only for a readable regular file. Never returns or reports its path."
-  [path]
-  (try
-    (let [f (io/file (str path))]
-      (boolean (and path (.isFile f) (.canRead f))))
-    (catch Exception _ false)))
+(defn- identity-state
+  "Describe the resolved identity: its `:source`, its `:path` unless it was
+  injected as contents, and whether it is `:usable?`, a readable regular file.
+  `problem` is the message of a failed resolution, or nil."
+  [{:keys [identity-file identity-source]} problem]
+  (let [injected? (#{:secrets-age-identity :secrets-age-identity-b64} identity-source)
+        f (some-> identity-file str io/file)]
+    {:source identity-source
+     :path (when-not injected? (some-> identity-file str))
+     :usable? (boolean (and f (not problem) (.isFile f) (.canRead f)))
+     :exists? (boolean (and f (.exists f)))
+     :problem problem}))
 
 (defn- recipient-state
   "Summarize recipients without retaining any recipient line."
@@ -1560,7 +1578,9 @@
     {:state (if (= :disabled (:state manifest-capability))
               :skipped
               (:state manifest-capability))
-     :keyless? (boolean (and ciphertext?
+     ;; `verify` fails on an identity problem before it compares anything.
+     :keyless? (boolean (and (not (:problem identity))
+                             ciphertext?
                              (= :ready (:state manifest-capability))))
      :full? (boolean (and (:available? age)
                           (:usable? identity)
@@ -1578,6 +1598,7 @@
             (and (not= :disabled (:state manifest-capability))
                  (not manifest?))
             (= :missing (:state recipients)))
+        invalid? (or invalid? (some? (:problem identity)))
         warning? (or (not (:available? age))
                      missing-artifact?
                      (not (:usable? identity))
@@ -1591,43 +1612,56 @@
       warning? :warning
       :else :healthy)))
 
+(defn- doctor-report
+  "Diagnose normalized environment `env`. `identity-problem` is the message of
+  a failed identity resolution, or nil when `env` carries a resolved identity."
+  [{:keys [secrets-file manifest template key-file recipients-file]
+    environment-name :name :as env}
+   identity-problem]
+  (let [artifacts {:ciphertext (artifact-state secrets-file :unconfigured)
+                   :manifest (artifact-state manifest :disabled)
+                   :template (artifact-state template :unconfigured)
+                   :key (artifact-state key-file :unconfigured)
+                   :recipients (artifact-state recipients-file :unconfigured)}
+        identity (identity-state env identity-problem)
+        age (age-state)
+        recipients (recipient-state env (:recipients artifacts))
+        manifest-capability (manifest-state manifest (:manifest artifacts))
+        verify (doctor-verification-capability age identity artifacts manifest-capability)
+        status (doctor-status age identity artifacts recipients manifest-capability verify)]
+    {:configuration {:valid? true :reason nil}
+     :age age
+     :environment environment-name
+     :artifacts artifacts
+     :identity identity
+     :encryption {:mode (if recipients-file :multi-recipient :single-key)
+                  :recipients recipients}
+     :verify verify
+     :status status
+     :exit (case status :healthy 0 :warning 1 :invalid 2)}))
+
+(defn- identity-failure?
+  "True when `e` came from resolving an identity: a blank or malformed
+  variable, a path that is not a local path, or a designated file that does
+  not exist."
+  [e]
+  (let [data (ex-data e)]
+    (boolean (and (not (:remaining-file data))
+                  (or (:env data) (contains? data :identity-source))))))
+
 (defn- doctor-data
   [config env-arg]
-  (let [config (normalize-config config)]
-    (with-environment-identity config (resolve-env config env-arg)
-      (fn [env]
-        (let [{:keys [secrets-file manifest template key-file recipients-file
-                      identity-file identity-source]
-               environment-name :name :as env} env
-              artifacts {:ciphertext (artifact-state secrets-file :unconfigured)
-                         :manifest (artifact-state manifest :disabled)
-                         :template (artifact-state template :unconfigured)
-                         :key (artifact-state key-file :unconfigured)
-                         :recipients (artifact-state recipients-file :unconfigured)}
-              identity {:source identity-source
-                        :usable? (usable-file? identity-file)}
-              age (age-state)
-              recipients (recipient-state env (:recipients artifacts))
-              mode (if recipients-file :multi-recipient :single-key)
-              manifest-capability (manifest-state manifest (:manifest artifacts))
-              verify (doctor-verification-capability
-                      age identity artifacts manifest-capability)
-              status (doctor-status
-                      age
-                      identity
-                      artifacts
-                      recipients
-                      manifest-capability
-                      verify)]
-          {:configuration {:valid? true :reason nil}
-           :age age
-           :environment environment-name
-           :artifacts artifacts
-           :identity identity
-           :encryption {:mode mode :recipients recipients}
-           :verify verify
-           :status status
-           :exit (case status :healthy 0 :warning 1 :invalid 2)})))))
+  (let [config (normalize-config config)
+        env (resolve-env config env-arg)]
+    (try
+      (with-environment-identity config env #(doctor-report % nil))
+      (catch clojure.lang.ExceptionInfo e
+        (if (identity-failure? e)
+          (doctor-report (assoc env
+                                :identity-file (:identity-file (ex-data e))
+                                :identity-source (:identity-source (ex-data e)))
+                         (ex-message e))
+          (throw e))))))
 
 (defn- artifact-state-line
   [label {:keys [state path exists?]}]
@@ -1644,8 +1678,21 @@
    [:key "Key"]
    [:recipients "Recipients file"]])
 
+(defn- identity-line
+  [{:keys [source path usable? exists? problem]}]
+  [:line "Identity:"
+   (str/join " — "
+             (remove nil?
+                     [(identity-source-display-label source)
+                      path
+                      (cond problem "invalid"
+                            usable? "usable"
+                            exists? "unusable"
+                            :else "missing")]))])
+
 (defn- doctor-lines
-  "The `doctor` report: one stable, value-free line per diagnostic."
+  "The `doctor` report: one stable line per diagnostic. It prints paths and
+  never file contents, recipient lines, or environment values."
   [{:keys [configuration age environment artifacts identity encryption verify status]}]
   (let [verify-label (fn [available?]
                        (cond
@@ -1663,10 +1710,10 @@
             [:line "Environment:" (name environment)]]
            (into (map (fn [[kind label]] (artifact-state-line label (artifacts kind))))
                  artifact-labels)
-           (conj [:line "Identity:"
-                  (str (identity-source-display-label (:source identity))
-                       " — " (if (:usable? identity) "usable" "unusable"))]
-                 [:line "Encryption mode:" (name (:mode encryption))]
+           (conj (identity-line identity))
+           (into (when (:problem identity)
+                   [[:line "Identity problem:" (:problem identity)]]))
+           (conj [:line "Encryption mode:" (name (:mode encryption))]
                  [:line "Recipients:"
                   (str (name state)
                        " — count " (if (nil? recipient-count) "unknown" recipient-count)
@@ -1677,23 +1724,26 @@
      [:line "Status:" (name status)])))
 
 (defn doctor!
-  "Safely diagnose one selected/default environment. Accepts raw config,
-  normalizes and validates it, prints stable value-free labels, and returns a
-  structured result containing :exit (0 healthy, 1 warning/action-needed, or 2
-  invalid configuration). An identity-variable error is reported with its
-  content-free reason line. It never exits and never returns an identity path,
-  recipient line, environment value, or secret."
+  "Diagnose one selected or default environment. Accepts raw config,
+  normalizes and validates it, prints one line per diagnostic, and returns a
+  structured result containing :exit (0 healthy, 1 warning or action needed, 2
+  invalid). It never exits.
+
+  The report names the resolved identity's source and its path. An identity
+  injected as contents is named by its variable and has no path. A failed
+  identity resolution, such as a blank variable, a path that is not a local
+  path, or a designated file that does not exist, is reported under
+  `Identity problem:` beside the rest of the diagnostics. A configuration that
+  does not normalize is reported as `Configuration: invalid` with its reason.
+  No line or returned value holds file contents, a recipient line, or an
+  environment variable's value."
   [config env-arg]
   (let [result (try
                  (doctor-data config env-arg)
-                 (catch Exception e
+                 (catch clojure.lang.ExceptionInfo e
                    (when (:remaining-file (ex-data e))
                      (throw e))
-                   {:configuration {:valid? false
-                                    ;; An identity-variable error (blank or
-                                    ;; malformed) has a content-free message
-                                    ;; that names the fix.
-                                    :reason (when (:env (ex-data e)) (ex-message e))}
+                   {:configuration {:valid? false :reason (ex-message e)}
                     :age nil
                     :environment nil
                     :artifacts nil

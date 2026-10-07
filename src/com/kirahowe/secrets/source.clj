@@ -52,6 +52,38 @@
     (when-not (re-find windows-absolute-path s)
       (some-> (second (re-find uri-scheme s)) str/lower-case))))
 
+(defn path-problem
+  "Return nil when string `s` can name a local file, or a map saying why it
+  cannot. `{:problem :key-contents}` means it holds an age secret key.
+  `{:problem :locator :scheme scheme :bare? boolean}` means it is URI-shaped;
+  `:bare?` is true when nothing after the scheme contains a `/`, which is what
+  a relative file name with a colon in it looks like. The map never holds any
+  part of `s` except its scheme."
+  [s]
+  (let [s (str/trim (str s))]
+    (if (str/includes? s "AGE-SECRET-KEY-")
+      {:problem :key-contents}
+      (when-let [scheme (locator-scheme s)]
+        {:problem :locator
+         :scheme scheme
+         :bare? (not (str/includes? (subs s (inc (count scheme))) "/"))}))))
+
+(defn path-problem-message
+  "Render a [[path-problem]] as one sentence about `subject`, the variable,
+  option, or configuration field that held the value. `expected` says what the
+  value should have been, such as \"a local filesystem path\". The value
+  itself is never rendered."
+  [subject expected {:keys [problem scheme bare?]}]
+  (case problem
+    :key-contents
+    (str subject " holds age key contents where " expected " was expected."
+         " Key contents belong in SECRETS_AGE_IDENTITY.")
+    :locator
+    (str subject " must be " expected ", but its value starts with the URI scheme \""
+         scheme "\"."
+         (when bare?
+           " For a relative file whose name contains a colon, write ./ before the name."))))
+
 (defn- parse-uri
   "Return `s` as a `java.net.URI`, or nil when it does not parse.
 
