@@ -17,7 +17,8 @@
   nothing built on it — can establish who produced a ciphertext."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [com.kirahowe.secrets.fs :as fs]))
 
 (defn version
   "Return the installed `age` version string, or nil when `age` is unavailable
@@ -89,8 +90,8 @@
 
   Replaces `path` when it already exists, so callers own the decision about
   whether overwriting is allowed. `age-keygen -o` refuses to open an existing
-  output file, so the key is generated inside a sibling temp directory and
-  moved over `path` only once it succeeds — a failed generation leaves any
+  output file, so the key is generated inside a temp directory beside `path`
+  and moved over `path` only once it succeeds. A failed generation leaves any
   existing key untouched. Throws if `path` is blank, or if `age-keygen` is
   missing or fails."
   [path]
@@ -113,12 +114,10 @@
           (doto tmp
             (.setReadable false false) (.setReadable true true)
             (.setWritable false false) (.setWritable true true))
-          ;; Same directory, so this is a rename(2): the old key is never
-          ;; observable as a half-written file.
-          (java.nio.file.Files/move
-           (.toPath tmp) (.toPath f)
-           (into-array java.nio.file.CopyOption
-                       [java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+          ;; The temp directory was created inside the key's directory, so the
+          ;; two share a filesystem and the atomic move is one rename(2). An
+          ;; existing key stays whole until the new one takes its place.
+          (fs/atomic-move! tmp f)
           (public-key f))
         (finally
           ;; Never let cleanup mask a genuine age-keygen failure.
@@ -468,32 +467,6 @@
                        :permissions (sort (map str permissions))})))
     staging))
 
-(defn- publish-plaintext!
-  "Atomically replace `dest` with the staged plaintext file `staging`.
-
-  Same directory, so this is a rename(2): `dest` is never observable as a
-  half-written or permissively-moded plaintext file, and it keeps its previous
-  contents until the move succeeds. `Files/move` replaces a symbolic link
-  *itself* rather than following it, so even a destination that turns into a
-  link after validation cannot receive plaintext through the link. There is
-  deliberately no non-atomic copy fallback: copying is what would reopen that
-  window."
-  [^java.io.File staging ^java.io.File dest]
-  (try
-    (java.nio.file.Files/move
-     (.toPath staging) (.toPath dest)
-     (into-array java.nio.file.CopyOption
-                 [java.nio.file.StandardCopyOption/ATOMIC_MOVE
-                  java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
-    (catch Exception e
-      ;; Babashka does not expose AtomicMoveNotSupportedException as a
-      ;; resolvable class, so identify this one portable NIO exception by name.
-      (if (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e)))
-        (throw (ex-info (str "The filesystem cannot atomically publish plaintext to " dest)
-                        {:destination (str dest)}
-                        e))
-        (throw e)))))
-
 (defn decrypt-to-file!
   "Decrypt `encrypted-file` to plaintext file `out`, byte-for-byte (binary
   content is preserved). Returns `out`.
@@ -523,7 +496,7 @@
        ;; NOFOLLOW_LINKS here is defence in depth: it refuses the open if the
        ;; staging name were swapped for a link between creation and write.
        (java.nio.file.Files/write (.toPath staging) ^bytes plaintext staging-write-options)
-       (publish-plaintext! staging dest)
+       (fs/atomic-move! staging dest)
        (catch Exception e
          (try (.delete staging) (catch Exception _ nil))
          (throw e)))

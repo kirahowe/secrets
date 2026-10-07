@@ -23,3 +23,38 @@
                             {:reason :owner-only-temp-file-unavailable}
                             e))))
     (.deleteOnExit)))
+
+(defn- ->path
+  ^java.nio.file.Path [x]
+  (if (instance? java.nio.file.Path x)
+    x
+    (.toPath (java.io.File. (str x)))))
+
+(defn atomic-move!
+  "Atomically move the file `source` to `target` and return `target`.
+
+  Each argument is a `Path`, a `File`, or a path string, and both must be on
+  one filesystem. The move replaces whatever entry sits at `target`. A symbolic
+  link there is replaced as a link and never written through, and `target`
+  keeps its previous contents until the move succeeds. There is no copy
+  fallback: a filesystem that cannot move atomically throws `ex-info` with
+  `:reason :atomic-move-unsupported`, the `:source` and `:target` paths, and
+  the NIO exception as its cause. Every other failure propagates unchanged."
+  [source target]
+  (try
+    (java.nio.file.Files/move
+     (->path source) (->path target)
+     (into-array java.nio.file.CopyOption
+                 [java.nio.file.StandardCopyOption/ATOMIC_MOVE
+                  java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+    target
+    (catch Exception e
+      ;; Babashka cannot resolve AtomicMoveNotSupportedException as a class, so
+      ;; the exception is recognized by name.
+      (if (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e)))
+        (throw (ex-info (str "This filesystem cannot atomically move a file to " target)
+                        {:reason :atomic-move-unsupported
+                         :source (str source)
+                         :target (str target)}
+                        e))
+        (throw e)))))

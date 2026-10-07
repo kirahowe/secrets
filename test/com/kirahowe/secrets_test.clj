@@ -982,7 +982,7 @@
     (spit out "{:v :previous}")
     (.setReadable out true false)
     (let [before (permission-names out)]
-      (with-redefs [com.kirahowe.secrets.age/publish-plaintext!
+      (with-redefs [fs/atomic-move!
                     (fn [_ _] (throw (ex-info "forced publish failure" {})))]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"forced publish failure"
                               (age/decrypt-to-file! *key* enc out))
@@ -992,6 +992,62 @@
       (is (= before (permission-names out)) "with its original permissions")
       (is (empty? (staging-leftovers *dir*))
           "the written staging plaintext is deleted rather than left on disk"))))
+
+;;;; Atomic moves
+
+(deftest atomic-move-replaces-the-target-entry-test
+  (testing "Path, File, and string arguments all move, and the target is returned"
+    (doseq [[label coerce] [["string" str] ["File" io/file] ["Path" #(.toPath (io/file %))]]]
+      (let [source (str *dir* "/move-source-" label)
+            target (str *dir* "/move-target-" label)]
+        (spit source "fresh")
+        (spit target "stale")
+        (is (= (coerce target) (fs/atomic-move! (coerce source) (coerce target))) label)
+        (is (= "fresh" (slurp target)) label)
+        (is (not (.exists (io/file source))) label))))
+  (testing "a link at the target is replaced as a link, never written through"
+    (let [canary (str *dir* "/move-canary")
+          source (str *dir* "/move-source")
+          link (str *dir* "/move-link")]
+      (spit canary "canary")
+      (spit source "fresh")
+      (symlink! link canary)
+      (fs/atomic-move! source link)
+      (is (= "canary" (slurp canary)) "the link's old target is untouched")
+      (is (not (java.nio.file.Files/isSymbolicLink (.toPath (io/file link)))))
+      (is (= "fresh" (slurp link)))))
+  (testing "an ordinary failure propagates unchanged and leaves the source"
+    (let [source (str *dir* "/move-kept")]
+      (spit source "kept")
+      (is (thrown? java.io.IOException
+                   (fs/atomic-move! source (str *dir* "/no-such-dir/target"))))
+      (is (= "kept" (slurp source))))))
+
+(deftest keygen-replaces-an-existing-key-through-the-atomic-move-test
+  (let [key-file (io/file *dir* "replaced-key.txt")
+        _ (age/keygen! key-file)
+        before (slurp key-file)
+        moves (atom [])
+        real-move fs/atomic-move!]
+    (testing "a failed move leaves the existing key whole and no staging behind"
+      (with-redefs [fs/atomic-move! (fn [& _] (throw (ex-info "forced move failure" {})))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"forced move failure"
+                              (age/keygen! key-file))))
+      (is (= before (slurp key-file)))
+      (is (empty? (filter #(str/includes? % ".keygen") (seq (.list (io/file *dir*)))))))
+    (testing "the new key reaches its path by one atomic move from inside its directory"
+      (with-redefs [fs/atomic-move! (fn [source target]
+                                      (swap! moves conj [(io/file (str source))
+                                                         (io/file (str target))])
+                                      (real-move source target))]
+        (let [recipient (age/keygen! key-file)]
+          (is (= recipient (age/public-key key-file)))))
+      (let [[[source target]] @moves]
+        (is (= 1 (count @moves)))
+        (is (= (.getAbsoluteFile key-file) target))
+        (is (= (.getParentFile target) (.getParentFile (.getParentFile source)))))
+      (is (not= before (slurp key-file)))
+      (is (= owner-only-names (permission-names key-file))))))
 
 ;;;; Resource limits
 
