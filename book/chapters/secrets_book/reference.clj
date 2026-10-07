@@ -115,11 +115,10 @@
 ;; scaffold programmatically.
 
 (doc-section #'init/init!
+             #'init/plan
+             #'init/apply-plan!
              #'init/proposed-config
-             #'init/task-spec
-             #'init/merge-bb-edn
-             #'init/root-trust
-             #'init/filesystem-capability)
+             #'init/task-spec)
 
 ;; ## com.kirahowe.secrets.cli
 
