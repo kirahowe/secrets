@@ -2714,3 +2714,25 @@
       (is (= (first paths) (:identity-file (ex-data failure))))
       (finally
         (doseq [path paths] (.delete (io/file path)))))))
+
+;;;; Release-hardening checks: cleanup, disclosure, and error paths
+
+(deftest write-secrets-releases-staging-when-a-later-acquisition-fails-test
+  (let [plaintext (str *dir* "/plain.edn")
+        env (get-in (cli/normalize-config (test-config)) [:environments :dev])
+        real-sibling-temp-file! @(cli-private 'sibling-temp-file!)
+        calls (atom 0)
+        leftovers #(->> (.listFiles (io/file *dir*))
+                        (map (fn [f] (.getName f)))
+                        (filter (fn [n] (str/ends-with? n ".tmp")))
+                        vec)]
+    (spit plaintext "{:a 1}")
+    (with-redefs-fn {(cli-private 'sibling-temp-file!)
+                     (fn [target suffix]
+                       (if (= 2 (swap! calls inc))
+                         (throw (java.io.IOException. "no space"))
+                         (real-sibling-temp-file! target suffix)))}
+      #(is (thrown? java.io.IOException
+                    ((cli-private 'write-secrets!) env {:identity-file *key*} plaintext))))
+    (is (= 2 @calls) "the manifest staging file was the failing acquisition")
+    (is (= [] (leftovers)) "the ciphertext staging file was released")))

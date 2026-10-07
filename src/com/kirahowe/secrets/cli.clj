@@ -1000,21 +1000,23 @@
                    "Secrets plaintext" :max-plaintext-bytes
                    {:secrets-file (str secrets-file)})
         value (validate-plaintext! secrets-file plaintext limits)
-        ciphertext-temp (sibling-temp-file! secrets-file ".age.tmp")
-        manifest-temp (when (string? manifest)
-                        (sibling-temp-file! manifest ".manifest.tmp"))]
+        ciphertext-temp (sibling-temp-file! secrets-file ".age.tmp")]
     (try
-      (age/encrypt-file! target plaintext-file ciphertext-temp)
-      (when manifest-temp
-        (spit manifest-temp
-              (manifest/render {:app app :ciphertext-sha (sha256 ciphertext-temp)}
-                               (manifest/entries value (manifest-hmac-key env)))))
-      (commit-replacements!
-       (cond-> [{:staged ciphertext-temp :target (io/file secrets-file)}]
-         manifest-temp (conj {:staged manifest-temp :target (io/file manifest)})))
+      (let [manifest-temp (when (string? manifest)
+                            (sibling-temp-file! manifest ".manifest.tmp"))]
+        (try
+          (age/encrypt-file! target plaintext-file ciphertext-temp)
+          (when manifest-temp
+            (spit manifest-temp
+                  (manifest/render {:app app :ciphertext-sha (sha256 ciphertext-temp)}
+                                   (manifest/entries value (manifest-hmac-key env)))))
+          (commit-replacements!
+           (cond-> [{:staged ciphertext-temp :target (io/file secrets-file)}]
+             manifest-temp (conj {:staged manifest-temp :target (io/file manifest)})))
+          (finally
+            (when manifest-temp (.delete manifest-temp)))))
       (finally
-        (.delete ciphertext-temp)
-        (when manifest-temp (.delete manifest-temp))))))
+        (.delete ciphertext-temp)))))
 
 (defn- report-written!
   "Report `outcome` for the ciphertext and, when the environment keeps a
