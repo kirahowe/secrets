@@ -152,7 +152,7 @@
     (parse-key-path s)
     false
     (catch clojure.lang.ExceptionInfo e
-      (= 1 (:secrets/exit (ex-data e))))))
+      (some? (ex-message e)))))
 
 (defspec anything-else-is-refused-as-a-key 200
   (prop/for-all [v not-a-key-path

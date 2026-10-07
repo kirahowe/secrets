@@ -38,7 +38,7 @@
     #(java.nio.file.Files/createTempFile (->path dir) prefix suffix owner-only))))
 
 (defn- try-delete!
-  "Delete `file` and return true when it no longer exists."
+  "Delete `file` and return true when it is gone."
   [^java.io.File file]
   (try (.delete file) (catch Exception _ nil))
   (not (.exists file)))

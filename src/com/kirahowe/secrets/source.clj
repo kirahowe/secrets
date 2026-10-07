@@ -11,7 +11,7 @@
             [com.kirahowe.secrets.fs :as fs]))
 
 (def ^:private max-locator-schemes
-  "How many nested locator schemes a descriptor unwraps — `jar:file:` is two —
+  "How many nested locator schemes a descriptor unwraps (`jar:file:` is two)
   before it keeps only the schemes it has seen. A source string can spell
   `a:b:c:…` to any depth, and describing one is bounded work."
   4)
@@ -232,7 +232,7 @@
      (instance? java.io.File source) {:file source}
      (instance? java.nio.file.Path source) {:file (.toFile ^java.nio.file.Path source)}
      (string? source) (if (locator-scheme source)
-                        (some-> source parse-uri locator-source)
+                        (some-> source str/trim parse-uri locator-source)
                         {:file (io/file source)})
      (instance? java.net.URI source) (locator-source source)
      (instance? java.net.URL source) (some-> source url->uri locator-source))

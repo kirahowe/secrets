@@ -3,7 +3,7 @@
 
   Every function shells out to the `age` / `age-keygen` binaries, so this
   namespace loads and runs identically under JVM Clojure and babashka. It holds
-  no state and takes no opinion about *where* keys or secrets live — that is the
+  no state and takes no opinion about *where* keys or secrets live. That is the
   caller's job (see `com.kirahowe.secrets` for runtime loading and `com.kirahowe.secrets.cli`
   for the management task).
 
@@ -13,8 +13,8 @@
   gives a single-key workflow: the same file both encrypts and decrypts.
 
   age encrypts *to* a recipient and does not sign. A recipient is shareable by
-  design and authorizes *encryption*, not authorship, so nothing here — and
-  nothing built on it — can establish who produced a ciphertext."
+  design and authorizes *encryption*, not authorship, so nothing here, and
+  nothing built on it, can establish who produced a ciphertext."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
@@ -73,7 +73,7 @@
   (and an `-i`/`-R` value of `-`) from stdin and writes `-o -` to stdout, and a
   blank path resolves to stdin rather than to a file. `./` names the same file
   without the ambiguity; an absolute path never begins with `-`. Blank fails
-  closed naming its role, the way a blank identity variable does — a blank
+  closed naming its role, the way a blank identity variable does. A blank
   input would otherwise exit 0 with a ciphertext of nothing, and CI is where
   an unset variable expands to nothing."
   ^String [role p]
@@ -118,9 +118,9 @@
   on failure.
 
   `recipients` selects who can decrypt. It is either:
-    • a bare String/File — always an identity-*file path*: encrypt to that
+    • a bare String/File, always an identity-*file path*: encrypt to that
       identity's own recipient (`age -e -i`), the single-key workflow. A bare
-      `age1…` public-key string throws — pass those as `{:recipients [\"age1…\"]}`
+      `age1…` public-key string throws. Pass those as `{:recipients [\"age1…\"]}`
       (age would otherwise try to read the key as a file path); or
     • a map with any of, whose recipients are unioned:
         :identity-file    encrypt to this identity's own recipient (`-i`)

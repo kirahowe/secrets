@@ -905,6 +905,12 @@
             (is (zero? @invoked)
                 "classification avoids handler rendering and I/O dispatch")))))))
 
+(deftest a-locator-with-surrounding-whitespace-is-read-as-that-locator-test
+  (let [enc (encrypt-edn! {:k "v"})
+        locator (str (.toURI (io/file enc)))]
+    (doseq [source [(str " " locator) (str locator "\n") (str "\t" locator " ")]]
+      (is (= {:k "v"} (secrets/load-secrets source *key*)) (pr-str source)))))
+
 ;;;; Multi-recipient encryption
 
 (deftest valid-recipient?-test

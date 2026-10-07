@@ -189,8 +189,7 @@
   "Run doctor with process boundaries replaced, including the app default key
   path so tests do not depend on the developer's home or environment."
   [config env-arg {:keys [environment version] :as opts}]
-  (with-redefs-fn {(cli-private 'getenv) (or environment {})
-                   #'secrets/default-key-file (fn [_] *key*)
+  (with-redefs-fn {#'secrets/default-key-file (fn [_] *key*)
                    #'age/version (fn [] (if (contains? opts :version)
                                           version
                                           "age test-version"))}
@@ -2342,7 +2341,7 @@
                 :limit (count exact-content)
                 :observed (inc (count exact-content))
                 :manifest manifest-file}
-               (dissoc (ex-data e) :secrets/exit)))
+               (ex-data e)))
         (is (str/includes? (ex-message e) manifest-file))))))
 
 (deftest verify-reports-a-tripped-bound-per-environment-test

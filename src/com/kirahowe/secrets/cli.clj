@@ -19,15 +19,15 @@
     :manifest → <secrets-file>.manifest    (secrets.edn.age → secrets.edn.manifest)
 
   Identity resolution separates two concerns per environment:
-    :key-file      — the durable configured/default path above. `keygen` writes
+    :key-file      the durable configured/default path above. `keygen` writes
                      here; `show-key` and `add-recipient` read the public key
                      from it.
-    :identity-file — what decrypt-side operations (edit, set, rm, reencrypt,
+    :identity-file what decrypt-side operations (edit, set, rm, reencrypt,
                      verify) and single-key encryption use. Resolved in order:
                        1. an explicit :identity-file
-                       2. $SECRETS_AGE_IDENTITY_FILE — a path to the key file
-                       3. $SECRETS_AGE_IDENTITY      — raw key contents (→ 0600 temp file)
-                       4. $SECRETS_AGE_IDENTITY_B64  — base64-encoded key contents
+                       2. $SECRETS_AGE_IDENTITY_FILE, a path to the key file
+                       3. $SECRETS_AGE_IDENTITY, raw key contents (written to a 0600 temp file)
+                       4. $SECRETS_AGE_IDENTITY_B64, base64-encoded key contents
                        5. the environment's :key-file
                      So CI holding only an SECRETS_AGE_IDENTITY* variable can encrypt,
                      decrypt, and verify, while `keygen` still writes to the
@@ -50,7 +50,7 @@
 
   The command fns are a REPL-safe API: they return data (a path, a results
   map, or :aborted) and signal failures by throwing `ex-info` instead of
-  exiting. `run!` — the CLI entry point — is the only fn here that prints
+  exiting. `run!`, the CLI entry point, is the only fn here that prints
   error data and calls System/exit."
   (:refer-clojure :exclude [run!])
   (:require [babashka.cli :as bbcli]
@@ -77,8 +77,8 @@
 
   Single quotes rather than backslash-escaping because inside `'…'` every
   character except `'` is literal. There is no metacharacter set to keep up to
-  date and no interaction with `$`, backticks, `\\`, newlines, or globs —
-  escaping would need a character class that is correct for every shell and
+  date and no interaction with `$`, backticks, `\\`, newlines, or globs.
+  Escaping would need a character class that is correct for every shell and
   every position, while this needs the one rule."
   [s]
   (str "'" (str/replace (str s) "'" "'\\''") "'"))
@@ -88,8 +88,8 @@
 ;;; Everything a command reports is a *line*: a vector whose first element is
 ;;; its level and whose remaining elements are segments, joined with one space
 ;;; the way `println` joins its arguments. A segment is a string or a
-;;; `[style string]` pair to paint. Commands build lines as plain data — the
-;;; `*-lines` functions below are pure — and `say!` is the one place a line is
+;;; `[style string]` pair to paint. Commands build lines as plain data (the
+;;; `*-lines` functions below are pure) and `say!` is the one place a line is
 ;;; painted and written out.
 ;;;
 ;;;   :line    stdout, no marker          :stderr  stderr, no marker
@@ -142,14 +142,13 @@
 
 (defn- fail!
   "Throw an `ex-info` for a user-facing failure. `run!` catches these, prints
-  the message (plus any :hint / :install / :error / :docs in the data), and
-  exits with (:secrets/exit data 1) — command fns never kill the process (or
-  a REPL) themselves."
+  the message plus any :hint, :install, :error, or :docs in the data, and exits
+  1. Command fns never exit the process, or a REPL, themselves."
   ([msg] (fail! msg {}))
-  ([msg data] (throw (ex-info msg (merge {:secrets/exit 1} data)))))
+  ([msg data] (throw (ex-info msg data))))
 
 (defn- confirm!
-  "Prompt y/N; true on \"y\", false otherwise. Never exits — callers decide
+  "Prompt y/N; true on \"y\", false otherwise. Never exits: callers decide
   what a declined prompt means."
   [prompt]
   (print (str (question-marker) " " prompt " [y/N] "))
@@ -158,21 +157,17 @@
 
 (defn- prompt-hidden!
   "Prompt on the terminal with echo turned off and return the typed line
-  without its newline, or nil at end of input. Only valid when `tty?` is true.
-  The console hands back a char array; it is copied into a string and zeroed."
+  without its newline, or nil at end of input. Only valid when `tty?` is true."
   [prompt]
   (let [console (System/console)
         chars (.readPassword console "%s" (object-array [prompt]))]
-    (when chars
-      (let [value (String. chars)]
-        (java.util.Arrays/fill chars (char 0))
-        value))))
+    (some-> chars String.)))
 
 ;;;; Config
 
 (defn- canonical-path
   "Canonicalize `path`, so aliases like `./key.txt` and `key.txt` compare
-  equal — used both for the artifact-collision check and for deciding which
+  equal. Used both for the artifact-collision check and for deciding which
   environments share a key file."
   [path]
   (.getCanonicalPath (io/file (str path))))
@@ -185,9 +180,6 @@
    :identity-file ":identity-file"
    :configured-key-file "configured key path"
    :default-key-file "default key path"})
-
-(defn- getenv [variable-name]
-  (System/getenv variable-name))
 
 (defn- require-path!
   "Reject a blank path, a URI-shaped path, and key contents in a path field,
@@ -217,8 +209,8 @@
 
 (def ^:private artifact-roles
   "Every path-valued artifact role a command can touch. `:identity-file` is the
-  *resolved* identity an environment carries — the value commands actually read
-  — not only an explicitly configured one."
+  *resolved* identity an environment carries, the value commands actually read,
+  and not only an explicitly configured one."
   [:secrets-file :manifest :template :key-file :recipients-file :identity-file])
 
 (def ^:private compatible-role-sets
@@ -226,14 +218,14 @@
   else is rejected: compatible sharing is enumerated here, never inferred from
   role names or matching path strings.
 
-  - `#{:key-file :identity-file}`, or either role alone — one underlying
+  - `#{:key-file :identity-file}`, or either role alone: one underlying
     identity artifact. `:identity-file` *defaults* to `:key-file`, so equality
     inside one environment is the normal case rather than an error, and
     `:key-file` defaults to one app-wide path, so several environments
     legitimately share one key ([[sharing-environments]] reports that set).
-  - `#{:recipients-file}` alone — a committed list of public keys, read-only;
+  - `#{:recipients-file}` alone: a committed list of public keys, read-only;
     one team list shared by several environments is ordinary.
-  - `#{:template}` alone — a read-only example file; one template shared across
+  - `#{:template}` alone: a read-only example file; one template shared across
     environments is ordinary.
 
   `#{:secrets-file}` and `#{:manifest}` are deliberately absent: two
@@ -258,7 +250,7 @@
              {:environment environment-name :role role :path path}))))
 
 (defn- artifact-entries
-  "One entry — `{:environment :role :path :canonical}` — per path-valued
+  "One entry, `{:environment :role :path :canonical}`, per path-valued
   artifact of a normalized environment. Non-string values are skipped, so
   `:manifest false` and an absent `:recipients-file` stay out of the table."
   [env]
@@ -275,7 +267,7 @@
 (defn- role-collision-message
   "Diagnostic for one canonical path carrying incompatible roles: every
   environment and role in the group, and only the pathnames the configuration
-  already carried — never file contents."
+  already carried, never file contents."
   [canonical entries]
   (str "Configuration assigns one path to incompatible artifact roles:\n"
        "    " canonical "\n"
@@ -483,7 +475,7 @@
   set-but-blank identity variable. There every outcome is wrong but plausible:
   the blank value resolves to an empty key file, and falling through reaches the
   developer's local key while the deployment that variable was meant to
-  configure stays broken. A blank editor variable has no such failure mode — the
+  configure stays broken. A blank editor variable has no such failure mode: the
   operator either watches the fallback editor open or gets a failure that leaves
   the store untouched, so falling through is safe here."
   [visual editor]
@@ -492,7 +484,7 @@
 (defn- editor
   "`editor-value` applied to the live environment."
   []
-  (editor-value (getenv "VISUAL") (getenv "EDITOR")))
+  (editor-value (System/getenv "VISUAL") (System/getenv "EDITOR")))
 
 (defn- editor-argv
   "The argv that runs editor command `command` on `path` through the shell.
@@ -508,7 +500,7 @@
   interpolated. An arbitrary editor would read a dash-leading path as its own
   option and `--` is not portable across editors, so `path` is made absolute
   before it reaches the editor. Throws if the editor exits non-zero, naming the
-  editor command — a misconfigured one is otherwise indistinguishable from an
+  editor command, because a misconfigured one is otherwise indistinguishable from an
   editor that genuinely failed. The command is configuration, not a secret; the
   plaintext path stays out of the message."
   [path]
@@ -753,15 +745,15 @@
   otherwise write `...` into the store and silently truncate secrets.
 
   Note the whole file is regenerated, so comments a human wrote in an edited
-  store do not survive a `set` — the values do."
+  store do not survive a `set`. The values do."
   [value]
   (binding [*print-length* nil *print-level* nil]
     (with-out-str (pprint/pprint value))))
 
 (defn- strip-trailing-newline
   "Strip exactly one trailing newline (\\n or \\r\\n) from `s`, so
-  `echo secret | bb secrets set …` stores the obvious value; anything else —
-  including a value that itself ends with a blank line — passes through
+  `echo secret | bb secrets set …` stores the obvious value; anything else,
+  including a value that itself ends with a blank line, passes through
   verbatim."
   [s]
   (cond
@@ -817,8 +809,7 @@
                       {:reason :manifest-stale
                        :secrets-file (str secrets-file)
                        :manifest manifest
-                       :environment environment-name
-                       :secrets/exit 1}
+                       :environment environment-name}
                       e))))))
       (finally
         (.delete staging)))))
@@ -924,8 +915,7 @@
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [{:keys [secrets-file] environment-name :name :as env}
-            env
+      (let [{:keys [secrets-file] environment-name :name} env
             target (encrypt-target! env)
             proceed? (or (not (.exists (io/file secrets-file)))
                          (do
@@ -953,8 +943,7 @@
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [{:keys [secrets-file] environment-name :name :as env}
-            env]
+      (let [{:keys [secrets-file] environment-name :name} env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
           (fail! (str "No secrets file at " secrets-file "\n"
@@ -1035,7 +1024,7 @@
                             (safe-edn/parse raw)]
                         (if ok?
                           value
-                          (fail! (str "Value on stdin is not valid EDN ("
+                          (fail! (str "Value is not valid EDN ("
                                       (edn-failure-message parsed) ").")
                                  (merge {:key path} (safe-edn/failure-data parsed)))))
                       raw)]
@@ -1104,7 +1093,7 @@
     [:warn (format "%s: no key at %s" (name environment-name) key-file)]))
 
 (defn show-key!
-  "Print the public key(s) — share these so teammates can encrypt to you.
+  "Print the public key(s). Share these so teammates can encrypt to you.
   Reads the configured :key-file (not the env-var identity). Returns a map of
   env name → public key (nil when the key is missing); environments sharing a
   :key-file are reported once, under whichever env is seen first."
@@ -1121,8 +1110,8 @@
           (distinct-by :key-file envs))))
 
 (defn reencrypt!
-  "Decrypt and immediately re-encrypt to the environment's current recipients —
-  use after adding or removing a recipient (an `edit` with no change is a no-op
+  "Decrypt and immediately re-encrypt to the environment's current recipients.
+  Use after adding or removing a recipient (an `edit` with no change is a no-op
   and would not pick up recipient changes). The recipient list is snapshotted
   before the decryption, so it is exactly the list the command was started
   against. Rewrites the manifest too. Returns the secrets-file path."
@@ -1130,8 +1119,7 @@
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [{:keys [secrets-file] environment-name :name :as env}
-            env]
+      (let [{:keys [secrets-file] environment-name :name} env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
           (fail! (str "No secrets file at " secrets-file "\n"
@@ -1288,8 +1276,8 @@
       :else
       {:committed value})))
 
-;;; A verification is computed as a *finding* — `:status` (:ok, :ok-keyless,
-;;; :drift, or :missing), a `:reason`, and whatever the report needs — and
+;;; A verification is computed as a *finding*: `:status` (:ok, :ok-keyless,
+;;; :drift, or :missing), a `:reason`, and whatever the report needs. It is
 ;;; rendered by `finding-lines`. `verify-one!` does the reading, hashing, and
 ;;; decrypting; the two functions between it and the report are pure.
 
@@ -1325,8 +1313,8 @@
   which can only be the absent app default, it compares the manifest's
   recorded :ciphertext-sha against the actual ciphertext (freshness only).
 
-  This establishes *agreement* between the two committed artifacts — drift
-  detection — and never who authored either of them; see [[verify!]]."
+  This establishes *agreement* between the two committed artifacts, which is drift
+  detection, and never who authored either of them; see [[verify!]]."
   [{:keys [app secrets-file manifest identity-file] :as env}]
   (cond
     (not (string? manifest))
@@ -1377,7 +1365,8 @@
   [{:keys [app secrets-file manifest] environment-name :name :as env}
    {:keys [reason] :as finding}]
   (let [label (name environment-name)
-        reencrypt (str "bb secrets reencrypt " (shell-quote label))]
+        regenerate [:line (str "    Regenerate it with:  bb secrets reencrypt "
+                               (shell-quote label))]]
     (case reason
       :manifest-disabled
       [[:info label "— manifest disabled; skipping."]]
@@ -1394,18 +1383,19 @@
 
       :manifest-malformed
       [[:oops label "— manifest is malformed: expected a map, with a map under :keys."]
-       [:line (str "    Regenerate it with `" reencrypt "`.")]]
+       regenerate]
 
       :unsupported-version
       [[:oops label "— manifest version" (pr-str (:version finding))
         "is unsupported by this version of the library."]
-       [:line (str "    Regenerate it with `" reencrypt "`, or upgrade the library.")]]
+       regenerate
+       [:line "    Or upgrade the library."]]
 
       :wrong-app
       [[:oops label "— manifest describes app" (pr-str (:app finding))
         (str "but this project is " (pr-str app) ".")]
-       [:line (str "    It belongs to a different store. Regenerate it with `"
-                   reencrypt "`.")]]
+       [:line "    It belongs to a different store."]
+       regenerate]
 
       :no-ciphertext-sha
       [[:warn label (str "— no identity at " (:identity-file env))
@@ -1418,7 +1408,7 @@
       :ciphertext-changed
       [[:oops label "— ciphertext changed since the manifest was written"
         (str "(" manifest ").")]
-       [:line (str "    Regenerate with:  " reencrypt)]]
+       regenerate]
 
       :too-large
       [[:oops label "—" (:message finding)]]
@@ -1433,9 +1423,9 @@
                   (cons [:oops label "— manifest is STALE" (str "(" manifest "):")]
                         (diff-lines diff))))
           (into (when (:ciphertext-changed? finding)
-                  [[:oops label (str "— ciphertext was re-encrypted out-of-band since "
-                                     "the manifest was written.")]]))
-          (conj [:line "    Regenerate with:" reencrypt]))
+                  [[:oops label
+                    "— ciphertext digest differs from the one the manifest records."]]))
+          (conj regenerate))
 
       :manifest-matches
       [[:ok label "— manifest matches" (str "(" manifest ")")]])))
@@ -1567,7 +1557,7 @@
       (catch Exception _ {:state :invalid}))))
 
 (defn- age-state []
-  (let [version (try (age/version) (catch Exception _ nil))]
+  (let [version (age/version)]
     {:available? (some? version)
      :version version}))
 
@@ -1829,8 +1819,7 @@
    :no-keyword-opts true
    :error-fn (fn [data]
                (let [data (restore-error-operand data operands)]
-                 (throw (ex-info (bbcli/format-command-error data)
-                                 (assoc data :secrets/exit 1)))))})
+                 (throw (ex-info (bbcli/format-command-error data) data))))})
 
 (defn- root-epilog [{:keys [environments default-environment]}]
   (str "Environments: "
@@ -1947,7 +1936,7 @@
     :spec [[:env {:positional true :coerce :string :desc "Environment"}]
            [:key {:positional true
                   :coerce :string
-                  :desc "Public key (read from stdin when omitted)"}]]
+                  :desc "Public key (the environment's own key when omitted)"}]]
     :exec-fn (fn [{:keys [env key]}]
                (add-recipient! (normalize-config config)
                                (operand operands env) (operand operands key)))}
@@ -1996,4 +1985,4 @@
     (dispatch! config args)
     (catch clojure.lang.ExceptionInfo e
       (say! (error-lines e))
-      (System/exit (:secrets/exit (ex-data e) 1)))))
+      (System/exit 1))))

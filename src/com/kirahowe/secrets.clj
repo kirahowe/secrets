@@ -14,25 +14,25 @@
 
   Two ways to consume secrets:
 
-  • As an Integrant/component value — call `load-secrets` to get the map and
+  • As an Integrant/component value: call `load-secrets` to get the map and
     `get-secret` to read keys from it. (See the README for a two-line init-key.)
 
-  • As EDN reader literals — call `reader-literals` (or `merge-readers`) to get
+  • As EDN reader literals: call `reader-literals` (or `merge-readers`) to get
     `#secret/req` / `#secret/opt` tags you can register with your config
     reader, so config files reference secrets inline:
 
-        :jdbc-url #secret/req :database/url  ; required — throws if absent
-        :api-key  #secret/opt :llm/api-key   ; optional — nil if absent
+        :jdbc-url #secret/req :database/url  ; required: throws if absent
+        :api-key  #secret/opt :llm/api-key   ; optional: nil if absent
 
   An explicit identity path takes precedence. Otherwise resolution uses:
-    1. $SECRETS_AGE_IDENTITY_FILE — a path to the key file.
-    2. $SECRETS_AGE_IDENTITY      — the raw key file *contents*, used verbatim and
+    1. $SECRETS_AGE_IDENTITY_FILE, a path to the key file.
+    2. $SECRETS_AGE_IDENTITY, the raw key file *contents*, used verbatim and
        materialized to a 0600 temp file. Lets a deploy inject the key as one
        secret/env var.
-    3. $SECRETS_AGE_IDENTITY_B64  — canonical base64-encoded key file contents.
+    3. $SECRETS_AGE_IDENTITY_B64, canonical base64-encoded key file contents.
        ASCII space, horizontal tab, carriage return, and line feed are permitted
        for wrapping; every other nonalphabet character or malformed encoding throws.
-    4. ~/.config/<app>/key.txt — the local developer default, used only when an
+    4. ~/.config/<app>/key.txt, the local developer default, used only when an
        app name is known (an `:app` option or app argument).
   When none of these yields an identity, resolution returns nil and loading
   throws with the options above rather than guessing a path.
@@ -132,7 +132,7 @@
   one. Neither alternative is safe: using the value resolves to an empty key
   file and fails far downstream as \"wrong key, or you are not a recipient\",
   and skipping to the next source would silently fall back to
-  ~/.config/<app>/key.txt — succeeding on a developer machine with the *local*
+  ~/.config/<app>/key.txt, succeeding on a developer machine with the *local*
   key while the deployment it was meant to configure is broken."
   [k v]
   (when (and v (str/blank? v))
@@ -367,8 +367,8 @@
   `clojure.edn`, not `eval`.
 
   Every failure about a source carries `:source`, allowlisted metadata naming
-  which source failed — a locator's scheme, host, port, and path, a file's path,
-  or a rejected object's class — and never the source value, whose userinfo,
+  which source failed (a locator's scheme, host, port, and path, a file's path,
+  or a rejected object's class) and never the source value, whose userinfo,
   query, or `toString` can be a credential. Injected identities are kept in a
   private temporary file only for the duration of this operation."
   ([source] (load-secrets source nil))
@@ -447,7 +447,7 @@
                                " needs an age identity, but none is available. "
                                identity-options)
                           (str "Required secret " (pr-str key-path)
-                               " — but no secrets file found (" describe ")."))
+                               " cannot be read: no secrets file found (" describe ")."))
                         {:key key-path :store describe :reason reason})))
       (let [value (get-secret secrets key-path not-found)]
         (when (= value not-found)
