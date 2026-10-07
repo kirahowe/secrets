@@ -33,13 +33,16 @@ All notable changes to this project are documented here. The format follows
 - Development tasks for formatting (`bb format`), non-mutating format checks
   (`bb format:check`), and linting (`bb lint`), enforcing the project's
   100-column Clojure style consistently.
-- An optional top-level `:limits` config key bounding untrusted inputs before
-  any `age` subprocess starts: `:max-recipients` (256), `:max-recipient-chars`
-  (1024), and `:max-recipients-bytes` (262144). Supplied values are merged over
-  those defaults and resolved onto every environment; each must be a positive
-  integer, and an unknown key inside `:limits` is rejected rather than ignored,
-  because a typo in a security limit must not read as "leave it at the
-  default".
+- An optional top-level `:limits` config key bounding accidentally large or
+  malformed inputs, with the recipient bounds checked before any `age`
+  subprocess starts: `:max-recipients` (256),
+  `:max-recipient-chars` (1024), `:max-recipients-bytes` (262144),
+  `:max-manifest-bytes` (1048576), `:max-manifest-entries` (10000), and
+  `:max-plaintext-bytes` and `:max-edn-depth`, which take the runtime defaults
+  (8 MiB and 100). Supplied values are merged over those defaults and resolved
+  onto every environment; each must be a positive integer, and an unknown key
+  inside `:limits` is rejected rather than ignored, because a typo in a limit
+  must not read as "leave it at the default".
 - Runtime loading takes a `:limits` map — `secrets/default-limits`, overridable
   through the opts of `load-secrets`, `reader-literals`, and `merge-readers` —
   bounding ciphertext read from accepted local files or local classpath-jar
@@ -96,31 +99,21 @@ All notable changes to this project are documented here. The format follows
   The owner-visible review records the prior raw package matches, affected surfaces,
   repository-input analysis, fixed versions, dispositions, and review dates
   without claiming advisory-specific reachability or exploitation.
-- An explicit **authenticity contract and threat model** in the README, plus
-  regression coverage that pins it. This documents and tests the boundary that
-  was already there; it adds no signing, no key material, and no new check.
-  The contract separates the four properties that are easy to run together —
-  confidentiality and ciphertext integrity (age provides both), sender
-  authenticity (age provides none, and a shareable public recipient is an
-  encryption key, not a signing key), and repository trust (a requirement on
-  the operator) — then names who may hold a public recipient (anyone: they are
-  committed), who may replace a deployed artifact (whoever can write the
-  repository or the deployment channel), the resulting trusted computing base,
-  and what accepting that channel demands of a deployment: reviewed and
-  protected refs, immutable artifact transfer, least-privilege writes. This
-  repository's own protected-tag release, digest-pinned CI, and step-scoped
-  identities are cited as the worked example. It also states plainly where
-  `verify` stops: a pass means the ciphertext and manifest *agree*, never that
-  either is authentic.
-  `team-mode-manifest-is-not-a-value-integrity-signal-test` makes the sharpest
-  case falsifiable: a team manifest carries no `:vhash`, so a public-recipient
-  holder can replace the ciphertext with a chosen payload, regenerate the
-  structure-only manifest with no key at all, and pass full verification —
-  while necessarily rewriting two committed files, which is what makes it
-  reviewable. Docstrings on `com.kirahowe.secrets`, `…secrets.age`,
-  `…secrets.manifest`, and `verify!`/`verify-one` now say the same thing where
-  the code is read, and the keyless `verify` line reports "ciphertext agrees
-  with the manifest" rather than "freshness verified".
+- The README states a short authenticity contract and links
+  `doc/threat-model.md`, which owns the rationale. It documents and tests the
+  boundary that was already there; it adds no signing, no key material, and no
+  new check. age provides confidentiality and ciphertext integrity, neither age
+  nor this library identifies the sender, `verify` detects drift and does not
+  establish authorship, and protecting the repository, build, and deployment
+  channel is the deployment's job.
+  `team-mode-manifest-is-not-a-value-integrity-signal-test` pins the sharpest
+  case: a team manifest carries no `:vhash`, so a public-recipient holder can
+  replace the ciphertext with a chosen payload, regenerate the structure-only
+  manifest with no key at all, and pass full verification. Docstrings on
+  `com.kirahowe.secrets`, `…secrets.age`, `…secrets.manifest`, and
+  `verify!`/`verify-one` say the same thing where the code is read, and the
+  keyless `verify` line reports "ciphertext agrees with the manifest" rather
+  than "freshness verified".
 - `verify` now refuses a manifest whose `:app` is not the configured one, or
   that records none, as drift rather than diffing it as a shape. Auditing the
   contract turned up that `:app` was written into every manifest and read back
@@ -302,12 +295,14 @@ All notable changes to this project are documented here. The format follows
   the result as raw UTF-16 code units rather than through a charset encoder that
   would substitute for unpaired surrogates: `=` and `;` inside a value can no
   longer be read as structure, `[[1]]`, `[(1)]`, and `#{[1]}` all encode
-  differently, and no two distinct values share a hash. Manifest entry paths are
-  ordered by the same encoding instead of by rendered text, so two distinct
-  paths can no longer compare equal and drop a manifest line. The encoding
-  version is mixed into the HMAC key derivation, so a v1 and a v2 hash of the
-  same value can never coincide, and `verify` and `doctor` reject `:version 1`
-  as an unsupported version rather than diffing it as if it were v2.
+  differently, so no two distinct values encode to the same string (the stored
+  `:vhash` is a truncated HMAC of that string and is not collision-free).
+  Manifest entry paths are ordered by the same encoding instead of by rendered
+  text, so two distinct paths can no longer compare equal and drop a manifest
+  line. The encoding version is mixed into the HMAC key derivation, so a v1 and
+  a v2 hash of the same value are computed under different keys, and `verify`
+  and `doctor` reject `:version 1` as an unsupported version rather than
+  diffing it as if it were v2.
 - `add-recipient` now distinguishes first-store bootstrap from recipient
   changes to existing ciphertext: it recommends `set` or `new` before a store
   exists, and `reencrypt` only when ciphertext already needs updating.
@@ -438,11 +433,6 @@ All notable changes to this project are documented here. The format follows
   truncated prefix of the offending line. `bb secrets recipients` remains an
   unvalidated read-only listing, but now marks any line encryption would
   refuse instead of presenting it as a recipient.
-- Environment-injected identities are materialized through a race-safe,
-  SHA-256-digest-keyed cache. Concurrent callers with identical identity
-  contents now share one owner-only temporary-file write, and realized cache
-  entries retain only the digest and resulting path rather than the raw
-  identity contents.
 - Every `age` invocation that takes an input pathname now ends its options with
   an explicit `--` terminator, and every path-valued argument — the positional
   input, `-o`, `-i`, and `-R` — is normalized (a leading `-` is prefixed with
@@ -537,20 +527,6 @@ All notable changes to this project are documented here. The format follows
   opts map, which can hold a resolver, a database password, or an entire
   configuration. A `#secret/req` failure names the configured store under
   `:store` rather than `:source`, so one key never means two shapes on one read.
-- An identity path this library materialized no longer reaches a diagnostic
-  through `age` or the CLI, closing the two paths issue 022's audit left open.
-  `age/decrypt`, `age/decrypt-bytes`, and `age/decrypt-to-file!` omit
-  `:identity-file` from a failure unless the call passes
-  `{:identity-nameable? true}` — only the caller knows whether it passed a path
-  the user has or a temp file it materialized from injected key contents — and
-  a wrong key still reports the captured stderr and its hint. `bb secrets` says
-  `from SECRETS_AGE_IDENTITY` where it used to print that temp path, in
-  `require-identity!` and in a keyless `verify`, and keeps naming a
-  caller-supplied path, which is the overwhelmingly common case. The reader
-  literals stopped laundering provenance on the way to a load: an identity they
-  resolved internally is no longer passed back in as an explicit
-  `:identity-file`, which is how a materialized path reached the Aero readers'
-  diagnostics.
 - A set-but-blank `VISUAL` or `EDITOR` no longer counts as an editor. The empty
   string is truthy, so `VISUAL=""` shadowed a correctly set `EDITOR` and the
   `vim` default, and the shell command word became the decrypted plaintext temp
