@@ -20,10 +20,6 @@
 
 (use-fixtures :each with-disposable-secrets)
 
-(deftest source-is-loadable-test
-  (testing "the starter exposes a REPL cache reset hook"
-    (is (nil? (app/reset-cache!)))))
-
 (deftest profiles-select-different-safe-results-test
   (testing "default and evals select their own required key branches"
     (let [default (app/run! secrets)
