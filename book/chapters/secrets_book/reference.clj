@@ -61,11 +61,11 @@
 ;; ## com.kirahowe.secrets.aero
 
 ;; This namespace provides the optional Aero integration. Requiring it registers
-;; the reader methods; Aero must already be present in the consuming
-;; application.
+;; the reader methods, and `read-config` reads a config whose secret tags
+;; decrypt the store at most once for that read. Aero must already be present
+;; in the consuming application.
 
-(doc-section #'secrets-aero/register!
-             #'secrets-aero/reset-cache!)
+(doc-section #'secrets-aero/read-config)
 
 ;; ## com.kirahowe.secrets.age
 
