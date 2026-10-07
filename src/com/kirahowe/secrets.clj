@@ -376,14 +376,24 @@
    (load-from source identity-or-opts)))
 
 (defn get-secret
-  "Read a secret from a loaded map. `key-path` is a single key (`:database/url`)
-  or a vector path into nested maps (`[:database :url]`). Returns `default`
-  (nil) when absent."
+  "Read a secret from a loaded store. `key-path` is a vector path
+  (`[:database :url]`) or a single key (`:database/url`), which is a path of
+  one element.
+
+  A vector path walks maps by key and vectors by integer index, and nothing
+  else. It does not index into a string, a set, a list, or any other value, so
+  a path that continues past such a leaf is not found. Returns `default` (nil
+  unless given) when the path is not found, and the stored value, which may be
+  nil, when it is."
   ([secrets key-path] (get-secret secrets key-path nil))
   ([secrets key-path default]
-   (if (vector? key-path)
-     (get-in secrets key-path default)
-     (get secrets key-path default))))
+   (reduce (fn [value k]
+             (if (or (and (map? value) (contains? value k))
+                     (and (vector? value) (integer? k) (contains? value k)))
+               (get value k)
+               (reduced default)))
+           secrets
+           (if (vector? key-path) key-path [key-path]))))
 
 ;;;; EDN reader literals
 

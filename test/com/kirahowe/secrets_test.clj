@@ -115,6 +115,45 @@
     (is (= :dflt (secrets/get-secret m [:r2 :missing] :dflt)))
     (is (= :dflt (secrets/get-secret m :nope :dflt)))))
 
+(deftest get-secret-paths-are-strict-test
+  (let [store {:a "xyz"
+               :set #{:x}
+               :n 42
+               :hosts ["one" "two"]
+               :nested {:list '(1 2) :nil nil 0 "zero-key"}}]
+    (testing "a vector path walks maps by key and vectors by integer index"
+      (are [path expected] (= expected (secrets/get-secret store path ::none))
+        [:a] "xyz"
+        [:hosts 1] "two"
+        [:nested 0] "zero-key"
+        [:nested :nil] nil
+        [] store))
+    (testing "and nothing else: a string, set, number, or list is a leaf"
+      (are [path] (= ::none (secrets/get-secret store path ::none))
+        [:a 0]
+        [:a 0 :deeper]
+        [:set :x]
+        [:n 0]
+        [:nested :list 0]
+        [:hosts 2]
+        [:hosts -1]
+        [:hosts "0"]
+        [:hosts :first]
+        [:missing]
+        [:nested :nil :deeper]))
+    (testing "a single key is a path of one element"
+      (is (= "xyz" (secrets/get-secret store :a)))
+      (is (= ::none (secrets/get-secret store :missing ::none)))
+      (is (= ::none (secrets/get-secret "xyz" 0 ::none)))
+      (is (= ::none (secrets/get-secret #{:x} :x ::none))))
+    (testing "#secret/req reports a path into a leaf as a missing key"
+      (let [enc (encrypt-edn! {:a "xyz"})
+            readers (secrets/reader-literals {:file enc :identity-file *key*})
+            e (try (edn/read-string {:readers readers} "#secret/req [:a 0]")
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :missing-key (:reason (ex-data e))))
+        (is (nil? (edn/read-string {:readers readers} "#secret/opt [:a 0]")))))))
+
 (deftest public-key-test
   (is (re-find #"^age1" (age/public-key *key*)))
   (is (nil? (age/public-key (str *dir* "/does-not-exist")))))
