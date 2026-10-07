@@ -2736,3 +2736,74 @@
                     ((cli-private 'write-secrets!) env {:identity-file *key*} plaintext))))
     (is (= 2 @calls) "the manifest staging file was the failing acquisition")
     (is (= [] (leftovers)) "the ciphertext staging file was released")))
+
+(deftest config-failures-carry-no-config-maps-test
+  (let [marker "CONFIG-MARKER-9d31"
+        failure (fn [config]
+                  (try (cli/normalize-config config)
+                       (catch clojure.lang.ExceptionInfo e e)))
+        base {:app "a" :environments {:dev {:secrets-file "s.age"}}}]
+    (are [config] (let [e (failure config)]
+                    (and (instance? clojure.lang.ExceptionInfo e)
+                         (not (str/includes? (pr-str [(ex-message e) (ex-data e)]) marker))))
+      {:app "a" :environments {:dev {:note marker}}}
+      {:app "a" :note marker :environments {}}
+      {:app " " :note marker :environments {:dev {:secrets-file "s.age"}}}
+      (assoc base :limits marker)
+      (assoc base :limits {:max-plaintext-bytes marker})
+      (assoc base :limits {:max-plaintext-bytes [marker]})
+      (assoc base :limits {marker 1})
+      (assoc base :limits {:unknown-limit 1 marker 1 [marker] 2}))))
+
+(deftest unknown-limit-keys-of-mixed-types-are-reported-test
+  (let [e (try (cli/normalize-config
+                (assoc (test-config) :limits {:zzz 1 "b" 2 :a 3}))
+               (catch Throwable e e))]
+    (is (instance? clojure.lang.ExceptionInfo e))
+    (is (re-find #"unknown key" (ex-message e)))
+    (is (= [:a :zzz] (:unknown-keys (ex-data e))))
+    (is (re-find #"1 that are not keywords" (ex-message e)))))
+
+(deftest set-never-echoes-a-misplaced-value-test
+  (let [marker "hunter2-MARKER"
+        config (test-config)
+        dispatch! (cli-private 'dispatch!)
+        refused (fn [argv]
+                  (let [{:keys [failure] :as captured}
+                        (capture-failure #(dispatch! config argv))]
+                    (is (some? failure) (pr-str argv))
+                    (assert-redacted! marker captured)
+                    failure))]
+    (testing "surplus operands and option-shaped operands"
+      (doseq [argv [["set" "dev" ":db/pw" marker]
+                    ["set" "dev" ":db/pw" marker marker]
+                    ["set" "--edn" "dev" ":db/pw" marker]
+                    ["set" "dev" "--edn" ":db/pw" marker]
+                    ["set" "dev" ":db/pw" "--" marker]
+                    ["set" "dev" ":db/pw" "--value" marker]
+                    ["set" "dev" ":db/pw" (str "--value=" marker)]]]
+        (refused argv)))
+    (testing "the value in the key position or the environment position"
+      (doseq [argv [["set" marker]
+                    ["set" "dev" marker]
+                    ["set" marker ":db/pw"]
+                    ["set" (str "dev/" marker) ":k"]
+                    ["set" ":db/pw" marker]
+                    ["set" "dev" (str "[:a \"" marker "\"")]
+                    ["set" "dev" (str "[:a " marker "]")]
+                    ["set" "dev" (str ":a " marker)]]]
+        (let [failure (refused argv)]
+          (is (str/includes? (str (:message failure) (:hint (:data failure)))
+                             "prompt or stdin")
+              (pr-str argv)))))))
+
+(deftest recipients-listing-escapes-and-truncates-an-invalid-line-test
+  (let [recipients-file (str *dir* "/recipients.txt")
+        line (str "AGE-SECRET-KEY-1\u001b[31m" (apply str (repeat 40 "Q")) "TAILMARKER")
+        config (cli/normalize-config (test-config {:recipients-file recipients-file}))]
+    (spit recipients-file (str line "\n"))
+    (let [out (with-out-str (cli/recipients! config "dev"))
+          prefix ((cli-private 'line-prefix) line)]
+      (is (str/includes? out (str "  " (pr-str prefix))))
+      (is (not (str/includes? out "\u001b")) "control characters are escaped")
+      (is (not (str/includes? out "TAILMARKER"))))))

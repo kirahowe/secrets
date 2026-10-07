@@ -342,24 +342,28 @@
 (defn- resolve-limits
   "Merge a configured `:limits` map over `default-limits`. Rejects anything a
   later read would silently see as a default: a non-map, an unknown key (a typo
-  in a security limit must not read as \"unset\"), or a value that is not a
-  positive integer."
+  in a limit must not read as \"unset\"), or a value that is not a positive
+  integer. Failures name known limits and types, never the rejected values."
   [limits]
   (when-not (or (nil? limits) (map? limits))
-    (fail! "secrets config :limits must be a map of limit name → positive integer."
-           {:limits limits}))
-  (let [unknown (sort (remove (set (keys default-limits)) (keys limits)))]
+    (fail! "secrets config :limits must be a map of limit name → positive integer."))
+  (let [unknown (remove (set (keys default-limits)) (keys limits))
+        named (sort-by str (filter keyword? unknown))
+        unnamed (- (count unknown) (count named))]
     (when (seq unknown)
       (fail! (str "secrets config :limits has unknown key(s): "
-                  (str/join ", " unknown) ".\n"
+                  (str/join ", " named)
+                  (when (pos? unnamed)
+                    (str (when (seq named) ", and ") unnamed " that are not keywords"))
+                  ".\n"
                   "    Known limits: "
                   (str/join ", " (sort (keys default-limits))) ".")
-             {:limits limits :unknown-keys (vec unknown)})))
+             {:unknown-keys (vec named)})))
   (doseq [[limit value] limits]
     (when-not (and (integer? value) (pos? value))
-      (fail! (str "secrets config :limits " limit " must be a positive integer, got "
-                  (pr-str value) ".")
-             {:limits limits :limit limit :value value})))
+      (fail! (str "secrets config :limits " limit " must be a positive integer, got a value "
+                  "of type " (name (manifest/value-type value)) ".")
+             {:limit limit})))
   (merge default-limits limits))
 
 (defn- normalize-environment
@@ -369,8 +373,7 @@
   (when-not (string? secrets-file)
     (fail! (str "Environment " environment-name
                 " has no :secrets-file (a path string is required).")
-           {:environment environment-name
-            :env-config env-config}))
+           {:environment environment-name}))
   (require-path! environment-name :secrets-file secrets-file)
   (when (and (not (str/ends-with? secrets-file ".age"))
              (not (and (contains? env-config :template)
@@ -431,15 +434,14 @@
   or create private files. Throws ex-info on invalid input."
   [{:keys [app environments] :as config}]
   (when (empty? environments)
-    (fail! "secrets config has no :environments" {:config config}))
+    (fail! "secrets config has no :environments"))
   (when-not (and (string? app) (not (str/blank? app)))
     (fail! (str "secrets config has no :app (a name string is required). It names the\n"
                 "    default key path ~/.config/<app>/key.txt and is recorded in the "
                 "manifest,\n"
                 "    so there is deliberately no default — projects must not share a key "
                 "path\n"
-                "    by accident.")
-           {:config config}))
+                "    by accident.")))
   (let [limits (resolve-limits (:limits config))
         normalized (reduce-kv (fn [normalized environment-name env-config]
                                 (assoc normalized
@@ -850,32 +852,36 @@
       (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
              (merge {:secrets-file secrets-file} (edn-failure-data parsed))))))
 
+(def ^:private set-usage
+  (str "`set` takes [env] <key>; the value is read from the prompt or stdin, "
+       "never from the command line."))
+
 (defn- parse-key-path
   "Parse a `set`/`rm` CLI key argument as EDN into the vector `assoc-in` /
   `get-in` / `update-in` expect: a bare keyword becomes a one-element path,
-  a vector of keywords/strings is a nested path. Rejects anything else —
-  including a missing argument — with a `fail!` naming both accepted forms,
-  so a typo'd path is caught before any file is touched."
+  a vector of keywords/strings is a nested path. Rejects anything else,
+  including a missing argument, with a `fail!` naming both accepted forms, so
+  a typo'd path is caught before any file is touched. The failure names the
+  rejected value's type and never the value: `set` receives the key where a
+  mistyped command line may have put the secret."
   [s limits]
   (when (str/blank? (str s))
     (fail! (str "Missing key. Accepted forms: a keyword (:some/key) or a vector path "
                 "([:a :b]).")))
-  (let [{:keys [ok? value] :as parsed} (safe-edn/parse (str s) limits)]
-    (when-not ok?
-      (fail! (str "Invalid key: " (edn-failure-message parsed) ".\n"
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse (str s) limits)
+        problem (cond
+                  (not ok?) (edn-failure-message parsed)
+                  (keyword? value) nil
+                  (and (vector? value) (empty? value)) "got an empty vector"
+                  (vector? value) (when-not (every? #(or (keyword? %) (string? %)) value)
+                                    "got a vector containing a non-keyword, non-string element")
+                  :else (str "got a value of type " (name (manifest/value-type value))))]
+    (when problem
+      (fail! (str "Invalid key: " problem ".\n"
                   "    Accepted forms: a keyword (:some/key) or a vector path "
                   "([:a :b]).")
-             (edn-failure-data parsed)))
-    (cond
-      (keyword? value) [value]
-      (and (vector? value)
-           (seq value)
-           (every? #(or (keyword? %) (string? %)) value))
-      value
-      :else (fail! (str "Invalid key: " (pr-str value) ".\n"
-                        "    Accepted forms: a keyword (:some/key) or a vector path "
-                        "([:a :b]).")
-                   {:key value}))))
+             (when-not ok? (edn-failure-data parsed))))
+    (if (keyword? value) [value] value)))
 
 (defn- render-secrets
   "Render a secrets map as the plaintext `set`/`rm` re-encrypt. Pretty-printed
@@ -1211,10 +1217,15 @@
   secrets file from an empty map, then re-encrypts and updates the manifest.
   Returns the secrets-file path. Re-rendering removes plaintext comments."
   [config env-arg key-arg edn?]
+  ;; An unrecognised environment operand may be the value itself.
+  (when (and env-arg (not (contains? (:environments config) (keyword env-arg))))
+    (fail! set-usage))
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
-      (let [path (parse-key-path key-arg (:limits env))
+      (let [path (try (parse-key-path key-arg (:limits env))
+                      (catch clojure.lang.ExceptionInfo e
+                        (throw (ex-info (ex-message e) (assoc (ex-data e) :hint set-usage) e))))
             {:keys [secrets-file]} env
             exists? (.exists (io/file secrets-file))]
         (when exists? (require-identity! env))
@@ -1496,7 +1507,7 @@
           (map (fn [recipient]
                  (if (age/valid-recipient? recipient)
                    [:line "  " recipient]
-                   [:line "  " recipient
+                   [:line "  " (pr-str (line-prefix recipient))
                     [:yellow "← invalid; encryption refuses this line"]])))
           recipients)))
 
@@ -2042,8 +2053,13 @@
 (defn- restore-error-operand [data operands]
   (cond
     (and (= :restrict-args (:cause data)) (operand-token? (:value data)))
-    (let [value (operand operands (:value data))]
-      (assoc data :value value :msg (str "Unexpected argument: " value)))
+    (if (= ["set"] (:dispatch data))
+      ;; The surplus operand is the likeliest place a value ends up.
+      (-> data
+          (dissoc :value)
+          (assoc :msg (str "Unexpected argument. " set-usage)))
+      (let [value (operand operands (:value data))]
+        (assoc data :value value :msg (str "Unexpected argument: " value))))
 
     (and (= :no-match (:cause data)) (operand-token? (:wrong-input data)))
     (let [wrong-input (operand operands (:wrong-input data))]
