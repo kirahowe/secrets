@@ -568,63 +568,44 @@
                                          (catch Throwable t t))))))
         (is (some? @created))
         (is (not (.exists ^java.io.File @created)))))
-    (testing "a write failure names a file its cleanup could not delete"
-      (doseq [[label failure delete!]
-              [["an Error carries the cleanup failure as suppressed"
-                (Error. "forced write error") (constantly false)]
-               ["a delete that throws cannot replace the write failure"
-                (java.io.IOException. "forced write failure")
-                (fn [_] (throw (IllegalStateException. "forced delete failure")))]]]
+    (testing "a failed delete names the remaining file, whatever the callback did"
+      (doseq [[label body expected-reason]
+              [["after success" (fn [] :completed) :private-file-remains]
+               ["after an ex-info" #(throw (ex-info "callback failed" {:reason :callback-failed}))
+                :callback-failed]
+               ["after another exception" #(throw (IllegalStateException. "callback failed"))
+                :private-file-remains]
+               ["after a failed write" nil :identity-not-materialized]]]
         (testing label
-          (let [created (atom nil)
-                real-temp fs/owner-only-temp-file!]
-            (try
-              (let [thrown (with-redefs-fn
-                             (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-                                    {#'fs/owner-only-temp-file!
-                                     (fn [& args] (reset! created (apply real-temp args)))
-                                     #'clojure.core/spit (fn [_ _] (throw failure))
-                                     #'secrets/try-delete-identity-file! delete!})
-                             (fn []
-                               (try (secrets/with-identity nil identity)
-                                    (catch Throwable t t))))
-                    leftover (.getAbsolutePath ^java.io.File @created)
-                    cleanup (if (instance? Error failure)
-                              (some-> ^Throwable thrown .getSuppressed first ex-data)
-                              (:cleanup (ex-data thrown)))]
-                (if (instance? Error failure)
-                  (is (identical? failure thrown))
-                  (is (= :identity-not-materialized (:reason (ex-data thrown)))))
-                (is (= {:reason :identity-cleanup-failed
-                        :identity-file leftover
-                        :identity-source :secrets-age-identity}
-                       cleanup)))
-              (finally
-                (some-> ^java.io.File @created .delete)))))))
-    (testing "deletion failures report each leftover, including when the callback fails"
-      (doseq [body-fails? [false true]]
-        (with-redefs-fn
-          (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-                 {#'secrets/try-delete-identity-file! (constantly false)})
-          (fn []
-            (try
-              (let [e (try
-                        (secrets/with-identity nil
-                          (fn [{:keys [identity-file]}]
-                            (reset! path identity-file)
-                            (if body-fails?
-                              (throw (ex-info "callback failed" {:reason :callback-failed}))
-                              :completed)))
-                        (catch clojure.lang.ExceptionInfo e e))
-                    data (ex-data e)
-                    cleanup (if body-fails? (:cleanup data) data)]
-                (is (= :identity-cleanup-failed (:reason cleanup)))
-                (is (= @path (:identity-file cleanup)))
-                (is (.exists (io/file @path)))
-                (when body-fails?
-                  (is (= :callback-failed (:reason data)))))
-              (finally
-                (when @path (.delete (io/file @path)))))))))))
+          (with-redefs-fn
+            (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+                   {#'fs/try-delete! (constantly false)}
+                   (when-not body
+                     {#'clojure.core/spit (fn [_ _] (throw (java.io.IOException. "forced")))}))
+            (fn []
+              (reset! path nil)
+              (let [created (atom nil)
+                    real-temp fs/owner-only-temp-file!
+                    e (with-redefs-fn
+                        {#'fs/owner-only-temp-file!
+                         (fn [& args] (reset! created (apply real-temp args)))}
+                        (fn []
+                          (try
+                            (secrets/with-identity nil
+                              (fn [{:keys [identity-file]}]
+                                (reset! path identity-file)
+                                (body)))
+                            (catch clojure.lang.ExceptionInfo e e))))
+                    leftover (.getAbsolutePath ^java.io.File @created)]
+                (try
+                  (is (= expected-reason (:reason (ex-data e))))
+                  (is (= leftover (:remaining-file (ex-data e))))
+                  (is (str/includes? (ex-message e) leftover)
+                      "the message tells the operator which file to remove")
+                  (is (not (str/includes? (pr-str e) "AGE-SECRET-KEY-")))
+                  (is (.exists (io/file leftover)))
+                  (finally
+                    (.delete (io/file leftover))))))))))))
 
 (deftest operation-owned-identities-are-independent-test
   (let [contents (slurp *key*)

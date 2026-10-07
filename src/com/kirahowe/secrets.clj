@@ -43,8 +43,9 @@
   `./key:txt` for such a file. Key contents in a path setting fail the same
   way and are never echoed.
 
-  Sources 2 and 3 are materialized into a private temporary file only while an
-  operation needs them, then deleted before that operation returns."
+  Sources 2 and 3 are written to a private temporary file only while an
+  operation needs them, then deleted before that operation returns. If the
+  delete fails, the error names the remaining path."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.age :as age]
@@ -175,57 +176,6 @@
            :identity-source :default-key-file})
         {:identity-file nil :identity-source nil})))
 
-(defn- try-delete-identity-file!
-  "Attempt to delete `file`. Kept as the narrow filesystem seam for tests."
-  [file]
-  (.delete file))
-
-(defn- cleanup-failure
-  [path source]
-  (ex-info "Could not delete the temporary age identity file."
-           {:reason :identity-cleanup-failed
-            :identity-file path
-            :identity-source source}))
-
-(defn- delete-materialized-identity!
-  "Delete a temporary identity, returning nil or a safe cleanup exception.
-  A delete that throws is reported the same way and never propagates."
-  [path source]
-  (let [file (io/file path)]
-    (try
-      (cond
-        (not (.exists file)) nil
-        (try-delete-identity-file! file) nil
-        (not (.exists file)) nil
-        :else (cleanup-failure path source))
-      (catch Exception _
-        (cleanup-failure path source)))))
-
-(defn- write-identity!
-  "Materialize injected contents in a private temp file for one operation.
-
-  A failed write attempts to delete the file before anything propagates. An
-  `Exception` is reported as `:identity-not-materialized` without its cause or
-  message, with a failed delete under `:cleanup`. An `Error` is rethrown as it
-  is, with a failed delete attached as a suppressed `:identity-cleanup-failed`
-  error. Either way a file that could not be deleted is named."
-  [contents source]
-  (let [file (fs/owner-only-temp-file! "age-identity-" ".txt")
-        path (.getAbsolutePath file)]
-    (try
-      (spit file contents)
-      path
-      (catch Throwable t
-        (let [cleanup (delete-materialized-identity! path source)]
-          (throw (if-not (instance? Exception t)
-                   (cond-> t cleanup (doto (.addSuppressed cleanup)))
-                   (ex-info (str "Could not write the injected age identity to a temp file ("
-                                 (.getName (class t)) "). Check the temp directory is writable.")
-                            (cond-> {:reason :identity-not-materialized
-                                     :identity-file path
-                                     :identity-source source}
-                              cleanup (assoc :cleanup (ex-data cleanup)))))))))))
-
 (def ^:private colon-path-hint
   " Prefix a relative path that contains a colon with ./")
 
@@ -261,38 +211,28 @@
   then an `:app` default; no configured identity gives a nil path for keyless
   operations. Paths owned by callers pass through untouched, except that a
   URI-shaped path or one holding key contents throws `:disallowed-identity`
-  before `f` runs. Raw and base64
-  identities are materialized only for this callback and deleted when it
-  returns. If both the callback and cleanup fail, an `ex-info` from the
-  callback is rethrown with its message and data plus the cleanup diagnostic
-  under `:cleanup`. Any other throwable becomes the cause of an
-  `:identity-cleanup-failed` error that carries the same diagnostic."
+  before `f` runs.
+
+  A raw or base64 identity is written to a private temporary file for this
+  call only, through [[com.kirahowe.secrets.fs/with-private-temp-file]], which
+  deletes it when `f` returns or throws and names the path under
+  `:remaining-file` if the delete fails. A failed write throws
+  `:identity-not-materialized` without the cause or its message."
   [identity-or-opts f]
   (let [{:keys [contents identity-source] :as candidate}
         (identity-candidate identity-or-opts)]
     (if (contains? candidate :contents)
-      (let [path (write-identity! contents identity-source)
-            descriptor {:identity-file path :identity-source identity-source}
-            callback-failure (volatile! nil)]
-        (try
-          (f descriptor)
-          (catch Throwable t
-            (vreset! callback-failure t)
-            (throw t))
-          (finally
-            (when-let [cleanup (delete-materialized-identity! path identity-source)]
-              (if-let [failure @callback-failure]
-                (if (instance? clojure.lang.ExceptionInfo failure)
-                  (throw (ex-info (ex-message failure)
-                                  (assoc (ex-data failure) :cleanup (ex-data cleanup))
-                                  failure))
-                  (throw (ex-info (ex-message cleanup)
-                                  {:reason :identity-cleanup-failed
-                                   :identity-file path
-                                   :identity-source identity-source
-                                   :cleanup (ex-data cleanup)}
-                                  failure)))
-                (throw cleanup))))))
+      (fs/with-private-temp-file "age-identity-" ".txt"
+        (fn [file]
+          (try
+            (spit file contents)
+            (catch Exception e
+              (throw (ex-info (str "Could not write the injected age identity to a temp file ("
+                                   (.getName (class e)) "). Check the temp directory is writable.")
+                              {:reason :identity-not-materialized
+                               :identity-source identity-source}))))
+          (f {:identity-file (.getAbsolutePath ^java.io.File file)
+              :identity-source identity-source})))
       (do
         (validate-identity-path! (:identity-file candidate) identity-source)
         (f (select-keys candidate [:identity-file :identity-source]))))))

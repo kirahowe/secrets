@@ -45,8 +45,8 @@
 
   By default, each environment commits `secrets.edn.age` (ciphertext) and
   `secrets.edn.manifest` (key paths, types, counts, and optional keyed hashes).
-  Editing uses an owner-only plaintext temp file and deletes it afterward on a
-  best-effort basis.
+  Editing uses an owner-only plaintext temp file and deletes it afterward; a
+  failed delete is an error that names the remaining path.
 
   The command fns are a REPL-safe API: they return data (a path, a results
   map, or :aborted) and signal failures by throwing `ex-info` instead of
@@ -55,7 +55,6 @@
   (:refer-clojure :exclude [run!])
   (:require [babashka.cli :as bbcli]
             [clojure.java.io :as io]
-            [clojure.java.shell :as shell]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
             [com.kirahowe.secrets :as secrets]
@@ -513,29 +512,11 @@
       (fail! (str "Editor exited with an error; leaving secrets unchanged."
                   " Editor: " command)))))
 
-(defn- secure-delete!
-  "Best-effort secure delete of a plaintext temp file. `rm`/`shred` receive
-  `--` and an absolute path, which can neither begin with a dash nor be the
-  bare `-` that `shred -u` rejects as a non-file — either one silently
-  downgrades the overwrite to the plain `.delete` fallback below."
-  [path]
-  (let [f (io/file (str path))]
-    (when (.exists f)
-      (try
-        (cond
-          (str/starts-with? (System/getProperty "os.name") "Mac")
-          (shell/sh "rm" "-P" "--" (.getAbsolutePath f))
-          (zero? (:exit (shell/sh "sh" "-c" "command -v shred")))
-          (shell/sh "shred" "-u" "--" (.getAbsolutePath f))
-          :else (.delete f))
-        (catch Exception _ (.delete f)))
-      (when (.exists f) (.delete f)))))
-
-(defn- temp-plaintext!
-  "Create an owner-only (0600 from the moment it exists) temp file for
-  plaintext secrets."
-  []
-  (fs/owner-only-temp-file! "secrets-" ".edn"))
+(defn- with-plaintext-temp
+  "Call `f` with a private temporary file for plaintext secrets, deleted when
+  `f` returns or throws. A failed delete is reported with the remaining path."
+  [f]
+  (fs/with-private-temp-file "secrets-" ".edn" f))
 
 (defn- distinct-by [f coll]
   (->> coll (group-by f) vals (map first)))
@@ -935,8 +916,8 @@
            [:warn "Back this key up (e.g. a password manager). It is NOT in git and"]
            [:line (str "    cannot be recovered. To deploy, set it as the "
                        "SECRETS_AGE_IDENTITY secret:")]
-           ;; `cat --` for the same reason `age`, `rm`, and `shred` get one: a
-           ;; key file named `-n` or `--help` has to reach cat as a pathname.
+           ;; `cat --` because a key file named `-n` or `--help` has to reach
+           ;; cat as a pathname.
            ;; The surrounding "$(…)" is the shell's own construct, not
            ;; interpolated data, and is what makes the file contents one
            ;; argument to flyctl.
@@ -1000,21 +981,19 @@
                                  "` instead.)"))))]
         (if-not proceed?
           (do (info "Aborted.") :aborted)
-          (let [tmp (temp-plaintext!)]
-            (try
+          (with-plaintext-temp
+            (fn [tmp]
               (spit tmp (template-content env))
               (info "Opening" (editor) "…")
               (run-editor! tmp)
               (info "Encrypting…")
               (write-secrets! env target tmp)
               (report-written! env "Encrypted secrets written:" secrets-file)
-              secrets-file
-              (finally (secure-delete! tmp)))))))))
+              secrets-file)))))))
 
 (defn edit!
   "Edit an existing secrets file through an owner-only plaintext temp file.
-  Re-encrypts only when the plaintext changes and deletes the temp file on a
-  best-effort basis. Returns the secrets-file path."
+  Re-encrypts only when the plaintext changes. Returns the secrets-file path."
   [config env-arg]
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
@@ -1028,21 +1007,20 @@
                       (shell-quote (clojure.core/name environment-name)))
                  {:secrets-file secrets-file
                   :environment environment-name}))
-        (let [target (encrypt-target! env)
-              tmp (temp-plaintext!)]
-          (try
-            (info "Decrypting" secrets-file "…")
-            (decrypt-to-temp! env tmp)
-            (let [before (sha256 tmp)]
-              (run-editor! tmp)
-              (if (= before (sha256 tmp))
-                (warn "No changes — leaving" secrets-file "untouched.")
-                (do
-                  (info "Re-encrypting…")
-                  (write-secrets! env target tmp)
-                  (report-written! env "Secrets updated:" secrets-file))))
-            secrets-file
-            (finally (secure-delete! tmp))))))))
+        (let [target (encrypt-target! env)]
+          (with-plaintext-temp
+            (fn [tmp]
+              (info "Decrypting" secrets-file "…")
+              (decrypt-to-temp! env tmp)
+              (let [before (sha256 tmp)]
+                (run-editor! tmp)
+                (if (= before (sha256 tmp))
+                  (warn "No changes — leaving" secrets-file "untouched.")
+                  (do
+                    (info "Re-encrypting…")
+                    (write-secrets! env target tmp)
+                    (report-written! env "Secrets updated:" secrets-file))))
+              secrets-file)))))))
 
 (defn- read-set-value!
   "The value for `set`: one line typed at a hidden terminal prompt when
@@ -1105,20 +1083,19 @@
                           (fail! (str "Value on stdin is not valid EDN ("
                                       (edn-failure-message parsed) ").")
                                  (merge {:key path} (safe-edn/failure-data parsed)))))
-                      raw)
-              tmp (temp-plaintext!)]
-          (try
-            (let [current (if exists?
-                            (do (info "Decrypting" secrets-file "…")
-                                (decrypt-secrets! env))
-                            (do (info "No secrets file at" secrets-file "— creating it.")
-                                {}))]
-              (spit tmp (render-secrets (assoc-in current path value)))
-              (info (if exists? "Re-encrypting…" "Encrypting…"))
-              (write-secrets! env target tmp)
-              (report-written! env "Set" (pr-str path) "in" secrets-file)
-              secrets-file)
-            (finally (secure-delete! tmp))))))))
+                      raw)]
+          (with-plaintext-temp
+            (fn [tmp]
+              (let [current (if exists?
+                              (do (info "Decrypting" secrets-file "…")
+                                  (decrypt-secrets! env))
+                              (do (info "No secrets file at" secrets-file "— creating it.")
+                                  {}))]
+                (spit tmp (render-secrets (assoc-in current path value)))
+                (info (if exists? "Re-encrypting…" "Encrypting…"))
+                (write-secrets! env target tmp)
+                (report-written! env "Set" (pr-str path) "in" secrets-file)
+                secrets-file))))))))
 
 (defn remove-secret!
   "Remove a keyword or vector key path, then re-encrypt and update the
@@ -1144,25 +1121,24 @@
                       (shell-quote (if (string? key-arg) key-arg (pr-str key-arg))))
                  {:secrets-file secrets-file
                   :environment environment-name}))
-        (let [target (encrypt-target! env)
-              tmp (temp-plaintext!)]
-          (try
-            (info "Decrypting" secrets-file "…")
-            (let [current (decrypt-secrets! env)]
-              (when (= ::missing (get-in current path ::missing))
-                (fail! (str "No such key: " (pr-str path) " in " secrets-file)
-                       {:secrets-file secrets-file :key path}))
-              (let [parent (butlast path)
-                    k (last path)
-                    updated (if (seq parent)
-                              (update-in current (vec parent) dissoc k)
-                              (dissoc current k))]
-                (spit tmp (render-secrets updated))
-                (info "Re-encrypting…")
-                (write-secrets! env target tmp)
-                (report-written! env "Removed" (pr-str path) "from" secrets-file)
-                secrets-file))
-            (finally (secure-delete! tmp))))))))
+        (let [target (encrypt-target! env)]
+          (info "Decrypting" secrets-file "…")
+          (let [current (decrypt-secrets! env)]
+            (when (= ::missing (get-in current path ::missing))
+              (fail! (str "No such key: " (pr-str path) " in " secrets-file)
+                     {:secrets-file secrets-file :key path}))
+            (let [parent (butlast path)
+                  k (last path)
+                  updated (if (seq parent)
+                            (update-in current (vec parent) dissoc k)
+                            (dissoc current k))]
+              (with-plaintext-temp
+                (fn [tmp]
+                  (spit tmp (render-secrets updated))
+                  (info "Re-encrypting…")
+                  (write-secrets! env target tmp)
+                  (report-written! env "Removed" (pr-str path) "from" secrets-file)
+                  secrets-file)))))))))
 
 (defn- show-key-line
   "One line per environment: its public key, or a warning that the key file
@@ -1208,16 +1184,15 @@
                       (shell-quote (clojure.core/name environment-name)))
                  {:secrets-file secrets-file
                   :environment environment-name}))
-        (let [target (encrypt-target! env)
-              tmp (temp-plaintext!)]
-          (try
-            (info "Decrypting" secrets-file "…")
-            (decrypt-to-temp! env tmp)
-            (info "Re-encrypting to current recipients…")
-            (write-secrets! env target tmp)
-            (report-written! env "Re-encrypted:" secrets-file)
-            secrets-file
-            (finally (secure-delete! tmp))))))))
+        (let [target (encrypt-target! env)]
+          (with-plaintext-temp
+            (fn [tmp]
+              (info "Decrypting" secrets-file "…")
+              (decrypt-to-temp! env tmp)
+              (info "Re-encrypting to current recipients…")
+              (write-secrets! env target tmp)
+              (report-written! env "Re-encrypted:" secrets-file)
+              secrets-file)))))))
 
 (defn- recipient-added-lines
   "The report after a recipient is appended: what to run next, which turns on
@@ -1767,8 +1742,7 @@
   (let [result (try
                  (doctor-data config env-arg)
                  (catch Exception e
-                   (when (or (= :identity-cleanup-failed (:reason (ex-data e)))
-                             (:cleanup (ex-data e)))
+                   (when (:remaining-file (ex-data e))
                      (throw e))
                    {:configuration {:valid? false
                                     ;; An identity-variable error (blank or
@@ -1824,18 +1798,15 @@
   (and (string? x) (re-matches #"\d+" x)))
 
 (defn- error-lines
-  "Render the error, remediation, and any remaining private file on stderr."
+  "Render the error and its remediation on stderr."
   [e]
-  (let [data (ex-data e)
-        cleanup (if (= :identity-cleanup-failed (:reason data)) data (:cleanup data))]
-    (cond-> (into [[:oops (ex-message e)]]
-                  (for [k [:hint :install :error :docs]
-                        :let [v (get data k)]
-                        :when (and (some? v) (not (str/blank? (str v))))
-                        line (str/split-lines (str/trim-newline (str v)))]
-                    [:stderr "   " line]))
-      cleanup (conj [:stderr "Temporary identity cleanup failed; remove the private file:"
-                     (:identity-file cleanup)]))))
+  (let [data (ex-data e)]
+    (into [[:oops (ex-message e)]]
+          (for [k [:hint :install :error :docs]
+                :let [v (get data k)]
+                :when (and (some? v) (not (str/blank? (str v))))
+                line (str/split-lines (str/trim-newline (str v)))]
+            [:stderr "   " line]))))
 
 (defn- restore-error-operand [data operands]
   (cond

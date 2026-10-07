@@ -117,10 +117,6 @@
 (defn- cli-private [sym]
   (ns-resolve 'com.kirahowe.secrets.cli sym))
 
-(defn- secrets-private [sym]
-  (or (ns-resolve 'com.kirahowe.secrets sym)
-      (throw (ex-info "Missing runtime test seam" {:symbol sym}))))
-
 (defn- with-identity-environment
   "Run `f` with exactly `environment` as the runtime's identity environment.
   This keeps tests independent from an operator's process environment without
@@ -733,17 +729,26 @@
       (is (str/includes? (ex-message failure) "No secrets file"))
       (assert-cleaned-identity! paths))))
 
+(defn- failing-delete-of
+  "A `with-redefs-fn` map under which deleting a private temp file whose name
+  starts with `prefix` fails, and every other delete behaves normally."
+  [prefix]
+  (let [real @#'fs/try-delete!]
+    {#'fs/try-delete! (fn [^java.io.File file]
+                        (if (str/starts-with? (.getName file) prefix)
+                          false
+                          (real file)))}))
+
 (deftest cleanup-failure-is-actionable-after-cli-success-or-failure-test
   (let [config (cli/normalize-config (test-config))
         failure-config (cli/normalize-config
                         (test-config {:secrets-file (str *dir* "/missing.age")}))
-        delete-var (secrets-private 'try-delete-identity-file!)
         environment (identity-environment :raw)
         success
         (capture-injected-identity-outcome
          #(with-identity-environment environment
             (fn []
-              (with-redefs-fn {delete-var (constantly false)}
+              (with-redefs-fn (failing-delete-of "age-identity-")
                 (fn []
                   (with-out-str
                     (with-in-str "written-before-cleanup-failure"
@@ -755,9 +760,9 @@
         (capture-injected-identity-outcome
          #(with-identity-environment environment
             (fn []
-              (with-redefs-fn {delete-var (constantly false)}
+              (with-redefs-fn (failing-delete-of "age-identity-")
                 (fn [] (with-out-str (cli/reencrypt! failure-config "dev")))))))]
-    (is (= :identity-cleanup-failed (:reason (ex-data success-error))))
+    (is (= :private-file-remains (:reason (ex-data success-error))))
     (is (.exists (io/file (str *dir* "/secrets.edn.age")))
         "the command committed its ciphertext before cleanup reported failure")
     (is (and remaining (.exists (io/file remaining)))
@@ -765,11 +770,46 @@
     (is (str/includes? rendered remaining))
     (is (not (str/includes? rendered (slurp *key*)))
         "the remediation reports only the temp path, never identity contents")
-    (is (= :identity-cleanup-failed (get-in (ex-data (:failure failure)) [:cleanup :reason])))
+    (is (= (first (:paths failure)) (:remaining-file (ex-data (:failure failure)))))
     (is (str/includes? (ex-message (:failure failure)) "No secrets file"))
+    (is (str/includes? (ex-message (:failure failure)) (first (:paths failure)))
+        "the operation's own failure also names the remaining file")
     (doseq [path (:paths failure)]
       (when (.exists (io/file path)) (.delete (io/file path))))
     (when (.exists (io/file remaining)) (.delete (io/file remaining)))))
+
+(deftest plaintext-temp-file-is-deleted-plainly-and-a-failure-is-reported-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          tmpdir (io/file (System/getProperty "java.io.tmpdir"))
+          plaintext-temps #(set (filter (fn [n] (re-matches #"secrets-.*\.edn" n))
+                                        (seq (.list tmpdir))))
+          before (plaintext-temps)
+          subprocesses (atom [])
+          real-sh shell/sh]
+      (testing "a successful command leaves no plaintext file and shells out to no eraser"
+        (with-redefs [shell/sh (fn [& args]
+                                 (swap! subprocesses conj (first args))
+                                 (apply real-sh args))]
+          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k" false))))
+        (is (= before (plaintext-temps)))
+        (is (empty? (filter #{"rm" "shred" "sh"} @subprocesses))))
+      (testing "a failed delete after success is an error naming the plaintext file"
+        (let [e (with-redefs-fn (failing-delete-of "secrets-")
+                  #(try
+                     (with-out-str (with-in-str "v2" (cli/set-secret! config "dev" ":k" false)))
+                     nil
+                     (catch clojure.lang.ExceptionInfo e e)))
+              remaining (:remaining-file (ex-data e))]
+          (try
+            (is (= :private-file-remains (:reason (ex-data e))))
+            (is (contains? (plaintext-temps) (.getName (io/file remaining))))
+            (is (str/includes? (ex-message e) remaining))
+            (is (= "v2" (:k (edn/read-string (age/decrypt *key* (str *dir* "/secrets.edn.age")))))
+                "the store was written before the cleanup failure was reported")
+            (finally
+              (some-> remaining io/file .delete))))))))
 
 (deftest reencrypt-writes-manifest-and-verify-passes-test
   (if (age-env-set?)
@@ -1098,72 +1138,6 @@
                  #(cli/edit! config "dev")))))
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
-
-(deftest secure-delete-option-boundary-test
-  (let [secure-delete! (cli-private 'secure-delete!)
-        real-sh shell/sh
-        calls (atom [])
-        recording (fn [& args]
-                    (let [argv (vec (take-while string? args))
-                          result (apply real-sh args)]
-                      (swap! calls conj {:args argv :exit (:exit result)})
-                      result))
-        outcome (fn [path]
-                  (spit path "plaintext that must be overwritten, not just unlinked")
-                  (reset! calls [])
-                  (with-redefs [shell/sh recording]
-                    (secure-delete! path))
-                  @calls)
-        dash-path "-secrets-cli-boundary-delete"
-        control (outcome (str *dir* "/control-plaintext.edn"))
-        dash (with-cwd-entry dash-path (fn [_] (outcome dash-path)))
-        only-dash (with-cwd-entry "-" (fn [_] (outcome "-")))
-        mechanism (fn [calls] (mapv (juxt (comp first :args) :exit) calls))]
-    (testing "a dash-named path is shredded by the same mechanism, same status"
-      (doseq [[label observed] [["dash-leading" dash] ["exact -" only-dash]]]
-        (is (= (mechanism control) (mechanism observed))
-            (str label ": a platform whose rm/shred is unusable for both paths makes "
-                 "this comparison vacuous but never wrong: control " (pr-str control)
-                 " vs " (pr-str observed)))))
-    (testing "argv shape (the overwrite guarantee is otherwise unobservable)"
-      (doseq [[path observed] [[dash-path dash] ["-" only-dash]]]
-        (let [deletions (filterv #(#{"rm" "shred"} (first (:args %))) observed)
-              absolute (.getAbsolutePath (io/file path))]
-          (if (seq deletions)
-            (doseq [{:keys [args]} deletions]
-              (is (= ["--" absolute] (take-last 2 args))
-                  (str "argv " (pr-str args) " must end with -- then an absolute path")))
-            (is true (str "vacuous: no rm/shred subprocess ran for " path))))))))
-
-(deftest secure-delete-platform-argv-shape-test
-  (let [secure-delete! (cli-private 'secure-delete!)
-        absolute (.getAbsolutePath (io/file "-"))]
-    (testing "macOS uses rm -P with an option terminator and absolute operand"
-      (with-cwd-entry "-"
-        (fn [entry]
-          (spit entry "plaintext")
-          (let [calls (atom [])
-                recording (fn [& args]
-                            (swap! calls conj (vec args))
-                            {:exit 0})]
-            (with-redefs [str/starts-with? (constantly true)
-                          shell/sh recording]
-              (secure-delete! "-"))
-            (is (= [["rm" "-P" "--" absolute]] @calls))))))
-    (testing "non-macOS probes for shred, then uses the same safe operand shape"
-      (with-cwd-entry "-"
-        (fn [entry]
-          (spit entry "plaintext")
-          (let [calls (atom [])
-                recording (fn [& args]
-                            (swap! calls conj (vec args))
-                            {:exit 0})]
-            (with-redefs [str/starts-with? (constantly false)
-                          shell/sh recording]
-              (secure-delete! "-"))
-            (is (= [["sh" "-c" "command -v shred"]
-                    ["shred" "-u" "--" absolute]]
-                   @calls))))))))
 
 ;;;; CLI flag extraction boundary
 
@@ -2502,11 +2476,11 @@
         (capture-injected-identity-outcome
          #(with-identity-environment (identity-environment :raw)
             (fn []
-              (with-redefs-fn {(secrets-private 'try-delete-identity-file!) (constantly false)}
+              (with-redefs-fn (failing-delete-of "age-identity-")
                 (fn [] (with-out-str (cli/doctor! (complete-doctor-config) "dev")))))))]
     (try
-      (is (= :identity-cleanup-failed (:reason (ex-data failure))))
-      (is (= (first paths) (:identity-file (ex-data failure))))
+      (is (= :private-file-remains (:reason (ex-data failure))))
+      (is (= (first paths) (:remaining-file (ex-data failure))))
       (finally
         (doseq [path paths] (.delete (io/file path)))))))
 

@@ -37,6 +37,41 @@
    (create-owner-only
     #(java.nio.file.Files/createTempFile (->path dir) prefix suffix owner-only))))
 
+(defn- try-delete!
+  "Delete `file` and return true when it no longer exists."
+  [^java.io.File file]
+  (try (.delete file) (catch Exception _ nil))
+  (not (.exists file)))
+
+(defn with-private-temp-file
+  "Create a private temporary file as [[owner-only-temp-file!]] does, call `f`
+  with it, delete it, and return what `f` returned.
+
+  The file is deleted whether `f` returns or throws. When the delete fails and
+  the file still exists, the operator has to remove it, so the path is
+  reported under `:remaining-file`. After a successful `f` that is an
+  `ex-info` with `:reason :private-file-remains`. After a failed `f` the
+  failure is rethrown as an `ex-info` whose message adds the path, whose data
+  is the failure's own data plus `:remaining-file` (and that `:reason` when
+  the failure had none), and whose cause is the failure."
+  [prefix suffix f]
+  (let [file (owner-only-temp-file! prefix suffix)
+        path (.getAbsolutePath ^java.io.File file)
+        remains (str "A private temporary file could not be deleted. Remove it: " path)
+        result (try
+                 (f file)
+                 (catch Throwable t
+                   (throw (if (try-delete! file)
+                            t
+                            (ex-info (str (ex-message t) "\n" remains)
+                                     (merge {:reason :private-file-remains}
+                                            (ex-data t)
+                                            {:remaining-file path})
+                                     t)))))]
+    (when-not (try-delete! file)
+      (throw (ex-info remains {:reason :private-file-remains :remaining-file path})))
+    result))
+
 (defn- atomic-move-unsupported?
   "True when `e` is NIO's AtomicMoveNotSupportedException. The class is
   recognized by name because babashka cannot resolve it."
