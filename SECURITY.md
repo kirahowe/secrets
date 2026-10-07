@@ -16,6 +16,13 @@ When a new alpha is published, it becomes the only supported release and
 release. People using an unsupported version should reproduce against the newest
 alpha when it is safe to do so and upgrade before applying a published fix.
 
+## Scope
+
+[`doc/threat-model.md`](doc/threat-model.md) defines what is in and out of
+scope for a report. A report is out of scope if it depends on replacing the
+deployed artifact, on a former recipient's access to values already disclosed,
+on a compromised decrypting host, or on a hostile `age` binary.
+
 ## Report a vulnerability privately
 
 Do not open a public issue or discussion with vulnerability details. Do not
@@ -47,7 +54,8 @@ Share only the non-secret information needed to reproduce and assess the issue:
 - minimal, deterministic reproduction steps using generated test identities,
   synthetic ciphertext, placeholder paths, and fake data;
 - whether exploitation needs repository access, a recipient, an identity, local
-  access, or control of an input or remote source;
+  access, or control of an input such as the ciphertext, manifest, or
+  configuration file;
 - any mitigations you have already confirmed;
 - an email address for private follow-up, and whether and how you want to be
   credited in a future advisory.
