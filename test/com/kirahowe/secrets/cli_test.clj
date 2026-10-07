@@ -361,6 +361,8 @@
         file-value (str *dir* "/FILE-IDENTITY-SENTINEL")
         _ (spit file-value "identity fixture")
         base (test-config)
+        configured-key (str *dir* "/configured-key.txt")
+        _ (io/copy (io/file *key*) (io/file configured-key))
         specs [{:source :secrets-age-identity-file
                 :label "SECRETS_AGE_IDENTITY_FILE"
                 :environment {"SECRETS_AGE_IDENTITY_FILE" file-value}
@@ -378,7 +380,8 @@
                 :label ":identity-file"
                 :config (test-config {:identity-file *key*})}
                {:source :configured-key-file
-                :label "configured key path"}
+                :label "configured key path"
+                :config (test-config {:key-file configured-key})}
                {:source :default-key-file
                 :label "default key path"
                 :config {:app "cli-test"
@@ -2737,6 +2740,21 @@
     (is (= 2 @calls) "the manifest staging file was the failing acquisition")
     (is (= [] (leftovers)) "the ciphertext staging file was released")))
 
+(deftest key-file-source-is-derived-and-stable-under-renormalizing-test
+  (let [normalized (fn [env-config]
+                     (cli/normalize-config
+                      {:app "cli-test"
+                       :environments {:dev (merge {:secrets-file (str *dir* "/s.age")}
+                                                  env-config)}}))
+        source #(get-in % [:environments :dev :key-file-source])]
+    (testing "a user-supplied :key-file-source is not honoured"
+      (is (= :default (source (normalized {:key-file-source :bogus}))))
+      (is (= :configured (source (normalized {:key-file-source :bogus
+                                              :key-file (str *dir* "/k.txt")})))))
+    (testing "normalizing twice changes nothing"
+      (doseq [config [(normalized {}) (normalized {:key-file (str *dir* "/k.txt")})]]
+        (is (= config (cli/normalize-config config)))))))
+
 (deftest config-failures-carry-no-config-maps-test
   (let [marker "CONFIG-MARKER-9d31"
         failure (fn [config]
@@ -2763,6 +2781,57 @@
     (is (re-find #"unknown key" (ex-message e)))
     (is (= [:a :zzz] (:unknown-keys (ex-data e))))
     (is (re-find #"1 that are not keywords" (ex-message e)))))
+
+(deftest doctor-reports-an-identity-variable-error-test
+  (let [run (fn [variable value]
+              (with-redefs-fn
+                {(secrets-private 'identity-env)
+                 #((secrets-private 'identity-env-value) % (get {variable value} %))}
+                #(capture-doctor (cli/normalize-config (test-config)) "dev")))]
+    (testing "a blank variable"
+      (let [{:keys [result out]} (run "SECRETS_AGE_IDENTITY" "")]
+        (is (= 2 (:exit result)))
+        (is (str/includes? out "Configuration: invalid"))
+        (is (str/includes? out "SECRETS_AGE_IDENTITY is set but empty"))))
+    (testing "invalid base64"
+      (let [marker "NOT-BASE64-MARKER!!"
+            {:keys [result out err]} (run "SECRETS_AGE_IDENTITY_B64" marker)]
+        (is (= 2 (:exit result)))
+        (is (str/includes? out "SECRETS_AGE_IDENTITY_B64 is not valid base64"))
+        (is (not (str/includes? (str out err) marker)))))
+    (testing "a valid configuration carries a nil reason"
+      (let [{:keys [result]} (doctor-under (test-config) nil {})]
+        (is (contains? (:configuration result) :reason))
+        (is (nil? (get-in result [:configuration :reason])))))))
+
+(deftest verify-reports-a-malformed-manifest-as-a-finding-test
+  (let [config (cli/normalize-config (test-config))
+        env (get-in config [:environments :dev])
+        keyless-config (cli/normalize-config
+                        (test-config {:key-file (str *dir* "/absent-key.txt")}))]
+    (encrypt-edn! {:a 1})
+    (with-identity-environment
+      {}
+      (fn []
+        (doseq [[label text] [["a top-level list" "(1 2 3)"]
+                              ["a wrapped map" "({:version 2 :app \"cli-test\" :keys {}})"]
+                              ["a vector" "[1 2]"]
+                              ["a number" "5"]
+                              ["a string" "\"x\""]
+                              ["nil" "nil"]
+                              [":keys a vector" "{:version 2 :app \"cli-test\" :keys []}"]
+                              [":keys a number" "{:version 2 :app \"cli-test\" :keys 5}"]
+                              [":keys nil" "{:version 2 :app \"cli-test\" :keys nil}"]]
+                cfg [config keyless-config]]
+          (spit (:manifest env) text)
+          (let [{:keys [result out err]} (capture-verify cfg "dev")]
+            (is (= 1 (:exit result)) label)
+            (is (= :drift (get-in result [:results :dev])) label)
+            (is (str/includes? (str out err) "manifest is malformed") label)))
+        (testing "a manifest with no :keys is not called malformed"
+          (spit (:manifest env) "{:version 2 :app \"cli-test\"}")
+          (let [{:keys [out err]} (capture-verify config "dev")]
+            (is (not (str/includes? (str out err) "malformed")))))))))
 
 (deftest set-never-echoes-a-misplaced-value-test
   (let [marker "hunter2-MARKER"

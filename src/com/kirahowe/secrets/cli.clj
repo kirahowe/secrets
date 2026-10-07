@@ -394,8 +394,7 @@
                    (default-key-file app))
         explicit-identity (when configured-identity-file?
                             (secrets/expand-home identity-file))
-        key-file-source (or (:key-file-source env-config)
-                            (if configured-key-file? :configured :default))
+        key-file-source (if (= key-file (default-key-file app)) :default :configured)
         template (if (contains? env-config :template)
                    template
                    (str/replace secrets-file #"\.age$" ".example"))
@@ -1563,28 +1562,33 @@
   "The committed manifest at `manifest-path` as `{:committed value}`, or a
   `{:problem …}` naming why it cannot be compared at all.
 
-  Two gates, both of which reject rather than diff. The `:version` gate keeps a
-  v1 hash from ever being read as a v2 one. The `:app` gate is the wrong-app
-  half of the authenticity contract: `:app` is the one field the manifest
-  records about *which store it describes*, and without checking it a manifest
-  written for another app whose key paths happen to agree is diffed as a shape.
-  Single-key mode would usually still catch that on a `:vhash` derived from
-  different key material, but a team manifest carries no `:vhash` at all, so a
-  refreshed `:ciphertext-sha` would otherwise verify clean."
+  Three gates, each rejecting rather than diffing. The structure gate wants a
+  map, with a map under `:keys` when that is present. The `:version` gate keeps
+  a hash from one manifest version from being read as another's. The `:app`
+  gate catches a manifest copied from another project: `:app` is the one field
+  the manifest records about which store it describes, and without the check a
+  manifest for another app whose key paths happen to agree is diffed as a
+  shape. Team manifests carry no `:vhash`, so a refreshed `:ciphertext-sha`
+  would otherwise verify clean. This detects an operator's wrong-file mistake,
+  not a forged manifest (see `doc/threat-model.md`, B1)."
   [expected-app manifest-path limits]
   (let [parsed (safe-edn/parse (read-manifest-bounded! manifest-path limits) limits)
-        {:keys [version app] :as value} (:value parsed)]
-    (when (:ok? parsed)
+        value (:value parsed)]
+    (when (and (:ok? parsed) (map? value))
       (enforce-manifest-entry-limit! manifest-path value limits))
     (cond
       (not (:ok? parsed))
       {:problem {:reason :manifest-invalid-edn :failure (edn-failure-data parsed)}}
 
-      (not= 2 version)
-      {:problem {:reason :unsupported-version :version version}}
+      (or (not (map? value))
+          (and (contains? value :keys) (not (map? (:keys value)))))
+      {:problem {:reason :manifest-malformed}}
 
-      (not= expected-app app)
-      {:problem {:reason :wrong-app :app app}}
+      (not= 2 (:version value))
+      {:problem {:reason :unsupported-version :version (:version value)}}
+
+      (not= expected-app (:app value))
+      {:problem {:reason :wrong-app :app (:app value)}}
 
       :else
       {:committed value})))
@@ -1685,6 +1689,10 @@
 
       :manifest-invalid-edn
       [[:oops label "— manifest is not valid EDN:" (edn-failure-message (:failure finding))]]
+
+      :manifest-malformed
+      [[:oops label "— manifest is malformed: expected a map, with a map under :keys."]
+       [:line (str "    Regenerate it with `" reencrypt "`.")]]
 
       :unsupported-version
       [[:oops label "— manifest version" (pr-str (:version finding))
@@ -1918,7 +1926,7 @@
                       recipients
                       manifest-capability
                       verify)]
-          {:configuration {:valid? true}
+          {:configuration {:valid? true :reason nil}
            :age age
            :environment environment-name
            :artifacts artifacts
@@ -1954,7 +1962,8 @@
         {:keys [state valid? invalid-count] recipient-count :count} (:recipients encryption)]
     (conj
      (if-not (:valid? configuration)
-       [[:line "Configuration: invalid"]]
+       (cond-> [[:line "Configuration: invalid"]]
+         (:reason configuration) (conj [:line "Reason:" (:reason configuration)]))
        (-> [[:line "Age:" (if (:available? age)
                             (str "available — " (:version age))
                             "unavailable")]
@@ -1978,7 +1987,8 @@
   "Safely diagnose one selected/default environment. Accepts raw config,
   normalizes and validates it, prints stable value-free labels, and returns a
   structured result containing :exit (0 healthy, 1 warning/action-needed, or 2
-  invalid configuration). It never exits and never returns an identity path,
+  invalid configuration). An identity-variable error is reported with its
+  content-free reason line. It never exits and never returns an identity path,
   recipient line, environment value, or secret."
   [config env-arg]
   (let [result (try
@@ -1987,7 +1997,11 @@
                    (when (or (= :identity-cleanup-failed (:reason (ex-data e)))
                              (:cleanup (ex-data e)))
                      (throw e))
-                   {:configuration {:valid? false}
+                   {:configuration {:valid? false
+                                    ;; An identity-variable error (blank or
+                                    ;; malformed) has a content-free message
+                                    ;; that names the fix.
+                                    :reason (when (:env (ex-data e)) (ex-message e))}
                     :age nil
                     :environment nil
                     :artifacts nil
