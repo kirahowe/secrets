@@ -22,14 +22,23 @@
 ;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the contents | the platform mangles newlines |
 
 ;; `SECRETS_AGE_IDENTITY` is used verbatim and is never decoded.
-;; `SECRETS_AGE_IDENTITY_B64` is always decoded; invalid base64 is an error
-;; rather than a reason to fall back silently. Using separate variables means
-;; the library doesn't have to guess whether a value is encoded. Because this
-;; wrapper passes identities to `age` as file paths, each operation writes raw
-;; or decoded contents to an exclusive owner-only temporary file and checks its
-;; deletion when the operation finishes. Caller-owned paths are never deleted.
-;; A cleanup failure includes the temporary path in structured error data so it
-;; can be removed. A process crash can leave a temporary file behind.
+;; `SECRETS_AGE_IDENTITY_B64` is always decoded, and invalid base64 is an
+;; error. Spaces, tabs, and line breaks inside the base64 are allowed, so a
+;; wrapped value works. Using separate variables means the library doesn't
+;; have to guess whether a value is encoded.
+
+;; `age` takes identities as file paths. For the two variables that carry
+;; contents, each operation writes them to an owner-only temporary file, uses
+;; it, and deletes it before the operation returns. If the delete fails, the
+;; error names the file that remains so you can remove it. A process that
+;; crashes mid-operation can leave the file behind, and deleting a file is not
+;; secure erasure. `SECRETS_AGE_IDENTITY_FILE` avoids the temporary file, so
+;; prefer it when the platform can mount a secret.
+
+;; `SECRETS_AGE_IDENTITY_FILE` has to name a file that exists. A path to a
+;; missing file is an error that names the variable and the path. The library
+;; does not fall back to another key, and it does not treat the store as
+;; having no key. A leading `~` in the path is expanded.
 
 ;; If one of these variables is **set but empty**, the library throws an error
 ;; that names it instead of treating it as unset. This matters in CI. The
@@ -41,10 +50,11 @@
 ;; a developer's machine with the wrong key. If you want fallback behaviour,
 ;; leave the variable unset.
 
-;; On Fly, that means one command:
+;; On Fly, that means one command. `bb secrets keygen` prints it with your key
+;; path filled in:
 
 ;; ```sh
-;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat ~/.config/myapp/key.txt)"
+;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- ~/.config/myapp/key.txt)"
 ;; ```
 
 ;; If the store mangles newlines, use the base64 variable instead:
@@ -68,7 +78,7 @@
 ;; ## Runtimes without `age`
 
 ;; Decryption shells out to the `age` binary, so every runtime that decrypts
-;; needs it on `PATH` — a container, a VM, a CI runner, or a laptop. Some
+;; needs it on `PATH`: a container, a VM, a CI runner, or a laptop. Some
 ;; serverless and edge runtimes do not allow application code to start
 ;; subprocesses.
 
@@ -112,10 +122,11 @@
    (java.net.URL. (str "jar:file:" jar "!/secrets.edn.age"))
    key-file))
 
-;; The library recognizes the local `jar:file:` source, streams it to an
-;; owner-only temporary copy under the configured 16 MiB source limit, passes
-;; that file to `age`, and then deletes it. It refuses remote and nested jar
-;; URLs, so loading secrets at runtime never makes a network request.
+;; The library recognizes a resource inside a local jar, streams it to an
+;; owner-only temporary copy, passes that file to `age`, and then deletes it.
+;; The copy stops at the fixed 16 MiB bound on ciphertext. The library refuses
+;; remote and nested jar URLs, so loading secrets at runtime never makes a
+;; network request.
 
 ;; ## Startup wiring
 
@@ -127,8 +138,8 @@
 ;; an injected identity.
 
 ;; The component decrypts the secrets during startup. `load-secrets` has no
-;; global cache or hot reload, so changing a secret normally requires a commit,
-;; deploy, and restart. The
+;; cache and nothing reloads the store, so changing a secret normally requires
+;; a commit, deploy, and restart. The
 ;; [caveats chapter](secrets_book.caveats.html#rotation-goes-through-a-deploy)
 ;; discusses what that means for emergency rotation.
 
@@ -153,13 +164,24 @@
 ;;     - run: bb secrets verify
 ;; ```
 
-;; When no identity is available, `verify` compares the manifest's recorded
-;; `:ciphertext-sha` with the file and exits with 0, 1, or 2. Exit 1 indicates
-;; drift and should fail the build. Exit 2 means an artifact is missing, or
-;; that an older manifest has no ciphertext hash for a keyless check. In a new
-;; repository, this usually means someone forgot to commit the manifest. The
+;; When no identity is available, `verify` checks that each manifest is
+;; complete and that its recorded `:ciphertext-sha` is the digest of the file.
+;; It exits with 0, 1, or 2. Exit 1 indicates drift and should fail the build.
+;; Exit 2 means a ciphertext or manifest is missing, or an environment could
+;; not be checked. In a new repository, this usually means someone forgot to
+;; commit the manifest. The
 ;; [team-ci example](https://github.com/kirahowe/secrets/tree/main/examples/team-ci)
 ;; commits such a fixture and uses it as a gate.
+
+;; The keyless check runs when no identity was named and no key file is
+;; present, which is the normal state of a CI runner. An identity you name has
+;; to exist: a job that sets `SECRETS_AGE_IDENTITY_FILE` to a path that isn't
+;; there, or sets an identity variable to an empty string, fails with an error
+;; instead of passing keyless.
+;;
+;; With no environment argument, `verify` checks every environment and keeps
+;; going past one it can't check, so one misconfigured environment doesn't
+;; hide the state of the others.
 
 ;; Since this job holds no secret, it doesn't need a gate based on the event
 ;; that triggered it: an untrusted pull request has no secret to take. It still
@@ -167,10 +189,9 @@
 ;; the repository. Even without a secret, the job runs third-party code with a
 ;; token.
 
-;; The full job decrypts the file and regenerates the manifest entries. In
-;; single-key mode, this includes the keyed value hashes; in team mode, it
-;; checks the structure. Give the runner a dedicated deploy identity and
-;; install `age`:
+;; The full job also decrypts the store and compares every key path, type, and
+;; value hash with the manifest, for solo and team stores alike. Give the
+;; runner a dedicated deploy identity and install `age`:
 
 ;; ```yaml
 ;; verify-secrets:

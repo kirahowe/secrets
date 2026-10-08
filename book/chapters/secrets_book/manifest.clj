@@ -2,8 +2,10 @@
 
 ^:kindly/hide-code
 (ns secrets-book.manifest
-  (:require [clojure.java.io :as io]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
+            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.manifest :as manifest]))
@@ -21,7 +23,7 @@
 (def key-file (str dir "/key.txt"))
 
 ^:kindly/hide-code
-(age/keygen! key-file)
+(def public-key (age/keygen! key-file))
 
 (let [plain (str dir "/p.edn")]
   (spit plain (pr-str {:a 1}))
@@ -33,18 +35,25 @@
 ;; reviewer to learn from the diff. The manifest records the useful parts of
 ;; the change without storing the plaintext secret values.
 
+;; To show the mechanism, this chapter calls `com.kirahowe.secrets.manifest`
+;; and `com.kirahowe.secrets.age` directly. Both are implementation
+;; namespaces, not API: you get a manifest by using `bb secrets`.
+
 ;; ## What the manifest records
 
-;; `entries` describes the shape of a secrets value. It includes every key
-;; path, the type of its value, and a count for collections, but does not
-;; include the plaintext values themselves:
+;; `entries` describes a secrets map. It lists every key path, the type of its
+;; value, a count for collections, and a keyed hash of the value called
+;; `:vhash`. It does not include the values. It recurses into non-empty maps,
+;; and every other value, a vector or a set included, is one entry:
 
 (def secrets-v1
   {:database/url "jdbc:postgresql://db/app"
    :auth {:admins #{"kira@example.com" "sam@example.com"}}
    :retries 3})
 
-(manifest/entries secrets-v1 nil)
+(def demo-key (manifest/generate-key))
+
+(manifest/entries secrets-v1 demo-key)
 
 ;; CLI commands that write secrets render this as line-oriented EDN in a
 ;; `.manifest` file beside the ciphertext. When both files are committed, the
@@ -54,168 +63,232 @@
 
 ;; ## Catching value changes with a keyed hash
 
-;; The shape alone can't show a value changing without changing type, which
-;; is what happens during a rotation. In a single-key environment, each entry
-;; therefore includes a `:vhash`: an HMAC of the value, keyed by a secret
-;; derived from the private key.
+;; The path and type can't show a value changing without changing type, which
+;; is what happens when you rotate a credential. The `:vhash` does:
 
-(def hkey (manifest/hmac-key (slurp key-file)))
+(manifest/entries {:token "old-value"} demo-key)
 
-(manifest/entries {:token "old-value"} hkey)
+(manifest/entries {:token "new-value"} demo-key)
 
-(manifest/entries {:token "new-value"} hkey)
+;; A `:vhash` is the first 64 bits of an HMAC-SHA-256 of the value, keyed by
+;; the manifest key, which is 256 random bits. Someone who has only the
+;; repository doesn't have the key, so they can't hash guesses of a
+;; low-entropy value and compare. At 64 bits two different values can share a
+;; hash, so an unchanged hash is strong evidence that a value didn't change
+;; and not proof.
 
-;; The shape is the same in these two entries, but the hash is different.
-;; Someone with access only to the repository can't use it to test guesses for
-;; a low-entropy value because the HMAC key comes from the private identity.
-;; The stored hash is truncated to eight bytes. It is intended to mark a
-;; change, rather than serve as a general-purpose integrity check.
+;; The key is the only other input. Equal values at different paths therefore
+;; have equal hashes, and a reader of the manifest can see that:
 
-;; For a native age identity, key derivation reads only the
-;; `AGE-SECRET-KEY` lines, so comments written by `age-keygen` do not affect the
-;; result. If the file has no such line, as with an SSH identity, derivation
-;; uses the complete trimmed contents. Two copies of the same native key
-;; therefore produce identical hashes even if comments have been removed from
-;; one of them:
+(manifest/entries {:primary/token "same" :backup/token "same"} demo-key)
 
-(let [with-comments (slurp key-file)
-      without-comments (->> (str/split-lines with-comments)
-                            (filter #(str/starts-with? % "AGE-SECRET-KEY"))
-                            first)]
-  (java.util.Arrays/equals (manifest/hmac-key with-comments)
-                           (manifest/hmac-key without-comments)))
+;; Under a different key, the same value hashes differently:
 
-;; In multi-recipient mode, there is no shared private key to derive the HMAC
-;; key from, so team manifests omit `:vhash` and record only the structure.
+(manifest/entries {:token "old-value"} (manifest/generate-key))
 
-;; ## The rendered file
+;; ## The store's manifest key {#the-stores-manifest-key}
 
-;; `render` produces the text that will be committed. Its header records the
-;; app, a format version, and the SHA-256 hash of the ciphertext it describes:
+;; Each store holds its own manifest key inside its encrypted EDN. Everyone
+;; who can decrypt the store computes the same hashes, so a solo store and a
+;; team store get the same kind of manifest. Let's create a store through the
+;; CLI and look:
 
-(def rendered
-  (manifest/render {:app "manifest-demo" :ciphertext-sha "0b7d9f31aa..."}
-                   (manifest/entries secrets-v1 hkey)))
-
-^:kindly/hide-code
-(print rendered)
-
-;; Each key path occupies one line, which lets git show changes to individual
-;; entries.
-
-;; ## Diffing two shapes
-
-;; `diff` compares two entry maps and reports the differences a reviewer needs
-;; to know about:
-
-(manifest/diff (manifest/entries {:a 1 :b "x"} nil)
-               (manifest/entries {:b :keyword-now :c true} nil))
-
-;; `:changed` includes type changes, count changes, and, when hashes are
-;; present, value changes.
-
-;; ## Verifying the manifest
-
-;; `bb secrets verify` decrypts the secrets, regenerates their entries, and
-;; compares the result with the committed manifest. First, set up an
-;; environment:
+(def store (str dir "/secrets.edn.age"))
 
 (def config
   (cli/normalize-config
    {:app "manifest-demo"
     :default-environment :dev
-    :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
+    :environments {:dev {:secrets-file store
                          :key-file key-file}}}))
 
 ^:kindly/hide-code
+(defn set-from-pipe!
+  "Calls `cli/set-secret!` with `value` on stdin and no terminal attached."
+  [config env k value edn?]
+  (with-redefs-fn {#'cli/tty? (constantly false)}
+    #(with-in-str value (cli/set-secret! config env k edn?))))
+
+;; `set-from-pipe!` is a helper for this chapter that calls `cli/set-secret!`
+;; with a string on stdin, as a shell pipe into `bb secrets set` would.
+
+(set-from-pipe! config "dev" ":database/url" "jdbc:postgresql://db/app" false)
+
+(set-from-pipe! config "dev" ":retries" "3" true)
+
+;; Decrypting the file with `age` directly shows what the library added beside
+;; our two values:
+
+(keys (edn/read-string (age/decrypt key-file store)))
+
+;; The entries in the `:com.kirahowe.secrets` namespace hold the manifest key
+;; and a record of the recipient set the store was last encrypted to. They
+;; belong to the library. `load-secrets` never returns them:
+
+(keys (secrets/load-secrets store key-file))
+
+;; The reader literals and `get-secret` on a loaded store don't see this
+;; metadata either. `edit` shows the plaintext without it and puts it back
+;; when you save. `set`, `rm`, and an edited plaintext can't name it, and
+;; `new` drops it from a template, so two stores made from one template never
+;; share a key. The manifest has no entry for it.
+
+;; The key's lifetime follows one rule:
+;;
+;; - `new`, and `set` when no store exists yet, generate a key.
+;; - `edit`, `set`, and `rm` keep it, unless the recipients changed.
+;; - `reencrypt` always generates a new one, and so does `edit`, `set`, or
+;;   `rm` when the recipients file no longer matches the set the store
+;;   records. Every `:vhash` changes once when that happens.
+;;
+;; The [teams chapter](secrets_book.teams.html#key-renewal) explains why a
+;; change of recipients has to renew the key.
+
+;; Copying an encrypted store file copies its key. Two copies then publish
+;; comparable hashes until one of them is re-encrypted.
+
+;; ## The rendered file
+
+;; This is the manifest the two writes above left beside the ciphertext. Its
+;; header records a format version, the app, and the SHA-256 of the
+;; ciphertext it describes:
+
+(println (slurp (str dir "/secrets.edn.manifest")))
+
+;; Each key path occupies one line, which lets git show changes to individual
+;; entries. `manifest/render` produces this text from an entries map.
+
+;; ## Diffing two sets of entries
+
+;; `diff` compares two entry maps and reports the differences a reviewer needs
+;; to know about:
+
+(manifest/diff (manifest/entries {:a 1 :b "x"} demo-key)
+               (manifest/entries {:b :keyword-now :c true} demo-key))
+
+;; `:changed` includes type changes, count changes, and value changes.
+
+;; ## Verifying the manifest
+
+;; With an identity, `bb secrets verify` decrypts the store, computes its
+;; entries under the store's manifest key, and compares them with the
+;; committed manifest. It also compares the ciphertext's SHA-256 with the one
+;; the manifest records:
+
+(cli/verify! config "dev")
+
+;; Now change a value behind the CLI's back, by decrypting, editing, and
+;; encrypting with `age` directly, without updating the manifest:
+
 (let [plain (str dir "/p2.edn")]
-  (spit plain (pr-str secrets-v1))
-  (age/encrypt-file! key-file plain (str dir "/secrets.edn.age"))
+  (spit plain (str/replace (age/decrypt key-file store) "db/app" "db/other"))
+  (age/encrypt-file! key-file plain store)
   (io/delete-file plain))
+
+(cli/verify! config "dev")
+
+;; The returned map contains `:exit 1`, and the output names the path whose
+;; value changed. A CI job can use that status to reject a stale manifest.
+
+;; A manifest has to be complete before anything is compared: `:version 3`,
+;; this project's `:app`, a `:ciphertext-sha`, and a `:type` and a `:vhash` on
+;; every entry. A manifest from another app, in another format version, or
+;; with an entry that lacks a hash is reported as drift, with or without an
+;; identity.
+
+;; `reencrypt` regenerates the manifest from the ciphertext:
 
 (cli/reencrypt! config "dev")
 
 (cli/verify! config "dev")
-
-;; Now re-encrypt a different set of secrets directly with `age`, without
-;; updating the manifest:
-
-(let [plain (str dir "/p3.edn")]
-  (spit plain (pr-str (assoc secrets-v1 :sneaky/addition "oops")))
-  (age/encrypt-file! key-file plain (str dir "/secrets.edn.age"))
-  (io/delete-file plain))
-
-(cli/verify! config "dev")
-
-;; The returned map contains `:exit 1`, and the output names the path that was
-;; added. A CI job can use that status to reject a stale manifest. Verification
-;; also rejects a manifest that belongs to another `:app`, or one that does not
-;; record an app at all. These checks apply even when the manifest is otherwise
-;; up to date.
 
 ;; ## Verifying without the key
 
-;; The manifest header's `:ciphertext-sha` also enables a check that does not
-;; need any secret material. When `verify` cannot find an identity, it compares
-;; the recorded hash with the actual ciphertext. This allows a CI job with no
-;; key, and without even `age` installed, to detect that a ciphertext changed
-;; without its manifest being regenerated. First regenerate the manifest, then
-;; verify with a missing key:
+;; The manifest's `:ciphertext-sha` also allows a check that needs no secret
+;; material. When no identity is available, `verify` checks that the manifest
+;; is complete and that the recorded hash is the digest of the ciphertext. A
+;; CI job with no key, and without `age` installed, can therefore detect a
+;; ciphertext that changed without its manifest.
 
-^:kindly/hide-code
-(cli/reencrypt! config "dev")
+;; "No identity is available" means that none was named, by `:identity-file`
+;; or an identity environment variable, and no key file is present. A named
+;; identity that doesn't exist is an error. This config, for the same app and
+;; store, has no key file to find:
 
 (def keyless-config
-  (-> (cli/normalize-config
-       {:app "manifest-demo"
-        :default-environment :dev
-        :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
-                             :key-file (str dir "/no-key-here.txt")}}})
-      ;; Environment identities normally override :key-file. Pin the resolved
-      ;; path so this example stays keyless on every build machine.
-      (assoc-in [:environments :dev :identity-file]
-                (str dir "/no-key-here.txt"))))
+  (cli/normalize-config
+   {:app "manifest-demo"
+    :default-environment :dev
+    :environments {:dev {:secrets-file store}}}))
 
 (cli/verify! keyless-config "dev")
 
-;; `:ok-keyless` passes with exit 0. This checks freshness, but checking the
-;; values still requires a key. The
+;; `:ok-keyless` passes with exit 0. It shows that the ciphertext is the one
+;; the manifest was written for. It can't show that the manifest describes the
+;; plaintext, which needs a key. The
 ;; [production chapter](secrets_book.production.html) turns both modes into
 ;; CI jobs.
 
-;; Neither mode proves who wrote the ciphertext. age does not sign files, and
-;; `verify` reports drift rather than authorship. The
+;; Neither mode shows who wrote the ciphertext. age does not sign files, and
+;; everyone who can decrypt a store holds its manifest key. Someone who can
+;; replace both files can make them agree. The
 ;; [caveats chapter](secrets_book.caveats.html#no-signatures-the-repository-is-the-boundary)
 ;; explains what this means for trusting the repository.
 
+;; ## A store without a manifest key
+
+;; A store that has no well-formed manifest key can't have a manifest. This
+;; happens to a store written by another tool, or by a version of this library
+;; that predates the key. Here is one, encrypted with `age` directly:
+
+(let [plain (str dir "/p3.edn")]
+  (spit plain (pr-str {:database/url "jdbc:postgresql://db/app"}))
+  (age/encrypt-file! key-file plain store)
+  (io/delete-file plain))
+
+(cli/verify! config "dev")
+
+;; `edit`, `set`, and `rm` fail on such a store with the same message.
+;; `reencrypt` doesn't read the existing key, so it is the repair:
+
+(cli/reencrypt! config "dev")
+
+(cli/verify! config "dev")
+
 ;; ## Format versioning
 
-;; Every manifest records `:version 2`. The version identifies the encoding
-;; used to hash values, and it is mixed into the HMAC key. This prevents a hash
-;; written by one version from being read as if it belonged to another.
-;;
-;; Version 2 recursively frames each value as
-;; `<type-tag>:<code-unit-count>:<payload>`. Since every field includes its own
-;; length, a `=` or `;` *inside* a secret cannot be mistaken for punctuation in
-;; the encoding. Every field also includes its type tag, so `[[1]]` and `[(1)]`
-;; hash differently. The framed string is hashed as raw UTF-16 code units
-;; instead of passing through a charset encoder. A charset encoder would
-;; substitute a replacement character for an unpaired surrogate and could
-;; collapse two distinct secrets into the same hash. `verify` reports any other
-;; version, including a legacy `:version 1` file, as drift and asks you to
+;; Every manifest records `:version 3`, the one format this library reads and
+;; writes. `verify` reports any other version as unsupported and asks you to
 ;; regenerate the file with `reencrypt` or upgrade the library.
+;;
+;; To hash a value, the library first encodes it as a string in which every
+;; value is framed as `<type-tag>:<length>:<payload>`, nested for collections.
+;; Since every frame carries its own length, a delimiter inside a secret
+;; cannot be mistaken for structure. Every frame also carries its type, so
+;; `[[1]]` and `[(1)]` encode differently. Map entries and set elements are
+;; sorted, so iteration order doesn't matter. Two values the EDN reader can
+;; produce share an encoding only when they are equal. The string is hashed as
+;; its UTF-16 code units, since a charset encoder would substitute for an
+;; unpaired surrogate and could make two different strings hash alike.
 
-;; ## What the manifest leaks, and how to turn it off
+;; ## What the manifest discloses, and how to turn it off
 
-;; Anyone with repository access can see key names, value types, and collection
-;; counts. In single-key mode they can also see which values are equal and when
-;; a value changes: equal values at different paths, or in different
-;; environments that share a key, have equal hashes, and a value that returns to
-;; an earlier one shows up in the history. Team manifests carry no hashes. Key
-;; paths through nested maps are public at every depth, so secret values must
-;; not be used as map keys. If even the existence of a key is sensitive, disable the manifest
-;; for that environment with `:manifest false`. Its ciphertext diff will then
-;; be opaque.
+;; Anyone with repository access can see:
+;;
+;; - every key path, through nested maps at every depth;
+;; - each value's type, and the size of each collection;
+;; - which values in a store are equal, and when a value changes or returns
+;;   to an earlier one, for as long as the store keeps one manifest key;
+;; - the size of the ciphertext, and the history of both files.
+;;
+;; Key paths are public, so secret values must not be used as map keys.
+;;
+;; Everyone who can decrypt the store holds its manifest key, and can test
+;; guesses of a value against any manifest published while that key was in
+;; use. That includes a former recipient and the manifests from their time.
+;;
+;; If even the existence of a key is sensitive, disable the manifest for that
+;; environment with `:manifest false`. Its changes are then not reviewable.
 
 ^:kindly/hide-code
 (doseq [f (reverse (file-seq (io/file dir)))]

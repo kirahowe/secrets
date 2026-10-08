@@ -3,208 +3,187 @@
 ^:kindly/hide-code
 (ns secrets-book.reference
   (:require [clojure.string :as str]
-            [com.kirahowe.secrets :as secrets]
-            [com.kirahowe.secrets.aero :as secrets-aero]
-            [com.kirahowe.secrets.age :as age]
-            [com.kirahowe.secrets.cli :as cli]
-            [com.kirahowe.secrets.fs :as fs]
-            [com.kirahowe.secrets.init :as init]
-            [com.kirahowe.secrets.manifest :as manifest]
+            [com.kirahowe.secrets]
+            [com.kirahowe.secrets.aero]
+            [com.kirahowe.secrets.cli]
+            [com.kirahowe.secrets.init]
             [scicloj.kindly.v4.kind :as kind]))
 
 ;; The signatures and docstrings below come from var metadata at render time.
+;; Each listing is checked against the namespace when the book is built, so it
+;; names every public var and nothing else.
+
+;; Four namespaces are the public API: `com.kirahowe.secrets`,
+;; `com.kirahowe.secrets.aero`, `com.kirahowe.secrets.cli`, and
+;; `com.kirahowe.secrets.init`. They are listed below.
+;;
+;; `com.kirahowe.secrets.age`, `com.kirahowe.secrets.manifest`,
+;; `com.kirahowe.secrets.fs`, `com.kirahowe.secrets.safe-edn`, and
+;; `com.kirahowe.secrets.source` are implementation namespaces. Their vars are
+;; public so the other namespaces can use them. They are not listed here and
+;; can change without notice.
+;;
+;; The library is in alpha, so the public API can still change between
+;; releases too.
 
 ^:kindly/hide-code
 (defn- doc-section
-  "Renders Vars' signatures and docstrings as a Markdown section."
-  [& vars]
-  (kind/md
-   (str/join
-    "\n\n"
-    (for [v vars
-          :let [{:keys [arglists doc] var-name :name} (meta v)]]
-      (str "#### `" var-name "`\n\n"
-           (str/join "  \n"
-                     (map #(str "`" (pr-str (cons var-name %)) "`") arglists))
-           "\n\n"
-           (-> (or doc "")
-               (str/replace #"\[\[([^\]]+)\]\]"
-                            (fn [[_ var-name]] (str "`" var-name "`")))
-               (str/replace #"(?m)^  " "")))))))
+  "Renders the public vars of namespace `ns-sym` named by `var-names`, in that
+  order, as a Markdown section of signatures and docstrings. Throws unless
+  `var-names` is exactly the namespace's public vars."
+  [ns-sym var-names]
+  (let [publics (ns-publics ns-sym)]
+    (when-not (= (set var-names) (set (keys publics)))
+      (throw (ex-info (str "The listing for " ns-sym " does not match its public vars.")
+                      {:missing (remove (set var-names) (keys publics))
+                       :unknown (remove (set (keys publics)) var-names)})))
+    (kind/md
+     (str/join
+      "\n\n"
+      (for [var-name var-names
+            :let [{:keys [arglists doc]} (meta (publics var-name))]]
+        (str "#### `" var-name "`\n\n"
+             (when arglists
+               (str (str/join "  \n"
+                              (map #(str "`" (pr-str (cons var-name %)) "`") arglists))
+                    "\n\n"))
+             (-> (or doc "")
+                 (str/replace #"\[\[([^\]]+)\]\]"
+                              (fn [[_ linked]] (str "`" linked "`")))
+                 (str/replace #"(?m)^  " ""))))))))
 
 ;; ## com.kirahowe.secrets
 
 ;; Application code requires this namespace to load secrets at runtime.
 
-(doc-section #'secrets/load-secrets
-             #'secrets/get-secret
-             #'secrets/reader-literals
-             #'secrets/merge-readers
-             #'secrets/with-identity
-             #'secrets/expand-home
-             #'secrets/default-key-file)
-
-;; `load-secrets` accepts local filesystem sources, local `file:` locators, and
-;; `jar:file:` classpath resources. It rejects HTTP(S), remote or nested jars,
-;; and arbitrary input-stream values.
-
-;; ## com.kirahowe.secrets.fs
-
-;; This namespace creates temporary files with owner-only permissions from the
-;; moment they're created, so you can write sensitive data to them safely. It
-;; also holds the atomic move the library uses to replace a file.
-
-(doc-section #'fs/owner-only-temp-file!
-             #'fs/atomic-move!)
+(doc-section 'com.kirahowe.secrets
+             '[load-secrets
+               get-secret
+               reader-literals
+               merge-readers
+               with-identity
+               expand-home
+               default-key-file])
 
 ;; ## com.kirahowe.secrets.aero
 
-;; This namespace provides the optional Aero integration. Requiring it registers
-;; the reader methods, and `read-config` reads a config whose secret tags
-;; decrypt the store at most once for that read. Aero must already be present
-;; in the consuming application.
+;; The optional Aero integration. Aero must already be a dependency
+;; of the consuming application.
 
-(doc-section #'secrets-aero/read-config)
-
-;; ## com.kirahowe.secrets.age
-
-;; This namespace wraps the `age` binary. You can use it directly in your own
-;; scripts; the CLI and runtime namespaces build on it.
-
-;; ### Path arguments
-
-;; Positional input comes after an option terminator (`--`), so a filename can't
-;; be read as an option. Every path-valued argument is normalized, including the
-;; input, the `-o` output, the `-i` identity, and the `-R` recipients file. A
-;; path that begins with a dash becomes `./-name`. Age reads a bare `-` from
-;; standard input even after the terminator, so this prefix ensures that age
-;; reads the named file. A blank or nil path throws instead of quietly falling
-;; back to standard input. Recipient strings passed as `:recipients` are values
-;; rather than paths and are used as given.
-
-(doc-section #'age/version
-             #'age/installed?
-             #'age/ensure-installed!
-             #'age/keygen!
-             #'age/public-key
-             #'age/valid-recipient?
-             #'age/encrypt-file!
-             #'age/decrypt
-             #'age/decrypt-bytes)
-
-;; ## com.kirahowe.secrets.manifest
-
-;; These are the pure functions used to build and compare the committed
-;; manifest. They don't touch the filesystem or the `age` binary.
-
-(doc-section #'manifest/entries
-             #'manifest/value-type
-             #'manifest/hmac-key
-             #'manifest/render
-             #'manifest/diff)
-
-;; ## com.kirahowe.secrets.init
-
-;; This is the one-shot Babashka project initializer. `-main` is the command-line
-;; entry point, and the other functions let tools preview or apply the same
-;; scaffold programmatically.
-
-(doc-section #'init/init!
-             #'init/plan
-             #'init/apply-plan!
-             #'init/proposed-config
-             #'init/task-spec)
+(doc-section 'com.kirahowe.secrets.aero
+             '[read-config])
 
 ;; ## com.kirahowe.secrets.cli
 
 ;; This namespace implements the management task. `run!` is the entry point
-;; wired up by `bb.edn`; the command functions can also be called from a REPL
+;; wired up by `bb.edn`. The command functions can also be called from a REPL
 ;; and return data instead of exiting.
 
-(doc-section #'cli/run!
-             #'cli/normalize-config
-             #'cli/keygen!
-             #'cli/new!
-             #'cli/edit!
-             #'cli/set-secret!
-             #'cli/remove-secret!
-             #'cli/verify!
-             #'cli/doctor!
-             #'cli/show-key!
-             #'cli/add-recipient!
-             #'cli/recipients!
-             #'cli/reencrypt!)
+(doc-section 'com.kirahowe.secrets.cli
+             '[run!
+               normalize-config
+               keygen!
+               new!
+               edit!
+               set-secret!
+               remove-secret!
+               verify!
+               doctor!
+               show-key!
+               add-recipient!
+               recipients!
+               reencrypt!])
+
+;; ## com.kirahowe.secrets.init
+
+;; The project initializer. `-main` is the command-line entry point, and the
+;; other functions let a tool preview or apply the same plan.
+
+(doc-section 'com.kirahowe.secrets.init
+             '[-main
+               init!
+               plan
+               apply-plan!
+               parse-args
+               proposed-config
+               task-spec
+               library-dependency])
 
 ;; ## Configuration keys
 
-;; The map passed to `cli/run!` and `cli/normalize-config`:
+;; The map passed to `cli/run!` and `cli/normalize-config`. A key that is not
+;; in these tables is an error.
 
 ;; | Key | Required | Meaning |
 ;; |-----|----------|---------|
 ;; | `:app` | yes | names the default key path `~/.config/<app>/key.txt`; recorded in the manifest |
 ;; | `:default-environment` | no | environment keyword used when a command omits `[env]` |
 ;; | `:environments` | yes | map of environment keyword to environment config |
-;; | `:limits` | no | positive integer bounds merged over the CLI defaults for every environment |
 
 ;; Per environment:
 
 ;; | Key | Required | Meaning |
 ;; |-----|----------|---------|
 ;; | `:secrets-file` | yes | path to the ciphertext; must end in `.age` unless both `:template` and `:manifest` are explicit |
-;; | `:key-file` | no | durable key path; default `~/.config/<app>/key.txt` |
-;; | `:identity-file` | no | explicit decrypt-side identity; commands use it before environment variables |
-;; | `:template` | no | seed for `new`; default `<secrets-file>` with `.example` |
-;; | `:manifest` | no | manifest path, or `false` to disable; default `<secrets-file>` with `.manifest` |
+;; | `:key-file` | no | where `keygen` writes and `show-key` reads, and the identity used when nothing else is named; default `~/.config/<app>/key.txt` |
+;; | `:identity-file` | no | explicit identity for commands that decrypt; used before the environment variables |
+;; | `:template` | no | what `new` opens; default `<secrets-file>` with `.example` in place of `.age` |
+;; | `:manifest` | no | manifest path, or `false` to keep none; default `<secrets-file>` with `.manifest` in place of `.age` |
 ;; | `:recipients-file` | no | committed list of age public keys; enables team mode |
 
-;; Normalization preserves an explicit `:identity-file` and validates configured
-;; paths. It does not read identity environment variables or materialize a
-;; temporary identity. Commands resolve their identity when they run.
+;; Path values are strings, and `:environments` is a map of maps. An
+;; `:identity-file` you set has to exist when a command that needs an identity
+;; runs.
 
-;; ### Configuration limits
+;; ## Size bounds
 
-;; | Key | Default | Meaning |
-;; |-----|---------|---------|
-;; | `:max-plaintext-bytes` | 8 MiB | decrypted store size |
-;; | `:max-edn-depth` | 100 | nested EDN collection depth |
-;; | `:max-recipients` | 256 | recipient entries in one file |
-;; | `:max-recipient-chars` | 1,024 | characters in one recipient entry |
-;; | `:max-recipients-bytes` | 256 KiB | total recipients-file size |
-;; | `:max-manifest-bytes` | 1 MiB | manifest file size |
-;; | `:max-manifest-entries` | 10,000 | key entries in one manifest |
+;; These are fixed. A file or value past one is refused.
 
-;; The separate runtime `secrets/default-limits` also includes
-;; `:max-source-bytes` (16 MiB) for local file and jar-resource loading.
+;; | Bound | Applies to |
+;; |-------|------------|
+;; | 16 MiB | ciphertext read by `load-secrets` and the reader literals |
+;; | 8 MiB | plaintext of a store or template |
+;; | 100 | nested EDN collections |
+;; | 256 KiB | a recipients file |
+;; | 1 MiB | a manifest |
 
 ;; ## Environment variables
 
 ;; | Variable | Contents |
 ;; |----------|----------|
-;; | `SECRETS_AGE_IDENTITY_FILE` | path to the key file |
+;; | `SECRETS_AGE_IDENTITY_FILE` | path to the key file; the file has to exist |
 ;; | `SECRETS_AGE_IDENTITY` | raw key file contents, used verbatim |
 ;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the key file contents; invalid base64 throws |
 
+;; They are checked in that order, after an explicit identity path and before
+;; the key file. A variable that is set but empty is an error. `VISUAL` and
+;; `EDITOR` choose the editor for `new` and `edit`.
+
 ;; ## Reader tags
 
-;; | Tag | Present | Missing key, file, or identity | Decryption failure |
-;; |-----|---------|--------------------------------|--------------------|
-;; | `#secret/req` | the value | throws | throws |
-;; | `#secret/opt` | the value | nil | throws |
+;; | Situation | `#secret/req` | `#secret/opt` |
+;; |-----------|---------------|---------------|
+;; | key present | the value | the value |
+;; | key missing, no secrets file, or no identity available | throws | nil |
+;; | a named identity file does not exist | throws | throws |
+;; | decryption fails | throws | throws |
 
 ;; ## Exit codes
 
-;; `bb secrets verify` exits 0 when every environment checks out (including
-;; keyless freshness passes), 1 on drift, and 2 when an artifact is missing or a
-;; keyless run cannot check an older manifest with no ciphertext hash. `doctor`
-;; exits 0 when healthy, 1 when action is needed, and 2 for invalid
-;; configuration. Other commands exit 0 on success and 1 on failure.
+;; | Command | 0 | 1 | 2 |
+;; |---------|---|---|---|
+;; | `verify` | every manifest agrees with its ciphertext | drift | a ciphertext or manifest is missing, or an environment could not be checked |
+;; | `doctor` | healthy | a warning | the setup is invalid |
+;; | every other command | success | failure | |
+
+;; For `verify`, drift decides the exit code before a missing file does.
 
 ;; ## File conventions
 
 ;; | File | Committed | Contents |
 ;; |------|-----------|----------|
 ;; | `secrets.edn.age` | yes | the encrypted secrets |
-;; | `secrets.edn.manifest` | by default | value-free shape, updated by secrets-writing commands |
+;; | `secrets.edn.manifest` | by default | key paths, types, and keyed value hashes; updated by every write |
 ;; | `secrets.edn.example` | when used | optional template for `bb secrets new` |
 ;; | `recipients.txt` | yes | age public keys, one per line, team mode |
 ;; | `~/.config/<app>/key.txt` | never | the private key |

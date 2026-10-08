@@ -42,7 +42,7 @@
 ;; have its own audit history, but it is separate from the code change that
 ;; consumes the secret. Twelve-Factor's own
 ;; [build, release, run](https://12factor.net/build-release-run) factor makes
-;; related point: a release is a build combined with its configuration,
+;; a related point: a release is a build combined with its configuration,
 ;; uniquely identified and immutable once created. To know what was deployed,
 ;; we need both the code and the configuration. If the configuration only lives
 ;; in a dashboard, git can't give us that complete history.
@@ -118,7 +118,31 @@
 ;; it. SOPS encrypts individual values, which makes encrypted diffs
 ;; field-specific.
 ;; This library keeps whole-file encryption and adds a
-;; [manifest](secrets_book.manifest.html) that records structural changes.
+;; [manifest](secrets_book.manifest.html) that records each key path, its
+;; type, and a keyed hash that changes when the value does.
+
+;; ## Why the manifest has its own key
+
+;; A hash of a password is only safe to publish if nobody can test guesses
+;; against it, so each value hash is an HMAC under a random key. That key
+;; lives inside the encrypted store. Everyone who can decrypt the store can
+;; compute the hashes, a solo store and a team store work the same way, and
+;; nothing is derived from anyone's age identity. The cost is that the key is
+;; shared with every recipient, so it is replaced whenever the recipient set
+;; changes. The [manifest chapter](secrets_book.manifest.html) covers the
+;; rule, and the repository's
+;; [threat model](https://github.com/kirahowe/secrets/blob/main/doc/threat-model.md)
+;; records the tradeoffs that were accepted.
+
+;; ## What the library leaves out
+
+;; The library manages one configured store per environment. It has no
+;; commands for encrypting arbitrary files, because `age` already does that.
+;; Its size bounds are fixed, because they exist to catch a wrong file and
+;; nobody needs to tune that. The Aero integration keeps no cache between
+;; reads. The initializer creates missing files and prints what to add to the
+;; ones you have, and it never edits a file. In each case the threat model
+;; names no need for more.
 
 ;; ## Prior art, and what I borrowed
 
@@ -155,5 +179,6 @@
 ;;  :auth/admins #{"kira@example.com"}}
 ;; ```
 
-;; Comments survive `bb secrets edit` round trips, because the CLI re-encrypts
-;; the text you saved, not a re-serialization of it.
+;; Comments survive `bb secrets edit` round trips, because the CLI encrypts the
+;; text you saved. `set` and `rm` print the map again, so comments don't
+;; survive those.

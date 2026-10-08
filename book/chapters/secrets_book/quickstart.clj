@@ -7,7 +7,7 @@
 
 ;; ## Requirements
 
-;; Install [age](https://age-encryption.org) and [Babashka](https://babashka.org). The one-time dependency resolution shown below also needs Java; a JVM Clojure project will normally have that already.
+;; Install [age](https://age-encryption.org) and [Babashka](https://babashka.org). Babashka resolves the dependencies in `bb.edn` through Java, so you need a JDK on your `PATH` as well. A JVM Clojure project will normally have that already.
 
 ;; ```sh
 ;; brew install age babashka
@@ -17,35 +17,29 @@
 
 ;; ## Set up a project
 
-;; Add the library to your project's `bb.edn`:
-
-;; ```clojure
-;; {:deps {com.kirahowe/secrets {:mvn/version "0.1.0-alpha1"}}}
-;; ```
-
-;; If you want the library to also be available to your app at runtime, add the same coordinate to `deps.edn` too. The dependency in `bb.edn` is for the management task.
-
-;; Now run the initializer from the same directory. It dry-runs by default. Change `myapp` to your application's name:
+;; Nothing is published to Clojars yet, so the quickest way to start is from a clone of the [repository](https://github.com/kirahowe/secrets). Run the initializer from your own project's directory, pointing Babashka at the clone's `src`. Change `myapp` to your application's name:
 
 ;; ```sh
-;; bb -m com.kirahowe.secrets.init --app myapp --keygen
+;; bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
 ;; ```
 
-;; The output is a preview listing the files it wants to create or merge but doesn't change anything yet. If the preview looks right, run the same command with `--apply`:
+;; The output is a preview. It lists the files the initializer would create and writes nothing. If the preview looks right, run the same command with `--apply`:
 
 ;; ```sh
-;; bb -m com.kirahowe.secrets.init --app myapp --keygen --apply
+;; bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen --apply
 ;; ```
 
-;; This bootstraps secrets management for your project:
-;; - it keeps the dependency you just added,
-;; - adds a `bb secrets` task to `bb.edn`,
-;; - creates a plaintext template with placeholder values, and
-;; - generates the age identity at `~/.config/myapp/key.txt`
+;; In a project with no `bb.edn`, this creates three files:
+;;
+;; - a `bb.edn` that declares the library and a `bb secrets` task,
+;; - a plaintext template with a placeholder value at `secrets/secrets.edn.example`, and
+;; - the age identity at `~/.config/myapp/key.txt`.
 
-;; Existing `bb.edn` comments and unrelated forms are preserved. If there's a conflicting dependency or task, the initializer stops and tells you about it.
+;; The initializer only creates files that don't exist. If you already have a `bb.edn`, it prints the dependency and the task for you to add and leaves your file alone. The [CLI chapter](secrets_book.cli.html#the-initializer) covers that case, and projects with a `deps.edn`.
 
-;; You'll want to back up `~/.config/myapp/key.txt` somewhere outside of version control, such as a password manager. Treat this like you would a password, it is the key to reading all of your app's secrets. You'll need it to decrypt this store, and **it is unrecoverable if you lose it**.
+;; The dependency it writes pins the commit your clone is at. If that commit isn't a release tag, the output says so, and the commit has to be on GitHub before another machine can resolve it.
+
+;; You'll want to back up `~/.config/myapp/key.txt` somewhere outside of version control, such as a password manager. Treat it like a password: it decrypts all of your app's secrets, and **it is unrecoverable if you lose it**.
 
 ;; ## Create the first secrets file
 
@@ -53,7 +47,7 @@
 ;; bb secrets new
 ;; ```
 
-;; This opens the generated template in `$VISUAL`, `$EDITOR`, or `vim`. The file you edit is ordinary EDN, so values can be any valid EDN value like strings, numbers, sets, vectors, or nested maps, and comments are preserved:
+;; This opens the template in `$VISUAL`, `$EDITOR`, or `vim`. The file you edit is one EDN map. Its values can be any EDN, like strings, numbers, sets, vectors, or nested maps, and comments are kept when you use `new` and `edit`:
 
 ;; ```clojure
 ;; {:database/url "jdbc:postgresql://db.internal/app"
@@ -65,12 +59,12 @@
 
 ;; ```text
 ;; secrets/secrets.edn.age       # encrypted values
-;; secrets/secrets.edn.manifest  # value-free description of what changed
+;; secrets/secrets.edn.manifest  # key paths, types, and keyed value hashes
 ;; ```
 
 ;; You commit both of these. **Be sure to keep `~/.config/myapp/key.txt` out of the repository.**
 
-;; If you would rather not open an editor, `set` stores one value at a time. Run it from a terminal and it prompts for the value with echo turned off:
+;; If you would rather not open an editor, `set` stores one value at a time, and creates the store if there isn't one yet. Run it from a terminal and it prompts for the value with echo turned off:
 ;;
 ;; ```sh
 ;; bb secrets set :database/url
@@ -81,7 +75,7 @@
 ;; ```sh
 ;; printf %s "$DATABASE_URL" | bb secrets set :database/url
 ;; ```
-;; Values are stored verbatim as strings unless you pass `--edn`, in which case the input is parsed as EDN and its type is inferred from the syntax.
+;; Values are stored verbatim as strings unless you pass `--edn`, in which case the input is parsed as EDN and its type follows from the syntax.
 ;;
 ;; ``` sh
 ;; printf %s '#{"kira@example.com" "sam@example.com"}' \
@@ -90,7 +84,7 @@
 
 ;; ## Read secrets in the app
 
-;; Now we can read the secrets from the app. `load-secrets` decrypts the whole map. Locally, secrets are decrypted with the identity we just created. In production, the age key can be set with a single `SECRETS_AGE_IDENTITY` environment variable,
+;; Now we can read the secrets from the app. `load-secrets` decrypts the whole map. Locally, secrets are decrypted with the identity we just created. In production, the key can come from a single `SECRETS_AGE_IDENTITY` environment variable.
 
 ;; ```clojure
 ;; (require '[com.kirahowe.secrets :as secrets])
@@ -117,7 +111,7 @@
 ;;    :email {:api-key #secret/opt :postmark/api-key}}")
 ;; ```
 
-;; `#secret/req` throws when the value cannot be loaded. `#secret/opt` returns `nil` when the secret, ciphertext, or identity is absent, but it still throws when an existing ciphertext fails to decrypt. The [runtime chapter](secrets_book.runtime.html) covers both APIs, classpath resources, caching, Aero, and input limits.
+;; `#secret/req` throws when the value cannot be loaded. `#secret/opt` returns `nil` when the key isn't in the store, when there is no secrets file, or when the app's default key file is absent. It still throws when decryption fails, and when you named an identity file that doesn't exist. The [runtime chapter](secrets_book.runtime.html) covers both APIs, classpath resources, Aero, and how the key is found.
 
 ;; ## Check the setup
 
@@ -126,13 +120,13 @@
 ;; bb secrets verify
 ;; ```
 
-;; `doctor` checks your age installation, configured identity, ciphertext, template, recipients, and manifest, and tells you if anything needs attention. It doesn't print secret values or change any files. `verify` checks that the committed manifest belongs to this app and agrees with the ciphertext.
+;; `doctor` reports on your age installation, the configured files, the identity it resolved and where that came from, and the recipients, and tells you if anything needs attention. It doesn't print secret values or change any files. `verify` checks that the committed manifest belongs to this app and agrees with the ciphertext.
 
 ;; Day to day, this is usually all you need:
 
 ;; ```sh
 ;; bb secrets edit             # decrypt, edit, and re-encrypt
-;; bb secrets set :some/key    # read a replacement from stdin
+;; bb secrets set :some/key    # set one value from a prompt or stdin
 ;; bb secrets rm :old/key      # remove a value
 ;; bb secrets verify           # check the manifest before committing
 ;; ```
@@ -141,7 +135,7 @@
 
 ;; ## Runnable examples
 
-;; The repository's [examples directory](https://github.com/kirahowe/secrets/tree/main/examples) has some small example starter projects showing different ways this library can be integrated into your project, depending on what else you are already using:
+;; The repository's [examples directory](https://github.com/kirahowe/secrets/tree/main/examples) has some small starter projects showing different ways to use the library, depending on what else you are already using:
 
 ;; - [quickstart-bb](https://github.com/kirahowe/secrets/tree/main/examples/quickstart-bb): a minimal Babashka consumer using `clojure.edn` reader tags.
 ;; - [integrant-service](https://github.com/kirahowe/secrets/tree/main/examples/integrant-service): a JVM HTTP service with secrets as an Integrant component.
