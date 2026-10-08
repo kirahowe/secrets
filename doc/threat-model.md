@@ -33,7 +33,7 @@ format are implementation or product choices that must justify their cost.
 
 - Private age identities, which can decrypt ciphertext addressed to them,
   including historical versions.
-- Plaintext secret values and any confidential manifest hashing key.
+- Plaintext secret values and each store's manifest key.
 - The correctness and availability of the stored configuration. A wrong endpoint
   can leak data or break an application; losing the only usable store is also a
   failure worth preventing.
@@ -61,7 +61,7 @@ For a public repository, this is everyone. They must not obtain secret values or
 enough public information to cheaply test guesses of low-entropy values.
 
 Reviewability deliberately discloses metadata: key paths, value types, collection
-sizes, and value equality/change indicators where hashes are present. Ciphertext
+sizes, and a value equality/change indicator for every leaf. Ciphertext
 size and committed change history are also visible. Manifest key paths must be
 treated as public metadata; secret values do not belong in map keys.
 
@@ -128,11 +128,11 @@ values published after revocation should not become guessable through the public
 manifest using a hashing key that former recipient retained.
 
 A shared manifest key inside the encrypted store creates this obligation.
-Re-encrypting to fewer recipients alone does not revoke knowledge of that key.
-Any replacement design must address its renewal before publishing future values,
-or explicitly revisit the product's revocation guarantee. The operator still
-rotates credentials at their provider; manifest-key handling cannot revoke an
-already disclosed provider credential.
+Re-encrypting to fewer recipients alone does not revoke knowledge of that key,
+so the key is renewed whenever the recipient set changes, before any later value
+is published. The chosen manifest contract below states the rule. The operator
+still rotates credentials at their provider; manifest-key handling cannot revoke
+an already disclosed provider credential.
 
 ## Threats out of scope
 
@@ -171,11 +171,11 @@ to contain a hostile encryption implementation.
 
 | Property | Responsibility or limit |
 | --- | --- |
-| Confidentiality of encrypted values | age, plus confidential hashing material for public value indicators |
+| Confidentiality of encrypted values | age, plus the per-store manifest key for public value indicators |
 | Ciphertext integrity against corruption | age |
-| Reviewable paths, types, and value changes | the committed manifest; desired consistently for solo and team use |
-| Keyless digest check | detects disagreement with the recorded ciphertext digest; cannot prove the manifest describes the plaintext |
-| Verification with an identity | compares the decrypted store with the manifest; does not establish authorship |
+| Reviewable paths, types, and value changes | the committed manifest, the same for solo and team stores |
+| Keyless digest check | requires a complete manifest and detects disagreement with the recorded ciphertext digest; cannot prove the manifest describes the plaintext |
+| Verification with an identity | the keyless check, plus a comparison of the decrypted store with the manifest; does not establish authorship |
 | Sender authenticity or replay prevention | outside this library |
 
 Ciphertext is the authoritative artifact. A manifest is derived metadata that an
@@ -230,6 +230,9 @@ Fresh random keys distinguish independently initialized stores; copying a keyed
 store does not generate a fresh key. Documentation must state the actual behavior
 and distinguish approved requirements, design proposals, and verified guarantees.
 
+The design that answers these five findings is recorded under "Chosen manifest
+contract" below.
+
 ## Architecture questions for separate sessions
 
 The review also identified candidates beyond the manifest. These are bounded
@@ -271,6 +274,71 @@ materializing one. A CLI command selects its environment, resolves its
 identity, validates that resolved path against the configured artifact roles,
 and then owns the operation scope. There is no identity cache or reset
 lifecycle. Aero's separate reader cache and `reset-cache!` remain unchanged.
+
+## Chosen manifest contract
+
+Every store holds a random 256-bit manifest key inside its encrypted EDN, under
+the reserved top-level key `:com.kirahowe.secrets/manifest-key`, as 64 lowercase
+hex characters drawn from `SecureRandom`. Each manifest entry carries a
+`:vhash`: the first 64 bits of HMAC-SHA-256 over the value's unambiguous
+encoding, keyed by that key. Nothing is derived from an age identity. A solo
+store and a team store produce the same kind of manifest, and every recipient
+of a store computes the same hashes.
+
+A `:vhash` marks change. At 64 bits it can collide, so an unchanged hash is
+strong evidence of an unchanged value and not proof. The hash is keyed by the
+store key alone, so equal values at different paths in one store have equal
+hashes, and a reader of the manifest can see that.
+
+Lifecycle. Creating a store generates its key: `new`, or `set` when no store
+exists yet. `edit`, `set`, and `rm` keep the key. `reencrypt` always generates
+a new one, so every `:vhash` changes once. A second reserved key,
+`:com.kirahowe.secrets/manifest-recipients`, records a digest of the recipient
+set the store was last encrypted to. `edit`, `set`, and `rm` encrypt to the
+recipients file as it reads when they run, so when that set differs from the
+recorded one they generate a new key as `reencrypt` does. Removing a recipient
+therefore renews the key on the next write of any kind, and a removed
+recipient's retained key says nothing about values published after it (A5).
+It still tests guesses against every manifest published before, as B2 says of
+old ciphertext. One function in `cli.clj` holds this rule.
+
+Validity. A store's plaintext is one EDN map, because the key lives in it. A
+store whose manifest key is missing or is not 64 lowercase hex characters is
+an error on every command that writes the store, and drift on a `verify` that
+has an identity. The message says what is wrong and that `reencrypt` generates
+a new key, and `reencrypt` repairs exactly that case. There is no manifest
+without value hashes. A manifest is valid only if it is a map with `:version
+3`, the project's `:app`, a `:ciphertext-sha`, and a `:keys` map in which every
+entry has a `:type` and a `:vhash`. Anything else is a manifest problem: drift,
+exit 1, with or without an identity. Keyless verification checks that
+structure and the ciphertext digest. Verification with an identity also
+compares the decrypted store's entries. Every other `:version` is unsupported
+and the report says to run `reencrypt`.
+
+Ownership. The two reserved keys are library metadata and never user data.
+`load-secrets`, the reader literals, and `get-secret` on a loaded store never
+return them. `edit` shows the plaintext without them and puts them back on
+save, and refuses a plaintext in which the user typed one. `set` and `rm`
+refuse a path at or under one. `new` drops any reserved key its template
+holds and generates a fresh key, so two stores created from one template never
+share a key. The manifest lists no entry for either.
+
+Tradeoffs accepted:
+
+- Copying an encrypted store file copies its key. Two copies then publish
+  comparable hashes until one of them is re-encrypted.
+- Everyone who can decrypt a store holds its manifest key, and can test guesses
+  against every manifest published while that key was in use.
+- A recipient change makes every `:vhash` change in one commit, so that commit's
+  manifest diff shows which paths exist and not which values changed.
+- The library writes its metadata as the first lines of the store's map, which
+  must be the first form in the plaintext after whitespace and comments. A
+  store written by another tool with a reserved key somewhere else is still
+  read, and its comments are dropped the next time `edit` or `reencrypt`
+  rewrites it.
+- Solo mode records the fixed word `identity` as its recipient set, because the
+  identity that decrypts a solo store is the one it is encrypted to. Moving a
+  store between solo and team mode renews the key.
 
 ## How to decide what to change
 
