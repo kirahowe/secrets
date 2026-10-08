@@ -311,10 +311,31 @@
   input, such as a path that names the wrong file."
   1048576)
 
+(def ^:private config-keys
+  "Every key a secrets config may hold at its top level."
+  #{:app :default-environment :environments})
+
+(def ^:private environment-keys
+  "Every key an environment's config may hold. `:name` and `:app` are the two
+  normalization stamps on it, so a normalized config normalizes again."
+  #{:secrets-file :key-file :identity-file :template :manifest :recipients-file
+    :name :app})
+
+(defn- reject-unknown-keys!
+  "Fail when map `m` holds a key outside `known`, naming the key and the known
+  ones. A misspelled key would otherwise configure nothing and say nothing.
+  `what` names the map in the message."
+  [what known m]
+  (when-let [unknown (seq (remove known (keys m)))]
+    (fail! (str what " has an unknown key: " (str/join ", " (map pr-str unknown)) ".\n"
+                "    Known keys: " (str/join ", " (sort (map pr-str known))) ".")
+           {:reason :unknown-config-key :unknown-keys (vec unknown)})))
+
 (defn- normalize-environment
   [app environment-name
    {:keys [secrets-file key-file identity-file template manifest recipients-file]
     :as env-config}]
+  (reject-unknown-keys! (str "Environment " environment-name) environment-keys env-config)
   (when-not (string? secrets-file)
     (fail! (str "Environment " environment-name
                 " has no :secrets-file (a path string is required).")
@@ -371,9 +392,12 @@
   at least one environment, and a non-blank :secrets-file string per
   environment. A secrets path not ending in `.age` requires explicit :template
   and :manifest values. Every resolved artifact path is checked for role
-  collisions across all environments. Does not select an environment identity
-  or create private files. Throws ex-info on invalid input."
+  collisions across all environments. A key the config or an environment does
+  not define is rejected by name, so a misspelled key cannot be silently
+  ignored. Does not select an environment identity or create private files.
+  Throws ex-info on invalid input."
   [{:keys [app environments] :as config}]
+  (reject-unknown-keys! "secrets config" config-keys config)
   (when (empty? environments)
     (fail! "secrets config has no :environments"))
   (when-not (and (string? app) (not (str/blank? app)))

@@ -2389,12 +2389,35 @@
         (is (= 1 (:exit result)))
         (is (str/includes? err big-manifest) "the report names the file")))))
 
-(deftest a-limits-key-configures-nothing-test
-  (let [normalized (cli/normalize-config
-                    (assoc (test-config) :limits {:max-plaintext-bytes 1}))]
-    (is (not (contains? (get-in normalized [:environments :dev]) :limits))
-        "environments carry no limits")
-    (is (nil? (cli-private 'default-limits)))))
+(deftest unknown-config-keys-are-rejected-test
+  (let [failure (fn [config]
+                  (try (cli/normalize-config config)
+                       nil
+                       (catch clojure.lang.ExceptionInfo e e)))]
+    (testing "a misspelled or leftover top-level key"
+      (doseq [[k v] [[:enviroments {}] [:limits {:max-plaintext-bytes 1}]]]
+        (let [e (failure (assoc (test-config) k v))]
+          (is (= {:reason :unknown-config-key :unknown-keys [k]} (ex-data e)))
+          (is (str/includes? (ex-message e) (str "secrets config has an unknown key: " k)))
+          (is (str/includes? (ex-message e)
+                             "Known keys: :app, :default-environment, :environments")))))
+    (testing "a misspelled per-environment key, which would otherwise leave the default in force"
+      (let [e (failure (test-config {:secrets-fle "elsewhere.age" :manfest false}))]
+        (is (= :unknown-config-key (:reason (ex-data e))))
+        (is (= #{:secrets-fle :manfest} (set (:unknown-keys (ex-data e)))))
+        (is (str/includes? (ex-message e) "Environment :dev has an unknown key"))
+        (is (str/includes? (ex-message e) ":secrets-fle"))
+        (doseq [known [:secrets-file :key-file :identity-file :template :manifest
+                       :recipients-file]]
+          (is (str/includes? (ex-message e) (str known)) known))
+        (is (not (str/includes? (ex-message e) "elsewhere.age"))
+            "the message names the key and never its value")))
+    (testing "every documented key is accepted"
+      (is (map? (cli/normalize-config
+                 (test-config {:identity-file *key*
+                               :template (str *dir* "/t.example")
+                               :manifest (str *dir* "/m.manifest")
+                               :recipients-file (str *dir* "/r.txt")})))))))
 
 (deftest age-receives-repeated-r-arguments-test
   (if (age-env-set?)
