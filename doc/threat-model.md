@@ -2,8 +2,11 @@
 
 This is the decision rule for what belongs in this library. It records the
 requirements, trust boundaries, and lessons from the September 2026 architecture
-review. It is a design target, not a claim that the implementation already meets
-every requirement below.
+review, and the contracts chosen since. The requirement sections are the design
+target. The sections titled "Chosen ... contract" and "Other chosen contracts"
+describe what the implementation does. No requirement below is known to be
+unmet. The design questions that are still undecided are listed under
+"Architecture questions still open".
 
 The library is unreleased and has no users. Compatibility with existing commands,
 formats, options, and identity resolution rules is not a constraint. Ergonomics,
@@ -183,12 +186,14 @@ authorized recipient can regenerate. Losing a temporary plaintext file does not
 prevent regeneration when valid ciphertext and a usable identity remain.
 
 Atomic replacement protects a single ciphertext from partial writes. Two atomic
-renames do not make a ciphertext/manifest pair one atomic transaction. Rollback
-can help with caught I/O failures but cannot run after process termination.
-A simpler recovery contract can permit detectable manifest staleness after
-interruption. The exact write/recovery behavior remains a separate implementation
-task; do not claim that pairwise atomicity or power-loss durability follows from
-rename alone.
+renames do not make a ciphertext/manifest pair one atomic transaction, and a
+rollback cannot run after process termination, so the library does not attempt
+one. A write validates the plaintext, encrypts it, and renders the manifest
+before it replaces anything. It then replaces the ciphertext, and then the
+manifest. If the manifest is not replaced after the ciphertext was, the manifest
+is stale: the command reports that when it is still running, `verify` detects
+it either way, and `reencrypt` regenerates the manifest. Do not claim that
+pairwise atomicity or power-loss durability follows from rename alone.
 
 ## Lessons from the manifest experiment
 
@@ -233,18 +238,17 @@ and distinguish approved requirements, design proposals, and verified guarantees
 The design that answers these five findings is recorded under "Chosen manifest
 contract" below.
 
-## Architecture questions for separate sessions
+## Architecture questions still open
 
-The review also identified candidates beyond the manifest. These are bounded
-work items to evaluate individually, not instructions to implement them all:
+The review also identified candidates beyond the manifest. Four of them are
+decided and recorded under "Other chosen contracts": the initializer, Aero
+loading, the general-purpose file commands, and the input bounds. These remain
+bounded work items to evaluate individually, not instructions to implement
+them all:
 
 - Evaluate a common recipient-based encryption path for solo and team use.
-- Keep setup ergonomic while reducing the initializer's responsibility for
-  modifying existing projects and proving filesystem ancestry.
-- Narrow overlapping source/argument forms and general-purpose file commands;
-  put store operations beneath prompts and CLI rendering.
-- Scope Aero loading to a configuration read or application-owned lifecycle,
-  instead of a global cache keyed by configuration equality.
+- Narrow overlapping source/argument forms, and put store operations beneath
+  prompts and CLI rendering.
 - Make normalization pure. Canonical path checks still use the filesystem, so
   this remains a separate simplification from the identity contract.
 - Reduce duplicated build/documentation policy and verification. Moving code to
@@ -259,21 +263,33 @@ path or `:identity-file` first, then `SECRETS_AGE_IDENTITY_FILE`,
 `SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then the CLI's
 configured `:key-file` or its app default.
 
+An explicit path and `SECRETS_AGE_IDENTITY_FILE` each designate a file, and a
+designated file that does not exist is an error. When nothing is designated
+and no key file is present, no identity is available, which is what leaves
+keyless verification and a `nil` optional secret possible. A missing
+designated file used to mean
+"no identity", so a typo in a deployment passed a keyless check. Every identity
+path has a leading `~` expanded. A URI-shaped path, and key contents in a path
+setting, are refused without being echoed (A2, A3).
+
 Raw and base64 identities are materialized for each operation in an exclusive
-0600 temporary file. The operation checks deletion on both success and failure.
+0600 temporary file. The operation deletes it with an ordinary delete and
+checks the deletion on both success and failure. It does not try to overwrite
+the file first: that protects nothing on a copy-on-write or flash filesystem.
 Caller-owned paths are never deleted. A cleanup failure carries structured
 error data with the temporary path so an operator can remove the remaining file.
 Paths are permitted diagnostic metadata; identity contents are never included. A process
 crash can leave a temporary file behind, and deletion is not secure erasure on
 every filesystem. The extra temporary-file write per operation is the accepted
-cost of removing shared identity state.
+cost of removing shared identity state. The plaintext temporary file that
+`new`, `edit`, `set`, `rm`, and `reencrypt` use follows the same rule.
 
 `load-secrets` owns this scope automatically. CLI normalization validates and
 canonicalizes configured paths without selecting an environment identity or
 materializing one. A CLI command selects its environment, resolves its
 identity, validates that resolved path against the configured artifact roles,
 and then owns the operation scope. There is no identity cache or reset
-lifecycle. Aero's separate reader cache and `reset-cache!` remain unchanged.
+lifecycle.
 
 ## Chosen manifest contract
 
@@ -339,6 +355,44 @@ Tradeoffs accepted:
 - Solo mode records the fixed word `identity` as its recipient set, because the
   identity that decrypts a solo store is the one it is encrypted to. Moving a
   store between solo and team mode renews the key.
+
+## Other chosen contracts
+
+Initializer. It creates the files a new setup needs and never modifies a file
+that exists. For an existing `bb.edn` or `deps.edn` it prints the entries to
+add. It previews by default and writes only with `--apply`. Because it does not
+edit or replace anything, it carries no merge logic, no diff preview, and no
+proof about the project directory's ancestry. Each file is created
+exclusively, so a file that appears after the plan was made stops the run
+instead of being replaced. There is one layout: a project that wants another
+describes it in its own config.
+
+Aero. `com.kirahowe.secrets.aero/read-config` is the one entry point. A read
+decrypts the store at most once and keeps nothing afterwards. There is no
+process-wide registration and no cache to reset, so two reads never share a
+decrypted store and a second read sees an edited one. The reader literals
+outside Aero keep their first load for the life of the readers map the caller
+built, which is a value the application owns.
+
+General-purpose commands. The CLI manages one configured store per
+environment. It has no commands that encrypt or decrypt an arbitrary file:
+that is what `age` does, and those commands needed their own bounds, streaming,
+and plaintext publication. `decrypt-bytes` is the one decryption primitive,
+and plaintext reaches disk only in the private temporary file a command owns.
+
+Bounds. Each size and depth bound is a constant in the namespace that enforces
+it: 16 MiB of ciphertext, 8 MiB of plaintext, EDN depth 100, 256 KiB of
+recipients file, 1 MiB of manifest. They exist to stop an accidental input
+(A2), nobody needs to tune that, and so there is no `:limits` configuration.
+The CLI refuses to write a plaintext that decryption would refuse to read.
+
+File permissions. The ciphertext, manifest, and recipients file are committed
+and shipped, so they get the permissions any new file gets. Only identities
+and temporary plaintext are private (A4).
+
+Configuration. A key the config or an environment does not define is an error
+that names the key and not its value, so a misspelled key cannot silently
+configure nothing.
 
 ## How to decide what to change
 
