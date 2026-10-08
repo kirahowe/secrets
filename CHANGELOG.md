@@ -5,578 +5,82 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
+"Removed" entries.
+
 ### Added
-- Property-based tests with test.check, run by both `bb test` and
-  `clojure -M:test`. Generated inputs cover the EDN parser, the manifest
-  encoding and diff, the CLI's shell quoting, argv handling, key paths, and
-  limits, and the initializer's preview redaction and file merging. They also
-  cover the runtime: the order in which identity sources resolve, blank and
-  malformed identity variables, injected identity files, and path settings
-  that hold key contents or a locator. Failures from loading (base64, EDN,
-  rejected identities, and source locators with credentials) are checked never
-  to repeat the text they rejected. The `age` wrapper's path arguments and
-  recipient check, owner-only temporary files, and a real encrypt and load of
-  generated secrets complete the set.
-- The initializer declares this library's coordinate in one file per project.
-  When a `deps.edn` exists it owns the coordinate and `bb.edn` gets a
-  `{:local/root "."}` dependency on the project, so the Babashka task and the
-  JVM application resolve the same version from one declaration. Without a
-  `deps.edn`, `bb.edn` owns it as before, and a `bb.edn` that already declares
-  it keeps doing so. A project declaring it in both files is refused with the
-  fix spelled out. Manual integration output now names the file each snippet
-  belongs in.
-- `bb secrets set` prompts for the value with echo turned off when run from a
-  terminal, and keeps reading stdin when the input is piped or redirected, so
-  scripts and CI are unchanged. Values are stored verbatim as strings; `--edn`
-  parses the input and stores the value with the type its syntax implies.
-- Babashka CLI 0.12.86 now provides declarative initializer option parsing,
-  management-command dispatch, positional validation, and generated help. JVM
-  users resolve it as a runtime dependency while Babashka supplies the same
-  namespace directly.
-- Discoverable global, per-command, and initializer help (`-h`/`--help`),
-  with explicit preview/error next steps instead of ignored extra arguments or
-  ambiguous no-op previews.
-- Development tasks for formatting (`bb format`), non-mutating format checks
-  (`bb format:check`), and linting (`bb lint`), enforcing the project's
-  100-column Clojure style consistently.
-- An optional top-level `:limits` config key bounding accidentally large or
-  malformed inputs, with the recipient bounds checked before any `age`
-  subprocess starts: `:max-recipients` (256),
-  `:max-recipient-chars` (1024), `:max-recipients-bytes` (262144),
-  `:max-manifest-bytes` (1048576), `:max-manifest-entries` (10000), and
-  `:max-plaintext-bytes` and `:max-edn-depth`, which take the runtime defaults
-  (8 MiB and 100). Supplied values are merged over those defaults and resolved
-  onto every environment; each must be a positive integer, and an unknown key
-  inside `:limits` is rejected rather than ignored, because a typo in a limit
-  must not read as "leave it at the default". A rejected `:limits` fails with
-  `:reason :invalid-limits`.
-- Runtime loading takes a `:limits` map — `secrets/default-limits`, overridable
-  through the opts of `load-secrets`, `reader-literals`, and `merge-readers` —
-  bounding ciphertext read from accepted local files or local classpath-jar
-  resources (`:max-source-bytes`, 16 MiB), the plaintext `age` may produce
-  (`:max-plaintext-bytes`, 8 MiB), and the nesting depth of the decrypted EDN
-  (`:max-edn-depth`, 100). Each bound is enforced while the bytes move rather
-  than after they are all allocated: classpath-jar resources are counted chunk
-  by chunk as they are copied, and decryption now streams through
-  `ProcessBuilder` instead of `clojure.java.shell/sh`, which materializes the
-  whole plaintext before any caller can look at its size. Passing a bound kills
-  the `age` process, drops the partial plaintext, deletes the partial temp copy
-  or staging file at once, and throws with `:source-too-large`,
-  `:plaintext-too-large`, or `:edn-too-deep` carrying the byte count and the
-  limit but no content; a malformed `:limits` throws `:invalid-limits` rather
-  than reading as the defaults, and the `age` functions that take `:limits`
-  use that same reason. The error names the limit with the bad value, or the
-  unknown keys that are keywords, and never a supplied value. Previously an
-  attacker-influenced source could
-  exhaust disk or heap (CWE-400). The EDN policy is documented where it is
-  enforced: `:max-plaintext-bytes` bounds graph size because EDN cannot expand,
-  a linear depth pre-scan bounds parser recursion (a `StackOverflowError` no
-  `catch` should be relying on), and `clojure.edn` with no custom readers
-  evaluates nothing. `age/decrypt-bytes`, `age/decrypt`, and
-  `age/decrypt-to-file!` take the same limits through an optional trailing opts
-  map; their existing arities are unchanged, as is the `--`/`path-arg` option
-  boundary the argv keeps. `bb secrets decrypt`, the general-purpose counterpart
-  to `bb secrets encrypt` for an arbitrary file, carries its own 1 GiB bound
-  instead of the store's 8 MiB: a store past that is hostile or broken, an
-  arbitrary file past it is ordinary.
-- Runtime secret loading is now explicitly local-only. `load-secrets` accepts
-  filesystem paths/Files/Paths, local `file:` locators, and `jar:file:`
-  classpath resources; reader `:file`/`:resource` configuration reaches the same
-  boundary, while CLI artifact configuration accepts filesystem paths only.
-  `reader-literals` and `merge-readers` refuse a URI-shaped `:file` or
-  `:resource` with `:disallowed-source` when the readers are built.
-  HTTP(S), every other nonlocal scheme, remote or nested `jar:` sources,
-  arbitrary `io/input-stream` dispatch, and malformed local locators fail with
-  content-free `:disallowed-source` diagnostics before DNS, connection,
-  redirect, or response reads. Local locator URLs are reconstructed as files or
-  opened directly with `JarFile`, so a caller-supplied URL handler cannot turn
-  an allowed-looking scheme into network access. This clean local/remote
-  contract deliberately exposes no HTTP operation and therefore has no network
-  timeout or redirect-policy settings to misconfigure.
-- `com.kirahowe.secrets/default-key-file` returns the default identity path
-  for an app: `~/.config/<app>/key.txt` with the home directory expanded.
-- A root [security policy](SECURITY.md) naming the sole supported alpha, the
-  maintainer-controlled private email route and safe fallback, sanitized triage
-  inputs, realistic response targets, and the coordinated disclosure deadline.
-  The README and GitHub issue chooser direct suspected vulnerabilities there
-  without asking reporters to put sensitive details in a public issue.
-- A reproducible dependency-advisory gate resolves the default classpath and
-  every alias (`:test`, `:book`, `:build`, `:deploy`, `:audit`, `:format`, and
-  `:lint`) to exact Maven coordinates, retains every tools.deps dependency path,
-  and scans each set with checksum-pinned OSV-Scanner 2.5.1. Any package match
-  fails CI; the release workflow separately scans the replaced `:deploy` graph
-  before its only credential-bearing step. Clay, Ring, Jackson, Jetty, and
-  tools.build moved to reviewed fixed lines; transitive overrides remain local
-  to `:book` and `:lint`, and the audit implementation dependency is confined to
-  `:audit` and `:test`. Tooling therefore enters neither the Clojure-only
-  library basis and published jar nor the credential-bearing deploy classpath.
-  The owner-visible review records the prior raw package matches, affected surfaces,
-  repository-input analysis, fixed versions, dispositions, and review dates
-  without claiming advisory-specific reachability or exploitation.
-- The README states a short authenticity contract and links
-  `doc/threat-model.md`, which owns the rationale. It documents and tests the
-  boundary that was already there; it adds no signing, no key material, and no
-  new check. age provides confidentiality and ciphertext integrity, neither age
-  nor this library identifies the sender, `verify` detects drift and does not
-  establish authorship, and protecting the repository, build, and deployment
-  channel is the deployment's job.
-  `team-mode-manifest-is-not-a-value-integrity-signal-test` pins the sharpest
-  case: a team manifest carries no `:vhash`, so a public-recipient holder can
-  replace the ciphertext with a chosen payload, regenerate the structure-only
-  manifest with no key at all, and pass full verification. Docstrings on
-  `com.kirahowe.secrets`, `…secrets.age`, `…secrets.manifest`, and
-  `verify!`/`verify-one` say the same thing where the code is read, and the
-  keyless `verify` line reports "ciphertext agrees with the manifest" rather
-  than "freshness verified".
-- `verify` now refuses a manifest whose `:app` is not the configured one, or
-  that records none, as drift rather than diffing it as a shape. Auditing the
-  contract turned up that `:app` was written into every manifest and read back
-  by nothing, so a manifest belonging to another project whose key paths
-  happened to agree was compared as a shape. It matters most in team mode,
-  where there are no `:vhash`es to disagree: a foreign structure-only manifest
-  with a refreshed `:ciphertext-sha` verified clean.
-- The published documentation book fetches nothing from a third party and
-  carries a hash-based Content Security Policy, enforced by
-  `com.kirahowe.secrets.site-policy` under `build/`. `bb book:build` now
-  rewrites its own output before checking it: the jQuery and jQuery UI tags Clay
-  injects into every page are removed rather than vendored, because nothing in
-  the book calls them (Bootstrap and `quarto.js` only use jQuery when it is
-  already present); the Google Fonts stylesheet Quarto's Bootstrap theme
-  `@import`s — the one remaining runtime fetch, and invisible in the HTML — goes
-  with them, leaving the theme's system font stack; Quarto's `.quarto` build
-  cache, which kept a copy of every removed reference, is no longer published.
-  Each page then declares `default-src 'self'` with a `script-src` that admits
-  its own inline scripts by SHA-256 hash and its `on…` handlers by the same
-  hashes under `'unsafe-hashes'`, never `'unsafe-inline'` and never
-  `'unsafe-eval'`; hashes are computed from the bytes Quarto generated, so a
-  Quarto upgrade cannot leave a stale hash behind a blank page. `style-src`
-  keeps `'unsafe-inline'`, and only that: `quarto-nav.js` writes `style`
-  attributes computed from the header height it measures at runtime, which no
-  build-time hash can cover. The check refuses an external script or stylesheet
-  URL anywhere in the artifact — page, `.qmd` source, or stylesheet `@import` —
-  an inline script or handler no hash admits, an inline or eval allowance, and a
-  page with no policy; `bb book:build` and CI's `build-book` job both fail on
-  any finding, and a browser confirms rendering, navigation, search, and
-  clipboard copy still work under the policy.
+- A project initializer, `com.kirahowe.secrets.init`. It previews by default
+  and, with `--apply`, creates a `bb.edn` with the `secrets` task, a template,
+  and with `--keygen` an identity. It never edits a file that exists: for an
+  existing `bb.edn` or `deps.edn` it prints the entries to add.
+- `bb secrets doctor`, which reports the state of `age`, the configured files,
+  the resolved identity and where it came from, and the recipients, without
+  printing any contents.
+- Value hashes in every manifest, team stores included. Each store holds a
+  random 256-bit manifest key inside its encrypted EDN, and every manifest
+  entry carries a `:vhash` keyed by it.
+- Manifest key renewal. `reencrypt` always generates a new key, and `edit`,
+  `set`, and `rm` do when the recipients file no longer matches the set the
+  store was last encrypted to, so a removed recipient's copy of the old key
+  says nothing about values published afterwards.
+- `com.kirahowe.secrets/with-identity`, which resolves an identity for one
+  operation and deletes a temporary identity file when the operation ends.
+- `com.kirahowe.secrets.aero/read-config`, which reads an Aero config whose
+  secret tags decrypt the store at most once for that read.
+- A hidden prompt for `bb secrets set` when it runs from a terminal.
+- `-h`, `--help`, and `bb secrets help <command>` for every command, and `--`
+  to end the options.
+- Fixed bounds that catch an accidental huge or deeply nested input: 16 MiB of
+  ciphertext, 8 MiB of plaintext, EDN depth 100, 256 KiB of recipients file,
+  and 1 MiB of manifest.
 
 ### Changed
-- Identity handling is now scoped to each operation. Explicit identity paths
-  take precedence over environment variables in both runtime and CLI commands,
-  which then fall back to the configured or app-default key path. Raw and
-  base64 environment identities use an exclusive 0600 temporary file that the
-  operation cleans up. `with-identity` now passes a descriptor map to its
-  callback. Removed the shared cache, `reset-identity-cache!`, and the
-  materializing `identity-from-env`, `resolve-identity-file`, and
-  `identity-available?` APIs.
-- An identity path must be a local filesystem path. A value that starts with a
-  URI scheme, after surrounding whitespace is trimmed, is refused with
-  `:disallowed-identity`, and the error names only the scheme. A bare relative
-  name containing a colon, such as `key:txt`, reads as a scheme, so write
-  `./key:txt` for such a file. A path setting that holds key contents
-  (`AGE-SECRET-KEY-`) is refused without echoing it. Key contents belong in
-  `SECRETS_AGE_IDENTITY`.
-- The library's coordinates are written in one file,
-  `src/com/kirahowe/secrets/coordinate.edn`: the release version, the Maven
-  coordinate, and the name the library is declared under as a git dependency.
-  The release guards read it from the repository and the initializer reads it
-  as a classpath resource, so the version a release checks and the version a
-  scaffolded project receives can no longer be edited apart. A test holds the
-  README's copies of both coordinates to the same file.
-- The initializer pins the library that is running instead of a commit copied
-  into a file, which could only ever name the release before it. From a source
-  checkout it writes that checkout's `HEAD`, with the release tag when the tag
-  names it; from the published jar it writes the Maven version. The preview
-  names the coordinate and says when the commit is not a release tag, since a
-  consumer can resolve such a pin only once it is pushed.
-- Publication runs on a classpath of its own, and no longer resolves a
-  deployment library at all. `clojure -M:deploy` (`bb deploy`) replaces
-  `clojure -T:build deploy`: a new `:deploy` alias whose `:replace-deps` and
-  `:replace-paths` leave the JVM holding the Clojars token carrying the new
-  `com.kirahowe.secrets.publish`, the release guards beside it, and Maven's own
-  deploy code — 25 jars, down from the 108 the build alias resolved, with no
-  `tools.build`, no library source, and no test dependency on it. Clojars is a
-  plain Maven repository over HTTPS, so the upload goes through `maven-resolver`
-  directly rather than through `slipset/deps-deploy`, whose graph dragged in a
-  legacy S3 wagon and with it the AWS SDK, Logback 1.0.12, Jackson, Ion, and
-  Joda-Time — seven packages matching 25 OSV advisories for code Clojars
-  publication can never reach (and which neither an exclusion nor a version bump
-  removes). The publisher re-runs every release guard on the credential-bearing
-  side before it uploads a byte, refuses a `CLOJARS_USERNAME` or
-  `CLOJARS_PASSWORD` that is missing *or* set but blank, exits non-zero on any
-  failure, keeps the resolver's local repository under `target/` instead of
-  `~/.m2`, and prints the coordinate, version, tag, jar, digest, and repository
-  but never a credential. `doc/release-dependency-review.md` records the
-  dependency path, applicability, and disposition of everything on that
-  classpath — as a review, not as a claim that any advisory match was reachable
-  — and new tests fail the suite when the resolved graph drifts from it, when an
-  unused transport branch returns, or when the build tooling reappears beside
-  the token. A fixture release is published to a local HTTP recorder to prove
-  the upload is the receipted bytes, authenticated, and silent about its
-  credentials.
-- Publishing is now a guarded, receipted, two-step flow. `clojure -T:build
-  release` (`bb release`) refuses a working tree holding modified or untracked
-  files, a `HEAD` that is not exactly the tag naming the declared version — a
-  descendant of the tag is a refusal, not a pass — and a version `CHANGELOG.md`
-  does not document. It then exports that tag with `git worktree` and builds the
-  jar from the snapshot rather than from live files that can diverge after
-  validation, checks the jar's name, both embedded Maven descriptors, and the
-  `<scm><tag>` the pom claims it was built from against the version — a release
-  that records no tag claims no provenance and is refused — and records the jar,
-  the pom that is published beside it, the commit, and the jar's SHA-256 in
-  `target/release.edn`. The deploy step no longer builds anything: it
-  re-reads that receipt, re-verifies the version, tag, commit, embedded
-  metadata, and digest, confirms the pom it is about to upload is byte-identical
-  to the one inside that jar — the pom, not the jar, is what defines the
-  coordinate and dependency list a consumer resolves, and it is served beside
-  the artifact rather than inside it — and hands the publisher exactly those two
-  files, so a jar or pom changed after inspection, a missing receipt, or a
-  `HEAD` that has moved off the tag each fail before any credential is used
-  (CWE-345). Previously the version was hardcoded beside the tag it claimed,
-  `jar` copied the live `src` tree while stamping it with tag metadata, and
-  `deploy` rebuilt and uploaded whatever that produced, with the published pom
-  taken from a path nothing had checked. The version now has one authoritative
-  source, `com.kirahowe.secrets.release/version`, on a new `build/` path that is
-  tested under both runtimes but never shipped in the jar. `clojure -T:build
-  jar` remains an unguarded development build from the live tree and now says
-  so: its pom records the repository URL without an `<scm><tag>`, because a
-  development build is not the tag.
-- A new `release` GitHub workflow publishes on a `v*` tag push (or an explicit
-  dispatch) from the protected `release` environment, whose protection rules —
-  required reviewers and the deployment tag restriction — are the enforcement a
-  build cannot perform on its own. It builds once from the tag, inspects those
-  exact bytes, uploads the jar and its receipt as a workflow artifact, and
-  exposes the Clojars credentials to nothing but its final deploy step. Every
-  action it uses is pinned to a full commit SHA, and it resolves dependencies
-  without a cache any earlier run could have written.
-- The project initializer now proves the project root untamperable before it
-  mutates anything, and refuses otherwise. It previously validated a pathname —
-  rejecting escapes and symlinked segments — and then wrote through that same
-  pathname, so another principal able to write an ancestor directory could
-  replace a validated directory with a symlink between the check and the write
-  and redirect the writes outside the project (CWE-367, CWE-59).
-  `SecureDirectoryStream` and openat-style anchored operations are unreachable
-  from Babashka, the initializer's own runtime, so instead of re-walking
-  ancestors an attacker might have swapped, `trusted-ancestry!` establishes that
-  nobody can swap them: every directory from the filesystem root down to and
-  including the project root must be a real directory under `NOFOLLOW_LINKS`,
-  owned by the current user or by `root`, and writable by nobody else.
-  Other-write needs the sticky bit, which restores the rename guarantee a write
-  bit takes away and keeps a root under `/tmp` usable; group write needs sticky
-  or a group whose name is the owner's, since the user-private group of Fedora,
-  RHEL, and Debian holds nobody but the owner and a `umask 002` checkout at mode
-  0775 is therefore exactly as safe as one at 0755. The path as written is
-  walked as well as the resolved one, because a symbolic link on the way in can
-  be repointed by whoever writes the link's own parent and the resolved path
-  never names that parent. A filesystem that cannot report the `posix` and
-  `unix` attributes the proof depends on fails closed rather than writing while
-  implying a race safety it never established.
-- Every initializer mutation re-verifies at the operation point. Directories are
-  created with an explicit `rwxr-xr-x` a umask can only narrow, and checked one
-  segment at a time below the verified root; each file is staged under an
-  unguessable name with `O_CREAT|O_EXCL`, which refuses any existing entry
-  including a symlink, and published with `ATOMIC_MOVE`, whose `renameat`
-  replaces an entry at the destination instead of following it. The non-atomic
-  copy-and-delete fallback is gone, because it would follow exactly the symlink
-  the atomic rename refuses. Rollback after a failed apply runs through those
-  same checked operations and reports any path it declined to touch rather than
-  claiming a restore it did not perform. Preview still needs none of this, since
-  it writes nothing, but it now reports whether applying would be refused — and
-  `init!`'s status map carries that `:trust` report — so a refusal is visible
-  before apply is chosen rather than after.
-- Initializer output no longer prints file bodies by default. A noninteractive
-  or `--apply` run names every proposed and completed path with its action —
-  create, merge, or leave as is — and the honest counts, and prints no old or
-  new contents at all; an interactive preview adds only the changed region of
-  each file, with control characters rendered as printable escapes so a crafted
-  `bb.edn` cannot repaint the decision it is being previewed for, and with
-  obvious credentials replaced by a marker naming how many characters it hid.
-  Complete contents now require the new `--show-contents`, which prints a
-  warning first and is implied by nothing else: where both could apply the safe
-  mode wins, so an interactive `--apply` run prints no bodies either. Previously
-  a credential already sitting in a file the initializer was about to replace —
-  realistically the consumer's own `bb.edn`, since the merge preserves what is
-  there — was copied to stdout even in an unattended apply, and from there to
-  any captured log (CWE-532). Planning stopped retaining it too: existing
-  contents are read to detect a change and classify the action, then dropped,
-  and `init!`'s status map carries `:actions` and `:trust` in place of
-  `:changes`, so a caller printing the status map is no longer the same
-  disclosure by another route. Redaction is deliberately three simple rules and
-  not a secret scanner: it over-redacts, hiding a Git SHA or a `:secrets-file`
-  path as readily as a real credential, and `--show-contents` is how to read
-  what a preview hid.
-- **BREAKING** — the manifest format is now `:version 2`, and committed
-  manifests must be regenerated with `bb secrets reencrypt <env>`. Value hashes
-  were derived from a rendered string that joined entries with `=` and `;` — the
-  same characters values may contain — and that flattened nested collections, so
-  two different secret graphs could receive the same `:vhash` and a party
-  holding only the public recipient could replace ciphertext, refresh
-  `:ciphertext-sha`, and still pass full verification. Version 2 encodes a value
-  recursively as `<type-tag>:<code-unit-count>:<payload>`, framing every scalar,
-  collection, map key, and map value with its own type and length, and hashes
-  the result as raw UTF-16 code units rather than through a charset encoder that
-  would substitute for unpaired surrogates: `=` and `;` inside a value can no
-  longer be read as structure, `[[1]]`, `[(1)]`, and `#{[1]}` all encode
-  differently, so no two distinct values encode to the same string (the stored
-  `:vhash` is a truncated HMAC of that string and is not collision-free).
-  Manifest entry paths are ordered by the same encoding instead of by rendered
-  text, so two distinct paths can no longer compare equal and drop a manifest
-  line. The encoding version is mixed into the HMAC key derivation, so a v1 and
-  a v2 hash of the same value are computed under different keys, and `verify`
-  and `doctor` reject `:version 1` as an unsupported version rather than
-  diffing it as if it were v2.
-- `add-recipient` now distinguishes first-store bootstrap from recipient
-  changes to existing ciphertext: it recommends `set` or `new` before a store
-  exists, and `reencrypt` only when ciphertext already needs updating.
-- Core, CLI, and Aero internals were simplified and reorganized for readability
-  while preserving public APIs, command behavior, and returned diagnostic
-  schemas.
-- Source style and behavior-oriented test names are now consistent, and example
-  task entrypoints use qualified function calls so static analysis is reliable
-  without changing how the examples run.
-- The CI workflow now pins every executable dependency it runs. Each `uses:`
-  reference is a full commit SHA with the version that commit is recorded
-  alongside it, and the Babashka container is a `@sha256:` digest with its
-  release tag kept only as a comment, so an upstream tag or registry reference
-  that moves no longer changes what a build executes — including the Pages
-  deployment, the one job holding `pages: write` and `id-token: write`
-  (CWE-829, CWE-494). No version was upgraded in the process, no trigger or
-  permission was widened, and Pages deployment keeps its main-only condition and
-  its protected `github-pages` environment. A new
-  `com.kirahowe.secrets.workflow-policy` namespace under `build/` decides whether
-  workflow text pins its references, and names which problem each finding is: a
-  mutable reference, a SHA with no version comment to review it against, a
-  reference form the policy has no pinning rule for, or an undigested image. A
-  test runs it over every discovered `.github/workflows/*.yml`, so a workflow
-  added later is covered without anyone extending the test, and Dependabot is
-  enabled for `github-actions` weekly — it bumps a pinned SHA and rewrites the
-  comment beside it, keeping the pins maintainable as reviewable diffs rather
-  than silent tag drift.
-- `bb book:watch` re-renders only the chapter you saved and reloads the page
-  you are on. Clay now writes just that chapter's `.qmd`, and `quarto preview`
-  renders it and reloads the browser in place; a save no longer re-evaluates
-  every chapter, re-renders the whole book, and returns the browser to the
-  first page. The driver is `com.kirahowe.secrets.book-watch` under `build/`,
-  and arguments to the task go to `quarto preview`, so `bb book:watch
-  --no-browser` and `bb book:watch --port 4444` work.
+- The manifest format is `:version 3`. `verify` reports a `v0.1.0` manifest as
+  unsupported, and a store written by `v0.1.0` has no manifest key, so `edit`,
+  `set`, and `rm` fail on it. Run `bb secrets reencrypt <env>` once per
+  environment to fix both.
+- A store's plaintext must be one EDN map. The library keeps its own metadata
+  in it as reserved top-level data in the `:com.kirahowe.secrets` namespace.
+- An identity named by a path argument, `:identity-file`, or
+  `SECRETS_AGE_IDENTITY_FILE` has to exist. A missing one is a `:no-identity`
+  error where `verify` used to fall back to a keyless check and `#secret/opt`
+  used to return `nil`.
+- Identity paths are local paths. A URI-shaped value, a bare `name:rest`, and
+  key contents in a path setting are refused with `:disallowed-identity`
+  without being echoed. A leading `~` is expanded for every identity path.
+- `load-secrets` and the reader literals accept only local sources: a path, a
+  `File` or `Path`, or a classpath resource, including one inside a jar. HTTP
+  and other remote URLs, and input streams, are refused with
+  `:disallowed-source`.
+- `get-secret` with a vector path walks maps and vectors only. A path that
+  continues into a string, set, or list is not found.
+- Aero configs with secret tags have to be read with
+  `com.kirahowe.secrets.aero/read-config`, passing the options under
+  `:secrets`. `aero.core/read-config` alone throws on a secret tag.
+- The CLI config rejects a key it does not know, at the top level and in an
+  environment.
+- With no environment argument, `verify` reports an environment it cannot
+  check and continues with the others. It exits 1 for drift and 2 for an
+  environment it could not check.
+- A manifest has to be complete before `verify` compares anything, with or
+  without an identity: `:version 3`, this project's `:app`, a
+  `:ciphertext-sha`, and a `:type` and `:vhash` on every entry.
+- A write replaces the ciphertext and then the manifest, each atomically, and
+  rolls nothing back. A failure between the two is reported as a stale
+  manifest, which `reencrypt` regenerates.
+- The ciphertext, manifest, and recipients file are written with ordinary file
+  permissions instead of 0600.
+- Temporary plaintext and identity files are deleted with an ordinary delete,
+  and a delete that fails is reported with the path.
 
-### Fixed
-- The initializer preview hides the value after a credential-like key even
-  when a `:` joins them with no space and another `key value` pair follows on
-  the line. The name match used to run on past that separator, so
-  `password:hunter2 host=x` printed the password and hid the host instead.
-- Production publication is fixed to the exact `https://repo.clojars.org`
-  origin. The production entry point rejects every command-line argument and
-  every nonblank value of the retired `SECRETS_DEPLOY_REPOSITORY_URL` override
-  before reading Clojars credentials or starting network I/O; local recorder
-  tests inject their target only below that entry point.
-- The exact 25-jar credential-bearing deploy graph now resolves
-  `org.codehaus.plexus/plexus-utils` 3.6.2 instead of the advisory-affected
-  3.5.1, without adding a coordinate or moving to the Plexus 4.x line.
-- Malformed EDN failures are content-free across runtime loading, CLI
-  plaintext, stdin `--edn`, manifests, and initializer templates. One shared
-  parser boundary retains only a stable allowlisted reason and safe numeric
-  depth or location metadata, never the parser message, source fragment, or
-  cause. A `bb.edn` or `deps.edn` the initializer cannot parse is reported by
-  file name, with the parser's line and column when it gives them and without
-  its message.
-- CLI editor/plaintext files, stdin, manifests, and read-only recipient paths
-  are bounded while read, and every CLI EDN route runs the same linear depth
-  pre-scan as the runtime before recursive parsing. Arbitrary binary decrypt
-  output is streamed to stdout in fixed-size chunks under its command-specific
-  bound instead of being accumulated in one process-sized byte array.
-- `SECRETS_AGE_IDENTITY_B64` now accepts only canonical standard base64 after
-  removing the documented ASCII space, horizontal tab, carriage return, and
-  line feed characters. Omitted padding, nonzero padding bits, punctuation,
-  Unicode whitespace, and other noncanonical forms fail without retaining the
-  input or decoder exception and before an identity file is materialized.
-- The CLI no longer lets a filename change how it parses its own arguments.
-  `--edn` was removed from every command's arguments before positional
-  dispatch, so a file named `--edn` was stripped and `encrypt`/`decrypt` ran
-  against a missing or shifted operand (CWE-88): `bb secrets encrypt --edn`
-  reported `No such file: ` and `bb secrets encrypt dev --edn` reported
-  `No such file: dev`. It failed closed — the existence guard rejected the
-  shifted operand before `age` was invoked, so no wrong file was read or
-  written and no ciphertext or plaintext was produced — which makes this a
-  parsing-correctness fix, not a disclosure fix. `--edn` is now extracted only
-  for `set`, the one command that defines it, and only after dispatch has
-  selected it; every other command reads a `--edn` operand as the filename or
-  key it is. Extraction still happens before `set`'s own positional
-  `[env]`/`<key>` decision, which is what the global extraction was really
-  protecting. Additionally `--` now ends the options for every command and is
-  consumed rather than passed on, so `bb secrets encrypt dev -- --edn` names the
-  file for the same reason age invocations take a terminator. `[env]` remains
-  positional and optional everywhere, and an omitted `[env]` still selects the
-  default environment.
-- The CI examples in the production chapter and the README no longer grant a
-  private age identity to a whole job. `SECRETS_AGE_IDENTITY` is declared on the
-  `bb secrets verify` step alone, so checkout, the `age` install, and the
-  third-party Babashka setup action stop inheriting a key none of them needs
-  (CWE-522). Each keyed job also declares `permissions: contents: read` and
-  gates itself to trusted events — a fork pull request receives no secrets
-  anyway, but a workflow that looks like it grants one invites the edit to
-  `pull_request_target` that would hand the key to unreviewed code — and every
-  `uses:` in the chapter is pinned to a full commit SHA with the version beside
-  it (CWE-829), the keyless job included, since a job holding no secret still
-  runs third-party code. The workflow policy grew the matching rule: it reports
-  an identity declared anywhere wider than the step that consumes it, in all
-  three spellings (`SECRETS_AGE_IDENTITY`, `_FILE`, `_B64` — a path is not key
-  material, but a job-wide pointer to the identity grants the same decryption),
-  and a new extractor reads the fenced YAML out of a chapter's `;;` prose so the
-  documented examples are checked by the same rules as
-  `.github/workflows/*.yml`.
-- The optional `aero` integration's registration and its decrypted-reader cache
-  are now one piece of state with one lifecycle, so `register!` retires the
-  cache it replaces: every decrypted store and every cached decryption failure
-  held under the previous registration is dropped, including when the new
-  config map compares equal to the retired one, and `(register! nil)` is the
-  same operation with no config. Previously the default config and the cache
-  were independent atoms, so clearing or replacing a registration left matching
-  plaintext — and cached failures — reachable, and a later registration whose
-  config merely compared equal to a retired one inherited the retired
-  lifecycle's secrets (CWE-672, CWE-668). Cache entries are now installed by
-  the same compare-and-set that reads them back, so a registration committing
-  first makes the installing swap retry against the new state rather than write
-  into a retired cache; readers already holding a reader map keep using it, and
-  once-per-lifecycle decryption, the cache key (the secrets config map alone,
-  so a distinguishing key is a distinct entry), and `reset-cache!`'s contract
-  are unchanged.
-- Every command that encrypts now reads, bounds, and validates the configured
-  recipients file exactly once — before an editor opens, before stdin is read,
-  before anything is decrypted — and encrypts to the resulting immutable list
-  of validated recipients, which `age` receives as repeated `-r` values. The
-  recipients pathname is no longer passed to `age` at all. Previously the file
-  was read once to check it was non-empty and then handed to `age` as `-R` to
-  be read again, so anyone able to write the worktree could substitute the list
-  during the interval between the two reads — an editor session, minutes long —
-  and choose the recipients of the resulting ciphertext, then restore the
-  original file (CWE-367). Recipient count, per-entry length, and total file
-  size are bounded by the new `:limits` before the file is read into memory,
-  and an entry that is not an age recipient, or an empty list, fails the
-  command with a diagnostic naming the file line number and quoting only a
-  truncated prefix of the offending line. `bb secrets recipients` remains an
-  unvalidated read-only listing, but now marks any line encryption would
-  refuse instead of presenting it as a recipient, and shows only an escaped
-  prefix of at most 16 characters of that line.
-- Every `age` invocation that takes an input pathname now ends its options with
-  an explicit `--` terminator, and every path-valued argument — the positional
-  input, `-o`, `-i`, and `-R` — is normalized (a leading `-` is prefixed with
-  `./`) so a pathname can never be parsed as an option or as standard
-  input/output. Files whose names begin with a dash, including names identical
-  to age options, now encrypt and decrypt as data: previously an existing file
-  named `--armor` made encryption succeed against empty stdin, writing a
-  ciphertext of nothing while the real plaintext went unencrypted, and
-  decrypting a file named `--version` or `--help` exited 0 with age's own
-  version or help output standing in for plaintext. A blank or nil path now
-  fails closed with `ex-info` before any subprocess starts, instead of silently
-  resolving to standard input. `-r` recipient strings are values rather than
-  paths and are untouched. The CLI's best-effort plaintext secure delete passes
-  `--` plus an absolute operand to `rm` / `shred`, because exact `-` remains a
-  special operand after option parsing ends. The editor operand is likewise
-  made absolute before it reaches the shell/editor, because a relative
-  `java.io.tmpdir` can otherwise produce a dash-leading temporary pathname.
-- `age/decrypt-to-file!` no longer writes plaintext through the destination
-  pathname it was handed. Previously a newly created output inherited process
-  defaults — confirmed as mode `0644` under umask `022` — and an existing
-  destination symlink was followed, so the public API could disclose plaintext
-  through permissions or write through a link outside the selected directory.
-  Plaintext now reaches the filesystem only through a sibling staging file that
-  `createTempFile` opens `CREATE_NEW` with owner-only (`0600`) permissions as a
-  creation attribute, so the mode never depends on umask and a guessed staging
-  name can never be the file written; the permissions are read back and
-  verified before any bytes are written. The destination's final component is
-  validated without following links (a symlinked *parent* stays legitimate) and
-  a symlink, directory, or other non-regular destination is refused. Success
-  publishes by atomic rename in the same directory, so the destination is 0600
-  whatever mode it had before and is never observable as permissive or partial
-  plaintext; decryption runs before any staging file exists, and a write,
-  permission, or move failure removes the staging plaintext and leaves the
-  previous destination intact. A filesystem without POSIX permissions fails
-  closed rather than downgrading to default permissions — use `decrypt-bytes`
-  or `decrypt`, which never write plaintext to disk.
-- Configuration validation now builds one global table of canonical artifact
-  paths and semantic roles — ciphertext, manifest, template, key file,
-  recipients file, and the *resolved* identity each environment reads — and
-  rejects incompatible reuse of a path across the whole configuration before
-  any command performs I/O (CWE-73). Previously each environment was checked
-  independently and the resolved identity was left out of the model entirely,
-  so an identity path equal to a manifest path, or `dev`'s ciphertext path
-  equal to `prod`'s key path, was accepted and a destructive command could
-  overwrite private identity material or ciphertext — or encrypt private
-  identity material as input. Compatible sharing is now an explicit allow-list
-  rather than an inference from matching path strings: one identity/key
-  artifact (`:identity-file` defaults to `:key-file`, `:key-file` to one
-  app-wide path), one recipients list shared by several environments, and one
-  shared template. Everything else is rejected, including two environments
-  writing one ciphertext or one manifest, so a configuration that relied on any
-  other shared path now fails at startup with a diagnostic naming every
-  environment and role involved and the shared canonical path — never file
-  contents. A configured path that cannot be canonicalized is likewise a
-  configuration error rather than an unattributed failure later.
-- Every shell command the CLI prints for an operator to paste now renders its
-  dynamic arguments through one tested POSIX quoting routine, and the
-  `flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- '<key>')"` line gained the
-  `cat --` option boundary already used for `age`, `rm`, and `shred`. The CLI
-  never executed these strings, so the defect was a hazardous instruction
-  handed to an operator rather than command execution (CWE-78): an environment
-  name or key path carrying `;`, `$( )`, a quote, a newline, a glob, a
-  redirect, or a leading dash turned one suggested command into several the
-  moment it was pasted, and a key file named `-n` or `--help` changed what
-  `cat` did. Values are single-quoted — inside `'…'` every character but `'` is
-  literal, so there is no metacharacter set to keep current — which makes an
-  ordinary suggestion read `bb secrets add-recipient 'dev'`; `bb secrets` with
-  no arguments now states that generated commands are POSIX `sh`. The
-  surrounding `"$(…)"` is unchanged: it is the shell's own construct, not
-  interpolated configuration, and is what makes the key file one argument to
-  `flyctl`.
-- Exception context is now an allowlist, so a failure no longer retains or
-  renders the source it was reading (CWE-209). Every failure about a secrets
-  source carries `:source`, type-aware metadata built kind by kind: a URL, URI,
-  or scheme-carrying string keeps its scheme chain, host, port, and path while
-  userinfo, query, and fragment are dropped — a signed URL keeps its credential
-  in the query and `https://user:pass@host/…` keeps one in the userinfo; a File
-  or path string keeps its path, which is the caller's own and most of the
-  message's value; anything else — an InputStream, a Reader, a caller's own type
-  — keeps only its class name, because `str` and `pr-str` on a value whose
-  `toString` the caller wrote is exactly how a credential-bearing object leaks.
-  Keeping a path is a judgement documented where it is made: a path can carry a
-  token, and the residual risk is stated rather than assumed away. The `:reason`
-  vocabulary is unchanged, and a source that cannot be opened at all — the
-  `IllegalArgumentException` `clojure.java.io` raises with `pr-str` of the value
-  in its message — is now translated to that same `:no-file` failure instead of
-  escaping. A transport failure's own message and the exception itself travel
-  only with a path source, where they can name nothing the failure does not
-  already name; for any other kind the failure keeps the exception's class,
-  since printing an exception prints its causes' messages too. Aero failures
-  carry the `:profile` and the *names* of the opts keys instead of the whole
-  opts map, which can hold a resolver, a database password, or an entire
-  configuration. A `#secret/req` failure names the configured store under
-  `:store` rather than `:source`, so one key never means two shapes on one read.
-- `expand-home` expands only a path that is exactly `~` or begins with `~/`.
-  It used to replace any leading `~`, so `~bob/x` became `<home>bob/x`, and
-  `keygen` could write a private key there from a `:key-file` spelled that
-  way.
-- `set` no longer echoes a surplus argument, and `set` and `rm` no longer echo
-  a key they cannot read. Either may be a secret value typed in the wrong
-  place. The error states what the command expects and, for a bad key, the
-  type it got or the EDN line and column.
-- `doctor` prints a `Reason:` line under `Configuration: invalid` when an
-  identity variable is blank or is not valid base64. It still exits 2.
-- `verify` reports a manifest that is not a map, or that holds something
-  other than a map under `:keys`, as drift and exits 1. A manifest holding a
-  top-level list used to throw.
-- A set-but-blank `VISUAL` or `EDITOR` no longer counts as an editor. The empty
-  string is truthy, so `VISUAL=""` shadowed a correctly set `EDITOR` and the
-  `vim` default, and the shell command word became the decrypted plaintext temp
-  file — `edit` asked the shell to execute the secrets file. It failed closed:
-  that file is owner-only and not executable, so the shell exited 126 and the
-  store was left unchanged, but the operator saw only "Editor exited with an
-  error" with nothing pointing at the variable. Blank and whitespace-only values
-  now fall through to the next source, which is safe here — unlike a blank
-  identity variable, which still throws, a fallback editor cannot silently
-  produce a wrong-but-plausible result. Values carrying arguments
-  (`EDITOR="code --wait"`) are unaffected, the path is still a separate
-  positional argument, and the failure message now names the editor command so a
-  genuine editor failure is attributable.
+### Removed
+- The `bb secrets encrypt` and `bb secrets decrypt` commands, and
+  `cli/encrypt!` and `cli/decrypt!`. Use `age` for arbitrary files.
+- `com.kirahowe.secrets.age/decrypt-to-file!`.
+- `com.kirahowe.secrets/identity-from-env`, `resolve-identity-file`, and
+  `identity-available?`. Use `with-identity`.
+- `com.kirahowe.secrets/owner-only-temp-file!`.
+- `com.kirahowe.secrets.aero/register!` and `reset-cache!`.
 
 ## [0.1.0] - 2026-08-21
 
