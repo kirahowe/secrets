@@ -6,9 +6,10 @@
    :task (cli/run! {:app "team-ci"
                     :default-environment :fixture
                     :environments
-                    {:fixture {:secrets-file "fixture/secrets.edn.age"
+                    {;; No :key-file here: a configured key file has to exist, and
+                     ;; CI checks this fixture without any identity.
+                     :fixture {:secrets-file "fixture/secrets.edn.age"
                                :recipients-file "fixture/recipients.txt"
-                               :key-file ".local/fixture-identity.txt"
                                :manifest "fixture/secrets.edn.manifest"}
                      :demo {:secrets-file ".local/demo/secrets.edn.age"
                             :recipients-file ".local/demo/recipients.txt"

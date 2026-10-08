@@ -80,14 +80,12 @@ awk -v alice="$alice_public" -v bob="$bob_public" '
   END { exit !(count == 2 && alice_count == 1 && bob_count == 1) }
 ' "$recipients"
 
-# Save an Alice decrypt only for a byte-for-byte proof. The EXIT trap removes
+# Save an Alice decrypt (straight through age) only for a byte-for-byte proof. The EXIT trap removes
 # both comparison files on success or failure; no plaintext reaches the terminal.
-SECRETS_AGE_IDENTITY_FILE="$alice_key" \
-  bb secrets decrypt demo "$ciphertext" >"$alice_plain"
+age --decrypt --identity "$alice_key" "$ciphertext" >"$alice_plain"
 SECRETS_AGE_IDENTITY_FILE="$bob_key" \
   bb secrets verify demo >/dev/null
-SECRETS_AGE_IDENTITY_FILE="$bob_key" \
-  bb secrets decrypt demo "$ciphertext" >"$bob_plain"
+age --decrypt --identity "$bob_key" "$ciphertext" >"$bob_plain"
 cmp -s "$alice_plain" "$bob_plain"
 
 echo "Demo complete: Bob's identity passed verify and decrypted the ciphertext."

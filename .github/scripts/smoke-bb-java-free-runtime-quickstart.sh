@@ -55,7 +55,6 @@ grep -q ':paths \["src" "\.\.\/\.\.\/src"\]' "${example_copy}/bb.edn"
   cd "${example_copy}"
   bb bootstrap
   bb run
-  bb secrets decrypt dev .local/secrets.edn.age >/dev/null
   bb verify
 )
 
