@@ -1,519 +1,275 @@
 # com.kirahowe/secrets
 
-Manage application secrets as a single **version-controlled, age-encrypted EDN
-file** instead of a pile of environment variables. One private key decrypts it;
-everything else — structure, defaults, and the encrypted ciphertext itself —
-lives in git, with a committed value-free manifest that makes each change
-reviewable.
+Keep an application's secrets in one age-encrypted EDN file per environment,
+committed next to the code that uses them. The only secret you manage outside
+the repository is an [age](https://age-encryption.org) private key.
 
-- **One private key to deploy.** Production receives a single age identity
-  through an environment variable or a mounted file, not a list of secret
-  values.
-- **Real EDN at runtime.** Sets, vectors, nested maps, and numbers, not just
-  strings. Load the whole map, or reference values from your EDN config with
-  `#secret/req` and `#secret/opt`. Works with Aero, and the plain map suits
-  Integrant or component.
-- **Encrypted secrets live in git** beside the code that uses them, one file
-  per environment. Load them from disk or from inside the jar.
-- **Reviewable changes.** Every write updates a value-free manifest, so a
-  diff shows which keys were added, removed, or changed. CI can check that
-  the manifest is fresh without holding a key.
-- **Solo or team.** Encrypt to your own key, or to a committed list of
-  recipients so each teammate decrypts with their own.
-- **A `bb secrets` task** for the day to day: edit in your editor, set one
-  value from a hidden prompt or from stdin, diagnose with `doctor`, and a
-  project initializer that previews before it writes.
-- **Just files and age.** No secrets server, no KMS, no cloud account, no
-  GPG keyring.
+- The secrets are EDN: strings, numbers, sets, vectors, and nested maps.
+- An application loads the whole map, or references single values from its EDN
+  config with `#secret/req` and `#secret/opt`. There is an Aero integration,
+  and the plain map suits Integrant or Component.
+- A `bb secrets` task creates, edits, and checks the encrypted file.
+- Every write also updates a committed manifest that holds no values. A diff
+  of it shows which keys were added, removed, retyped, or changed, and CI can
+  check it against the ciphertext without holding a key.
+- A store is encrypted to your own key, or to a committed list of public keys
+  so each teammate decrypts with their own.
 
-It wraps [`age`](https://age-encryption.org) — a small, audited, modern
-file-encryption tool — so there are no GPG keyrings, no KMS, no vault to run.
-Command-line parsing uses [babashka/cli](https://github.com/babashka/cli),
-which is built into Babashka and included as a JVM dependency for
-reproducible resolution; the project otherwise uses core Clojure APIs plus
-the `age` CLI.
+The library shells out to the `age` binary and otherwise needs only Clojure or
+Babashka. It is alpha software: the API, the commands, and the file formats
+can still change between releases. It suits a solo developer or a small team
+whose secrets change rarely. [Security](#authenticity-contract-and-threat-model)
+says what it does not do.
 
-## Why not environment variables?
-
-Environment variables are easy to start with and painful to live with. They
-sprawl: every integration adds another, and nobody can tell from the
-repository what the application needs. They are untyped strings, so a
-comma-separated allowlist becomes parsing code. And they live outside version
-control, as mutable state in a deploy platform, with no history and no review.
-
-Encrypting a plain EDN map fixes all three. The map is real data, the
-encrypted form is committed, and the only out-of-band secret is one `age` key.
-The ciphertext itself diffs opaquely, since age re-encrypts the whole file, so
-the committed [manifest](#manifest-seeing-what-changed) is what makes changes
-*reviewable*: it records the shape of the secrets, and a PR shows which keys
-were added, removed, or changed without revealing any value. Secrets travel
-with the code that needs them, so a new environment is a checkout and one key
-rather than a checklist copied between dashboards.
-
-That is the configuration-management principle behind
-[*Continuous Delivery*](https://continuousdelivery.com/foundations/configuration-management/): version everything required to build, test,
-and deploy the system, application configuration included, so that any
-environment can be reproduced and any change traced. Secrets are the part of
-that configuration usually kept out of version control because they are
-sensitive. Encrypting them is what lets them in.
-
-This is a deliberately small tool for solo developers and small teams whose
-secrets change infrequently. If you need dynamic credentials, per-secret
-access rules, or automatic rotation, see
-[Trade-offs and limitations](#trade-offs-and-limitations).
+Longer explanations live in the book under `book/chapters`
+([Development](#development) shows how to build it), and
+[`doc/threat-model.md`](doc/threat-model.md) is the design's decision rule.
 
 ## Install
 
-`age` must be on the PATH (`brew install age`, `apt install age`).
+Install `age` (`brew install age`, `apt install age`) and, for the `bb secrets`
+task, [Babashka](https://babashka.org). Babashka resolves `:deps` entries
+through Java, so a JDK has to be on the `PATH` too.
 
-Add the library as a dependency. For a sibling checkout (local development):
-
-```clojure
-;; deps.edn
-com.kirahowe/secrets {:local/root "../secrets"}
-```
-
-For sharing across repos and remote/CI builds, prefer a git or Maven coordinate
-when running on JVM Clojure. In Babashka `1.13.219`, every normal `bb.edn`
-dependency mode tested here requires Java: `:local/root`, Git coordinates, and
-Maven coordinates. Warming the Git or Maven dependency caches does not remove
-that requirement. The Java-free Babashka path is an already materialized
-classpath, with the library source placed directly on `:paths` or supplied as
-an explicit classpath. (A `:local/root` does not resolve inside a remote Docker
-build, where the sibling isn't in the build context):
+Nothing is published to Clojars yet. Depend on the library through git:
 
 ```clojure
-;; git: a release tag and the commit it names. The initializer fills the commit
-;; in; by hand, `git rev-parse v0.1.0` in a checkout prints it.
+;; a release tag and the commit it names
 io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "<commit the tag names>"}
-;; or Maven, after `clojure -T:build install` locally or a Clojars release (see
-;; [Releasing](#releasing) — nothing is published yet)
+
+;; Maven, once a release is on Clojars, or after `clojure -T:build install`
+;; in a checkout
 com.kirahowe/secrets {:mvn/version "0.1.0"}
 ```
 
-As of 2026-08-23 there is no public Maven artifact for `com.kirahowe/secrets`.
-The Maven example above is for local JVM installs and future publication, not a
-currently fetchable coordinate. With Babashka `1.13.219`, the CLI,
-`merge-readers`, `load-secrets`, `decrypt`, and `verify` run without Java only
-after the library is already on the classpath directly.
+The `v0.1.0` tag is older than this README and lacks several things described
+here (the [changelog](CHANGELOG.md) lists them). To use the library as
+documented before the next tag, pin a commit of `main` instead: write
+`{:git/sha "<commit>"}` as the coordinate, or let the initializer below write
+it for you.
 
 ## Quick start
 
-**1. Initialize the project.** Until a release containing the initializer is
-tagged, invoke it from this source checkout (replace the path with the checkout's
-absolute `src` path):
+Run the initializer from a checkout of this repository, in your project's
+directory. It previews by default:
 
 ```sh
 bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
 ```
 
-Use the same launcher with `-h` or `--help` to see the initializer's readable
-usage and option list without supplying `--app`.
+In an empty project the preview lists three files it would create: a `bb.edn`
+that declares the library and a `secrets` task, a template at
+`secrets/secrets.edn.example`, and the identity at `~/.config/myapp/key.txt`.
+This is the task it writes:
 
-The dependency it writes is the commit that checkout is at, so the project runs
-the code that initialized it: `:git/tag` and `:git/sha` at a release tag, a bare
-`:git/sha` anywhere else. The preview names the coordinate. A commit that is not
-a release tag has to be pushed before another machine can resolve it.
-
-The initializer proposes a minimal `dev` store, names every file it would
-create, merge, or leave alone, and then offers to apply it, print the
-configuration for manual integration, or cancel. `--keygen` is an explicit
-request to generate the identity at `~/.config/myapp/key.txt`; it runs only
-after you accept and the public scaffold succeeds. Omit it to leave all
-private-key handling for a later `bb secrets keygen` command. Nothing is
-committed automatically.
-
-The default tracked layout is:
-
-```text
-bb.edn
-secrets/secrets.edn.example
-secrets/secrets.edn.age       # created by the first set/new; safe to commit
-secrets/secrets.edn.manifest  # created with the ciphertext; holds no values
-~/.config/myapp/key.txt       # private identity; outside the repository
+```clojure
+{secrets
+ {:doc "Manage encrypted secrets"
+  :requires ([com.kirahowe.secrets.cli :as cli])
+  :task
+  (cli/run!
+   {:app "myapp"
+    :default-environment :dev
+    :environments {:dev {:secrets-file "secrets/secrets.edn.age"}}}
+   *command-line-args*)}}
 ```
 
-Existing `bb.edn` comments and unrelated forms are preserved. A conflicting
-dependency or `secrets` task is refused rather than overwritten. Existing valid
-templates and hand-maintained recipients files are also preserved.
+Run it again with `--apply` to create those files. The initializer only
+creates files that do not exist. For a `bb.edn` or `deps.edn` that is already
+there, it prints the entries to add and leaves the file alone. In a project
+with a `deps.edn`, the library goes into `deps.edn` and `bb.edn` reaches it
+through a `:local/root "."` dependency, so the application and the task load
+the same version.
 
-For a non-interactive scaffold, the first run is preview-only and explicitly
-says that no files changed. When the project path is trusted and changes are
-pending, rerun with `--apply`; an untrusted preview instead explains that apply
-will be refused and does not offer it as a successful next step. Applied runs
-print paths and actions only. Other layout options are described under
-[Initialization layouts](#initialization-layouts), and what a preview does and
-does not print under [Preview output](#initializer-preview-output).
+The dependency it writes is the commit the checkout is at: `:git/tag` and
+`:git/sha` when that commit is the release tag, and `:git/sha` alone otherwise.
+A commit that is not a release tag has to be pushed before another machine can
+resolve it. `--env` names the environment (default `dev`), and `--keygen`
+generates the identity at `~/.config/myapp/key.txt`. Without `--keygen`, run
+`bb secrets keygen` later.
 
-**2. Set the first value.** Run `set` from a terminal and it prompts for the
-value with echo turned off, so nothing lands in shell history or a process
-argument:
+Back the identity up, for example in a password manager. It is not in git and
+cannot be recovered.
+
+Set a first value. From a terminal, `set` prompts for it with echo turned off:
 
 ```sh
 bb secrets set :example/api-key
 ```
 
-**3. Verify the resulting store:**
+The first `set` creates the ciphertext, `secrets/secrets.edn.age`, and its
+manifest, `secrets/secrets.edn.manifest`. Check that they agree, then commit
+`bb.edn` and everything under `secrets/`:
 
 ```sh
 bb secrets verify
 ```
 
-For comparison, the minimum configuration the initializer adds is the same
-manual wiring shown below, with the commit filled in. Use this directly when you
-choose the initializer's "manual" option or need a layout it should not infer:
-
-```clojure
-{:deps  {io.github.kirahowe/secrets
-         {:git/tag "v0.1.0"
-          :git/sha "<commit the tag names>"}}
- :tasks {secrets
-         {:doc      "Manage encrypted secrets (age)"
-          :requires ([com.kirahowe.secrets.cli :as secrets-cli])
-          :task     (secrets-cli/run!
-                     {:app "myapp"
-                      :default-environment :dev
-                      :environments
-                      {:dev {:secrets-file "secrets/secrets.edn.age"
-                             :template "secrets/secrets.edn.example"
-                             :manifest "secrets/secrets.edn.manifest"}}}
-                     *command-line-args*)}}}
-```
-
-Per-environment defaults fill in automatically: `:key-file` →
-`~/.config/<app>/key.txt`, `:template` → `<secrets-file>.example`, `:manifest` →
-`<secrets-file>.manifest`. The optional `:identity-file` is an explicit path
-used by decrypting commands. Configuration normalization validates the paths
-provided in the config, but does not read identity environment variables or
-materialize a temporary identity. Each command resolves its identity when it
-runs, using an explicit `:identity-file` first, then the identity environment
-variables, then the configured `:key-file` or its app default. The config is
-validated up front: `:app` and each
-`:secrets-file` are required (`:app` names the default key path, so there is no
-default — unrelated projects must not share a key by accident), and the secrets
-file must end in `.age` — otherwise the derived template/manifest names would
-collide with (and overwrite) the ciphertext itself — unless you set both
-`:template` and `:manifest` explicitly. Every configured artifact path — the
-ciphertext, manifest, template, key file, recipients file, and an explicit
-identity file — is canonicalized and checked as one global table
-across all environments, so reusing a path for an incompatible role is rejected
-before any command touches the filesystem, within one environment or between
-two. Exactly three kinds of sharing are permitted: one identity/key artifact
-where the configured paths agree, one recipients list shared by several
-environments, and one shared template. Anything else, such as two environments
-writing one ciphertext or one manifest, an identity path doubling as a
-manifest, or a key file doubling as ciphertext, is a configuration error.
-
-In `:key-file`, `:identity-file`, and `:recipients-file`, a path that is exactly
-`~` or begins with `~/` is expanded to your home directory. Any other path,
-including `~bob/x`, is used as written.
-
-An optional top-level `:limits` map bounds accidentally large or malformed
-inputs. The recipient bounds are checked before any `age` subprocess starts. The
-map is merged over the defaults and resolved onto every environment:
-
-```clojure
-{:limits {:max-recipients       256      ; entries in a recipients file
-          :max-recipient-chars  1024     ; characters in one recipient entry
-          :max-recipients-bytes 262144   ; total size of a recipients file
-          :max-manifest-bytes   1048576  ; size of a manifest file
-          :max-manifest-entries 10000    ; key entries in one manifest
-          :max-plaintext-bytes  8388608  ; plaintext of a store or template
-          :max-edn-depth        100}}    ; collection nesting depth of EDN
-```
-
-The last two have the same defaults as the runtime limits of the same name (see
-[Resource limits](#resource-limits)). The runtime's `:max-source-bytes` is not a
-configuration key. Supply only the keys you want to change. Every supplied value
-must be a positive integer, and an unknown key inside `:limits` is rejected
-rather than ignored, because a typo in a limit must not read as "leave it at the
-default". These failures carry `:reason :invalid-limits`, like the runtime's.
-
-To create a store through an editor instead of the stdin-based three-command
-flow:
-
-```sh
-bb secrets keygen dev    # → ~/.config/myapp/key.txt  (BACK THIS UP — not in git)
-bb secrets new dev       # opens $EDITOR with the template; fill in, save, encrypt
-```
-
-`new` seeds your editor from `secrets.edn.example` (if present) so the shape is
-self-documenting. Saving writes `secrets.edn.age` (ciphertext) and
-`secrets.edn.manifest` (its value-free shape) — commit both.
-
-`new` and `edit` open `$VISUAL`, then `$EDITOR`, then `vim`. A variable that is
-set but blank counts as unset and falls through to the next source, so an empty
-`VISUAL` can't shadow a working `EDITOR`. The value may carry arguments
-(`EDITOR="code --wait"`, `EDITOR="emacsclient -t"`); the file is passed to it as
-a separate positional argument, never interpolated into the command.
-
-Day to day:
-
-```sh
-bb secrets edit dev      # decrypt → $EDITOR → re-encrypt (the temp plaintext file is deleted)
-bb secrets show-key       # print public key(s) to share with teammates
-bb secrets decrypt dev secrets/secrets.edn.age  # plaintext to stdout
-```
-
-Discover the full command list or one command's exact operands without touching
-the encrypted files:
-
-```sh
-bb secrets              # empty arguments show the same global help
-bb secrets --help
-bb secrets help set       # the same command help is available as: bb secrets set -h
-```
-
-`-h` and `--help` are recognized anywhere before the `--` operand
-terminator. After `--`, a flag-shaped value remains a filename, key, or
-environment operand. Only `set` recognizes `--edn`, also anywhere before the
-terminator; other commands preserve that spelling as an operand.
-
-Every command takes the environment first (`bb secrets decrypt [env] <file>`);
-omit it to use the default environment. `decrypt` writes to stdout byte-for-byte,
-so it works for any `.age` file, not just EDN.
-
-From a terminal, `set` prompts for the value with echo turned off. In a
-script or CI, where stdin is a pipe or a file, it reads the whole input
-instead:
-
-```sh
-printf %s "$OPENROUTER_API_KEY" | bb secrets set dev :openrouter/api-key
-printf %s '#{"a@b.com" "b@b.com"}' | bb secrets set dev :auth/admins --edn
-bb secrets rm dev :openrouter/old-key
-```
-
-`set` never takes the value as a command-line argument, so it never lands in
-shell history or `ps`. Piped input loses one trailing newline. Values are
-stored verbatim as strings unless you pass `--edn`, in which case the input
-is parsed as EDN and its type follows from the syntax: a set, a number, a
-nested map. `set` creates the environment's secrets file when it doesn't
-exist yet, so bootstrapping a new environment end to end is scriptable. A
-blank value is refused, because an unset CI variable expands to nothing and
-storing that silently is worse than failing loudly; pass `--edn` with `""` if
-you genuinely want an empty string. `rm` fails, rather than quietly doing
-nothing, when the key or the file doesn't exist. `<key>` is a keyword
-(`:some/key`) or a vector path (`[:a :b]`) for both commands, and both
-refresh the manifest like every other write. Neither command echoes a key it
-cannot read, and `set` does not echo a surplus argument, because either may be
-a value typed in the wrong place.
-
-Two things can still expose the value. If you type the value itself into a
-`printf` command at an interactive shell, the shell saves that command, value
-included, in its history. Use the prompt instead. If shell tracing (`set -x`)
-is on, the shell prints each command with its variables expanded before
-running it, so the value appears in the trace output. Turn tracing off before
-the `set` line and back on after it.
-
-Runnable starter projects for each application shape, from a Babashka script
-to an Integrant service and a team with keyless CI, are listed under
-[Examples](#examples).
-
-## Using secrets at runtime
-
-### Reader literals (recommended for EDN-configured systems)
-
-`reader-literals` returns `#secret/req` / `#secret/opt` tag functions to merge
-into the `:readers` you pass to `clojure.edn/read-string` or
-`integrant.core/read-string`. (The tags are namespaced because the EDN spec
-reserves bare tags like `#secret` for EDN itself.)
+Read the value from the application:
 
 ```clojure
 (require '[com.kirahowe.secrets :as secrets])
 
-(def readers
-  (secrets/merge-readers
-   {'env (fn [k] (System/getenv k))}          ; your existing literals, if any
-   {:app "myapp" :resource "secrets.edn.age"})) ; resolved on the classpath
+(def secret-values
+  (secrets/load-secrets "secrets/secrets.edn.age" {:app "myapp"}))
 
-(integrant.core/read-string {:readers readers} (slurp config))
+(secrets/get-secret secret-values :example/api-key)
 ```
 
-Then config files reference secrets inline:
+Day to day:
 
-```clojure
-{:db   {:jdbc-url #secret/req :database/url}    ; required — throws if absent
- :llm  {:api-key  #secret/opt :llm/api-key}     ; optional — nil if absent
- :auth {:admins   #secret/req :auth/admins}}    ; values are real EDN: #{"a@b.com"}
+```sh
+bb secrets edit            # decrypt, open your editor, re-encrypt
+bb secrets set :some/key   # one value, from a hidden prompt or stdin
+bb secrets rm :old/key     # remove a value
+bb secrets verify          # check the manifest before committing
+bb secrets doctor          # diagnose the setup without printing values
+bb secrets --help          # every command; `bb secrets help set` for one
 ```
 
-The file is resolved and decrypted **once, lazily**, on the first secret tag
-encountered — so dev/test configs with no secret tags never touch `age` or the
-key, even if a secrets file happens to be on the classpath. Each readers map
-caches that first successful load **or genuine decryption failure** for its
-lifetime. This avoids repeated decryption across tags and prevents one config
-read from mixing values from ciphertext changed midway through the read. After
-editing the encrypted store, explicitly construct a new `reader-literals` or
-`merge-readers` map before re-reading the config; the old map deliberately
-continues serving its first successful load or rethrowing its first decryption
-failure. A process restart naturally constructs fresh readers and therefore
-observes the current ciphertext. There is no filesystem polling or automatic
-retry per tag.
+## Configuration
 
-The two tags mirror required/optional env reads: `#secret/opt` returns `nil`
-when the secrets file is absent, when no identity (key) is available, or when
-the key is missing from the decrypted map; `#secret/req` throws in all three
-cases, saying which. A genuine decryption failure — the identity exists but
-`age` fails — always throws, for both tags.
-
-For a safe REPL reload, edit secrets out of process (for example, run
-`bb secrets edit dev` in another terminal), deliberately recreate the readers,
-then re-read the whole config. Inspect only non-secret status or structure:
+The `secrets` task passes one map to `com.kirahowe.secrets.cli/run!`:
 
 ```clojure
-(require '[clojure.edn :as edn]
+{:app "myapp"
+ :default-environment :dev
+ :environments
+ {:dev  {:secrets-file "env/dev/resources/secrets.edn.age"}
+  :prod {:secrets-file "env/prod/resources/secrets.edn.age"
+         :recipients-file "env/prod/recipients.txt"}}}
+```
+
+`:app` and `:environments` are required. `:app` names the default identity
+path, `~/.config/<app>/key.txt`, and is recorded in each manifest. A command
+that omits its environment argument uses `:default-environment`.
+
+| Environment key | Meaning |
+| --- | --- |
+| `:secrets-file` | Required. Path to the ciphertext. It must end in `.age` unless `:template` and `:manifest` are both set. |
+| `:template` | What `new` opens in the editor. Default: the secrets file with `.example` in place of `.age`. |
+| `:manifest` | Path to the manifest, or `false` to keep none. Default: the secrets file with `.manifest` in place of `.age`. |
+| `:key-file` | Where `keygen` writes and `show-key` reads. Default: `~/.config/<app>/key.txt`. |
+| `:identity-file` | An explicit identity for commands that decrypt. It wins over the environment variables. |
+| `:recipients-file` | A committed file of age public keys, one per line. When set, the store is encrypted to all of them. |
+
+A key the library does not know, at the top level or in an environment, is an
+error that names it, so a misspelling cannot be ignored silently. Paths are
+local filesystem paths. A leading `~` is expanded in `:key-file`,
+`:identity-file`, and `:recipients-file`. Two environments may share a key
+file, a recipients file, or a template. Any other reuse of one path, such as
+two environments writing the same ciphertext, is refused.
+
+Each environment is a separate encrypted file. Environments share the app's
+default key unless one sets its own `:key-file`.
+
+## Using secrets in an application
+
+### Load the map
+
+```clojure
+(require '[clojure.java.io :as io]
          '[com.kirahowe.secrets :as secrets])
 
-(defn read-app-config []
-  (let [readers (secrets/merge-readers
-                 {'env (fn [k] (System/getenv k))}
-                 {:app "myapp" :resource "secrets.edn.age"})] ; new map every call
-    (edn/read-string {:readers readers} (slurp "config.edn"))))
+(def m (secrets/load-secrets (io/resource "secrets.edn.age") {:app "myapp"}))
 
-;; After the out-of-process edit:
-(def app-config (read-app-config))
-{:config-loaded? (map? app-config)
- :section-count  (count app-config)}
+(secrets/get-secret m :database/url)
+(secrets/get-secret m [:r2 :account-id])     ; a path into nested maps
+(secrets/get-secret m :missing/key "default")
 ```
 
-Do not print the config or secret values while checking a reload. Make each
-reload an explicit action like this rather than polling or watching the
-ciphertext.
+The source is a local file, given as a path string, a `File`, or a `Path`, or
+a classpath resource from `io/resource`, which also works inside an uberjar.
+A remote source, HTTP included, is refused with `:reason :disallowed-source`
+before it is opened.
+
+The second argument chooses the identity. It is a path, or a map with
+`:identity-file` or `:app`. [Identity resolution](#identity-resolution) gives
+the full order.
+
+A vector path walks maps by key and vectors by integer index. It does not
+index into a string, set, or list, so a path that continues past such a value
+is not found.
+
+Failures throw `ex-info` with a `:reason`: `:no-identity`,
+`:disallowed-identity`, `:no-file`, `:disallowed-source`, `:source-too-large`,
+`:plaintext-too-large`, or one of the EDN reasons (`:edn-empty`,
+`:edn-extra-values`, `:edn-too-deep`, `:edn-malformed`). A failure about the
+source carries `:source`, a description of it that leaves out userinfo, query,
+and fragment. An EDN parse failure carries at most a line and column, never
+the text.
+
+### Reader literals
+
+`reader-literals` returns the `#secret/req` and `#secret/opt` tag functions,
+and `merge-readers` adds them to a readers map you already have:
+
+```clojure
+(def readers
+  (secrets/merge-readers
+   {'env (fn [k] (System/getenv k))}
+   {:app "myapp" :resource "secrets.edn.age"}))
+
+(clojure.edn/read-string {:readers readers} (slurp "config.edn"))
+```
+
+```clojure
+;; config.edn
+{:db   {:jdbc-url #secret/req :database/url}
+ :llm  {:api-key  #secret/opt :llm/api-key}
+ :auth {:admins   #secret/req :auth/admins}}
+```
+
+The options are `:resource` (a classpath resource name) or `:file` (a path),
+plus `:app` or `:identity-file`. Both tags take a keyword or a vector path.
+
+| Situation | `#secret/req` | `#secret/opt` |
+| --- | --- | --- |
+| The key is in the store | the value | the value |
+| The key is not in the store | throws | `nil` |
+| The secrets file is not found | throws | `nil` |
+| No identity was named and the app's default key file is absent | throws | `nil` |
+| A named identity file does not exist | throws | throws |
+| Decryption fails | throws | throws |
+
+A readers map decrypts its store at most once, when the first tag is read, and
+keeps that result, or that decryption failure, for as long as the map lives. A
+config with no secret tags never touches the store or the key. After editing
+the store, build a new readers map.
 
 ### Aero
 
-[aero](https://github.com/juxt/aero) resolves tags through its own
-`aero.core/reader` multimethod rather than a `:readers` map, so the
-integration ships as a namespace instead of a snippet to paste into your own
-code:
+[Aero](https://github.com/juxt/aero) is not a dependency of this library. Add
+it to your project, then read the config with this namespace's `read-config`
+in place of `aero.core/read-config`:
 
 ```clojure
-(require '[com.kirahowe.secrets.aero])
+(require '[com.kirahowe.secrets.aero :as secrets-aero])
+
+(secrets-aero/read-config
+ "config.edn"
+ {:profile :dev
+  :secrets {:app "myapp" :resource "secrets.edn.age"}})
 ```
 
-That's the whole thing — requiring the namespace registers the `#secret/req` /
-`#secret/opt` methods on `aero.core/reader`; there's nothing else to call.
-`aero` is **not** a dependency of this library (`deps.edn`'s `:deps` stays
-clean); the namespace only compiles and loads for consumers who already have
-`aero` on their own classpath.
+`:secrets` takes the options `reader-literals` takes, and the tags behave the
+same way. Every other key goes to Aero. Each call decrypts the store at most
+once and keeps nothing afterwards, so the next call reads the store as it then
+is. A config with secret tags read through `aero.core/read-config` directly
+throws an error that names this function.
 
-There are two ways to supply the secrets config — the same opts map
-`reader-literals` takes (`:app`/`:resource`, `:file`, `:identity-file`):
-
-- **Per read (preferred)**, through aero's own opts. `aero.core/read-config`
-  passes its entire opts map to readers, so the config comes from a `:secrets`
-  key and can vary per call (see the profile recipe below):
-
-  ```clojure
-  (aero.core/read-config "config.edn"
-    {:secrets {:app "myapp" :resource "secrets.edn.age"}})
-  ```
-
-- **Process-wide**, as an explicit convenience for an application with one
-  secrets configuration and a deliberate process lifecycle:
-
-  ```clojure
-  (com.kirahowe.secrets.aero/register! {:app "myapp" :resource "secrets.edn.age"})
-  ```
-
-`register!` stores mutable process state: a later call replaces the default,
-and `(register! nil)` clears it when that lifecycle ends. A per-read `:secrets`
-opt always wins over the registered default. With neither supplied, reading a
-`#secret/…` tag throws rather than resolving to nil.
-
-Each distinct Aero secrets configuration is likewise decrypted once and
-cached, including a genuine decryption failure. The cache key is the secrets
-config map itself: two reads passing equal maps deliberately share one
-decrypted store, and any distinguishing key — a `:tenant`, a different `:file`
-— is a distinct entry. In a long-running REPL, edit the ciphertext out of
-process, call `reset-cache!`, and only then re-read the whole config:
-
-```clojure
-(require '[aero.core :as aero]
-         '[com.kirahowe.secrets.aero :as secrets-aero])
-
-(secrets-aero/register!
- {:app "myapp" :resource "secrets.edn.age"})
-
-;; In another terminal: bb secrets edit dev
-(secrets-aero/reset-cache!)
-(def app-config (aero/read-config "config.edn"))
-{:config-loaded? (map? app-config)
- :section-count  (count app-config)}
-```
-
-`reset-cache!` invalidates **all** cached Aero reader maps and their decrypted
-stores, both successful and failed, so the next `#secret/…` read decrypts the
-current ciphertext. It leaves the process-wide default supplied by `register!`
-intact; the example therefore does not register again after reset. Without a
-reset, a successful load remains stale and a decryption failure keeps
-rethrowing. As with native readers, a process restart begins with an empty Aero
-cache and sees current ciphertext. Do not print the config or secret values,
-poll the file, or reset/re-read once per tag.
-
-That cache belongs to the registration live when it was populated, so
-`register!` retires it: replacing the default, or clearing it with
-`(register! nil)`, drops every decrypted store and every cached failure held
-under the previous registration. An equal replacement is still a new
-lifecycle — re-registering a config map that compares equal to the one it
-replaces clears the cache exactly as a different map would, because equal maps
-from two lifecycles are not one secret. The cost is one decryption per config
-at start-up and nothing after it: inside one lifecycle a config is still
-decrypted once, however many tags or reads use it.
-
-#### A different key per profile
-
-A real case: eval runs need to authenticate with a different OpenRouter key
-than production, so benchmark spend stays off the key serving real traffic.
-Both keys live in the same store — the whole solution is one config line,
-combining aero's `#profile` with `#secret/req`:
+Aero evaluates only the branch a `#profile` selects, so a key one profile
+needs can be absent from the store another profile reads:
 
 ```clojure
 :api-key #profile {:default #secret/req :openrouter/api-key
                    :evals   #secret/req :openrouter/evals-api-key}
 ```
 
-with the caller passing `{:profile :evals}` to `read-config`. This is safe
-because aero evaluates **only the selected branch** — reading with `:default`
-decrypts and looks up `:openrouter/api-key` alone, and `:openrouter/evals-api-key`
-doesn't need to exist in the store at all; reading with `:evals` is the
-mirror image. That's a genuine advantage of building on aero rather than a
-bespoke reader: you can add a profile for a key some consumers don't have —
-a benchmark-only key, say — without breaking every `read-config` call that
-never selects it.
+### Integrant
 
-### As a map (Integrant component / direct use)
-
-```clojure
-(require '[com.kirahowe.secrets :as secrets])
-
-(def m (secrets/load-secrets (clojure.java.io/resource "secrets.edn.age")
-                             {:app "myapp"}))
-(secrets/get-secret m :database/url)        ; → "jdbc:…"
-(secrets/get-secret m [:r2 :account-id])    ; nested path
-```
-
-The second argument selects the identity (private key): a path string/File, or
-an opts map with `:identity-file` (an explicit path) or `:app` (→
-`~/.config/<app>/key.txt`). Resolution is scoped to the operation. An explicit
-path wins first, followed by `SECRETS_AGE_IDENTITY_FILE`,
-`SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then the app's default
-key path. Without an explicit identity or app, the environment variables are
-the only sources. Raw and base64 values are written to a private temporary file
-for the operation and removed before it returns. Passing `{:app "myapp"}`
-provides the local fallback while still allowing an injected identity when no
-explicit path was supplied.
-
-An identity path is a local filesystem path, whichever source it comes from. A
-value that starts with a URI scheme, after surrounding whitespace is trimmed,
-is refused with `:reason :disallowed-identity`, and the error names only the
-scheme. A bare relative name containing a colon, such as `key:txt`, reads as a
-scheme too, so write `./key:txt` for such a file. A path setting that holds key
-contents (`AGE-SECRET-KEY-`) is refused with the same reason and the value is
-not echoed. Key contents belong in `SECRETS_AGE_IDENTITY`.
-
-An Integrant `init-key` is two lines. Both the resource name and the app name
-come from the component's config, so the code holds no literal of its own:
+The loaded map is an ordinary value, so a component that provides it is one
+method:
 
 ```clojure
 {::secrets {:resource "secrets.edn.age" :app "myapp"}}
@@ -522,471 +278,86 @@ come from the component's config, so the code holds no literal of its own:
   (secrets/load-secrets (io/resource resource) {:app app}))
 ```
 
-### Source provenance: local only
+Or pass `merge-readers` output as the `:readers` of
+`integrant.core/read-string` and reference secrets from the system config.
 
-Runtime source loading performs no remote network operation. `load-secrets`
-accepts filesystem path strings, `File`/`Path` values, local `file:` locators,
-and `jar:file:` classpath resources such as the URL returned by `io/resource`
-inside an uberjar. `reader-literals` and `merge-readers` resolve `:file` as a
-filesystem path and `:resource` on the classpath, then pass the result through
-that same boundary. They refuse a URI-shaped `:file` or `:resource` with
-`:disallowed-source` when the readers are built, before any tag is read.
-`bb secrets` configuration is stricter still: every
-artifact location is a filesystem path string, not a URL.
+### Identity resolution
 
-HTTP(S), other nonlocal schemes, remote or multiply nested `jar:` locators,
-`file:` locators with an authority, malformed local locators, InputStreams, and
-arbitrary `clojure.java.io/input-stream` values are rejected with
-`:reason :disallowed-source`. Rejection happens from the locator alone, before
-DNS resolution, connection setup, redirects, or response reads. Allowed URL
-objects are reconstructed as a local file or opened directly with `JarFile`, so
-a caller-provided URL handler cannot turn an allowed-looking locator into
-network access.
+Every operation that decrypts resolves its identity when it runs, from the
+first of these that applies:
 
-There is deliberately no HTTP loading option and therefore no connect/read
-timeout or redirect policy to configure. Fetch a remote ciphertext in an
-explicit, policy-aware application step, then pass the resulting trusted local
-path here; that fetcher, not this local loader, owns scheme, DNS/address, port,
-redirect-hop, and finite timeout policy.
+1. An explicit path: the second argument of `load-secrets`, or `:identity-file`
+   in the options or in the environment's config.
+2. `SECRETS_AGE_IDENTITY_FILE`, a path to the key file.
+3. `SECRETS_AGE_IDENTITY`, the key file's contents.
+4. `SECRETS_AGE_IDENTITY_B64`, the key file's contents in base64.
+5. The environment's configured `:key-file` (CLI only).
+6. `~/.config/<app>/key.txt`, when an app name is known.
 
-### Resource limits
+A path from 1 or 2 names a specific file, and it is an error (`:no-identity`)
+if that file does not exist. When nothing is named and no key file is
+present, no identity is available. An identity variable that is set
+but empty is an error that names the variable: a CI runner expands a missing
+secret to the empty string, and falling through to another key would hide
+that. Unset the variable to fall back.
 
-Every runtime entry point — `load-secrets`, `reader-literals`, `merge-readers`
-— takes an optional `:limits` map in its opts, merged over
-`secrets/default-limits`:
+Identity paths are local paths with a leading `~` expanded. A value that
+starts with a URI scheme is refused with `:disallowed-identity`. A bare
+relative name with a colon in it, such as `key:txt`, reads as a scheme, so
+write `./key:txt`. Key contents placed in a path setting are refused the same
+way and are not echoed.
 
-| limit                  | default | bounds                                                   |
-| ---------------------- | ------- | -------------------------------------------------------- |
-| `:max-source-bytes`    | 16 MiB  | ciphertext bytes in a local file or classpath-jar entry  |
-| `:max-plaintext-bytes` | 8 MiB   | plaintext bytes `age` may produce                        |
-| `:max-edn-depth`       | 100     | collection nesting depth of the decrypted EDN            |
+`age` reads identities from files, so the contents from 3 and 4 are written to
+an owner-only temporary file for the one operation and deleted when it ends.
+If the delete fails, the error names the file that remains. A process that
+crashes mid-operation can leave that file behind, and deleting a file does not
+erase it from the disk. Use `SECRETS_AGE_IDENTITY_FILE` with a mounted secret
+when the platform offers one.
 
-```clojure
-(secrets/load-secrets (io/resource "secrets.edn.age")
-                      {:app "myapp" :limits {:max-source-bytes 65536}})
-```
+### Size bounds
 
-The defaults sit far above every example in this README. A real store is
-kilobytes, so ordinary use never meets them. They guard against an
-accidentally oversized or malformed input exhausting disk or heap. They are not
-a defence against a hostile source.
+Fixed bounds catch an accidental huge or deeply nested input, such as a path
+that names the wrong file: 16 MiB of ciphertext, 8 MiB of plaintext, EDN
+nested 100 collections deep, 256 KiB of recipients file, and 1 MiB of
+manifest. They are not configurable.
 
-Bounds are enforced before or *while* bytes move, not after they have all been
-allocated. An existing filesystem source is length-checked before `age` starts;
-a classpath-jar entry is counted chunk by chunk while it is copied, without
-trusting its declared size, and the copy is abandoned before the first byte past
-the bound is written. Plaintext is read from `age`'s stdout through
-`ProcessBuilder` a chunk at a time, and the read stops at the bound. Passing a
-bound kills the `age` process (`destroy`, escalating to `destroyForcibly`), drops the
-partial plaintext, removes the partial temp copy or staging file immediately
-rather than at JVM exit, and throws with a distinguishing `:reason` —
-`:source-too-large`, `:plaintext-too-large`, or `:edn-too-deep` — carrying the
-byte count and the limit, never any content.
+## CI and production
 
-Parsing needs one further bound and no more. EDN has no aliasing or expansion
-mechanism, so a parsed graph's size is linear in the plaintext's byte count and
-`:max-plaintext-bytes` already covers it; what a byte bound cannot cover is
-parser recursion, so a linear pre-scan rejects nesting past `:max-edn-depth`
-before `clojure.edn` — which, having no custom readers, evaluates nothing at
-all — ever sees the text.
-
-A malformed `:limits` is refused rather than read as the defaults: a non-map, an
-unknown key, or a value that is not a positive integer throws with
-`:invalid-limits`, because a typo in a limit must not read as "leave it at the
-default". The error names the limit with the bad value, or the unknown keys that
-are keywords, and never a supplied value. The `age` functions that take
-`:limits` fail the same way. (The management CLI's `:limits` config key is
-separate. It shares the
-defaults of `:max-plaintext-bytes` and `:max-edn-depth` and adds the recipient
-and manifest keys listed in the [quick start](#quick-start).)
-
-These bound a *secrets store*. `bb secrets decrypt <file>.age` is the
-general-purpose counterpart to `bb secrets encrypt <file>` — it decrypts
-whatever file you name — so it carries its own far larger 1 GiB bound instead.
-A store past 8 MiB is almost certainly a mistake; an arbitrary file past it is
-ordinary, and refusing it would break a documented command.
-
-## Production & CI: injecting the key
-
-When an operation has no explicit identity path, it can use one of three
-environment variables, checked in this order and before the local default path:
-
-| Var                 | Value                                                                 |
-| ------------------- | --------------------------------------------------------------------- |
-| `SECRETS_AGE_IDENTITY_FILE` | a path to the key file                                                |
-| `SECRETS_AGE_IDENTITY`      | the key file *contents*, used verbatim (never decoded) — materialized to an owner-only (0600) temp file |
-| `SECRETS_AGE_IDENTITY_B64`  | canonical base64 of the key file contents; documented ASCII wrapping is allowed, and every other malformed input throws |
-
-For `SECRETS_AGE_IDENTITY_B64`, wrapping may contain only ASCII space (`U+0020`),
-horizontal tab (`U+0009`), carriage return (`U+000D`), and line feed (`U+000A`);
-those four characters are removed anywhere in single- or multi-line environment
-values before decoding. Unicode whitespace, punctuation, omitted or malformed
-padding, nonzero padding bits, and every other noncanonical encoding throw
-without materializing an identity or echoing the input. There is no raw-content
-fallback.
-
-A variable that is **set but empty** throws, naming itself, rather than being
-treated as absent. CI runners expand a missing or misnamed secret to the empty
-string (`SECRETS_AGE_IDENTITY: ${{ secrets.AGE_KEY }}` with no such secret), and
-falling through to the local `~/.config/<app>/key.txt` would let that broken
-deployment config quietly succeed on a developer machine. Unset the variable to
-fall back deliberately.
-
-So a Fly / Docker / CI deployment sets exactly one secret. `bb secrets keygen`
-prints this line for you, in the form every generated snippet uses: POSIX `sh`,
-one single-quoted word per dynamic argument, and `cat --` so a key path can
-never be read as an option. `:key-file` is already `~`-expanded, so the path is
-absolute:
+A deployment needs the `age` binary, the ciphertext, and one identity. The
+ciphertext ships with the code, on disk or inside the jar. Give the process
+the identity through one of the three variables above. `bb secrets keygen`
+prints the command for Fly:
 
 ```sh
 flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- '/Users/you/.config/myapp/key.txt')"
 ```
 
-The surrounding `"$(…)"` is the shell's own construct rather than interpolated
-configuration, and is what makes the whole key file one argument to `flyctl`.
-
-The container image needs the `age` binary (e.g. `apt-get install -y age`). The
-encrypted `secrets.edn.age` ships in the image — in the jar or on the classpath.
-`load-secrets` and the reader literals handle `jar:` resource URLs from inside
-an uberjar (the ciphertext is copied to an owner-only temp file so `age` can
-read it), so the file works the same whether it sits on disk or inside the jar.
-`SECRETS_AGE_IDENTITY` decrypts it at startup.
-
-### Scoped temporary identities
-
-`age` reads its identity from a file. For raw or base64 environment values, each
-operation creates an exclusive temporary file with owner-only (0600)
-permissions, uses it for the operation, and checks its deletion on both success
-and failure. Caller-owned paths, including `SECRETS_AGE_IDENTITY_FILE`, an
-explicit `:identity-file`, and `~/.config/<app>/key.txt`, are never deleted.
-
-`load-secrets` owns this scope automatically. Code that passes an identity to a
-lower-level operation can use the same contract:
-
-```clojure
-(secrets/with-identity {:app "myapp"}
-  (fn [{:keys [identity-file]}]
-    (age/decrypt identity-file "secrets.edn.age")))
-```
-
-The callback receives the resolved path and its source keyword. A cleanup
-failure throws a structured error that includes the temporary path so an
-operator can remove it. Paths are allowed in diagnostics for recovery; key
-contents are never included. If the process crashes before cleanup, the
-temporary file can remain on disk, so use a mounted identity file when the
-deployment platform provides one. Temporary-file deletion is not secure
-erasure on every filesystem. The extra temporary-file write per operation is
-the cost of avoiding shared identity state.
-
-### GitHub Actions
-
-GitHub's runner images don't ship `age`, so decryption fails until you install
-it. Next to the Fly command above, a job that actually reads secrets (as
-opposed to the manifest-only [verify job](#verifying-in-ci) below) needs an
-install step and the identity in its environment:
-
-```yaml
-- name: Install age
-  run: sudo apt-get update && sudo apt-get install -y age
-
-- name: Run the thing
-  run: bb evals
-  env:
-    SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
-```
-
-Those are steps, not a whole job. The job around them wants the hardening in
-[Verifying in CI](#verifying-in-ci): the identity on the consuming step only,
-minimal `permissions:`, every action pinned to a commit SHA, and fork pull
-requests kept out of the keyed path.
-
-The repository secret's value is the **contents** of `~/.config/<app>/key.txt`,
-not a path — and the ciphertext it decrypts is the one already committed to
-the repo. That's the whole point of the design (the secret Actions holds is
-small and rotatable; the thing it unlocks travels with the code), but it's
-still the part that feels backwards the first time. Set it with:
-
-```sh
-gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
-```
-
-### When the runtime can't exec `age`
-
-Decryption shells out to the `age` binary (see [Trade-offs and
-limitations](#trade-offs-and-limitations)), so every runtime that decrypts
-needs it on `PATH`. Some platforms can't offer that at all — Cloudflare
-Workers, Deno Deploy, and edge runtimes generally run your code somewhere that
-can't exec a subprocess, `age` or otherwise.
-
-That's a boundary of the design, not a gap: this library wraps a CLI tool, so
-anywhere a CLI tool can't run, neither can it. The fix isn't to work around
-that — it's to use this library for development and CI, where the ciphertext
-and manifest still do their job, and let the edge platform's own secret store
-hold the value for production.
-
-| Where | How the identity gets there |
-|---|---|
-| Laptop | `~/.config/<app>/key.txt` |
-| GitHub Actions | `SECRETS_AGE_IDENTITY` repository secret |
-| Container / VM | env var, `age` installed in the image |
-| Edge runtime (Workers, Deno Deploy) | **it doesn't** — use the platform's own secret store; this library covers dev and CI |
-
-## Initialization layouts
-
-The initializer requires `--app`, defaults to `--env dev`, and accepts `-h` or
-`--help` for its launcher-neutral usage and options. It supports these explicit
-layouts:
-
-| Invocation | Template | Ciphertext + manifest | Identity | Recipients |
-| --- | --- | --- | --- | --- |
-| default tracked | `secrets/secrets.edn.example` | `secrets/secrets.edn.{age,manifest}` | `~/.config/<app>/key.txt` | none |
-| `--team` | same tracked template | same tracked store | external app key | tracked `secrets/recipients.txt` |
-| `--layout disposable` | tracked `secrets/secrets.edn.example` | ignored `.local/secrets/secrets.edn.{age,manifest}` | ignored `.local/secrets/key.txt` | ignored `.local/secrets/recipients.txt` with `--team` |
-
-The tracked template is safe documentation and contains placeholders, never
-real values. The ciphertext is safe encrypted data. The manifest is plaintext
-but value-free; it exposes key names and shapes as described below. A recipients
-file contains public keys only. These four public artifacts and `bb.edn` may be
-committed. Private identities, decrypted plaintext, and the explicit
-`.local/secrets/` disposable layout must not be committed.
-
-Team initialization creates or preserves the public recipients file, but does
-not silently add a key to it. After explicitly generating a personal identity,
-run `bb secrets add-recipient dev` before creating the first team ciphertext.
-All configured artifact paths must remain canonically distinct; aliases such as
-`secret.age` and `./secret.age` count as the same path and are rejected.
-
-Before applying anything, the initializer proves that no other principal can
-tamper with the project root's ancestry: every directory from the filesystem
-root down to and including the root itself is owned by you or by `root` and is
-writable by nobody else. Other-write needs the sticky bit; group write needs the
-sticky bit or a group whose name is the owner's, the user-private group of
-Fedora, RHEL, and Debian, because a group holding nobody but the owner is not
-another principal and a `umask 002` checkout at mode 0775 is exactly as safe as
-one at 0755. Sticky means only an entry's own owner may rename or delete it,
-which is why a root under `/tmp` is fine. The path as written is checked too, so
-a symbolic link on the way in that someone else could repoint is refused even
-when what it resolves to is private. Anything else is refused, naming the
-offending directory, and a filesystem that cannot report POSIX ownership and
-mode attributes is refused rather than assumed safe. This ancestry proof is what
-replaces openat-style anchoring: Babashka cannot reach `SecureDirectoryStream`,
-so instead of re-walking ancestors an attacker might have swapped, the
-initializer establishes that nobody is able to swap them and refuses to write
-when it cannot. Every mutation then re-verifies at the operation point —
-directories are created with an explicit mode a umask can only narrow, never
-widen, and checked one segment at a time under the verified root, each file is
-staged with `O_CREAT|O_EXCL` under an unguessable name and published with an
-atomic rename, and the rollback path uses those same checked operations. A
-preview never needs the guarantee, because it writes nothing, but it reports
-whether applying would be refused so you learn that before choosing to apply.
-
-The four included consumers illustrate different needs rather than four copies
-of one schema: quickstart, Aero, and team-CI carry CLI configuration in
-`bb.edn`; the Integrant service uses JVM runtime wiring and a shell bootstrap.
-The common CLI schema is only `:app`, `:default-environment`, and an environment
-with `:secrets-file`. Template, manifest, and key paths derive from that minimum;
-disposable and multi-recipient layouts make their exceptional paths explicit.
-
-### Initializer preview output
-
-The file most likely to be replaced is the consumer's own `bb.edn`, which may
-already hold a credential. A preview therefore has three modes, and the safe
-one is the default:
-
-| Run | Printed |
-| --- | --- |
-| noninteractive, or `--apply` | every path and its action (create, merge, leave as is) plus the counts — no file bodies at all |
-| interactive, no flag | the same summary, plus the changed region of each file only: redacted, escaped, and line-length bounded |
-| `--show-contents` | complete old and new bodies, unredacted, behind a warning printed first |
-
-`--show-contents` is the only route to complete contents. Neither `--apply` nor
-a noninteractive run nor anything else implies it, and when both could apply the
-safe mode wins: an interactive `--apply` run prints no bodies either. The
-warning it prints says plainly that a credential already sitting in one of these
-files is about to reach stdout.
-
-Redaction in the interactive mode is a targeted guard, not a secret scanner:
-three rules cover a value under a key named like a secret, an
-`AGE-SECRET-KEY-1…` identity, and a long opaque token, each replaced by a marker
-naming how many characters it hid. It over-redacts by design — a Git SHA and a
-`:secrets-file` path go the same way as a real credential — and
-`--show-contents` is how to read what a preview hid. Control characters,
-`ESC` first among them, are rendered as printable escapes rather than emitted,
-because a previewed file is untrusted input to the terminal: a crafted `bb.edn`
-must not be able to repaint what the operator is deciding on.
-
-The plan behind the preview keeps no file bodies it does not need. Existing
-contents are read to detect a change and classify the action, then dropped;
-`init!`'s status map carries `:actions` and `:trust` and no contents at all, so
-a programmatic caller printing it discloses nothing either.
-
-## Environments
-
-Each environment is an independent encrypted file. By default they share one key
-(`~/.config/<app>/key.txt`) — simplest for a solo project. Give an environment
-its own `:key-file` to isolate it (e.g. so a dev key can't read prod). The same
-resource name (`secrets.edn.age`) can live on each environment's own classpath,
-so one set of reader literals serves every environment.
-
-## Teams: multiple recipients
-
-The default single-key model means everyone shares one private key. For a team,
-point an environment at a **recipients file** — a committed list of age public
-keys — and it encrypts to all of them. Each person decrypts with their own
-private identity; private identities are never shared.
-
-```clojure
-;; bb.edn — add :recipients-file to an environment
-{:prod {:secrets-file    "env/prod/resources/secrets.edn.age"
-        :recipients-file "env/prod/recipients.txt"}}
-```
-
-Every command that encrypts reads and validates that list exactly once, up
-front (before an editor opens, before stdin is read, before anything is
-decrypted) and encrypts to those exact public keys, so one operation uses one
-consistent set of recipients. The recipients pathname is never handed to `age`.
-Bounds and validation are applied to that one read: a file over
-`:max-recipients-bytes`, more entries than `:max-recipients`, an entry over
-`:max-recipient-chars`, a line that is not an age recipient, and an empty list
-each fail the command before `age` starts. `bb secrets recipients` stays a
-read-only listing and marks any line encryption would refuse, showing only an
-escaped prefix of at most 16 characters of that line.
-
-### First owner: no ciphertext yet
-
-Team initialization creates or preserves an empty public recipients file. The
-first owner creates a personal identity, adds its public recipient, then creates
-the initial store:
-
-```sh
-bb secrets keygen prod
-bb secrets add-recipient prod
-printf %s "$INITIAL_SECRET_VALUE" | bb secrets set prod :service/token
-# Or create the initial store in an editor instead:
-# bb secrets new prod
-```
-
-Run either `set` or `new` for the last step. There is nothing to `reencrypt`
-after `add-recipient` while the ciphertext is absent: the first `set` or `new`
-already encrypts to every public recipient currently in `recipients.txt`.
-
-### Existing ciphertext: add, then re-encrypt
-
-After ciphertext exists, a teammate generates and keeps their own private
-identity and sends only its `age1…` public recipient to a maintainer. A current
-recipient who can decrypt the store adds that public key and re-encrypts:
-
-```sh
-bb secrets add-recipient prod age1...teammate-public-key...
-bb secrets reencrypt prod
-bb secrets recipients prod
-```
-
-`add-recipient` changes only the public list. `reencrypt` is what writes a new
-ciphertext and value-free manifest for the current recipient set. Onboarding
-therefore grants access to ciphertext produced after that re-encryption.
-
-For offboarding, remove the person's public-key line from `recipients.txt` and
-run `bb secrets reencrypt prod`. This prevents that identity from decrypting
-future ciphertext only. It cannot revoke ciphertext, plaintext, clones, or
-backups the person already obtained. If a private identity or an old ciphertext
-is compromised, changing the recipient list is not enough: rotate every
-underlying secret value or credential that copy exposed, then write ciphertext
-for the remaining recipients.
-
-Deployments and CI use a separate, non-human recipient — never a developer's
-identity. Commit its public recipient, re-encrypt, and give the runtime only
-that deployment recipient's private identity through exactly one supported
-mechanism: `SECRETS_AGE_IDENTITY_FILE` (a secret-provided file path),
-`SECRETS_AGE_IDENTITY` (raw identity contents), or
-`SECRETS_AGE_IDENTITY_B64` (base64 identity contents).
-
-The repository boundary is explicit:
-
-- Commit public-only `recipients.txt`, encrypted `*.age` ciphertext, its
-  value-free `*.manifest`, and templates containing only safe fake placeholders.
-- Never commit private identities, decrypted plaintext, or real secret values.
-
-Runtime decryption is otherwise unchanged: any currently listed identity can
-decrypt the file, so `load-secrets` / `#secret/req` need no team-specific
-configuration.
-
-## Manifest: seeing what changed
-
-Because age re-encrypts the whole file, a `git diff` of `secrets.edn.age` is an
-opaque blob — you can't tell *what* changed. So every `new` / `edit` / `reencrypt`
-also writes a plaintext **manifest** next to it (`secrets.edn.manifest`) that
-records only the *shape* of the secrets — never a value:
-
-```clojure
-{:version 2
- :app "myapp"
- :ciphertext-sha "0b7d9f31…"   ; SHA-256 of secrets.edn.age when it was written
- :keys
- {[:auth :admins]  {:type :set, :count 3, :vhash "9ad1126f40c10b21"}
-  [:database/url]  {:type :string, :vhash "32450c7262fdd852"}}}
-```
-
-Commit it. A diff of the manifest shows keys added, removed, retyped, or (via
-`:vhash`) a value changed — enough to review a change meaningfully without ever
-exposing a secret. `:vhash` is an HMAC keyed by a secret derived from the
-private key *material* — only the `AGE-SECRET-KEY` lines, so the identity
-file's comment lines and whitespace don't affect it and two copies of the same
-key always agree — and someone with only the repo can't brute-force a value
-from it. (In multi-recipient mode there's no single shared key, so the manifest
-is structure-only — no `:vhash`.)
-
-Anyone who can read the repository sees the manifest's key paths, value types,
-and collection sizes, plus the ciphertext's size and the commit history of both
-files. In single-key mode they also see value equality and change: the HMAC key
-comes from the identity alone, so equal values at different paths, or in
-different environments that share a key, have equal `:vhash`es, and a value that
-returns to an earlier one repeats the earlier hash in history. Key paths through
-nested maps are public at every depth, so never use a secret value as a map
-key.
-
-`:version` is the manifest encoding version, and it is part of the `:vhash`
-derivation, not just a label. Version 2 encodes a value as a recursively typed,
-length-framed string: every scalar, collection, map key, and map value carries
-its own type tag and its own length, so a `=` or `;` inside a value can't be
-mistaken for structure and `[[1]]` doesn't encode like `[(1)]`. That string is
-hashed as its raw UTF-16 code units rather than through a charset encoder, which
-would fold distinct values together by substituting for unpaired surrogates.
-Version 1 did neither, so it is rejected outright rather than reinterpreted:
-`verify` reports an unsupported version as drift, and a v1 manifest must be
-regenerated with `bb secrets reencrypt <env>`. The encoding is unambiguous, so two different
-secret graphs never produce the same string to hash. The `:vhash` itself is a
-64-bit truncated HMAC of that string: it marks a change and is not
-collision-free.
-
-`:ciphertext-sha` is the SHA-256 of the encrypted `.age` file at the moment the
-manifest was written. It ties the manifest to the exact ciphertext, which lets
-CI check the manifest is fresh without holding any key, and lets a keyed
-`verify` catch an out-of-band re-encryption even when the shape still matches.
-
-```sh
-bb secrets verify         # regenerate from the ciphertext and check every env
-bb secrets verify prod    # …or just one
-```
+A runtime that cannot start a subprocess cannot decrypt. There, use the
+platform's own secret store in production and this library in development and
+CI.
 
 ### Verifying in CI
 
-`verify` exits 0 when everything matches, 1 on drift, and 2 when the ciphertext
-or manifest is missing, or when no identity is available and the manifest
-records no `:ciphertext-sha`. So `bb secrets verify` gates a pipeline directly.
-It runs in two modes:
+`bb secrets verify` exits 0 when every manifest agrees with its ciphertext, 1
+on drift, and 2 when a ciphertext or manifest is missing or an environment
+could not be checked. It runs in one of two modes per environment.
 
-- **Keyless freshness check.** With no identity available, `verify` compares
-  the manifest's recorded `:ciphertext-sha` against the actual file. A CI job
-  holding **no secret material at all** can still catch a manifest that drifted
-  from its ciphertext (exit 0 on a pass, same as a keyed run).
-- **Full verification.** With a key (e.g. `SECRETS_AGE_IDENTITY` on the runner),
-  `verify` decrypts and checks the full shape and `:vhash`es, and also flags an
-  out-of-band re-encryption via the sha even when the shape matches.
+Without an identity, it checks that the manifest is complete and that the
+SHA-256 it records is the digest of the ciphertext. This needs no key and no
+`age`, so any CI job can run it. It applies when no identity was named and no
+key file is present, which is the usual state of a CI runner. An identity
+named by `:identity-file` or an identity variable has to exist: a missing one
+is an error, not a reason to skip the comparison.
 
-Placement matters in the keyed job. Give the identity to the one step that runs
-`verify`, keep untrusted code out of that job, ask for the least permission that
-can check the repository out, and pin every action to a commit:
+With an identity, it also decrypts the store and compares every key path,
+type, and value hash with the manifest.
+
+With no environment argument, `verify` checks every environment and keeps
+going past one that fails. With one named, a failure to resolve the identity
+or to decrypt stops the command with an error.
+
+A job that holds the identity should give it to the one step that needs it,
+keep unreviewed code out, and pin its actions:
 
 ```yaml
 verify-secrets:
@@ -998,432 +369,274 @@ verify-secrets:
     contents: read
   steps:
     - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+    - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      with: {distribution: temurin, java-version: '21'}
+    - uses: DeLaGuardo/setup-clojure@4c7a6f613e5089821bb3bb2a33a3ee115578580d # v13.6.1
+      with: {bb: 1.13.219}
     - run: sudo apt-get update && sudo apt-get install -y age
-    - uses: turtlequeue/setup-babashka@d78ec6570aea3b614bc695cafcceb82eb45c2af9 # v1.8.0
-      with: {babashka-version: 1.12.208}
     - run: bb secrets verify
       env:
         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ```
 
-A job-level `env:` would hand that identity to checkout, the `apt-get` install,
-and a third-party setup action, none of which needs a key; a tag in place of a
-commit SHA would let upstream change what runs beside it. A fork's
-`pull_request` receives no repository secrets, so the `if:` is not what stops a
-leak today — it stops this from being edited into a `pull_request_target`
-workflow that hands the key to unreviewed code. The keyless variant needs none
-of the gating, because it holds nothing to take; the production chapter under
-`book/chapters` works through both.
+The repository secret holds the contents of the key file, not a path:
 
-`verify` reads the manifest's `:version` and treats anything but 2, including a
-legacy v1 manifest, as drift, never as a shape to diff. A manifest whose `:app`
-is not this project's, or that records none, is reported as drift the same way,
-and so is a manifest that is not valid EDN, is not a map, or holds something
-other than a map under `:keys`. No ciphertext is bound to an
-environment name, so a wrong environment is only a misconfigured path, which
-`bb secrets doctor` reports per environment. Disable the manifest for an environment with `:manifest false`.
+```sh
+gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
+```
 
-## Diagnosing configuration
+For the keyless job, drop the `env:`, the `age` install, and the `if:`. The
+book's production chapter walks through both jobs.
 
-Run `bb secrets doctor [env]` before an operation to inspect one explicitly
-selected environment, or the configured default when `[env]` is omitted. It
-reports the installed `age` version, selected environment, single-key or
-multi-recipient mode, and canonical paths plus existence for the ciphertext,
-manifest, template, key, and recipients file. Disabled manifests and
-unconfigured recipients files are labeled explicitly.
+## Teams
 
-Recipient diagnostics contain only count and validity. Identity diagnostics
-contain only the source label (`SECRETS_AGE_IDENTITY_FILE`,
-`SECRETS_AGE_IDENTITY`, `SECRETS_AGE_IDENTITY_B64`, `:identity-file`,
-`configured key path`, or `default key path`) and whether it is usable. The
-command never returns or prints identity environment values, materialized
-raw/base64 identity paths, recipient lines, private-key text, or secret values.
+Point an environment at a recipients file and every write encrypts to all the
+public keys in it. Each person keeps their own private identity.
 
-The verification fields distinguish a keyless freshness check from full
-verification. Keyless verification is available only when ciphertext exists
-and a readable version-2 manifest contains `:ciphertext-sha`; full verification
-requires `age`, a usable identity, ciphertext, and a manifest. A disabled
-manifest is reported as `skipped`.
+The first owner creates a key, adds its public half, and creates the store:
 
-`doctor` has exact, scriptable exit meanings:
+```sh
+bb secrets keygen prod
+bb secrets add-recipient prod
+bb secrets set prod :service/token     # or: bb secrets new prod
+```
 
-- **0 — healthy:** the selected configuration is complete.
-- **1 — warning/action needed:** a required tool, file, or identity is missing,
-  recipients are unreadable, the manifest needs attention, or verification
-  cannot run.
-- **2 — invalid configuration:** normalization fails, the environment cannot be
-  selected, or a configured recipients file is empty or contains invalid
-  recipients. When an identity variable is blank or is not valid base64,
-  `doctor` prints a `Reason:` line under `Configuration: invalid`.
+To add someone, a current recipient adds the newcomer's public key (the
+newcomer gets it from `bb secrets show-key`) and re-encrypts:
 
-### What a failure carries
+```sh
+bb secrets add-recipient prod age1...
+bb secrets reencrypt prod
+```
 
-These exceptions are meant to be safe to hand to an error reporter, so their
-context is an allowlist rather than a rendering. Every failure about a secrets
-source carries `:source`: a local or rejected locator's scheme, host, port, and
-path with **userinfo, query, and fragment dropped**; a File, Path, or path
-string's path, which is yours already; or, for any rejected object, its class
-name alone. Nothing calls `str` or `pr-str` on an arbitrary object you passed
-in, because a `toString` you wrote is exactly how a credential-bearing object
-leaks. A *path* can carry a token too, so keeping it is a judgement rather than
-a safe default: a diagnostic that cannot name the failing resource is not one,
-and that residual risk is real, not zero.
+To remove someone, delete their line from the recipients file and run
+`bb secrets reencrypt prod`. Commit the recipients file, the ciphertext, and
+the manifest together.
 
-Identity paths are permitted diagnostic metadata. A cleanup failure for a
-temporary identity includes its path for recovery, while identity contents and
-environment values are never included.
+Removal stops that identity from decrypting ciphertext written afterwards. It
+does not take back anything already read, and the old ciphertext stays in git
+history, where the removed identity still decrypts it. Rotate the affected
+credentials at their providers.
 
-An I/O failure's own message travels only with a filesystem path source, where
-it can name nothing the failure does not already name. A local locator failure
-keeps the exception's class instead of its message and does not attach it as a
-cause — printing an exception prints its causes' messages too. A rejected
-source has no I/O cause because policy runs before opening. Aero failures name
-the `:profile` and the opts map's *key names*, never a value: an
-opts map can hold a resolver, a database password, or a whole configuration. A
-bound that trips carries the byte count and the limit, never content.
+`reencrypt` also gives the store a new manifest key, so every value hash in
+the manifest changes once. `edit`, `set`, and `rm` do the same when they find
+that the recipients file no longer matches the set the store was last
+encrypted to. [The manifest](#the-manifest) explains why.
 
-## API
+Each command reads the recipients file once, before it decrypts or opens an
+editor, and refuses a line that is not an age or SSH public key.
+`bb secrets recipients` lists the file and marks such lines.
 
-`com.kirahowe.secrets`
-- `(load-secrets source)` / `(load-secrets source identity-or-opts)` — decrypt + read an EDN map. `source` is local-only: a filesystem path string, File, Path, local `file:` locator, or `jar:file:` classpath resource; the second arg is an identity path String/File or an opts map `{:identity-file … :app …}`. Every failure throws `ex-info` with a `:reason`: `:no-identity`, `:no-file`, or `:disallowed-source` for anything outside the provenance contract. No HTTP operation exists and no DNS, connection, redirect, or response read occurs for a rejected locator. Every failure about the source also carries `:source`, allowlisted metadata naming which source failed and never the source value — see *What a failure carries*.
-- `(get-secret m key-path)` / `(get-secret m key-path default)` — keyword or vector path.
-- `(reader-literals opts)` → `{'secret/req … 'secret/opt …}`; `(merge-readers readers opts)`.
-- `(with-identity identity-or-opts f)` — resolve an identity for one operation and call `f` with `{:identity-file path :identity-source source}`. Explicit paths are left untouched; raw and base64 environment values are materialized to an owner-only temporary file and cleaned up when the callback returns or throws. A cleanup failure includes the temporary path in structured error data.
-- `(expand-home path)`: expands a path that is exactly `~` or begins with `~/`. Every other string is returned unchanged.
-- `(default-key-file app)`: the default identity path, `~/.config/<app>/key.txt` with the home directory expanded.
+Give deployments and CI their own recipient instead of a person's key.
 
-`com.kirahowe.secrets.age` — `version`, `installed?`, `public-key`, `valid-recipient?`, `keygen!`, `encrypt-file!` (to an identity file, a `:recipients-file`, or a `:recipients` list — a bare String/File always means an identity-file *path*; bare `age1…` public-key strings throw, pass them as `{:recipients […]}`), `decrypt` (UTF-8 string), `decrypt-bytes` (byte array, binary-safe), `decrypt-to-file!` (byte-for-byte). The positional input is passed behind an option terminator (`--`), and every path-valued argument — that input, the `-o` output, the `-i` identity, the `-R` recipients file — is normalized so a dash-leading path becomes `./-name`, so filenames beginning with `-` (including names identical to age options) work like any other file; a blank or nil path throws `ex-info` instead of falling back to stdin. `:recipients` strings are recipient *values*, not paths, and are passed through as given. `decrypt-to-file!` publishes plaintext only through an owner-only (0600) sibling staging file that is then atomically moved over the destination: the published file is 0600 whatever the umask and whatever mode the destination had before, the destination's final component is validated without following links so a symlink or other non-regular destination is refused, and a decryption, write, or move failure removes the staging plaintext and leaves the previous destination intact. On a filesystem without POSIX permissions it fails closed rather than writing plaintext with default permissions — use `decrypt-bytes` or `decrypt`, which never write plaintext to disk.
+## The manifest
 
-`com.kirahowe.secrets.manifest` — pure manifest helpers: `entries`, `(render {:app … :ciphertext-sha …} entries)`, `diff`, `value-type`, `hmac-key`.
+A diff of `secrets.edn.age` says nothing, because age re-encrypts the whole
+file. Every write therefore also writes `secrets.edn.manifest`:
 
-`com.kirahowe.secrets.cli` — `(run! config args)` and the individual command fns. The command fns are a REPL-safe API: they return data (paths, result maps, `:aborted` from a declined overwrite prompt) and throw `ex-info` on failure — only `run!` prints error data and exits. `(verify! config env)` returns `{:results {env status} :exit code}`; `(doctor! config env)` safely normalizes one raw selected/default environment and returns its structured age, artifact, identity-source, recipient, and verification-capability fields plus `:status` and `:exit`. Config keys: `:app`, `:default-environment`, `:environments {env {:secrets-file … :key-file … :identity-file … :template … :manifest … :recipients-file …}}` — validated on load (`:app` and `:secrets-file` required, no blank path strings, `.age` extension unless both `:template` and `:manifest` are explicit). Normalization does not read identity environment variables or create temporary files. Each command selects its environment, resolves its identity in a scoped operation, validates the resolved path against the configured artifact roles, and then performs the command using an explicit `:identity-file`, the environment variables, or the configured/default `:key-file` in that order.
+```clojure
+{:version 3
+ :app "myapp"
+ :ciphertext-sha "0e6487cf6f4562d51ef450dbe7ce54d76e91b350425d65ea1ab94288fe3acd6e"
+ :keys
+ {[:auth/admins] {:type :set, :count 2, :vhash "ce4caccbfee081c6"}
+  [:example/api-key] {:type :string, :vhash "89ae7df577fa8bb8"}
+  [:r2 :account-id] {:type :string, :vhash "d32adde248640142"}}}
+```
 
-`com.kirahowe.secrets.init` — Babashka-only project bootstrap entrypoint.
-`(-main & args)` parses `--app`, optional `--env`, `--layout`, `--team`,
-`--keygen`, `--apply`, and `--show-contents`; `(init! opts)` exposes the
-preview/apply operation for programmatic use, returning a status map that
-carries the `:trust` report the preview printed and `:actions`, one path and
-action per proposed file, and deliberately no file contents. It preserves
-`bb.edn` formatting with Babashka's bundled `rewrite-clj`, refuses conflicts and
-unsafe paths, prints paths and actions rather than file bodies unless
-`--show-contents` explicitly asks for them, and refuses to mutate a project at
-all unless `(trusted-ancestry! root)` proves the root's ancestry untamperable
-and `(filesystem-capability)` reports the POSIX attributes that proof needs.
+Commit it. Its diff shows keys added, removed, or retyped, and a changed
+`:vhash` shows that a value changed. `:ciphertext-sha` is the SHA-256 of the
+ciphertext the manifest was written for, which is what the keyless `verify`
+compares.
+
+A `:vhash` is the first 64 bits of an HMAC-SHA-256 of the value. Its key is
+256 random bits that the store holds inside its own encrypted EDN, so solo and
+team stores work the same way and every recipient computes the same hashes.
+At 64 bits a hash can collide: an unchanged hash is strong evidence that a
+value did not change, not proof.
+
+The store keeps that key, and a record of the recipient set it was encrypted
+to, as reserved top-level data in the `:com.kirahowe.secrets` namespace that
+the library owns. `load-secrets`, the reader literals, and the editor never
+show it, and `set`, `rm`, and an edited plaintext cannot name it. A store's
+plaintext has to be one EDN map.
+
+`new`, or `set` when no store exists, generates the key. `edit`, `set`, and
+`rm` keep it. `reencrypt` always replaces it, and so does any write that finds
+the recipient set changed. A store whose key is missing or malformed fails
+every write and fails `verify`, and `reencrypt` repairs it.
+
+### What the manifest discloses
+
+Anyone who can read the repository sees:
+
+- every key path, through nested maps at every depth;
+- each value's type, and the size of each collection;
+- whether two values in one store are equal, and when a value changes or
+  returns to an earlier one, for as long as the store keeps one manifest key;
+- the size of the ciphertext and the commit history of both files.
+
+Key paths are public, so never use a secret value as a map key.
+
+Everyone who can decrypt the store holds its manifest key and can test guesses
+of a value against any manifest published while that key was in use. Someone
+without the key cannot. A removed recipient keeps the key they had, which is
+why the next write replaces it.
+
+If a key name is itself sensitive, set `:manifest false` for that environment.
+Its changes are then not reviewable at all.
+
+### Writes
+
+A write validates the plaintext, encrypts it, and renders the manifest before
+it replaces anything, so a rejected edit leaves both files alone. It then
+replaces the ciphertext with an atomic rename, and then the manifest the same
+way. The two renames are not one transaction and nothing is rolled back. If
+the manifest cannot be replaced after the ciphertext was, the command says the
+manifest is stale, `verify` reports the drift, and `bb secrets reencrypt`
+regenerates it. A write that is killed can leave a `.secrets.edn.*.tmp` file
+beside the ciphertext, which is safe to delete.
+
+The ciphertext, manifest, and recipients file are written with ordinary file
+permissions. Key files and the temporary plaintext that `new`, `edit`, `set`,
+`rm`, and `reencrypt` use are readable only by their owner from the moment
+they are created, and the temporary files are deleted when the command ends.
+
+## Authenticity contract and threat model
+
+[`doc/threat-model.md`](doc/threat-model.md) states what the library protects
+and what it leaves to the deployment. In short:
+
+- age keeps the values confidential and detects a corrupted or truncated
+  ciphertext. Only a holder of a matching private identity can decrypt.
+- Nothing identifies who wrote a ciphertext. A public recipient is meant to be
+  shared, and anyone who has one can encrypt a file that decrypts cleanly. An
+  older valid file can also be put back in place of a newer one.
+- `verify` shows that a ciphertext and its manifest agree. Someone who can
+  replace both can make them agree, so a pass is not evidence of authorship or
+  approval, with or without an identity.
+- The values a process loads are as trustworthy as the commit that carried
+  them and the channel that delivered them. Protect the branches and tags a
+  deploy builds from, and limit who can write to whatever serves the
+  ciphertext.
+- A leaked identity decrypts every ciphertext in git history that was
+  encrypted to it. Rotate the secret values, not only the key.
+- One identity decrypts a whole environment. There is no access control per
+  secret.
+- The decrypted map sits in process memory like any other config. The library
+  does not defend a compromised host or application process.
+- `edit` and `new` put plaintext in an owner-only temporary file while the
+  editor is open. Your editor's swap and backup files are outside the
+  library's control, and deleting a file does not erase it from the disk.
+- [The manifest discloses](#what-the-manifest-discloses) key paths, types,
+  sizes, and value equality and change.
+
+If you need dynamic credentials, access rules per secret, automatic rotation,
+or a central audit log, use a secrets manager.
+
+Report a suspected vulnerability privately, as [SECURITY.md](SECURITY.md)
+describes.
+
+## Reference
+
+### Commands
+
+Every command takes the environment first and uses the default when it is
+omitted. `--` ends the options, so an operand may begin with a dash.
+
+| Command | What it does |
+| --- | --- |
+| `keygen [env]` | Generate an identity at the environment's `:key-file`. Asks before replacing one. |
+| `new [env]` | Create the store from its template in `$VISUAL`, `$EDITOR`, or `vim`. |
+| `edit [env]` | Decrypt, open the editor, and re-encrypt if the text changed. Comments are kept. |
+| `set [env] <key> [--edn]` | Set one value from a hidden prompt, or from stdin when it is not a terminal. Creates the store if there is none. |
+| `rm [env] <key>` | Remove one key. Fails if the key or the store is absent. |
+| `verify [env]` | Check manifests against ciphertexts. With no `env`, checks every environment. |
+| `doctor [env]` | Report the state of `age`, the files, the identity, and the recipients. |
+| `show-key [env]` | Print the public key of the configured `:key-file`. |
+| `add-recipient [env] [key]` | Append a public key to the recipients file. With no key, the environment's own. |
+| `recipients [env]` | List the recipients file. |
+| `reencrypt [env]` | Re-encrypt to the current recipients with a new manifest key. |
+| `help [command]` | Show help. |
+
+`<key>` is a keyword (`:some/key`) or a vector path (`'[:a :b]'`). `set` never
+takes the value as an argument. Piped input loses one trailing newline, is
+stored as a string unless `--edn` parses it, and is refused when blank (use
+`--edn` with `""` for an empty string). `set` and `rm` rewrite the plaintext,
+so comments in it do not survive them.
+
+`doctor` is for finding out why a command will not run: it says whether `age`
+is installed, which files exist, and which identity it resolved and from
+where. It prints paths and never file contents, recipient lines, or variable
+values. It exits 0 when healthy, 1 for a warning, and 2 for an invalid setup.
+
+Other commands exit 0 on success and 1 on failure.
+
+### Initializer
+
+`bb -m com.kirahowe.secrets.init --app NAME [--env NAME] [--keygen] [--apply]`,
+with `--help` for usage. It needs the library on the classpath: as a
+dependency in `bb.edn`, or with `-cp /path/to/secrets/src`.
+
+### API
+
+`com.kirahowe.secrets` is the runtime API:
+
+- `(load-secrets source)`, `(load-secrets source identity-or-opts)`
+- `(get-secret secrets key-path)`, `(get-secret secrets key-path default)`
+- `(reader-literals opts)`, `(merge-readers readers opts)`
+- `(with-identity identity-or-opts f)` calls `f` with
+  `{:identity-file path :identity-source source}` for one operation
+- `(expand-home path)`, `(default-key-file app)`
+
+`com.kirahowe.secrets.aero` has `(read-config source opts)`.
+
+`com.kirahowe.secrets.cli` has `(run! config args)`, `(normalize-config
+config)`, and one function per command: `keygen!`, `new!`, `edit!`,
+`set-secret!`, `remove-secret!`, `verify!`, `doctor!`, `show-key!`,
+`add-recipient!`, `recipients!`, and `reencrypt!`. The command functions
+return data and throw `ex-info`. Only `run!` exits the process.
+
+`com.kirahowe.secrets.init` has `-main`, `init!`, `plan`, and `apply-plan!`.
+
+Those four namespaces are the public API. `com.kirahowe.secrets.age`,
+`.manifest`, `.fs`, `.safe-edn`, and `.source` are implementation namespaces
+and can change without notice. The book's reference chapter lists every
+public API var with its docstring.
 
 ## Examples
 
-See the [examples guide](examples/README.md) for a choice matrix and runnable
-starters: [quickstart-bb](examples/quickstart-bb/README.md),
+The [examples](examples/README.md) are runnable starter projects:
+[quickstart-bb](examples/quickstart-bb/README.md),
 [integrant-service](examples/integrant-service/README.md),
 [aero-profiles](examples/aero-profiles/README.md), and
 [team-ci](examples/team-ci/README.md).
 
 ## Development
 
-Project Clojure code follows a 100-column policy. Book files under `book/chapters`
-are exempt so prose can use editor soft wrapping; other lint checks still apply.
-Tests require `age` and a JDK.
+The tests need `age` and a JDK. The book also needs
+[Quarto](https://quarto.org).
 
 ```sh
-bb format          # format Clojure source with cljfmt
-bb format:check    # check formatting without changing files
-bb lint            # lint Clojure source with clj-kondo
-bb test            # run the suite under Babashka
-clojure -M:test    # run the suite under JVM Clojure
+bb test            # the suite under Babashka
+clojure -M:test    # the suite under JVM Clojure
+bb lint            # clj-kondo
+bb format:check    # cljfmt, without changing files (`bb format` fixes)
+bb book:build      # render the book into book/rendered
+bb book:watch      # re-render chapters as you save them
+bb secrets help    # the CLI against a throwaway store under tmp/
 ```
 
-Both runners include the property-based suites, the `*_property_test.clj`
-files under `test/`. They use test.check to generate inputs for the pure parts
-of the library: the EDN boundary, the manifest, the CLI's argument and quoting
-helpers, and the initializer's rendering and merging. A failing property prints
-the seed and the smallest failing input it found. To replay one, call the spec
-as a function with that seed, for example
-`(parse-reads-back-every-printable-value 200 :seed 1234)`.
+Source lines stay within 100 columns. The chapters under `book/chapters` are
+literate Clojure namespaces rendered with
+[Clay](https://scicloj.github.io/clay/), so their examples run against the
+library at build time.
 
-Other development tasks:
-
-```sh
-bb secrets help            # demo the CLI against a throwaway tmp/ file
-clojure -T:build install   # build + install the jar to ~/.m2 (needs a JDK)
-```
-
-### Continuous integration
-
-CI runs the Babashka and JVM suites, builds and inspects the jar, renders the
-book, and deploys it to Pages from `main`. Every executable dependency it runs
-is immutable: each `uses:` is a full commit SHA with the version that commit is
-recorded beside it, and the Babashka container is an `@sha256:` digest whose
-release tag survives only as a comment. A tag or registry reference that moves
-upstream therefore cannot change what a build executes without a reviewed diff
-here — which matters most for the Pages deployment, the only job holding
-`pages: write` and `id-token: write`, gated on `main` and on the protected
-`github-pages` environment. Every other job runs with the workflow's top-level
-`contents: read`.
-
-`com.kirahowe.secrets.workflow-policy`, under `build/`, is what decides that,
-and `bb test` runs it over every `.github/workflows/*.yml` it discovers rather
-than a list of names, so a workflow added later is covered without anyone
-extending the test. It refuses a tag, a branch, a short SHA, a reference form it
-has no pinning rule for, an image without a digest, and a bare SHA carrying no
-version comment — a pin nobody can review is not a pin. Dependabot proposes the
-upgrades weekly, bumping the SHA and rewriting the comment beside it, so staying
-current is a reviewable diff rather than tag drift.
-
-### The documentation book
-
-Full documentation lives in a [Quarto](https://quarto.org) book under
-`book/chapters` — quick start, design rationale, runtime/CLI/teams/manifest
-guides, production & CI, caveats, and a generated API reference. Chapters are
-literate Clojure namespaces rendered with [Clay](https://scicloj.github.io/clay/),
-so every example is evaluated against the real library at build time.
-
-```sh
-bb book:build     # render the book into book/rendered (needs JDK + quarto + age)
-bb book:preview   # serve the rendered book locally
-bb book:watch     # re-render a chapter when you save it, and reload it in the browser
-```
-
-The published book carries no third-party executable assets. Clay injects jQuery
-and jQuery UI into every page and this book calls neither, so `bb book:build`
-strips them — an unused dependency is removed rather than vendored — along with
-the Google Fonts stylesheet Quarto's Bootstrap theme imports, and Quarto's build
-cache. Each page then gets a `<meta>` Content Security Policy: `default-src
-'self'`, and a `script-src` that admits its own inline scripts and event
-handlers by SHA-256 hash, computed at build time from the exact bytes Quarto
-generated, never by `'unsafe-inline'` and never with `'unsafe-eval'`.
-`com.kirahowe.secrets.site-policy`, under `build/`, performs both the rewrite and
-the check, and `bb book:build` fails on any finding — an external script or
-stylesheet URL, an inline script no hash admits, an inline or eval allowance, a
-page without a policy — so a render cannot produce an artifact CI would reject.
-
-## Releasing
-
-A release is built once, from the tag, and the bytes that were inspected are the
-bytes that get published.
-
-1. Write the `CHANGELOG.md` entry under a `## [<version>]` heading and commit it.
-   The version lives in exactly one place, `src/com/kirahowe/secrets/coordinate.edn`,
-   beside the two names the library is declared under. The release guards read
-   that file from the repository and the initializer reads it as a classpath
-   resource, and the tag, jar name, pom, embedded `pom.properties`, CHANGELOG
-   heading, and the coordinates this README shows are all checked against it
-   rather than maintained beside it. No commit is written there: the
-   initializer pins the checkout it runs from, and tagging the release is what
-   puts the tag into scaffolded projects.
-2. Tag that commit `v<version>` and push the tag.
-3. The `release` workflow takes over: it is restricted to the protected
-   `release` GitHub environment, builds from the tag, inspects the artifact, and
-   uploads it. The Clojars credentials are visible only to its final deploy
-   step; checkout, build, and inspection never have them in their environment.
-
-The same flow by hand, when a release has to be cut locally:
-
-```sh
-clojure -T:build release   # guarded build, writes target/release.edn
-bash .github/scripts/inspect-jar.sh target/secrets-0.1.0.jar
-clojure -M:deploy          # uploads exactly the files named in the receipt
-```
-
-`release` refuses a working tree with modified *or untracked* files, a `HEAD`
-that is not exactly the tag naming the declared version (a descendant of the tag
-is a refusal, not a pass), and a version the CHANGELOG does not document. It
-then exports the tag with `git worktree` and builds from that snapshot, so
-nothing that changes after the guards pass can reach the jar. The artifact must
-name the version in its file name, in both embedded Maven descriptors, and as
-the `<scm><tag>` it was built from — a release that claims no provenance is
-refused — and `target/release.edn` records the jar, the pom that ships beside
-it, the commit, and the jar's SHA-256.
-
-`clojure -M:deploy` builds nothing. It re-reads that receipt, re-checks the
-version, tag, commit, and embedded metadata, recomputes the digest, confirms the
-pom it is about to publish is byte-identical to the one inside that jar, and
-uploads exactly those two files. A jar or pom changed after inspection, a
-missing receipt, or a `HEAD` that has moved off the tag each fail before any
-credential is used, and so does a `CLOJARS_USERNAME` or `CLOJARS_PASSWORD` that
-is missing *or* set but blank — in CI a misnamed secret expands to the empty
-string, which means a broken release environment, not an anonymous upload.
-
-The upload is a separate alias rather than a build task because it is the only
-step that holds a credential. `:deploy` *replaces* `:deps` and `:paths` instead
-of extending them, so the JVM holding the Clojars token carries
-`com.kirahowe.secrets.publish`, the release guards beside it, and Maven's own
-deploy code — 25 jars, no `tools.build`, no library source, no test
-dependencies. Clojars is a plain Maven repository over HTTPS, so the upload goes
-through `maven-resolver` directly and resolves no wagon and none of the S3, AWS,
-logging, or serialization branches a wagon-based publisher brings with it. Every
-dependency on that classpath has a recorded dependency path and disposition in
-[doc/release-dependency-review.md](doc/release-dependency-review.md), and three
-tests fail the suite if the resolved graph drifts from it. A deploy prints three
-SLF4J "NOP logger" lines to stderr: no logging binding is on that classpath, by
-choice.
-
-The Clojars **deploy token** is the only credential a release needs. Scope it to
-deployment of `com.kirahowe/secrets` and nothing else, inject it into the deploy
-step's environment alone — never job-wide, so checkout, build, and inspection
-cannot read it — and rotate it in Clojars, and in the `release` environment's
-secrets, if it is ever exposed or if the machine that held it is in doubt. The
-publisher never prints either credential: publication output is the coordinate,
-version, tag, jar path, SHA-256, and the fixed
-`https://repo.clojars.org` repository URL. The production entry point accepts no
-repository override: every argument and every nonblank value of the retired
-`SECRETS_DEPLOY_REPOSITORY_URL` input is rejected before credentials are read or
-network I/O can begin. The authenticated local-recorder test calls the
-lower-level `deploy!` seam directly with its HTTP URL and fixture credentials;
-those test-only values cannot change production target selection.
-
-`clojure -T:build jar` is a development build from the live working tree: it
-makes no provenance claim (its pom carries no `<scm><tag>`) and is not
-publishable. `clojure -T:build install` installs that same development jar into
-`~/.m2`.
-
-## Authenticity contract and threat model
-
-[`doc/threat-model.md`](doc/threat-model.md) is the full statement of what this
-library protects, what it leaves to the deployment, and why. What a user needs
-from it:
-
-- age provides confidentiality and ciphertext integrity. Only a holder of a
-  private identity matching one of the file's recipients can decrypt
-  `secrets.edn.age`, and a modified, truncated, or spliced ciphertext fails to
-  decrypt instead of yielding altered plaintext.
-- Neither age nor this library identifies the sender. A public recipient
-  (`age1…`) is meant to be shared and committed, and anyone holding one can
-  encrypt a file that decrypts cleanly for every recipient. A successful
-  decryption shows the file is readable, not who wrote it, and an older valid
-  file can be put back in place of a newer one. Treat every public recipient as
-  known to every reader of the repository.
-- A keyless `verify` compares the ciphertext's digest with the one the manifest
-  records. A keyed `verify` also compares the decrypted store with the manifest
-  entries. Neither establishes authorship.
-- Protecting the repository, the build, and the channel that delivers the
-  ciphertext to the running process is the deployment's job. The values a
-  process loads are only as trustworthy as the commit that carried them and
-  that channel.
-
-### What the model requires of a deployment
-
-The deployment has to hold the channel it relies on. Three requirements, in the
-order they bite:
-
-1. **Reviewed, protected refs.** The artifact is only as trustworthy as the
-   commit that carried it, so require review and protect the branches and tags
-   a deploy builds from. An unreviewed push to that ref is an unreviewed change
-   to production configuration.
-2. **Immutable artifact transfer.** Nothing between the reviewed commit and the
-   running process may be able to substitute the ciphertext: build from the
-   protected ref, address every intermediate artifact and dependency by digest
-   rather than by a movable tag, and check the bytes you ship are the bytes you
-   inspected.
-3. **Least-privilege writes.** Whatever serves the ciphertext — repository,
-   registry, bucket, mounted volume — grants write access to as few principals
-   and as few build steps as the deployment can function with, since each one
-   is a party that can choose your configuration.
-
-This project's own CI and release pipeline are described under [Continuous
-integration](#continuous-integration) and [Releasing](#releasing).
-
-## Trade-offs and limitations
-
-This is the "encrypted secrets in git" model (like SOPS, git-crypt, sealed-
-secrets), done with EDN and age. It's a deliberately small tool; know what
-you're trading for that simplicity.
-
-- **Ciphertext diffs are opaque.** age re-encrypts the whole file, so a `git
-  diff` of `secrets.edn.age` reveals nothing. The [manifest](#manifest-seeing-what-changed)
-  makes *which* keys changed reviewable, but you never see the changed *value*
-  in a PR. If reviewing plaintext values is a hard requirement, you want per-
-  value encryption (SOPS) instead.
-- **Access is coarse and shared.** One key decrypts an entire environment;
-  there's no per-secret access control within a file. Multi-recipient gives each
-  person their own key, but every recipient can still read the whole file.
-- **Key rotation is all-or-nothing, and history is immutable.** A leaked key can
-  decrypt every past commit it encrypted; true revocation means rotating the
-  secret *values*, not just the key (see [Security notes](#security-notes)).
-- **No authenticity / signing.** age encrypts *to* a recipient but doesn't sign,
-  so anyone holding the public key(s) can craft a file that decrypts cleanly.
-  `verify` and `:vhash` detect *drift* between the manifest and the ciphertext,
-  not forgery. (A keyless `verify` run checks freshness only, via
-  `:ciphertext-sha`; the full value-level check still needs a key.) Protecting
-  the repository and the deployment channel is the deployment's job; see
-  [Authenticity contract and threat
-  model](#authenticity-contract-and-threat-model).
-- **`age` is a runtime dependency.** Decryption shells out, so every environment
-  that decrypts — dev, CI, the production container — needs the `age` binary on
-  PATH, not just the build. (The one exception: a keyless `bb secrets verify`
-  compares hashes only, so a freshness-gating CI job needs neither a key nor
-  the binary.)
-- **Plaintext briefly touches disk on `edit`/`new`.** It's an owner-only temp
-  file, deleted afterward, but the window is unavoidable, editor swap/undo
-  files are outside this tool's control, and deletion is best-effort, not
-  secure erasure (largely symbolic on SSD / copy-on-write filesystems like
-  APFS).
-- **The manifest leaks structure.** Key paths, value types, collection sizes,
-  and (in single-key mode) value equality and change are committed in the clear
-  (values are not). Opt out per environment with
-  `:manifest false`.
-- **`:vhash` only in single-key mode.** Detecting a same-type value edit needs a
-  shared secret to key the HMAC; multi-recipient setups have no single shared
-  key, so their manifests are structure-only (add / remove / retype still show;
-  a rotated string does not).
-- **Where it fits.** A solo developer or small team shipping a handful of apps
-  with no secrets infrastructure. If you need dynamic secrets, centralized
-  audit, fine-grained IAM, or automatic rotation, a dedicated secrets manager
-  (Vault, a cloud KMS / secret manager) earns its extra complexity.
-
-## Security notes
-
-Report a suspected vulnerability through the private route in the
-[security policy](SECURITY.md), not a public issue. Never put sensitive report
-details, real secrets or user data, proof-of-concept payloads, or unpatched
-exploit instructions in a public issue.
-
-- Never commit decrypted plaintext — only `*.edn.age` (encrypted),
-  `*.edn.manifest` (value-free shape), `*.edn.example` (templates), and
-  `recipients.txt` (public keys). `edit`/`new` keep plaintext in an owner-only
-  temp file and delete it afterward on a best-effort basis.
-- Back up the private key (a password manager). It is not in git and cannot be
-  recovered; losing it means re-keying every secret.
-- **A leaked key exposes history, not just the present.** Git history is
-  immutable, so a key that leaks can decrypt every past version of every file it
-  encrypted. Rotating the key is not enough — you must rotate the underlying
-  secret *values*. Likewise, removing a recipient stops *future* access but not
-  their ability to decrypt old commits.
-- The decrypted map lives in process memory like any config; an RCE in the host
-  app can read it. Encryption protects secrets at rest and in git, not from a
-  compromised running process.
-- The manifest is intentionally plaintext: it leaks key *paths*, value
-  *types/shape*, and in single-key mode value equality and change (not values).
-  If a key's mere existence is sensitive, set `:manifest false` for that
-  environment.
-- Sensitive temp files (injected identities, plaintext during `edit`) are
-  created owner-only (0600) atomically on POSIX filesystems. On non-POSIX
-  filesystems (e.g. Windows), private-file creation fails closed when those
-  permissions cannot be established. Raw and base64 injected identities are
-  removed when their owning operation finishes, including failure cleanup. A
-  process crash can still leave a temporary identity behind; see
-  [Scoped temporary identities](#scoped-temporary-identities).
-- **Decrypted plaintext files are published 0600, never written in place.**
-  `decrypt-to-file!` writes into an owner-only sibling staging file and then
-  atomically renames it over the destination, so the result does not depend on
-  the umask or on the destination's previous mode and no permissive or partial
-  plaintext is ever observable there. A destination that is a symlink,
-  directory, or other non-regular file is refused rather than written through,
-  and a filesystem without POSIX permissions fails closed — decrypt in memory
-  with `decrypt-bytes` / `decrypt` instead.
-- **Pathnames reaching `age` are data, never options.** Encryption and
-  decryption shell out to the `age` binary, so a path that arrived on its
-  command line as an option would let a filename choose the operation instead of
-  naming the file it operates on. Every invocation that takes an input pathname
-  therefore terminates its options with `--` before it, and every path argument
-  that starts with a dash is passed as `./-name` — age reads a bare `-` from
-  standard input even behind a terminator, so the prefix is the part that keeps
-  a filename a filename.
-- **A filename cannot change how the CLI parses its own arguments either.**
-  `--edn` is `set`'s flag, so only `set`'s arguments are searched for it; every
-  other command reads a `--edn` operand as the filename or key it is. `--` ends
-  the options for every command and is consumed rather than passed on, so
-  `bb secrets encrypt dev -- --edn` encrypts the file. `[env]` stays positional
-  and optional throughout.
+The version and coordinates live in `src/com/kirahowe/secrets/coordinate.edn`.
+A release is built from a `v<version>` tag by the `release` workflow, or by
+hand with `clojure -T:build release` and `clojure -M:deploy`.
+[`doc/release-dependency-review.md`](doc/release-dependency-review.md) records
+the dependencies of the deploy step.
 
 ## License
 
