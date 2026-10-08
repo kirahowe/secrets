@@ -3188,3 +3188,38 @@
                   "in the command's own private temp file, not a second one")
               (is (not (.exists (io/file path))) "which is gone"))
             (is (= bytes-before (file-bytes ciphertext)))))))))
+
+(deftest verify-continues-past-an-environment-that-throws-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [missing (str *dir* "/no-such-key.txt")
+          other-key (str *dir* "/other-key.txt")
+          env (fn [n key-file] {:secrets-file (str *dir* "/" n ".edn.age") :key-file key-file})
+          config (fn [envs] (cli/normalize-config {:app "cli-test" :environments envs}))
+          good {:good (env "good" *key*) :fine (env "fine" *key*)}
+          all (config (assoc good
+                             :no-identity (env "no-identity" missing)
+                             :wrong-key (env "wrong-key" other-key)))]
+      (age/keygen! other-key)
+      (doseq [n ["good" "fine" "wrong-key"]]
+        (with-out-str
+          (with-in-str "v" (cli/set-secret! (config {(keyword n) (env n *key*)}) n ":k" false))))
+      (testing "each failing environment is reported and the others are verified"
+        (let [{:keys [result out err]} (capture-verify all nil)]
+          (is (= {:good :ok :fine :ok :no-identity :error :wrong-key :error} (:results result)))
+          (is (= 2 (:exit result)))
+          (is (str/includes? err (str "no-identity — The configured :key-file names an age"
+                                      " identity file that does not exist: " missing)))
+          (is (str/includes? out "Create it with `bb secrets keygen`."))
+          (is (str/includes? err "wrong-key —"))
+          (is (= 2 (count (re-seq #"manifest matches" out))))))
+      (testing "an environment named on the command line still throws"
+        (is (= :no-identity
+               (:reason (ex-data (try (verify all "no-identity")
+                                      (catch clojure.lang.ExceptionInfo e e)))))))
+      (testing "drift in another environment still decides the exit code"
+        (spit (str *dir* "/fine.edn.manifest") "{:version 3}")
+        (let [{:keys [result]} (capture-verify all nil)]
+          (is (= {:good :ok :fine :drift :no-identity :error :wrong-key :error}
+                 (:results result)))
+          (is (= 1 (:exit result))))))))

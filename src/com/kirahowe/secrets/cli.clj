@@ -1429,9 +1429,9 @@
         {:committed (:value parsed)}))))
 
 ;;; A verification is computed as a *finding*: `:status` (:ok, :ok-keyless,
-;;; :drift, or :missing), a `:reason`, and whatever the report needs. It is
-;;; rendered by `finding-lines`. `verify-one!` does the reading, hashing, and
-;;; decrypting; the two functions between it and the report are pure.
+;;; :drift, :missing, or :error), a `:reason`, and whatever the report needs.
+;;; It is rendered by `finding-lines`. `verify-one!` does the reading, hashing,
+;;; and decrypting; the two functions between it and the report are pure.
 
 (defn- keyless-finding
   "Freshness without a key: the manifest's recorded `:ciphertext-sha` against
@@ -1551,6 +1551,10 @@
        [:line "    It belongs to a different store."]
        regenerate]
 
+      :error
+      (into [[:oops label "—" (:message finding)]]
+            (when-let [hint (:hint finding)] [[:line "   " hint]]))
+
       :ciphertext-agrees
       [[:ok label "— ciphertext agrees with the manifest"
         "(freshness only: no key, so values are not checked)."]]
@@ -1584,8 +1588,9 @@
   "Check that each environment's committed manifest matches its encrypted
   secrets. With no env, verifies all of them. Never exits: returns
   {:results {env-name status} :exit code}, where each status is :ok,
-  :ok-keyless, :drift, or :missing. The exit code is 1 on drift and 0 when
-  everything agrees. It is 2 when a secrets file or manifest is missing.
+  :ok-keyless, :drift, :missing, or :error. The exit code is 1 on drift and 0
+  when everything agrees. It is 2 when a secrets file or manifest is missing,
+  or when an environment could not be verified at all.
 
   Every manifest has to be complete before anything is compared: the supported
   `:version`, this project's `:app`, a `:ciphertext-sha`, and a `:keys` map
@@ -1599,8 +1604,11 @@
   A store whose manifest key is missing or malformed is drift: it cannot agree
   with any manifest, and the report says that `reencrypt` generates a new key.
 
-  An identity designated by :identity-file, a configured :key-file, or
-  SECRETS_AGE_IDENTITY_FILE that does not exist throws `:no-identity`.
+  Some failures throw: an identity designated by :identity-file, a configured
+  :key-file, or SECRETS_AGE_IDENTITY_FILE that does not exist (`:no-identity`),
+  and a store this identity cannot decrypt. With an environment named, the
+  failure propagates. With no env, it is reported as that environment's
+  problem with status :error and the other environments are still verified.
 
   A pass means the ciphertext and the manifest agree, which detects drift and
   a manifest from the wrong store. It does not establish authorship, even when
@@ -1612,18 +1620,26 @@
   (let [envs (if env-arg
                [(resolve-env config env-arg)]
                (vals (:environments config)))
+        verify-env (fn [env]
+                     (try
+                       (with-environment-identity config env
+                         (fn [env] [env (verify-one! env)]))
+                       (catch clojure.lang.ExceptionInfo e
+                         (when env-arg (throw e))
+                         [env {:status :error
+                               :reason :error
+                               :message (ex-message e)
+                               :hint (:hint (ex-data e))}])))
         results (into {}
                       (map (fn [env]
-                             (with-environment-identity config env
-                               (fn [env]
-                                 (let [finding (verify-one! env)]
-                                   (say! (finding-lines env finding))
-                                   [(:name env) (:status finding)])))))
+                             (let [[env finding] (verify-env env)]
+                               (say! (finding-lines env finding))
+                               [(:name env) (:status finding)])))
                       envs)
         statuses (set (vals results))]
     {:results results
      :exit (cond (statuses :drift) 1
-                 (statuses :missing) 2
+                 (some statuses [:missing :error]) 2
                  :else 0)}))
 
 ;;;; Doctor
