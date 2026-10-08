@@ -1,7 +1,8 @@
 (ns com.kirahowe.secrets.secrets-property-test
   "Properties of the runtime namespace. Only `~` and a leading `~/` expand to
   the home directory. Identity sources resolve in their documented order, and
-  a blank or malformed variable is refused instead of skipped. An injected
+  a blank or malformed variable is refused instead of skipped, and a
+  designated identity file that does not exist is refused by name. An injected
   identity is private, exact, and gone after the call, whether the callback
   returns or throws. A caller's own identity file is never touched, and a path setting that holds
   key contents or a locator is refused without repeating it. `get-secret`
@@ -17,6 +18,7 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.generators :as g]
+            [com.kirahowe.secrets.safe-edn]
             [com.kirahowe.secrets.test-env :as test-env :refer [rendered thrown]]))
 
 (defn- with-env
@@ -34,8 +36,32 @@
 (defn- key-line [text]
   (first (filter #(str/starts-with? % "AGE-SECRET-KEY-1") (map str/trim (str/split-lines text)))))
 
+(def ^:private key-dir
+  "A temporary directory for the identity files these properties name. A
+  designated identity path has to exist, so a path-text value must be real."
+  (delay
+    (let [dir (java.nio.file.Files/createTempDirectory
+               "kira-secrets-identity-property-test"
+               (into-array java.nio.file.attribute.FileAttribute []))]
+      (.deleteOnExit (.toFile dir))
+      (str dir))))
+
+(def ^:private missing-path-text
+  "A path under `key-dir` that no property creates."
+  (gen/fmap #(str @key-dir "/missing-" %) (gen/not-empty gen/string-alphanumeric)))
+
 (def ^:private path-text
-  (gen/fmap #(str "/keys/" %) (gen/not-empty gen/string-alphanumeric)))
+  "A path under `key-dir`. Call `touch!` on it where the file must exist."
+  (gen/fmap #(str @key-dir "/" %) (gen/not-empty gen/string-alphanumeric)))
+
+(defn- touch!
+  "Create the empty file at `path` unless it exists, and return `path`."
+  [path]
+  (let [f (io/file path)]
+    (when-not (.exists f)
+      (spit f "")
+      (.deleteOnExit f))
+    path))
 
 (def ^:private word (gen/not-empty gen/string-alphanumeric))
 
@@ -82,10 +108,6 @@
             wrapped (wrapped-b64 text)]
     [text wrapped]))
 
-(def ^:private key-file-sources
-  "Option value for `:key-file-source`, and the `:identity-source` it yields."
-  [[nil :configured-key-file] [:configured :configured-key-file] [:default :default-key-file]])
-
 (def ^:private resolution
   "Generator of which identity sources are present, with the values they hold,
   as `{:arg :env :expected}`: the argument for `with-identity`, the
@@ -96,7 +118,6 @@
             explicit path-text
             file-path path-text
             key-file path-text
-            [key-file-source key-file-id] (gen/elements key-file-sources)
             app word
             [text wrapped] identity-and-wrapped]
     (let [bare-explicit? (and explicit? bare?)
@@ -105,7 +126,7 @@
                       [raw? {:contents text :source :secrets-age-identity}]
                       [b64? {:contents text :source :secrets-age-identity-b64}]
                       [(and key-file? (not bare-explicit?))
-                       {:path key-file :source key-file-id}]
+                       {:path key-file :source :configured-key-file}]
                       [(and app? (not bare-explicit?))
                        {:path (secrets/default-key-file app) :source :default-key-file}]]]
       {:arg (if bare-explicit?
@@ -113,7 +134,6 @@
               (cond-> {}
                 explicit? (assoc :identity-file explicit)
                 key-file? (assoc :key-file key-file)
-                (and key-file? key-file-source) (assoc :key-file-source key-file-source)
                 app? (assoc :app app)))
        :env (cond-> {}
               file? (assoc "SECRETS_AGE_IDENTITY_FILE" file-path)
@@ -124,7 +144,9 @@
 
 (defspec identity-sources-resolve-in-documented-order 300
   (prop/for-all [{:keys [arg env expected]} resolution]
-    (let [seen (with-env env
+    (let [_ (when (and (:path expected) (not= :default-key-file (:source expected)))
+              (touch! (:path expected)))
+          seen (with-env env
                  #(secrets/with-identity
                     arg
                     (fn [{:keys [identity-file identity-source]}]
@@ -171,7 +193,7 @@
                  blank blank-text
                  explicit path-text
                  form (gen/elements [:string :opts])]
-    (let [arg (if (= :string form) explicit {:identity-file explicit})
+    (let [arg (if (= :string form) (touch! explicit) {:identity-file (touch! explicit)})
           seen (with-env {(nth identity-vars index) blank}
                  #(secrets/with-identity arg identity))]
       (and (= explicit (:identity-file seen))
@@ -323,9 +345,49 @@
                  rest-of-name word]
     (let [bare (str name ":" rest-of-name)
           refused (thrown #(secrets/with-identity bare identity))
-          seen (secrets/with-identity (str "./" bare) identity)]
+          ;; Only the dot-slash form gets past the locator check, to the
+          ;; existence check that the missing file then fails.
+          kept (thrown #(secrets/with-identity (str "./" bare) identity))]
       (and (= :disallowed-identity (:reason (ex-data refused)))
-           (= (str "./" bare) (:identity-file seen))))))
+           (= :no-identity (:reason (ex-data kept)))
+           (= (str "./" bare) (:identity-file (ex-data kept)))))))
+
+(def ^:private designation-sources
+  "Each way to designate an identity file, and the `:identity-source` it reports."
+  {:string :identity-file
+   :opts :identity-file
+   :env :secrets-age-identity-file
+   :key-file :configured-key-file})
+
+(defspec a-designated-identity-that-does-not-exist-is-refused-by-name 200
+  (prop/for-all [path missing-path-text
+                 via (gen/elements (keys designation-sources))
+                 tilde? gen/boolean
+                 name word]
+    (let [home (System/getProperty "user.home")
+          value (if tilde? (str "~/.kira-secrets-property-missing/" name) path)
+          expanded (if tilde? (str home "/.kira-secrets-property-missing/" name) path)
+          called? (atom false)
+          arg (case via
+                :string value
+                :opts {:identity-file value}
+                :env nil
+                :key-file {:key-file value})
+          environment (when (= :env via) {"SECRETS_AGE_IDENTITY_FILE" value})
+          e (thrown #(with-env environment
+                       (fn [] (secrets/with-identity arg (fn [_] (reset! called? true))))))]
+      (and (instance? clojure.lang.ExceptionInfo e)
+           (= :no-identity (:reason (ex-data e)))
+           (= expanded (:identity-file (ex-data e)))
+           (= (designation-sources via) (:identity-source (ex-data e)))
+           (str/includes? (ex-message e) expanded)
+           (not @called?)))))
+
+(defspec an-app-default-identity-need-not-exist 50
+  (prop/for-all [app word]
+    (let [seen (with-env {} #(secrets/with-identity {:app (str "kira-missing-" app)} identity))]
+      (and (= :default-key-file (:identity-source seen))
+           (= (secrets/default-key-file (str "kira-missing-" app)) (:identity-file seen))))))
 
 ;;;; get-secret
 
@@ -403,38 +465,41 @@
         (.delete (io/file plain))
         (.delete (io/file encrypted))))))
 
+(def ^:private max-edn-depth
+  "The nesting depth the loader refuses past. It is a fixed private constant,
+  so the deep template reads it rather than guessing."
+  @#'com.kirahowe.secrets.safe-edn/max-depth)
+
 (defn- malformed
-  "Generator of `[text limits]` where `text` is malformed secrets text that
-  repeats `marker` inside a string or token, and loading it must fail."
+  "Generator of malformed secrets text that repeats `marker` inside a string
+  or token, and loading it must fail."
   [marker]
-  (gen/let [depth (gen/choose 1 6)
+  (gen/let [extra (gen/choose 1 5)
             template (gen/elements [:unclosed :odd-map :duplicate-set :duplicate-key :bad-tag
                                     :bad-instant :bad-escape :bad-char :extra :deep])]
     (case template
-      :unclosed [(str "{:k [\"" marker "\"") nil]
-      :odd-map [(str "{:k \"" marker "\" :v}") nil]
-      :duplicate-set [(str "#{\"" marker "\" \"" marker "\"}") nil]
-      :duplicate-key [(str "{\"" marker "\" 1 \"" marker "\" 2}") nil]
-      :bad-tag [(str "#" marker " 1") nil]
-      :bad-instant [(str "{:at #inst \"" marker "\"}") nil]
-      :bad-escape [(str "[1 " marker "\\") nil]
-      :bad-char [(str "{:k \\" marker "}") nil]
-      :extra [(str "{:k \"" marker "\"} [\"" marker "\"]") nil]
-      :deep [(str (str/join (repeat (inc depth) "[")) "\"" marker "\""
-                  (str/join (repeat (inc depth) "]")))
-             {:max-edn-depth depth}])))
+      :unclosed (str "{:k [\"" marker "\"")
+      :odd-map (str "{:k \"" marker "\" :v}")
+      :duplicate-set (str "#{\"" marker "\" \"" marker "\"}")
+      :duplicate-key (str "{\"" marker "\" 1 \"" marker "\" 2}")
+      :bad-tag (str "#" marker " 1")
+      :bad-instant (str "{:at #inst \"" marker "\"}")
+      :bad-escape (str "[1 " marker "\\")
+      :bad-char (str "{:k \\" marker "}")
+      :extra (str "{:k \"" marker "\"} [\"" marker "\"]")
+      :deep (let [layers (+ max-edn-depth extra)]
+              (str (str/join (repeat layers "[")) "\"" marker "\""
+                   (str/join (repeat layers "]")))))))
 
 (def ^:private edn-reasons #{:edn-empty :edn-extra-values :edn-too-deep :edn-malformed})
 
 (defspec a-load-of-malformed-text-never-repeats-it 30
-  (prop/for-all [[marker [text limits]] (gen/let [marker g/marker
-                                                  failing (malformed marker)]
-                                          [marker failing])]
+  (prop/for-all [[marker text] (gen/let [marker g/marker
+                                         failing (malformed marker)]
+                                 [marker failing])]
     (with-ciphertext text
       (fn [encrypted]
-        (let [e (thrown #(secrets/load-secrets
-                          encrypted
-                          (cond-> {:identity-file (:key @fixture)} limits (assoc :limits limits))))]
+        (let [e (thrown #(secrets/load-secrets encrypted {:identity-file (:key @fixture)}))]
           (and (instance? clojure.lang.ExceptionInfo e)
                (contains? edn-reasons (:reason (ex-data e)))
                (not (str/includes? (rendered e) marker))))))))

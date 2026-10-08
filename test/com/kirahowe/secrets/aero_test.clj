@@ -7,7 +7,8 @@
             [clojure.test :refer [deftest is testing use-fixtures]]
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.aero :as secrets-aero]
-            [com.kirahowe.secrets.age :as age]))
+            [com.kirahowe.secrets.age :as age]
+            [com.kirahowe.secrets.test-env :as test-env]))
 
 ;;;; Fixtures
 
@@ -128,10 +129,19 @@
     (testing "no :secrets options at all"
       (is (= {:v nil} (secrets-aero/read-config cfg-opt {})))
       (is (= :no-file (reason {}))))
-    (testing "no identity"
+    (testing "a designated identity that does not exist is an operator mistake"
       (let [keyless (assoc store :identity-file (str *dir* "/absent-key.txt"))]
-        (is (= {:v nil} (secrets-aero/read-config cfg-opt {:secrets keyless})))
-        (is (= :no-identity (reason {:secrets keyless})))))))
+        (is (= :no-identity (:reason (ex-data (thrown-by #(secrets-aero/read-config
+                                                           cfg-opt {:secrets keyless}))))))
+        (is (= :no-identity (reason {:secrets keyless})))))
+    (testing "an app default key that does not exist only means no identity is available"
+      (let [keyless (-> store
+                        (dissoc :identity-file)
+                        (assoc :app (str "kira-absent-" (random-uuid))))]
+        (with-redefs-fn (test-env/getenv-redefs {})
+          (fn []
+            (is (= {:v nil} (secrets-aero/read-config cfg-opt {:secrets keyless})))
+            (is (= :no-identity (reason {:secrets keyless})))))))))
 
 (deftest missing-required-key-is-the-core-error-test
   (let [store (encrypt-edn! {:present 1})

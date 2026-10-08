@@ -107,7 +107,7 @@
   A returned copy is cleaned up first."
   [input]
   (let [result (atom nil)
-        e (thrown #(reset! result (source/acquire! input (source/descriptor input) 1024)))]
+        e (thrown #(reset! result (source/acquire! input (source/descriptor input))))]
     (when-let [[_ cleanup!] @result] (cleanup!))
     e))
 
@@ -185,7 +185,7 @@
                   :uri (java.net.URI. locator)
                   :url (java.net.URL. locator))]
       (try
-        (let [[found cleanup!] (source/acquire! input (source/descriptor input) 1024)]
+        (let [[found cleanup!] (source/acquire! input (source/descriptor input))]
           (cleanup!)
           (and (= (.getAbsolutePath file) (.getAbsolutePath ^java.io.File found))
                (.exists file)))
