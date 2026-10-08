@@ -2,8 +2,8 @@
   "One-shot project bootstrapper for `bb secrets`.
 
   It creates the files a new setup needs and never modifies a file that already
-  exists. For an existing `bb.edn`, `deps.edn`, or `.gitignore` it prints what
-  to add and leaves the file alone."
+  exists. For an existing `bb.edn` or `deps.edn` it prints what to add and
+  leaves the file alone."
   (:require [babashka.cli :as bbcli]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
@@ -100,18 +100,12 @@
 (def ^:private init-spec
   [[:app {:coerce :string :desc "Application name"}]
    [:env {:coerce :string :default "dev" :desc "Environment name"}]
-   [:layout {:coerce keyword
-             :default :tracked
-             :validate #{:tracked :disposable}
-             :desc "Artifact layout: tracked or disposable"}]
-   [:team {:coerce :boolean :desc "Create a public recipients file"}]
    [:keygen {:coerce :boolean :desc "Also generate an age identity"}]
    [:apply {:coerce :boolean :desc "Create the files instead of previewing"}]
    [:help {:alias :h :coerce :boolean :desc "Show this help"}]])
 
 (def ^:private boolean-option-names
-  {:team :team?
-   :keygen :keygen?
+  {:keygen :keygen?
    :apply :apply?
    :help :help?})
 
@@ -129,7 +123,8 @@
                     {:option option}))))
 
 (defn parse-args
-  "Parse initializer options, including standalone `-h` and `--help`."
+  "Parse initializer options, including standalone `-h` and `--help`. The names
+  are checked when [[proposed-config]] uses them."
   [args]
   (let [parsed (bbcli/parse-opts args {:spec init-spec
                                        :restrict true
@@ -143,27 +138,22 @@
                         boolean-option-names)]
     (when-not (:help? opts)
       (when-not (and (string? (:app opts)) (not (str/blank? (:app opts))))
-        (throw (ex-info "--app <name> is required" {})))
-      (require-plain-name! "--app" (:app opts))
-      (require-plain-name! "--env" (:env opts)))
+        (throw (ex-info "--app <name> is required" {}))))
     opts))
 
 ;;;; What a project needs
 
 (defn proposed-config
-  "Build a proposed secrets configuration from initializer options."
-  [{:keys [app env layout team?]
-    :or {env "dev" layout :tracked}}]
-  (let [disposable? (= layout :disposable)
-        dir (if disposable? ".local/secrets" "secrets")
-        env-config (cond-> {:secrets-file (str dir "/secrets.edn.age")
-                            :template "secrets/secrets.edn.example"
-                            :manifest (str dir "/secrets.edn.manifest")}
-                     disposable? (assoc :key-file (str dir "/key.txt"))
-                     team? (assoc :recipients-file (str dir "/recipients.txt")))]
-    {:app app
-     :default-environment (keyword env)
-     :environments {(keyword env) env-config}}))
+  "The secrets configuration a new project starts with: one environment whose
+  ciphertext is `secrets/secrets.edn.age`. The CLI derives the template and
+  manifest paths beside it and the identity path from the app name. Throws when
+  `app` or `env` is not a plain name."
+  [{:keys [app env] :or {env "dev"}}]
+  (require-plain-name! "--app" app)
+  (require-plain-name! "--env" env)
+  {:app app
+   :default-environment (keyword env)
+   :environments {(keyword env) {:secrets-file "secrets/secrets.edn.age"}}})
 
 (defn task-spec
   "Build the `bb.edn` task specification for a secrets configuration."
@@ -172,17 +162,18 @@
    :requires '([com.kirahowe.secrets.cli :as cli])
    :task (list 'cli/run! config '*command-line-args*)})
 
-(defn self-dependency
+(defn- self-dependency
   "The bb.edn dependency that puts the project's own deps.edn on Babashka's
   classpath: `{myapp/myapp {:local/root \".\"}}`, keyed by the app name so
   the entry says what it is."
   [app]
-  (require-plain-name! "--app" app)
   {(symbol app app) {:local/root "."}})
 
+(def ^:private template-path
+  "Where the CLI looks for the template of `secrets/secrets.edn.age`."
+  "secrets/secrets.edn.example")
+
 (def ^:private template-content "{:example/api-key \"replace-me\"}\n")
-(def ^:private recipients-content "# One age recipient per line.\n")
-(def ^:private gitignore-line "/.local/secrets/")
 
 (defn- edn-text
   "`x` as copyable EDN: pretty printed, with namespace-map shorthand and the
@@ -217,11 +208,12 @@
   (Files/exists (target root path) no-follow))
 
 (defn- existing-map
-  "The top-level map of the existing EDN file `path`, or nil when the file does
-  not read as one EDN map. Such a file counts as having nothing, so every
-  wanted entry is printed for it."
+  "The top-level map of the existing EDN file `path`, or nil when it is not a
+  readable file holding one EDN map. Such an entry counts as having nothing,
+  so every wanted entry is printed for it."
   [root path]
-  (let [{:keys [ok? value]} (safe-edn/parse (slurp (.toFile (target root path))))]
+  (let [file (.toFile (target root path))
+        {:keys [ok? value]} (when (.isFile file) (safe-edn/parse (slurp file)))]
     (when (and ok? (map? value)) value)))
 
 (defn- present?
@@ -258,8 +250,7 @@
          :action :add
          :entries missing
          :additions (mapv (fn [[section k v]]
-                            {:where (str "under " section)
-                             :text (entry-text k v)})
+                            {:under section :text (entry-text k v)})
                           missing)}))))
 
 (defn- plain-file
@@ -268,20 +259,6 @@
   (if (exists? root path)
     {:path path :action :exists}
     {:path path :action :create :content content}))
-
-(defn- gitignore-file [root]
-  (cond
-    (not (exists? root ".gitignore"))
-    {:path ".gitignore" :action :create :content (str gitignore-line "\n")}
-
-    (some #(= gitignore-line (str/trim %))
-          (str/split-lines (slurp (.toFile (target root ".gitignore")))))
-    {:path ".gitignore" :action :exists}
-
-    :else
-    {:path ".gitignore" :action :add
-     :additions [{:where "as a new line, so .local/secrets/ stays out of git"
-                  :text gitignore-line}]}))
 
 (defn plan
   "Decide, without writing anything, what initializing a project would do.
@@ -294,7 +271,7 @@
     content, because `age-keygen` writes it.
   - `:exists` for a file that is already there and needs nothing.
   - `:add` for an existing file that lacks something, with `:additions`, each
-    a `:where` and the `:text` to put there.
+    the top-level key to put it `:under` and the `:text` to put there.
 
   Without a deps.edn, bb.edn declares the library. With one, deps.edn declares
   it and bb.edn reaches it through a `:local/root \".\"` dependency on the
@@ -302,10 +279,8 @@
   A bb.edn that already declares the library keeps doing so. `:dependency` is
   the library's `{lib coordinate}` entry when the plan creates or prints it."
   [opts]
-  (let [{:keys [root app env layout team? keygen?] :as opts}
-        (merge {:root "." :env "dev" :layout :tracked} opts)
+  (let [{:keys [root app keygen?] :as opts} (merge {:root "."} opts)
         config (proposed-config opts)
-        env-config (get-in config [:environments (keyword env)])
         library (vec (cons :deps (first @default-dependency)))
         task [:tasks 'secrets (task-spec config)]
         deps-owns? (and (exists? root "deps.edn")
@@ -317,13 +292,10 @@
                             library)
                           task])
         deps-edn (when deps-owns? (edn-file root "deps.edn" [library]))
-        key-file (or (:key-file env-config) (secrets/default-key-file app))
-        files (cond-> []
-                deps-edn (conj deps-edn)
-                true (conj bb-edn)
-                (= layout :disposable) (conj (gitignore-file root))
-                true (conj (plain-file root (:template env-config) template-content))
-                team? (conj (plain-file root (:recipients-file env-config) recipients-content))
+        key-file (secrets/default-key-file app)
+        files (cond-> (filterv some? [deps-edn
+                                      bb-edn
+                                      (plain-file root template-path template-content)])
                 keygen? (conj (if (exists? root key-file)
                                 {:path key-file :action :exists}
                                 {:path key-file :action :create :private? true})))]
@@ -405,8 +377,8 @@
               (map #(str "  " (:path %)) (:exists by-action)))
      (section "Add these yourself. The initializer does not edit existing files."
               (for [{:keys [path additions]} (:add by-action)
-                    {:keys [where text]} additions
-                    line (cons (str "  " path ", " where ":") (indented 6 text))]
+                    {:keys [under text]} additions
+                    line (cons (str "  " path ", under " under ":") (indented 6 text))]
                 line))
      (when (and (:git/sha coordinate) (not (:git/tag coordinate)))
        ["" (str lib " is pinned to this checkout's HEAD commit, which is not a release tag.")
