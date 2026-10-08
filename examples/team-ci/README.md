@@ -1,16 +1,14 @@
 # Team CI starter
 
 This example uses `com.kirahowe/secrets` from the repository root via
-`{:local/root "../.."}`. It demonstrates the team mode: a committed list of
-age public recipients, an encrypted fixture, and a value-free manifest that a
-CI job can verify without installing age or receiving a private identity.
+`{:local/root "../.."}`. It demonstrates team mode: a committed list of age
+public recipients, an encrypted fixture, and a manifest that a CI job can
+verify without installing age or receiving a private identity.
 
-From this checkout, the fixture gate needs Babashka (`bb`) and `java` because
-this example's `bb.edn` uses `{:local/root "../.."}` and Babashka `1.13.219`
-resolves that through Java-backed deps tooling. It does not need `age`, a
-private identity, or secret values. The Alice/Bob demo additionally needs the
-`age` CLI. From this directory, the committed fixture can be checked without
-any key:
+The fixture gate needs Babashka (`bb`) and `java`, because Babashka resolves
+the `:local/root` dependency through Java. It does not need `age`, a private
+identity, or secret values. The Alice and Bob demo also needs the `age` CLI.
+From this directory, check the committed fixture without any key:
 
 ```sh
 bb secrets verify fixture
@@ -18,38 +16,43 @@ bb secrets verify fixture
 bb verify
 ```
 
-The fixture's `recipients.txt`, ciphertext, and manifest are safe repository
-artifacts. The fixture identity used to generate them was disposable and is
-not present here. The ciphertext contains only fake values. The manifest
-records paths and types plus the ciphertext SHA; it never records values.
+The fixture's `recipients.txt`, ciphertext, and manifest are safe to commit.
+The identity used to generate them was disposable and is not present here.
+The ciphertext contains only fake values. The manifest records key paths,
+types, a keyed hash of each value, and the ciphertext's SHA-256. It never
+records a value.
 
-## Disposable Alice/Bob and first-owner workflow
+The check runs without a key because the job names no identity and the
+runner has no key file. An identity that is named, by `:identity-file` or an
+identity variable, has to exist.
+
+## Disposable Alice and Bob workflow
 
 The separate `demo` environment lives entirely under ignored `.local/`. The
-script starts from an empty store, generates Alice's disposable identity, adds
-Alice's public recipient, and silently proves that there is still no
-ciphertext and that the command did not recommend `reencrypt`. It creates the
-first store from fake stdin values, adds Bob's public recipient, confirms that
-`reencrypt` is now recommended, re-encrypts, and asserts the exact two-recipient
-set. Finally, both private identities decrypt the resulting ciphertext to
-temporary comparison files and Bob runs `verify`.
+script starts from an empty store, generates Alice's disposable identity, and
+adds her public recipient. It checks that there is still no ciphertext and
+that the command did not recommend `reencrypt`. It creates the store from fake
+values on stdin, adds Bob's public recipient, confirms that `reencrypt` is now
+recommended, re-encrypts, and asserts the exact two-recipient set. Finally Bob
+runs `verify` with his own identity, and both identities decrypt the
+ciphertext with `age` to temporary files that are compared byte for byte.
 
-No secret value or private identity is printed. The comparison plaintext files
-are removed automatically on exit, including failure. Disposable identities,
-ciphertext, and manifest remain under `.local/demo` until explicit cleanup so
-the state can be inspected:
+No secret value or private identity is printed. The comparison files are
+removed on exit, including on failure. The disposable identities, ciphertext,
+and manifest remain under `.local/demo` until you clean up, so you can inspect
+them:
 
 ```sh
 bb demo
 bb cleanup
 ```
 
-Values enter `bb secrets set` only on stdin, never as command arguments. Only
-Bob's public recipient is passed as an argument. Nothing under `.local/` is
-committed, and cleanup removes only the script's exact named artifacts.
+Values enter `bb secrets set` only on stdin. Only Bob's public recipient is
+passed as an argument. Nothing under `.local/` is committed, and cleanup
+removes only the script's own named files.
 
-For a real team's first store, the first owner follows the same state
-transition with a durable, securely backed-up private identity:
+For a real team's first store, the first owner follows the same steps with a
+durable private identity that is backed up:
 
 ```sh
 bb secrets keygen demo
@@ -59,14 +62,13 @@ printf %s "$FIRST_SECRET_VALUE" | bb secrets set demo :service/token
 ```
 
 There is no `reencrypt` step before the first `set` or `new`: no ciphertext
-exists yet, and store creation encrypts directly to the current public
-recipients.
+exists yet, and creating the store encrypts to the current public recipients.
 
-## Onboarding, offboarding, deployment, and repository boundaries
+## Adding and removing people
 
-When ciphertext already exists, a teammate creates and retains their private
-identity, gives a maintainer only its public `age1…` recipient, and is onboarded
-with:
+When ciphertext already exists, a teammate creates and keeps their own private
+identity and gives a maintainer only its public `age1…` recipient. The
+maintainer, who must be a current recipient, runs:
 
 ```sh
 bb secrets add-recipient demo age1...teammate-public-key...
@@ -74,67 +76,66 @@ bb secrets reencrypt demo
 bb secrets recipients demo
 ```
 
-The maintainer must be a current recipient able to decrypt the existing store.
-Adding the public key changes only `recipients.txt`; re-encryption writes the
-new ciphertext and value-free manifest. The teammate gains access to that new
-and future ciphertext, not by changing any private identity.
+Adding the public key changes only `recipients.txt`. Re-encryption writes the
+new ciphertext and manifest, and the teammate can read from then on.
 
-To offboard someone, remove their public-key line from the committed recipients
-file and re-encrypt. This blocks their identity from future ciphertext only. An
-old clone, backup, downloaded ciphertext, or plaintext cannot be revoked. If a
-private identity or old ciphertext is compromised, changing recipients is
-insufficient: rotate the underlying secret values and affected credentials,
-then write new ciphertext for the remaining recipients.
+To remove someone, delete their public-key line from the committed recipients
+file and re-encrypt. Their identity cannot decrypt ciphertext written after
+that. It still decrypts every earlier version in git history, and nothing
+takes back a value they already read, so rotate the affected credentials at
+their providers.
 
-Use a dedicated, non-human deployment recipient and never a developer's
-identity. Commit the deployment public recipient and inject only its private
-identity into the job through one supported mechanism:
-`SECRETS_AGE_IDENTITY_FILE` for a secret-provided file path,
-`SECRETS_AGE_IDENTITY` for raw identity contents, or
-`SECRETS_AGE_IDENTITY_B64` for base64 identity contents.
+`reencrypt` also gives the store a new manifest key, so every `:vhash` in the
+manifest changes in that commit. The removed person held the old key, and
+with it they could have tested guesses against later manifests. `edit`, `set`,
+and `rm` renew the key the same way when they find that the recipients file
+has changed since the store was last encrypted.
 
-Commit only the public recipient list, encrypted `*.age` ciphertext, its
-value-free `*.manifest`, safe templates containing fake placeholders, CLI
-configuration, and the CI workflow. Never commit private identities, decrypted
-plaintext, or real secret values. The fixture's committed ciphertext contains
-explicitly fake values; its discarded generation identity is not present.
+Use a dedicated deployment recipient instead of a developer's identity. Commit
+its public recipient and give the job its private identity through one of
+`SECRETS_AGE_IDENTITY_FILE` (a path to a mounted file), `SECRETS_AGE_IDENTITY`
+(the identity's contents), or `SECRETS_AGE_IDENTITY_B64` (the contents in
+base64).
+
+Commit the recipient list, the `*.age` ciphertext, its `*.manifest`, templates
+that contain only placeholders, the CLI configuration, and the CI workflow.
+Never commit private identities, decrypted plaintext, or real secret values.
 
 ## Reading manifest changes
 
-The ciphertext is intentionally opaque. A manifest diff makes reviewable
-changes visible without values. For example:
+The ciphertext diff is opaque. The manifest diff shows what changed without
+the values:
 
 ```diff
  :keys
- {[:service/url] {:type :string}
-- [:service/timeout] {:type :string}
-- [:service/old-token] {:type :string}}
-+ [:service/timeout] {:type :integer}
-+ [:service/retries] {:type :integer}
-+ [:service/new-token] {:type :string}}
+ {[:service/url] {:type :string, :vhash "6e9027b4e13dd2e0"}
+- [:service/timeout] {:type :string, :vhash "4a4fc93ef568f4b1"}
+- [:service/token] {:type :string, :vhash "fc994298c8dbd774"}}
++ [:service/timeout] {:type :integer, :vhash "2f0df714792f03c7"}
++ [:service/retries] {:type :integer, :vhash "d32adde248640142"}
++ [:service/token] {:type :string, :vhash "89ae7df577fa8bb8"}}
 ```
 
-Here `:service/timeout` was retyped, `:service/old-token` was removed,
-`:service/retries` was added, and `:service/new-token` was added. In
-single-recipient mode, a value-only change appears as a changed `:vhash`:
+Here `:service/timeout` was retyped, `:service/retries` was added, and
+`:service/token` kept its type and changed its value. `:service/url` did not
+change. The hash values in this example are illustrative.
 
-```diff
-# Single-recipient mini-diff: the key and type stayed the same; the value changed.
-- [:service/api-key] {:type :string, :vhash "old-hash"}
-+ [:service/api-key] {:type :string, :vhash "new-hash"}
-```
+Team stores have value hashes like any other store. The hashes are keyed by a
+random key held inside the encrypted file, so every recipient computes the
+same ones and someone with only the repository cannot test guesses against
+them. They do disclose equality and change: equal values in one store have
+equal hashes at any path, and a value that returns to an earlier one repeats
+its earlier hash while the store keeps the same key. Key paths, types, and
+collection sizes are public too, so never use a secret value as a map key.
 
-The hashes do not reveal the value, but they do reveal equality and change:
-equal values hashed with the same identity have equal hashes, at any path, and a value that returns to
-an earlier one is visible in history. Multi-recipient manifests intentionally
-remain structure-only, so they carry no hashes and expose no value-only signal.
+## The CI workflow
 
-The nested `.github/workflows/verify-secrets.yml` is a copyable CI gate for this
-starter. GitHub only loads workflows from a repository's root `.github/workflows`
-directory, so this nested file is inert while the example remains inside this
-monorepo. To use it here, copy the workflow unchanged into this repository's
-top-level `.github/workflows`; its `examples/team-ci/**` path filters and
-`examples/team-ci` working directory are already configured for this layout.
-If adapting the example into a standalone repository, remove or update those
-path prefixes and the working directory. It has no private-material step and
-runs the same keyless freshness check as a pull request reviewer.
+The nested `.github/workflows/verify-secrets.yml` is a copyable CI gate for
+this starter. GitHub only loads workflows from a repository's root
+`.github/workflows` directory, so the nested file is inert while the example
+stays inside this repository. To use it here, copy it into the top-level
+`.github/workflows`. Its `examples/team-ci/**` path filters and
+`examples/team-ci` working directory already fit that layout. In a standalone
+repository, remove or update those prefixes. Pin its actions to commit SHAs
+before you rely on it. The job holds no private material and runs the keyless
+check.
