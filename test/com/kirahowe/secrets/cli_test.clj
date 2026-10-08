@@ -34,7 +34,16 @@
         (finally
           (doseq [p (reverse (file-seq (io/file dir)))] (.delete p)))))))
 
-(use-fixtures :each with-tmp-key)
+(defn- with-no-terminal
+  "Run `f` as if no terminal were attached. `set` prompts when it sees one, so
+  a run from an interactive shell would otherwise wait on the keyboard instead
+  of reading the piped input these tests give it. The tests that exercise the
+  prompt put a terminal back themselves."
+  [f]
+  (with-redefs-fn {(ns-resolve 'com.kirahowe.secrets.cli 'tty?) (constantly false)}
+    f))
+
+(use-fixtures :each with-no-terminal with-tmp-key)
 
 (defn- age-env-set?
   "Whether an SECRETS_AGE_IDENTITY* variable overrides the fixture key."
