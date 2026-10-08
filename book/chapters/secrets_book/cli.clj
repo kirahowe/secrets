@@ -194,12 +194,6 @@
 
 (cli/doctor! config "dev")
 
-;; `encrypt!` handles arbitrary files:
-
-(do
-  (spit (str dir "/service-account.json") "{\"type\": \"service_account\"}")
-  (cli/encrypt! config "dev" (str dir "/service-account.json")))
-
 ;; ## Understanding errors {#errors-carry-their-remediation}
 
 ;; Command functions throw `ex-info` with the exit code and any suggestions in

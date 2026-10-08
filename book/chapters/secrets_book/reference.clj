@@ -40,7 +40,6 @@
              #'secrets/get-secret
              #'secrets/reader-literals
              #'secrets/merge-readers
-             #'secrets/default-limits
              #'secrets/with-identity
              #'secrets/expand-home
              #'secrets/default-key-file)
@@ -91,11 +90,7 @@
              #'age/valid-recipient?
              #'age/encrypt-file!
              #'age/decrypt
-             #'age/decrypt-bytes
-             #'age/decrypt-to-stream!
-             #'age/decrypt-to-file!
-             #'age/default-max-plaintext-bytes
-             #'age/resolve-limits)
+             #'age/decrypt-bytes)
 
 ;; ## com.kirahowe.secrets.manifest
 
@@ -138,9 +133,7 @@
              #'cli/show-key!
              #'cli/add-recipient!
              #'cli/recipients!
-             #'cli/reencrypt!
-             #'cli/encrypt!
-             #'cli/decrypt!)
+             #'cli/reencrypt!)
 
 ;; ## Configuration keys
 
