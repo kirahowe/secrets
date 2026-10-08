@@ -64,9 +64,9 @@
                                 :key-file *key*}
                                env-overrides)}}))
 
-(defn- encrypt-edn!
-  "Encrypt `m` to the config's secrets file out-of-band (no manifest written),
-  as a teammate bypassing the CLI would."
+(defn- encrypt-raw-edn!
+  "Encrypt exactly `m` to the config's secrets file out-of-band (no manifest
+  written), so the store holds only the metadata `m` itself carries."
   [m]
   (let [plain (str *dir* "/plain.edn")
         enc (str *dir* "/secrets.edn.age")]
@@ -74,6 +74,47 @@
     (age/encrypt-file! *key* plain enc)
     (.delete (io/file plain))
     enc))
+
+(defn- encrypt-edn!
+  "Encrypt `m` to the config's secrets file out-of-band (no manifest written),
+  as a teammate bypassing the CLI would: the store carries a well-formed
+  manifest key and the single-key recipients record, written by hand."
+  [m]
+  (encrypt-raw-edn! (assoc m
+                           manifest/store-key (manifest/generate-key)
+                           manifest/store-recipients (manifest/recipients-id nil))))
+
+(defn- new-store!
+  "Create the store through `cli/new!`, with an editor that writes `text`."
+  [config env-arg text]
+  (with-out-str
+    (with-redefs-fn {(ns-resolve 'com.kirahowe.secrets.cli 'run-editor!) #(spit % text)}
+      #(cli/new! config env-arg))))
+
+(defn- edit-store!
+  "Run `cli/edit!` with an editor that replaces the plaintext with
+  `(f plaintext)`."
+  [config env-arg f]
+  (with-out-str
+    (with-redefs-fn {(ns-resolve 'com.kirahowe.secrets.cli 'run-editor!)
+                     #(spit % (f (slurp %)))}
+      #(cli/edit! config env-arg))))
+
+(defn- manifest-of
+  "The committed manifest at `path`, parsed."
+  [path]
+  (edn/read-string (slurp path)))
+
+(defn- store-text
+  "The decrypted plaintext of the store at `path`, library metadata included."
+  [path identity]
+  (age/decrypt identity path))
+
+(defn- store-manifest-key
+  "The manifest key the store at `path` holds, read as a recipient who
+  decrypts it with `identity` reads it."
+  [path identity]
+  (get (edn/read-string (store-text path identity)) manifest/store-key))
 
 (defn- verify
   "Run verify! with its chatter (stdout and stderr — drift goes to *err*)
@@ -220,7 +261,9 @@
      (spit cipher "age ciphertext fixture")
      (when (string? template) (spit template "{}"))
      (when (string? manifest)
-       (spit manifest "{:version 2 :ciphertext-sha \"fixture-sha\"}"))
+       (spit manifest (manifest/render {:app "cli-test"
+                                        :ciphertext-sha (apply str (repeat 64 "0"))}
+                                       {})))
      config)))
 
 ;;;; Normalize config
@@ -274,7 +317,7 @@
                       (cli/set-secret! config "dev" ":identity/precedence" false))))))]
         (is (empty? paths) "an explicit path is caller-owned and needs no temp file")
         (is (= {:identity/precedence "chosen-explicitly"}
-               (edn/read-string (age/decrypt *key* (str *dir* "/secrets.edn.age")))))))))
+               (secrets/load-secrets (str *dir* "/secrets.edn.age") *key*)))))))
 
 (deftest normalize-config-validation-test
   (testing "no :environments"
@@ -501,11 +544,15 @@
       (let [result (:result (doctor-under config nil {:version nil}))]
         (is (= {:state :ready :keyless? true :full? false} (:verify result)))))
     (testing "an incomplete manifest prevents keyless verification"
-      (spit (str *dir* "/secrets.edn.manifest") "{:version 2}")
+      (spit (str *dir* "/secrets.edn.manifest") "{:version 3 :app \"cli-test\" :keys {}}")
       (let [result (:result (doctor-under config nil {}))]
         (is (= 1 (:exit result)))
-        (is (= {:state :missing-ciphertext-sha :keyless? false :full? true}
-               (:verify result))))))
+        (is (= {:state :invalid :keyless? false :full? true}
+               (:verify result)))))
+    (testing "so does a manifest in another version"
+      (spit (str *dir* "/secrets.edn.manifest") "{:version 2}")
+      (is (= {:state :unsupported :keyless? false :full? true}
+             (:verify (:result (doctor-under config nil {})))))))
   (testing "a disabled manifest skips verification"
     (let [result (:result
                   (doctor-under (complete-doctor-config {:manifest false}) nil {}))]
@@ -690,7 +737,7 @@
                 (catch clojure.lang.ExceptionInfo e e))]
         (is (= [encrypted manifest-path] @moves)
             "the ciphertext is replaced, then the manifest; nothing is rolled back")
-        (is (= {:version :new} (edn/read-string (age/decrypt *key* encrypted)))
+        (is (= {:version :new} (secrets/load-secrets encrypted *key*))
             "the ciphertext is authoritative and holds the edit")
         (is (= manifest-before (slurp manifest-path)) "the manifest is the old one")
         (is (= :manifest-stale (:reason (ex-data e))))
@@ -768,38 +815,7 @@
             (is (some? result) (str label " completes with an injected identity"))
             (assert-cleaned-identity! paths)))
         (is (= {:value "after-edit"}
-               (edn/read-string (age/decrypt *key* ciphertext))))))))
-
-(deftest injected-cli-identity-remains-through-manifest-hashing-test
-  (let [value {:database/url "jdbc:test" :service/token "manifest-value"}
-        expected-config (cli/normalize-config (test-config {:identity-file *key*}))
-        actual-config (cli/normalize-config (test-config))
-        manifest-path (str *dir* "/secrets.edn.manifest")]
-    (encrypt-edn! value)
-    (with-out-str (cli/reencrypt! expected-config "dev"))
-    (let [expected-keys (:keys (edn/read-string (slurp manifest-path)))]
-      (encrypt-edn! value)
-      (let [present-during-hash? (atom false)
-            created (atom [])
-            real-hmac-key manifest/hmac-key
-            hash-with-live-identity
-            (fn [identity]
-              (reset! present-during-hash?
-                      (and (seq @created)
-                           (every? #(.exists (io/file %)) @created)))
-              (real-hmac-key identity))
-            {:keys [paths]}
-            (observe-injected-identities
-             created
-             #(with-identity-environment (identity-environment :raw)
-                (fn []
-                  (with-redefs [manifest/hmac-key hash-with-live-identity]
-                    (with-out-str (cli/reencrypt! actual-config "dev"))))))]
-        (is @present-during-hash?
-            "the identity temp file exists while the manifest HMAC is derived")
-        (is (= expected-keys (:keys (edn/read-string (slurp manifest-path))))
-            "an operation-scoped raw identity produces the same keyed manifest entries")
-        (assert-cleaned-identity! paths)))))
+               (secrets/load-secrets ciphertext *key*)))))))
 
 (deftest caller-owned-cli-identity-files-survive-operations-test
   (let [ciphertext (str *dir* "/secrets.edn.age")
@@ -817,7 +833,7 @@
         (is (.exists (io/file *key*)) (str label " leaves the caller's key file alone"))
         (is (empty? paths) (str label " does not materialize a copy"))))
     (is (= {:caller-owned true}
-           (edn/read-string (age/decrypt *key* ciphertext))))))
+           (secrets/load-secrets ciphertext *key*)))))
 
 (deftest failed-cli-operation-cleans-its-injected-identity-test
   (doseq [source [:raw :b64]]
@@ -907,7 +923,7 @@
             (is (= :private-file-remains (:reason (ex-data e))))
             (is (contains? (plaintext-temps) (.getName (io/file remaining))))
             (is (str/includes? (ex-message e) remaining))
-            (is (= "v2" (:k (edn/read-string (age/decrypt *key* (str *dir* "/secrets.edn.age")))))
+            (is (= "v2" (:k (secrets/load-secrets (str *dir* "/secrets.edn.age") *key*)))
                 "the store was written before the cleanup failure was reported")
             (finally
               (some-> remaining io/file .delete))))))))
@@ -919,11 +935,11 @@
       (encrypt-edn! {:database/url "jdbc:x" :auth/admins #{"a@b.com"}})
       (with-out-str (cli/reencrypt! config "dev"))
       (let [m (edn/read-string (slurp (str *dir* "/secrets.edn.manifest")))]
-        (is (= 2 (:version m)))
+        (is (= 3 (:version m)))
         (is (string? (:ciphertext-sha m)) "manifest records the ciphertext hash")
-        (is (contains? (:keys m) [:database/url]))
-        (is (contains? (get-in m [:keys [:database/url]]) :vhash)
-            "single-key mode keys the value hashes"))
+        (is (= #{[:database/url] [:auth/admins]} (set (keys (:keys m))))
+            "the store's reserved keys get no entry")
+        (is (every? :vhash (vals (:keys m))) "every leaf has a value hash"))
       (let [{:keys [results exit]} (verify config "dev")]
         (is (= 0 exit))
         (is (= :ok (:dev results)))))))
@@ -982,40 +998,46 @@
           (is (= 1 exit))
           (is (= :drift (:dev results))))))))
 
-(deftest verify-version-gate-test
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config (cli/normalize-config (test-config))]
-      (encrypt-edn! {:a 1})
-      (spit (str *dir* "/secrets.edn.manifest")
-            "{:version 3 :app \"cli-test\" :keys {}}")
-      (let [{:keys [results exit]} (verify config "dev")]
-        (is (= 1 exit))
-        (is (= :drift (:dev results)) "an unsupported :version is reported, not misdiffed")))))
+(defn- keyless-config
+  "A config with no designated identity, for use under `under-default-key-file`
+  with an absent default, so `verify` takes the keyless path."
+  [absent]
+  (under-default-key-file absent #(cli/normalize-config (test-config {:key-file nil}))))
 
-(deftest v1-manifest-is-rejected-test
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config (cli/normalize-config (test-config))
-          manifest-path (str *dir* "/secrets.edn.manifest")]
-      (encrypt-edn! {:a 1})
-      (with-out-str (cli/reencrypt! config "dev"))
-      (let [committed (edn/read-string (slurp manifest-path))]
-        (is (= 2 (:version committed)) "the CLI writes v2")
-        ;; Everything but :version stays consistent with the ciphertext, so only
-        ;; the version can be what fails: a v1 hash is never read as a v2 one.
-        (spit manifest-path (pr-str (assoc committed :version 1))))
-      (let [{:keys [results exit]} (verify config "dev")]
-        (is (= 1 exit) "a v1 manifest fails verification")
-        (is (= :drift (:dev results)) "and is never reported as :ok")))))
+(defn- capture-keyed-and-keyless
+  "Run `verify` on dev with the fixture identity and again with none. Returns
+  `[[label captured] …]`."
+  [config]
+  (let [absent (str *dir* "/absent-key.txt")
+        keyless (keyless-config absent)]
+    [["keyed" (with-identity-environment {} #(capture-verify config "dev"))]
+     ["keyless" (with-identity-environment
+                  {} (fn [] (under-default-key-file absent #(capture-verify keyless "dev"))))]]))
+
+(deftest verify-version-gate-test
+  (let [config (cli/normalize-config (test-config))
+        manifest-path (str *dir* "/secrets.edn.manifest")]
+    (new-store! config "dev" "{:a 1}")
+    (let [committed (manifest-of manifest-path)]
+      (is (= 3 (:version committed)) "the CLI writes version 3")
+      ;; Everything but :version stays consistent with the ciphertext, so only
+      ;; the version can be what fails.
+      (doseq [version [1 2 4 "3" nil]]
+        (spit manifest-path (pr-str (if (nil? version)
+                                      (dissoc committed :version)
+                                      (assoc committed :version version))))
+        (doseq [[label {:keys [result out err]}] (capture-keyed-and-keyless config)]
+          (testing (str label " version " (pr-str version))
+            (is (= {:results {:dev :drift} :exit 1} result))
+            (is (str/includes? err "is unsupported by this version of the library"))
+            (is (str/includes? out "bb secrets reencrypt 'dev'")))))
+      (testing "and the manifest as written verifies on both paths"
+        (spit manifest-path (pr-str committed))
+        (is (= [0 0] (map (comp :exit :result second) (capture-keyed-and-keyless config))))))))
 
 (deftest wrong-app-manifest-is-rejected-test
-  ;; The wrong-app half of the authenticity contract. `:app` is the one field a
-  ;; manifest records about *which store* it describes, so a manifest belonging
-  ;; to another project must be refused rather than diffed as a shape. It
-  ;; matters most in team mode, where there are no :vhashes to disagree: a
-  ;; foreign structure-only manifest with a refreshed :ciphertext-sha would
-  ;; otherwise verify clean.
+  ;; `:app` is the one field a manifest records about which store it describes,
+  ;; so a manifest belonging to another project is refused rather than diffed.
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))
@@ -1036,97 +1058,84 @@
           (spit manifest-path (pr-str committed))
           (is (= 0 (:exit (verify config "dev")))))))))
 
-(deftest public-recipient-forgery-fails-verification-test
-  ;; The single-key half of the README's authenticity contract and threat
-  ;; model: a public-recipient holder who replaces the ciphertext cannot
-  ;; recompute a :vhash, so a keyed `verify` reports the forgery.
-  ;;
-  ;; The two values here collided under the v1 encoding, so this exact forgery
-  ;; — ciphertext replaced using only the public recipient, :ciphertext-sha
-  ;; refreshed, every committed :vhash left alone — passed full verification
-  ;; before manifest v2.
-  (if (age-env-set?)
-    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [config (cli/normalize-config (test-config))
-          ciphertext (str *dir* "/secrets.edn.age")
-          manifest-path (str *dir* "/secrets.edn.manifest")
-          sha256 (cli-private 'sha256)]
-      (encrypt-edn! {:x ['{a=b c}]})
-      (with-out-str (cli/reencrypt! config "dev"))
-      (let [committed (edn/read-string (slurp manifest-path))
-            recipient (age/public-key *key*)
-            forged (str *dir* "/forged.edn")]
-        (is (age/valid-recipient? recipient)
-            "the public recipient is the attacker's only key material")
-        (spit forged (pr-str {:x ['{a b=c}]}))
-        (age/encrypt-file! {:recipients [recipient]} forged ciphertext)
-        (.delete (io/file forged))
-        (spit manifest-path
-              (pr-str (assoc committed :ciphertext-sha (sha256 ciphertext))))
-        (is (= (:keys committed) (:keys (edn/read-string (slurp manifest-path))))
-            "the forged manifest keeps every original :vhash"))
-      (let [{:keys [result out]} (capture-verify config "dev")]
-        (is (= 1 (:exit result)) "full verification fails")
-        (is (= :drift (get-in result [:results :dev])))
-        (is (str/includes? out "value or type changed")
-            "and names the forged entry as stale")))))
+(deftest an-incomplete-manifest-is-drift-with-and-without-an-identity-test
+  (let [config (cli/normalize-config (test-config))
+        manifest-path (str *dir* "/secrets.edn.manifest")]
+    (new-store! config "dev" "{:a 1 :b {:c \"x\"}}")
+    (let [committed (manifest-of manifest-path)
+          without-vhash (update-in committed [:keys [:a]] dissoc :vhash)]
+      (is (= 0 (:exit (verify config "dev"))) "the manifest the CLI wrote is complete")
+      (doseq [[label text]
+              [["a top-level list" "(1 2 3)"]
+               ["a wrapped map" (str "(" (pr-str committed) ")")]
+               ["a vector" "[1 2]"]
+               ["a number" "5"]
+               ["nil" "nil"]
+               ["no :keys" (pr-str (dissoc committed :keys))]
+               [":keys a vector" (pr-str (assoc committed :keys []))]
+               [":keys a number" (pr-str (assoc committed :keys 5))]
+               [":keys nil" (pr-str (assoc committed :keys nil))]
+               ["an entry without :vhash" (pr-str without-vhash)]
+               ["every entry without :vhash"
+                (pr-str (update committed :keys update-vals #(dissoc % :vhash)))]
+               ["an entry with a nil :vhash"
+                (pr-str (assoc-in committed [:keys [:a] :vhash] nil))]
+               ["an entry with a short :vhash"
+                (pr-str (assoc-in committed [:keys [:a] :vhash] "abc"))]
+               ["an entry without :type"
+                (pr-str (update-in committed [:keys [:a]] dissoc :type))]
+               ["an entry that is not a map" (pr-str (assoc-in committed [:keys [:a]] :integer))]
+               ["no :ciphertext-sha" (pr-str (dissoc committed :ciphertext-sha))]
+               ["a :ciphertext-sha that is not a digest"
+                (pr-str (assoc committed :ciphertext-sha "fresh"))]]]
+        (spit manifest-path text)
+        (doseq [[path {:keys [result out err]}] (capture-keyed-and-keyless config)]
+          (testing (str path ": " label)
+            (is (= {:results {:dev :drift} :exit 1} result))
+            (is (str/includes? err "manifest is incomplete"))
+            (is (str/includes? (str out err) "bb secrets reencrypt 'dev'")))))
+      (testing "reencrypt writes a complete manifest again"
+        (with-out-str (cli/reencrypt! config "dev"))
+        (is (= [0 0] (map (comp :exit :result second) (capture-keyed-and-keyless config))))))))
 
-;; The team half of the same contract, and a *documented boundary* rather than
-;; a bug anyone forgot to fix. Multi-recipient mode has no shared private key,
-;; so `manifest-hmac-key` is nil and team manifests carry no :vhash at all.
-;; A holder of one listed public recipient can therefore encrypt a chosen
-;; payload, regenerate the structure-only manifest from it with no key
-;; whatsoever, refresh :ciphertext-sha, and pass full verification. Sender
-;; authenticity is the repository's job here, not `verify`'s. This test exists
-;; so the limitation cannot change silently and so the README's claim is
-;; falsifiable: if it starts failing, the tool gained a property the contract
-;; says it does not have, and the contract is what needs updating.
-(deftest team-mode-manifest-is-not-a-value-integrity-signal-test
+(deftest a-replaced-ciphertext-fails-verification-in-solo-and-team-stores-test
+  ;; Someone who holds only a public recipient can encrypt a chosen payload and
+  ;; refresh :ciphertext-sha, but cannot compute a :vhash: the manifest key is
+  ;; inside the store they cannot read. The same holds for a team store.
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [recipients (str *dir* "/recipients.txt")
-          ciphertext (str *dir* "/secrets.edn.age")
-          manifest-path (str *dir* "/secrets.edn.manifest")
-          sha256 (cli-private 'sha256)
-          config (cli/normalize-config (test-config {:recipients-file recipients}))
-          recipient (age/public-key *key*)
-          forged-value {:db/url "postgres://attacker.example/app"}
-          forged-file (str *dir* "/forged.edn")
-          body #(remove (fn [line] (str/includes? line ":ciphertext-sha"))
-                        (str/split-lines %))]
-      (spit recipients (str recipient "\n"))
-      (encrypt-edn! {:db/url "postgres://prod.internal/app"})
-      (with-out-str (cli/reencrypt! config "dev"))
-      (let [committed (edn/read-string (slurp manifest-path))
-            honest-manifest (slurp manifest-path)
-            honest-ciphertext (file-bytes ciphertext)]
-        (is (not-any? #(contains? % :vhash) (vals (:keys committed)))
-            "a team manifest is structure-only: there is no :vhash to forge")
-        (is (age/valid-recipient? recipient)
-            "the committed public recipient is the attacker's only key material")
-        (spit forged-file (pr-str forged-value))
-        (age/encrypt-file! {:recipients [recipient]} forged-file ciphertext)
-        (.delete (io/file forged-file))
-        (spit manifest-path
-              (manifest/render {:app "cli-test" :ciphertext-sha (sha256 ciphertext)}
-                               (manifest/entries forged-value nil)))
-        (testing "the app will now load the attacker's configuration"
-          (is (= forged-value (edn/read-string (age/decrypt *key* ciphertext)))))
-        (testing "and a same-shape forgery leaves the manifest body untouched"
-          (is (= (body honest-manifest) (body (slurp manifest-path)))
-              "only :ciphertext-sha moves, so the diff reads as a re-encryption"))
-        (testing "so full verification passes — the known boundary"
-          (let [{:keys [result out]} (capture-verify config "dev")]
-            (is (= 0 (:exit result))
-                "expected: nothing in a team manifest binds a value to its shape")
-            (is (= :ok (get-in result [:results :dev]))
-                "verify reports agreement, which is all it ever claimed")
-            (is (str/includes? out "manifest matches"))))
-        (testing "but the forgery had to rewrite committed artifacts"
-          (is (not= honest-ciphertext (file-bytes ciphertext))
-              "the ciphertext is tracked, so replacing it is a repository change")
-          (is (not= honest-manifest (slurp manifest-path))
-              "and so is refreshing :ciphertext-sha — the reviewable boundary"))))))
+    (doseq [[mode env-config] [["solo" {}]
+                               ["team" {:recipients-file (str *dir* "/recipients.txt")}]]]
+      (testing mode
+        (let [config (cli/normalize-config (test-config env-config))
+              ciphertext (str *dir* "/secrets.edn.age")
+              manifest-path (str *dir* "/secrets.edn.manifest")
+              sha256 (cli-private 'sha256)
+              recipient (age/public-key *key*)
+              forge! (fn [committed value]
+                       (let [forged (str *dir* "/forged.edn")]
+                         (spit forged (pr-str value))
+                         (age/encrypt-file! {:recipients [recipient]} forged ciphertext)
+                         (.delete (io/file forged))
+                         (spit manifest-path
+                               (pr-str (assoc committed :ciphertext-sha (sha256 ciphertext))))))]
+          (when (:recipients-file env-config)
+            (spit (:recipients-file env-config) (str recipient "\n")))
+          (.delete (io/file ciphertext))
+          (new-store! config "dev" "{:db/url \"postgres://prod.internal/app\"}")
+          (let [committed (manifest-of manifest-path)]
+            (is (= 0 (:exit (verify config "dev"))))
+            (testing "a same-shape payload with no manifest key"
+              (forge! committed {:db/url "postgres://attacker.example/app"})
+              (let [{:keys [result err]} (capture-verify config "dev")]
+                (is (= {:results {:dev :drift} :exit 1} result))
+                (is (str/includes? err "has no manifest key"))))
+            (testing "a same-shape payload with a key the forger made up"
+              (forge! committed {:db/url "postgres://attacker.example/app"
+                                 manifest/store-key (manifest/generate-key)})
+              (let [{:keys [result out err]} (capture-verify config "dev")]
+                (is (= {:results {:dev :drift} :exit 1} result))
+                (is (str/includes? (str out err) "value or type changed"))))))))))
 
 (deftest verify-missing-is-exit-2-and-repl-safe-test
   (let [config (cli/normalize-config (test-config))
@@ -1350,7 +1359,7 @@
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (test-config)
           encrypted (str *dir* "/secrets.edn.age")
-          stored (fn [k] (k (edn/read-string (age/decrypt *key* encrypted))))]
+          stored (fn [k] (k (secrets/load-secrets encrypted *key*)))]
       (doseq [[k args] [[:flag-only-arg ["set" "--edn" ":flag-only-arg"]]
                         [:flag-after-key ["set" ":flag-after-key" "--edn"]]
                         [:flag-before-env ["set" "--edn" "dev" ":flag-before-env"]]
@@ -1405,7 +1414,7 @@
       (testing "set writes the default environment's store"
         (with-out-str (with-in-str "v" (cli/run! config ["set" ":default-env"])))
         (let [store (str *dir* "/secrets.edn.age")]
-          (is (= "v" (:default-env (edn/read-string (age/decrypt *key* store)))))))
+          (is (= "v" (:default-env (secrets/load-secrets store *key*))))))
       (testing "verify reports the same result either way"
         (is (= (with-out-str (cli/run! config ["verify" "dev"]))
                (with-out-str (cli/run! config ["verify"]))))))))
@@ -1643,7 +1652,7 @@
         (with-in-str "s3cr3t" (cli/set-secret! config "dev" ":openrouter/api-key" false)))
       (is (.exists (io/file encrypted)) "set creates the file")
       (is (= {:openrouter/api-key "s3cr3t"}
-             (edn/read-string (age/decrypt *key* encrypted)))))))
+             (secrets/load-secrets encrypted *key*))))))
 
 (deftest set-overwrites-an-existing-key-leaving-others-untouched-test
   (if (age-env-set?)
@@ -1653,7 +1662,7 @@
       (encrypt-edn! {:a "old" :b "keep"})
       (with-out-str (cli/reencrypt! config "dev"))
       (with-out-str (with-in-str "new" (cli/set-secret! config "dev" ":a" false)))
-      (is (= {:a "new" :b "keep"} (edn/read-string (age/decrypt *key* encrypted)))))))
+      (is (= {:a "new" :b "keep"} (secrets/load-secrets encrypted *key*))))))
 
 (deftest set-nested-vector-path-test
   (if (age-env-set?)
@@ -1662,12 +1671,12 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str
         (with-in-str "acct-123" (cli/set-secret! config "dev" "[:r2 :account-id]" false)))
-      (is (= {:r2 {:account-id "acct-123"}} (edn/read-string (age/decrypt *key* encrypted))))
+      (is (= {:r2 {:account-id "acct-123"}} (secrets/load-secrets encrypted *key*)))
       (testing "a sibling key added under the same parent leaves the first untouched"
         (with-out-str
           (with-in-str "us-east" (cli/set-secret! config "dev" "[:r2 :region]" false)))
         (is (= {:r2 {:account-id "acct-123" :region "us-east"}}
-               (edn/read-string (age/decrypt *key* encrypted))))))))
+               (secrets/load-secrets encrypted *key*)))))))
 
 (deftest set-edn-flag-parses-typed-values-and-manifest-records-type-test
   (if (age-env-set?)
@@ -1678,7 +1687,7 @@
         (with-in-str "#{\"a@b.com\" \"c@d.com\"}"
           (cli/set-secret! config "dev" ":auth/admins" true)))
       (is (= {:auth/admins #{"a@b.com" "c@d.com"}}
-             (edn/read-string (age/decrypt *key* encrypted))))
+             (secrets/load-secrets encrypted *key*)))
       (let [m (edn/read-string (slurp (str *dir* "/secrets.edn.manifest")))]
         (is (= :set (get-in m [:keys [:auth/admins] :type]))
             "manifest records the EDN-parsed value's real type, not :string")))))
@@ -1689,7 +1698,7 @@
     (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str (with-in-str "42" (cli/set-secret! config "dev" ":n" false)))
-      (is (= {:n "42"} (edn/read-string (age/decrypt *key* encrypted)))
+      (is (= {:n "42"} (secrets/load-secrets encrypted *key*))
           "default (no --edn) always stores a string, regardless of stdin's shape"))))
 
 (deftest set-strips-exactly-one-trailing-newline-test
@@ -1699,16 +1708,16 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (testing "a single trailing \\n is stripped"
         (with-out-str (with-in-str "secret\n" (cli/set-secret! config "dev" ":a" false)))
-        (is (= "secret" (:a (edn/read-string (age/decrypt *key* encrypted))))))
+        (is (= "secret" (:a (secrets/load-secrets encrypted *key*)))))
       (testing "a single trailing \\r\\n is stripped"
         (with-out-str (with-in-str "secret\r\n" (cli/set-secret! config "dev" ":b" false)))
-        (is (= "secret" (:b (edn/read-string (age/decrypt *key* encrypted))))))
+        (is (= "secret" (:b (secrets/load-secrets encrypted *key*)))))
       (testing "only exactly one trailing newline is stripped — the rest is verbatim"
         (with-out-str (with-in-str "line1\n\n" (cli/set-secret! config "dev" ":c" false)))
-        (is (= "line1\n" (:c (edn/read-string (age/decrypt *key* encrypted))))))
+        (is (= "line1\n" (:c (secrets/load-secrets encrypted *key*)))))
       (testing "no trailing newline at all is untouched"
         (with-out-str (with-in-str "bare" (cli/set-secret! config "dev" ":d" false)))
-        (is (= "bare" (:d (edn/read-string (age/decrypt *key* encrypted)))))))))
+        (is (= "bare" (:d (secrets/load-secrets encrypted *key*))))))))
 
 (deftest set-refuses-a-blank-value-test
   (if (age-env-set?)
@@ -1727,7 +1736,7 @@
              (with-out-str (with-in-str "\n" (cli/set-secret! config "dev" ":a" false))))))
       (testing "--edn is the escape hatch for a deliberately empty value"
         (with-out-str (with-in-str "\"\"" (cli/set-secret! config "dev" ":a" true)))
-        (is (= {:a ""} (edn/read-string (age/decrypt *key* encrypted))))))))
+        (is (= {:a ""} (secrets/load-secrets encrypted *key*)))))))
 
 (deftest set-prompts-on-a-terminal-test
   (if (age-env-set?)
@@ -1741,7 +1750,7 @@
                                          (cli-private 'prompt-hidden!)
                                          (fn [prompt] (swap! prompts conj prompt) @typed)}
                           f))
-          stored #(edn/read-string (age/decrypt *key* encrypted))]
+          stored #(secrets/load-secrets encrypted *key*)]
       (testing "a terminal gets a hidden prompt and stdin is left alone"
         (reset! typed "typed-secret")
         (with-out-str
@@ -1774,15 +1783,17 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:a :b]" false)))
       (with-out-str (with-in-str "w" (cli/set-secret! config "dev" ":c" false)))
-      (let [plaintext (age/decrypt *key* encrypted)]
+      (let [plaintext ((cli-private 'user-plaintext) (age/decrypt *key* encrypted))]
         (is (= {:a {:b "v"} :c "w"} (edn/read-string plaintext)))
+        (is (= "{:a {:b \"v\"}, :c \"w\"}\n" plaintext)
+            "what `edit` shows next is the pretty-printed map, without library metadata")
         (is (re-find #"\n" plaintext)
             "the regenerated store is pretty-printed, so the next `edit` is readable"))
       (testing "print limits set in a REPL cannot truncate the store"
         (binding [*print-length* 1 *print-level* 1]
           (with-out-str (with-in-str "x" (cli/set-secret! config "dev" ":d" false))))
         (is (= {:a {:b "v"} :c "w" :d "x"}
-               (edn/read-string (age/decrypt *key* encrypted))))))))
+               (secrets/load-secrets encrypted *key*)))))))
 
 (deftest set-refreshes-the-manifest-so-verify-passes-test
   (let [config (cli/normalize-config (test-config))]
@@ -1799,7 +1810,7 @@
       (encrypt-edn! {:a "keep" :b "gone"})
       (with-out-str (cli/reencrypt! config "dev"))
       (with-out-str (cli/remove-secret! config "dev" ":b"))
-      (is (= {:a "keep"} (edn/read-string (age/decrypt *key* encrypted))))
+      (is (= {:a "keep"} (secrets/load-secrets encrypted *key*)))
       (let [{:keys [results exit]} (verify config "dev")]
         (is (= 0 exit))
         (is (= :ok (:dev results)))))))
@@ -1812,7 +1823,7 @@
       (encrypt-edn! {:r2 {:account-id "acct-123"}})
       (with-out-str (cli/reencrypt! config "dev"))
       (with-out-str (cli/remove-secret! config "dev" "[:r2 :account-id]"))
-      (is (= {:r2 {}} (edn/read-string (age/decrypt *key* encrypted)))
+      (is (= {:r2 {}} (secrets/load-secrets encrypted *key*))
           "the (now empty) parent map is left in place, not pruned"))))
 
 (deftest rm-of-an-absent-key-fails-test
@@ -1824,7 +1835,7 @@
       (with-out-str (cli/reencrypt! config "dev"))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No such key"
                             (with-out-str (cli/remove-secret! config "dev" ":nope"))))
-      (is (= {:a 1} (edn/read-string (age/decrypt *key* encrypted)))
+      (is (= {:a 1} (secrets/load-secrets encrypted *key*))
           "a failed rm never touches the ciphertext"))))
 
 (deftest rm-on-a-missing-store-fails-pointing-at-new-or-set-test
@@ -1862,16 +1873,16 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (testing "run! dispatches set as <key> alone via the default env, --edn before it"
         (with-out-str (with-in-str "42" (cli/run! config ["set" "--edn" ":n"])))
-        (is (= 42 (:n (edn/read-string (age/decrypt *key* encrypted))))))
+        (is (= 42 (:n (secrets/load-secrets encrypted *key*)))))
       (testing "run! dispatches set as [env] <key>, --edn after both"
         (with-out-str (with-in-str "\"s\"" (cli/run! config ["set" "dev" ":m" "--edn"])))
-        (is (= "s" (:m (edn/read-string (age/decrypt *key* encrypted))))))
+        (is (= "s" (:m (secrets/load-secrets encrypted *key*)))))
       (testing "without --edn the value is stored as a plain string"
         (with-out-str (with-in-str "plain" (cli/run! config ["set" "dev" ":p"])))
-        (is (= "plain" (:p (edn/read-string (age/decrypt *key* encrypted))))))
+        (is (= "plain" (:p (secrets/load-secrets encrypted *key*)))))
       (testing "run! dispatches rm as [env] <key>"
         (with-out-str (cli/run! config ["rm" "dev" ":n"]))
-        (is (not (contains? (edn/read-string (age/decrypt *key* encrypted)) :n)))))))
+        (is (not (contains? (secrets/load-secrets encrypted *key*) :n)))))))
 
 ;;;; Regressions
 
@@ -1997,8 +2008,8 @@
                       set))))
         (testing "both private identities decrypt the final ciphertext"
           (let [expected {:service/token secret-value}]
-            (is (= expected (edn/read-string (age/decrypt *key* ciphertext))))
-            (is (= expected (edn/read-string (age/decrypt bob-key ciphertext))))))
+            (is (= expected (secrets/load-secrets ciphertext *key*)))
+            (is (= expected (secrets/load-secrets ciphertext bob-key)))))
         (testing "captured command output contains no secret values or private identities"
           (doseq [sensitive-value sensitive-values]
             (is (not (str/includes? all-output sensitive-value)))))))))
@@ -2176,7 +2187,7 @@
             (with-redefs-fn {(cli-private 'run-editor!) swapping-editor} command))
           (is (= [bob-public] (str/split-lines (slurp recipients)))
               "the swap really happened, so the assertions below are not vacuous")
-          (is (map? (edn/read-string (age/decrypt *key* ciphertext)))
+          (is (map? (secrets/load-secrets ciphertext *key*))
               "the snapshotted recipient still decrypts")
           (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))
               "the recipient substituted during the editor interval cannot"))))))
@@ -2212,8 +2223,8 @@
         (with-bound (cli-private 'max-recipients-bytes) (.length (io/file recipients))
           #(store-through-stdin! config))
         (let [expected {:a "snapshot-value"}]
-          (is (= expected (edn/read-string (age/decrypt *key* ciphertext))))
-          (is (= expected (edn/read-string (age/decrypt bob-key ciphertext))))))
+          (is (= expected (secrets/load-secrets ciphertext *key*)))
+          (is (= expected (secrets/load-secrets ciphertext bob-key)))))
       (testing "no count or line-length bound sits beside the byte bound"
         (spit recipients (str/join "\n" (repeat 300 alice-public)))
         (let [listed (atom nil)]
@@ -2287,38 +2298,44 @@
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [plaintext-file (str *dir* "/bounded-plain.edn")
           exact-plaintext (str "{:a 1}" (apply str (repeat 26 " ")))
-          limit (count exact-plaintext)
+          manifest-key (manifest/generate-key)
+          ;; The bound is on what is encrypted: the user's text plus the
+          ;; store's metadata lines.
+          limit (+ (count exact-plaintext)
+                   (count ((cli-private 'metadata-lines)
+                           manifest-key (manifest/recipients-id nil))))
           bounded (fn [n f] (with-bound #'age/max-plaintext-bytes n f))
           config (cli/normalize-config (test-config {:manifest false}))
           env (get-in config [:environments :dev])
-          write-secrets! (cli-private 'write-secrets!)
+          write-secrets! (fn [text]
+                           ((cli-private 'write-secrets!)
+                            env {:identity-file *key*} plaintext-file text manifest-key))
           ciphertext (:secrets-file env)]
       (testing "an editor plaintext at the exact byte bound is accepted"
-        (spit plaintext-file exact-plaintext)
-        (bounded limit #(write-secrets! env {:identity-file *key*} plaintext-file))
-        (is (= {:a 1} (edn/read-string (age/decrypt *key* ciphertext)))))
+        (bounded limit #(write-secrets! exact-plaintext))
+        (is (= {:a 1} (secrets/load-secrets ciphertext *key*))))
       (testing "the first byte over is rejected before parsing or encryption"
         (let [sentinel "~"
-              before (file-bytes ciphertext)]
-          (spit plaintext-file (str exact-plaintext sentinel))
-          (let [e (bounded limit #(try
-                                    (write-secrets! env {:identity-file *key*} plaintext-file)
-                                    (catch clojure.lang.ExceptionInfo e e)))
-                rendered (str (ex-message e) (pr-str (ex-data e)))]
-            (is (= {:reason :input-too-large :limit limit :observed (inc limit)}
-                   (select-keys (ex-data e) [:reason :limit :observed])))
-            (is (str/includes? (ex-message e) ciphertext) "the message names the store")
-            (is (not (str/includes? rendered sentinel)))
-            (is (= before (file-bytes ciphertext))))))
+              before (file-bytes ciphertext)
+              e (bounded limit #(try
+                                  (write-secrets! (str exact-plaintext sentinel))
+                                  (catch clojure.lang.ExceptionInfo e e)))
+              rendered (str (ex-message e) (pr-str (ex-data e)))]
+          (is (= {:reason :input-too-large :limit limit :observed (inc limit)}
+                 (select-keys (ex-data e) [:reason :limit :observed])))
+          (is (str/includes? (ex-message e) ciphertext) "the message names the store")
+          (is (not (str/includes? rendered sentinel)))
+          (is (= before (file-bytes ciphertext)))))
       (testing "stdin accepts exact UTF-8 bytes and rejects one byte over"
-        (let [stdin-limit 64
+        ;; Large enough that the stored plaintext, metadata included, fits too.
+        (let [stdin-limit 512
               exact-stdin (str "\"é\"" (apply str (repeat (- stdin-limit 4) " ")))]
           (is (= stdin-limit (alength (.getBytes exact-stdin "UTF-8")))
               "the fixture is at the bound in bytes, not characters")
           (with-out-str
             (with-in-str exact-stdin
               (bounded stdin-limit #(cli/set-secret! config "dev" ":n" true))))
-          (is (= "é" (:n (edn/read-string (age/decrypt *key* ciphertext)))))
+          (is (= "é" (:n (secrets/load-secrets ciphertext *key*))))
           (let [e (try
                     (with-out-str
                       (with-in-str (str exact-stdin " ")
@@ -2330,11 +2347,10 @@
 (deftest manifest-byte-bound-test
   (let [manifest-file (str *dir* "/bounded.manifest")
         read-supported (cli-private 'read-supported-manifest)
-        value {:version 2
-               :app "cli-test"
-               :keys {[:a] {:type :string}
-                      [:b] {:type :integer}}}
-        exact-content (pr-str value)
+        exact-content (manifest/render
+                       {:app "cli-test" :ciphertext-sha (apply str (repeat 64 "a"))}
+                       (manifest/entries {:a "x" :b 1} (manifest/generate-key)))
+        value (edn/read-string exact-content)
         bounded (fn [f] (with-bound (cli-private 'max-manifest-bytes) (count exact-content) f))]
     (testing "the bound is 1 MiB"
       (is (= 1048576 @(cli-private 'max-manifest-bytes))))
@@ -2620,11 +2636,12 @@
     (let [plaintext (str *dir* "/plain.edn")
           env (assoc (get-in (cli/normalize-config (test-config)) [:environments :dev])
                      :identity-file *key*)
-          write! #((cli-private 'write-secrets!) env {:identity-file *key*} plaintext)
+          manifest-key (manifest/generate-key)
+          write! #((cli-private 'write-secrets!)
+                   env {:identity-file *key*} plaintext "{:a 1}" manifest-key)
           entries #(sort (.list (io/file *dir*)))
           real-encrypt age/encrypt-file!
           real-move fs/atomic-move!]
-      (spit plaintext "{:a 1}")
       (write!)
       (let [settled (entries)
             ciphertext (file-bytes (:secrets-file env))
@@ -2754,40 +2771,6 @@
         (is (contains? (:configuration result) :reason))
         (is (nil? (get-in result [:configuration :reason])))))))
 
-(deftest verify-reports-a-malformed-manifest-as-a-finding-test
-  (let [config (cli/normalize-config (test-config))
-        env (get-in config [:environments :dev])
-        absent (str *dir* "/absent-key.txt")
-        keyless-config (under-default-key-file
-                        absent #(cli/normalize-config (test-config {:key-file nil})))
-        capture-verify (fn [cfg env-arg]
-                         (if (identical? cfg keyless-config)
-                           (under-default-key-file absent #(capture-verify cfg env-arg))
-                           (capture-verify cfg env-arg)))]
-    (encrypt-edn! {:a 1})
-    (with-identity-environment
-      {}
-      (fn []
-        (doseq [[label text] [["a top-level list" "(1 2 3)"]
-                              ["a wrapped map" "({:version 2 :app \"cli-test\" :keys {}})"]
-                              ["a vector" "[1 2]"]
-                              ["a number" "5"]
-                              ["a string" "\"x\""]
-                              ["nil" "nil"]
-                              [":keys a vector" "{:version 2 :app \"cli-test\" :keys []}"]
-                              [":keys a number" "{:version 2 :app \"cli-test\" :keys 5}"]
-                              [":keys nil" "{:version 2 :app \"cli-test\" :keys nil}"]]
-                cfg [config keyless-config]]
-          (spit (:manifest env) text)
-          (let [{:keys [result out err]} (capture-verify cfg "dev")]
-            (is (= 1 (:exit result)) label)
-            (is (= :drift (get-in result [:results :dev])) label)
-            (is (str/includes? (str out err) "manifest is malformed") label)))
-        (testing "a manifest with no :keys is not called malformed"
-          (spit (:manifest env) "{:version 2 :app \"cli-test\"}")
-          (let [{:keys [out err]} (capture-verify config "dev")]
-            (is (not (str/includes? (str out err) "malformed")))))))))
-
 (deftest set-never-echoes-a-misplaced-value-test
   (let [marker "hunter2-MARKER"
         config (test-config)
@@ -2831,3 +2814,377 @@
       (is (str/includes? out (str "  " (pr-str prefix))))
       (is (not (str/includes? out "\u001b")) "control characters are escaped")
       (is (not (str/includes? out "TAILMARKER"))))))
+
+;;;; The per-store manifest key
+
+(defn- team-fixture
+  "A two-recipient team store's moving parts: Alice holds the fixture key and
+  Bob a second one, and each has a config that differs only in whose key it
+  names. The recipients file lists both."
+  []
+  (let [recipients (str *dir* "/recipients.txt")
+        bob-key (str *dir* "/bob-key.txt")
+        bob-public (age/keygen! bob-key)
+        alice-public (age/public-key *key*)]
+    (spit recipients (str alice-public "\n" bob-public "\n"))
+    {:recipients recipients
+     :ciphertext (str *dir* "/secrets.edn.age")
+     :manifest-path (str *dir* "/secrets.edn.manifest")
+     :bob-key bob-key
+     :alice-public alice-public
+     :alice (cli/normalize-config (test-config {:recipients-file recipients}))
+     :bob (cli/normalize-config (test-config {:recipients-file recipients :key-file bob-key}))}))
+
+(defn- set-value! [config k v]
+  (with-out-str (with-in-str v (cli/set-secret! config "dev" k false))))
+
+(defn- vhash-of
+  "The `:vhash` `manifest-key` gives `value`."
+  [manifest-key value]
+  (:vhash (get (manifest/entries {:x value} manifest-key) [:x])))
+
+(deftest every-store-gets-a-vhash-on-every-leaf-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [recipients (str *dir* "/recipients.txt")
+          template (str *dir* "/shared.example")
+          env (fn [n extra]
+                (merge {:secrets-file (str *dir* "/" n ".edn.age")
+                        :key-file *key*
+                        :template template}
+                       extra))
+          config (cli/normalize-config
+                  {:app "cli-test"
+                   :environments {:solo (env "solo" {})
+                                  :team (env "team" {:recipients-file recipients})
+                                  :copy (env "copy" {})}})
+          text "{:db {:url \"postgres://x\" :port 5432}\n :admins #{\"a@b.c\"}\n :empty {}}"
+          manifest-for #(manifest-of (str *dir* "/" % ".edn.manifest"))
+          key-for #(store-manifest-key (str *dir* "/" % ".edn.age") *key*)]
+      (spit recipients (str (age/public-key *key*) "\n"))
+      ;; The template is a decrypted store someone saved, manifest key and all.
+      (new-store! config "solo" text)
+      (spit template (store-text (str *dir* "/solo.edn.age") *key*))
+      (is (str/includes? (slurp template) (key-for "solo"))
+          "the template really holds a manifest key")
+      (.delete (io/file (str *dir* "/solo.edn.age")))
+      (doseq [n ["solo" "team" "copy"]]
+        ;; The editor saves the template as it was presented.
+        (with-out-str
+          (with-redefs-fn {(cli-private 'run-editor!) (fn [_])}
+            #(cli/new! config n))))
+      (testing "solo and team manifests are the same kind"
+        (doseq [n ["solo" "team"]]
+          (let [m (manifest-for n)]
+            (is (= 3 (:version m)))
+            (is (= #{[:db :url] [:db :port] [:admins] [:empty]} (set (keys (:keys m))))
+                "one entry per leaf, and none for the store's reserved keys")
+            (is (every? #(re-matches #"[0-9a-f]{16}" (:vhash %)) (vals (:keys m))) n)
+            (is (= 0 (:exit (verify config n)))))))
+      (testing "stores created from one template never share a key"
+        (is (every? manifest/valid-key? (map key-for ["solo" "team" "copy"])))
+        (is (= 3 (count (set (map key-for ["solo" "team" "copy"]))))
+            "none of them is the template's key either")
+        (is (not (contains? (set (map key-for ["solo" "team" "copy"]))
+                            (get (edn/read-string (slurp template)) manifest/store-key)))))
+      (testing "so equal values hash differently in each"
+        (let [hashes (fn [n] (update-vals (:keys (manifest-for n)) :vhash))]
+          (doseq [path [[:db :url] [:db :port] [:admins] [:empty]]]
+            (is (= 3 (count (set (map #(get (hashes %) path) ["solo" "team" "copy"]))))
+                path))))
+      (testing "the stores hold the same user data"
+        (is (= (edn/read-string text)
+               (secrets/load-secrets (str *dir* "/solo.edn.age") *key*)
+               (secrets/load-secrets (str *dir* "/team.edn.age") *key*)))))))
+
+(deftest a-template-with-a-reserved-key-anywhere-is-accepted-and-not-copied-test
+  (let [template (str *dir* "/hand.example")
+        config (cli/normalize-config (test-config {:template template}))
+        template-key (manifest/generate-key)
+        presented (atom nil)]
+    (spit template (str "{:a 1 " manifest/store-key " \"" template-key "\"}"))
+    (with-out-str
+      (with-redefs-fn {(cli-private 'run-editor!) #(reset! presented (slurp %))}
+        #(cli/new! config "dev")))
+    (is (not (str/includes? @presented "manifest-key")) "the editor never shows the key")
+    (is (= {:a 1} (edn/read-string @presented)))
+    (is (not= template-key (store-manifest-key (str *dir* "/secrets.edn.age") *key*)))
+    (is (= 0 (:exit (verify config "dev"))))))
+
+(deftest recipients-of-a-team-store-agree-on-unchanged-values-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [{:keys [alice bob bob-key ciphertext manifest-path]} (team-fixture)
+          entries #(:keys (manifest-of manifest-path))
+          unchanged-agree (fn [before paths]
+                            (is (= (select-keys before paths) (select-keys (entries) paths))))]
+      (new-store! alice "dev" "{:a \"one\" :b \"two\" :c {:d \"three\"}}")
+      (let [created (entries)
+            manifest-key (store-manifest-key ciphertext *key*)]
+        (is (= manifest-key (store-manifest-key ciphertext bob-key))
+            "both recipients read the same key")
+        (testing "Bob sets a value"
+          (set-value! bob ":b" "TWO")
+          (unchanged-agree created [[:a] [:c :d]])
+          (is (not= (created [:b]) ((entries) [:b]))))
+        (testing "Alice edits another"
+          (let [before (entries)]
+            (edit-store! alice "dev" #(str/replace % "\"one\"" "\"ONE\""))
+            (unchanged-agree before [[:b] [:c :d]])
+            (is (not= (before [:a]) ((entries) [:a])))))
+        (testing "Bob removes a third and adds a fourth by editing"
+          (let [before (entries)]
+            (with-out-str (cli/remove-secret! bob "dev" "[:c :d]"))
+            (unchanged-agree before [[:a] [:b]])
+            (edit-store! bob "dev" #(str/replace % "{:a" "{:e \"five\" :a"))
+            (unchanged-agree before [[:a] [:b]])
+            (is (= (vhash-of manifest-key "five") (:vhash ((entries) [:e]))))))
+        (testing "the key never moved, and each recipient's verify passes"
+          (is (= manifest-key
+                 (store-manifest-key ciphertext *key*)
+                 (store-manifest-key ciphertext bob-key)))
+          (is (= 0 (:exit (verify alice "dev"))))
+          (is (= 0 (:exit (verify bob "dev")))))))))
+
+(deftest a-removed-recipients-key-says-nothing-about-later-values-test
+  ;; The reproduction from the threat model's manifest lessons, as a test. Bob
+  ;; is a recipient and keeps the manifest key. He is removed, and Alice then
+  ;; changes a 4-digit PIN. Bob tries every PIN under the key he kept.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (doseq [[label after-removal!]
+            [["reencrypt, then set" (fn [alice]
+                                      (with-out-str (cli/reencrypt! alice "dev"))
+                                      (set-value! alice ":pin" "4821"))]
+             ["set without a reencrypt" (fn [alice] (set-value! alice ":pin" "4821"))]
+             ["edit without a reencrypt"
+              (fn [alice] (edit-store! alice "dev" #(str/replace % "1234" "4821")))]
+             ["rm without a reencrypt, then set"
+              (fn [alice]
+                (with-out-str (cli/remove-secret! alice "dev" ":other"))
+                (set-value! alice ":pin" "4821"))]]]
+      (testing label
+        (let [{:keys [alice bob-key alice-public recipients ciphertext manifest-path]}
+              (team-fixture)
+              candidates (map #(format "%04d" %) (range 10000))]
+          (.delete (io/file ciphertext))
+          (new-store! alice "dev" "{:pin \"1234\" :other \"x\"}")
+          (let [retained (store-manifest-key ciphertext bob-key)
+                published #(set (map :vhash (vals (:keys (manifest-of manifest-path)))))]
+            (is (contains? (published) (vhash-of retained "1234"))
+                "while Bob is a recipient his key does identify the PIN")
+            (spit recipients (str alice-public "\n"))
+            (after-removal! alice)
+            (is (= "4821" (:pin (secrets/load-secrets ciphertext *key*))))
+            (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))
+                "Bob's identity no longer decrypts")
+            (let [now (published)]
+              (is (not-any? #(contains? now (vhash-of retained %)) candidates)
+                  "no candidate PIN under the retained key matches a published hash")
+              (is (contains? now (vhash-of (store-manifest-key ciphertext *key*) "4821"))
+                  "the store's current key does, so the search above could have matched"))
+            (is (= 0 (:exit (verify alice "dev"))))))))))
+
+(deftest the-manifest-key-is-kept-until-the-recipients-change-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [{:keys [alice ciphertext recipients alice-public]} (team-fixture)
+          current #(store-manifest-key ciphertext *key*)]
+      (new-store! alice "dev" "{:a 1}")
+      (let [created (current)]
+        (set-value! alice ":b" "x")
+        (edit-store! alice "dev" #(str/replace % ":a 1" ":a 2"))
+        (with-out-str (cli/remove-secret! alice "dev" ":b"))
+        (is (= created (current)) "set, edit, and rm keep the key")
+        (with-out-str (cli/reencrypt! alice "dev"))
+        (let [renewed (current)]
+          (is (not= created renewed) "reencrypt generates a key even with the same recipients")
+          (spit recipients (str alice-public "\n"))
+          (let [out (set-value! alice ":c" "y")]
+            (is (not= renewed (current)) "a write after a recipient change generates one too")
+            (is (str/includes? out "Recipients changed since the last write")))
+          (let [settled (current)]
+            (set-value! alice ":d" "z")
+            (is (= settled (current)) "and the next write keeps it")))))))
+
+(deftest reserved-keys-never-reach-the-public-api-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")
+          user-data {:database/url "jdbc:x" :nested {:token "t"}}]
+      (new-store! config "dev" (pr-str user-data))
+      (is (manifest/valid-key? (store-manifest-key ciphertext *key*))
+          "the store on disk does hold the key")
+      (let [loaded (secrets/load-secrets ciphertext *key*)
+            readers (secrets/reader-literals {:file ciphertext :identity-file *key*})
+            req (readers 'secret/req)
+            opt (readers 'secret/opt)]
+        (is (= user-data loaded))
+        (doseq [reserved manifest/reserved-keys
+                path [reserved [reserved]]]
+          (testing (pr-str path)
+            (is (nil? (secrets/get-secret loaded path)))
+            (is (= ::absent (secrets/get-secret loaded path ::absent)))
+            (is (nil? (opt path)))
+            (is (= :missing-key
+                   (:reason (ex-data (try (req path)
+                                          (catch clojure.lang.ExceptionInfo e e))))))))
+        (is (= "jdbc:x" (req :database/url) (opt :database/url)))
+        (is (not (str/includes? (pr-str loaded) (store-manifest-key ciphertext *key*))))))))
+
+(deftest set-rm-and-edit-cannot-touch-a-reserved-key-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")
+          failure (fn [f] (try (with-out-str (f)) nil (catch clojure.lang.ExceptionInfo e e)))]
+      (new-store! config "dev" ";; the team's notes\n{:a 1 ; inline note\n :b {:c 2}}\n")
+      (let [manifest-key (store-manifest-key ciphertext *key*)
+            bytes-before (file-bytes ciphertext)
+            manifest-before (slurp manifest-path)
+            untouched? #(and (= bytes-before (file-bytes ciphertext))
+                             (= manifest-before (slurp manifest-path)))]
+        (testing "set and rm refuse a path at or under a reserved key"
+          (doseq [reserved manifest/reserved-keys
+                  path [(pr-str reserved) (pr-str [reserved]) (pr-str [reserved :x])]
+                  [label command] [["set" #(with-in-str "chosen-by-the-user"
+                                             (cli/set-secret! config "dev" path false))]
+                                   ["rm" #(cli/remove-secret! config "dev" path)]]]
+            (testing (str label " " path)
+              (let [e (failure command)]
+                (is (= :reserved-key (:reason (ex-data e))))
+                (is (str/includes? (ex-message e) "is reserved for the library's own metadata"))
+                (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) manifest-key))
+                    "the refusal does not read the key out")
+                (is (untouched?))))))
+        (testing "edit shows the plaintext without reserved keys, exactly as it was written"
+          (let [presented (atom nil)]
+            (with-out-str
+              (with-redefs-fn {(cli-private 'run-editor!) #(reset! presented (slurp %))}
+                #(cli/edit! config "dev")))
+            (is (= ";; the team's notes\n{:a 1 ; inline note\n :b {:c 2}}\n" @presented))
+            (is (untouched?) "and an edit that changes nothing writes nothing")))
+        (testing "a plaintext that comes back holding a reserved key is refused"
+          (doseq [reserved manifest/reserved-keys
+                  typed [(str "{:a 1 " reserved " \"" (manifest/generate-key) "\"}")
+                         (str "{:a 1 " reserved " nil}")]]
+            (let [e (failure #(with-redefs-fn {(cli-private 'run-editor!)
+                                               (fn [path] (spit path typed))}
+                                (fn [] (cli/edit! config "dev"))))]
+              (is (= :reserved-key (:reason (ex-data e))))
+              (is (str/includes? (ex-message e) "which the library reserves"))
+              (is (untouched?)))))
+        (testing "a saved edit keeps the key and the comments"
+          (edit-store! config "dev" #(str/replace % ":a 1" ":a 10"))
+          (is (= manifest-key (store-manifest-key ciphertext *key*)))
+          (is (= {:a 10 :b {:c 2}} (secrets/load-secrets ciphertext *key*)))
+          (is (= ";; the team's notes\n{:a 10 ; inline note\n :b {:c 2}}\n"
+                 ((cli-private 'user-plaintext) (store-text ciphertext *key*))))
+          (is (= 0 (:exit (verify config "dev")))))))))
+
+(deftest a-store-without-a-well-formed-manifest-key-fails-until-reencrypt-test
+  ;; Setting the key to nil once produced a manifest with no value hashes that
+  ;; still verified. Every such store is an error now, on writes and on verify.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")
+          manifest-path (str *dir* "/secrets.edn.manifest")
+          failure (fn [f] (try (with-out-str (f)) nil (catch clojure.lang.ExceptionInfo e e)))
+          short-key "0123456789abcdef"]
+      (doseq [[label store problem]
+              [["missing" {:a 1} :missing]
+               ["nil" {:a 1 manifest/store-key nil} :missing]
+               ["short" {:a 1 manifest/store-key short-key} :malformed]
+               ["upper case" {:a 1 manifest/store-key (str/upper-case (manifest/generate-key))}
+                :malformed]
+               ["not a string" {:a 1 manifest/store-key 42} :malformed]
+               ["a keyword" {:a 1 manifest/store-key :none} :malformed]]]
+        (testing label
+          ;; A complete manifest first, so verify gets as far as the store.
+          (encrypt-edn! {:a 1})
+          (with-out-str (cli/reencrypt! config "dev"))
+          (encrypt-raw-edn! store)
+          (let [bytes-before (file-bytes ciphertext)
+                manifest-before (slurp manifest-path)]
+            (doseq [[command run]
+                    [["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b" false))]
+                     ["rm" #(cli/remove-secret! config "dev" ":a")]
+                     ["edit" #(with-redefs-fn {(cli-private 'run-editor!)
+                                               (fn [path] (spit path "{:a 2}"))}
+                                (fn [] (cli/edit! config "dev")))]]]
+              (testing command
+                (let [e (failure run)]
+                  (is (= {:reason :invalid-manifest-key :problem problem}
+                         (select-keys (ex-data e) [:reason :problem])))
+                  (is (str/includes? (ex-message e)
+                                     (if (= :missing problem)
+                                       "has no manifest key"
+                                       "holds a malformed manifest key")))
+                  (is (str/includes? (ex-message e)
+                                     "Generate a new one with:  bb secrets reencrypt 'dev'"))
+                  (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) short-key))
+                      "the failure never carries the value found")
+                  (is (= bytes-before (file-bytes ciphertext)))
+                  (is (= manifest-before (slurp manifest-path))))))
+            (testing "verify"
+              (let [{:keys [result err]} (capture-verify config "dev")]
+                (is (= {:results {:dev :drift} :exit 1} result))
+                (is (str/includes? err "manifest key"))
+                (is (str/includes? err "bb secrets reencrypt 'dev'"))))
+            (testing "reencrypt repairs it"
+              (with-out-str (cli/reencrypt! config "dev"))
+              (is (manifest/valid-key? (store-manifest-key ciphertext *key*)))
+              (is (= {:a 1} (secrets/load-secrets ciphertext *key*)))
+              (is (every? :vhash (vals (:keys (manifest-of manifest-path)))))
+              (is (= 0 (:exit (verify config "dev"))))
+              (set-value! config ":b" "v")
+              (is (= {:a 1 :b "v"} (secrets/load-secrets ciphertext *key*))))))))))
+
+(deftest a-store-that-is-not-a-map-is-refused-test
+  (let [config (cli/normalize-config (test-config))]
+    (doseq [[text reason] [["[1 2 3]" :secrets-not-a-map]
+                           ["\"just a string\"" :secrets-not-a-map]
+                           ["#_ {:skipped 1} {:a 1}" :secrets-map-not-first]]]
+      (let [e (try (new-store! config "dev" text) nil
+                   (catch clojure.lang.ExceptionInfo e e))]
+        (is (= reason (:reason (ex-data e))) text)
+        (is (not (.exists (io/file (str *dir* "/secrets.edn.age")))))))))
+
+(deftest a-failure-after-the-plaintext-is-written-leaves-no-temp-file-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")
+          plaintexts (atom [])
+          failing-encrypt (fn [_target in _out]
+                            (swap! plaintexts conj {:path (str in) :text (slurp (str in))})
+                            (throw (ex-info "forced encryption failure" {})))]
+      (new-store! config "dev" "{:a 1}")
+      (let [bytes-before (file-bytes ciphertext)]
+        (doseq [[label run]
+                [["new" #(with-redefs-fn {(cli-private 'run-editor!)
+                                          (fn [path] (spit path "{:n 1}"))
+                                          (cli-private 'confirm!) (constantly true)}
+                           (fn [] (cli/new! config "dev")))]
+                 ["edit" #(with-redefs-fn {(cli-private 'run-editor!)
+                                           (fn [path] (spit path "{:e 1}"))}
+                            (fn [] (cli/edit! config "dev")))]
+                 ["set" #(with-in-str "v" (cli/set-secret! config "dev" ":s" false))]
+                 ["rm" #(cli/remove-secret! config "dev" ":a")]
+                 ["reencrypt" #(cli/reencrypt! config "dev")]]]
+          (testing label
+            (reset! plaintexts [])
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo #"forced encryption failure"
+                 (with-out-str (with-redefs [age/encrypt-file! failing-encrypt] (run)))))
+            (let [[{:keys [path text]}] @plaintexts]
+              (is (= 1 (count @plaintexts)))
+              (is (str/includes? text (str manifest/store-key))
+                  "the failure came after the keyed plaintext was on disk")
+              (is (re-matches #"secrets-.*\.edn" (.getName (io/file path)))
+                  "in the command's own private temp file, not a second one")
+              (is (not (.exists (io/file path))) "which is gone"))
+            (is (= bytes-before (file-bytes ciphertext)))))))))

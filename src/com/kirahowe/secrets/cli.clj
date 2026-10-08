@@ -44,9 +44,12 @@
   add-recipient · recipients · reencrypt · help.
 
   By default, each environment commits `secrets.edn.age` (ciphertext) and
-  `secrets.edn.manifest` (key paths, types, counts, and optional keyed hashes).
-  Editing uses an owner-only plaintext temp file and deletes it afterward; a
-  failed delete is an error that names the remaining path.
+  `secrets.edn.manifest` (key paths, types, counts, and a keyed hash per value).
+  The hashes are keyed by a random manifest key the store holds inside its
+  encrypted EDN; `manifest-key-for` states when that key is generated, kept,
+  and renewed. A store's plaintext is one EDN map. Editing uses an owner-only
+  plaintext temp file and deletes it afterward; a failed delete is an error
+  that names the remaining path.
 
   The command fns are a REPL-safe API: they return data (a path, a results
   map, or :aborted) and signal failures by throwing `ex-info` instead of
@@ -656,13 +659,53 @@
 
 ;;;; Manifest
 
-(defn- manifest-hmac-key
-  "The manifest HMAC key for an environment: derived from the shared identity
-  in single-key mode, nil in multi-recipient mode (no single shared key), so the
-  manifest is structure-only for teams."
-  [{:keys [recipients-file identity-file]}]
-  (when (and (not recipients-file) (.exists (io/file identity-file)))
-    (manifest/hmac-key (slurp identity-file))))
+(defn- require-manifest-key!
+  "Return the manifest key held by decrypted store value `store`, or fail
+  saying whether it is missing or malformed and that `reencrypt` generates a
+  new one. The failure never carries the value found."
+  [{:keys [secrets-file] environment-name :name} store]
+  (let [found (when (map? store) (get store manifest/store-key ::missing))]
+    (if (manifest/valid-key? found)
+      found
+      (let [problem (if (or (nil? found) (= ::missing found)) :missing :malformed)]
+        (fail! (str "The store " secrets-file
+                    (if (= :missing problem)
+                      " has no manifest key"
+                      " holds a malformed manifest key")
+                    " (" (pr-str manifest/store-key) "), so its manifest cannot be"
+                    " written or checked.\n"
+                    "    Generate a new one with:  bb secrets reencrypt "
+                    (shell-quote (name environment-name)))
+               {:reason :invalid-manifest-key
+                :problem problem
+                :secrets-file (str secrets-file)
+                :environment environment-name})))))
+
+(defn- manifest-key-for
+  "Return the manifest key a write of this store carries. This is the one rule
+  for the key's lifetime (`doc/threat-model.md`, A5 and the chosen manifest
+  contract):
+
+  - `:create` (`new`, and `set` when no store exists) generates a key.
+  - `:reencrypt` always generates a key, so every `:vhash` changes once. It
+    does not read the existing key, which is how it repairs a store whose key
+    is missing or malformed.
+  - `:update` (`edit`, `set`, `rm`) keeps the key of `store`, the decrypted
+    value, and fails when that key is missing or malformed. These commands
+    encrypt to the recipients as they read now, so when `target` is not the
+    recipient set the store records, they generate a key instead. A removed
+    recipient's retained key then says nothing about values published by this
+    write or any later one."
+  [operation env store target]
+  (if (= :update operation)
+    (let [existing (require-manifest-key! env store)]
+      (if (= (manifest/recipients-id (:recipients target))
+             (get store manifest/store-recipients))
+        existing
+        (do (info "Recipients changed since the last write:"
+                  "generating a new manifest key, so every value hash changes once.")
+            (manifest/generate-key))))
+    (manifest/generate-key)))
 
 (defn- edn-failure-message
   [{:keys [reason depth limit] :as failure}]
@@ -691,21 +734,20 @@
   [{:keys [secrets-file identity-file]}]
   (safe-edn/parse (age/decrypt identity-file secrets-file)))
 
-(defn- decrypt-secrets!
-  "The environment's store as one EDN value, or a failure naming why it is not."
-  [{:keys [secrets-file] :as env}]
-  (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
+(defn- decrypt-text!
+  "The environment's decrypted store as text, library metadata included."
+  [{:keys [secrets-file identity-file]}]
+  (age/decrypt identity-file secrets-file))
+
+(defn- parsed-store!
+  "The value of decrypted store text `text`, or a failure naming why it is not
+  one EDN value."
+  [{:keys [secrets-file]} text]
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse text)]
     (if ok?
       value
       (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
              (merge {:secrets-file secrets-file} (safe-edn/failure-data parsed))))))
-
-(defn- decrypt-to-temp!
-  "Write the environment's decrypted store, byte for byte, into the private
-  temp file `tmp`."
-  [{:keys [secrets-file identity-file]} tmp]
-  (with-open [out (io/output-stream tmp)]
-    (.write out (age/decrypt-bytes identity-file secrets-file))))
 
 (def ^:private set-usage
   (str "`set` takes [env] <key>; the value is read from the prompt or stdin, "
@@ -716,7 +758,8 @@
   `get-in` / `update-in` expect: a bare keyword becomes a one-element path,
   a vector of keywords/strings is a nested path. Rejects anything else,
   including a missing argument, with a `fail!` naming both accepted forms, so
-  a typo'd path is caught before any file is touched. The failure names the
+  a typo'd path is caught before any file is touched. A path at or under one
+  of the store's reserved metadata keys is rejected too. The failure names the
   rejected value's type and never the value: `set` receives the key where a
   mistyped command line may have put the secret."
   [s]
@@ -736,7 +779,12 @@
                   "    Accepted forms: a keyword (:some/key) or a vector path "
                   "([:a :b]).")
              (when-not ok? (safe-edn/failure-data parsed))))
-    (if (keyword? value) [value] value)))
+    (let [path (if (keyword? value) [value] value)]
+      (when (manifest/reserved-keys (first path))
+        (fail! (str "The key " (pr-str (first path)) " is reserved for the library's own"
+                    " metadata. `set` and `rm` do not read, change, or remove it.")
+               {:reason :reserved-key :key path}))
+      path)))
 
 (defn- render-secrets
   "Render a secrets map as the plaintext `set`/`rm` re-encrypt. Pretty-printed
@@ -771,29 +819,131 @@
       (fs/atomic-move! staging target)
       (finally (.delete staging)))))
 
-(defn- write-secrets!
-  "Validate `plaintext-file`, encrypt it to the already-resolved `target`
-  recipient spec, and replace the ciphertext and then the manifest, each
-  atomically.
+;;; A store's plaintext is the user's text with the library's metadata written
+;;; as the first lines of its map. `with-metadata` puts those lines in and
+;;; `user-plaintext` takes them out, so the user's text, comments included,
+;;; round-trips byte for byte and never shows the metadata.
 
-  Validation, encryption, and manifest rendering all finish before anything is
-  replaced, so a failure there leaves both files as they were. The pair is not
-  one transaction: the ciphertext is authoritative and the manifest is derived
-  from it. If the manifest cannot be replaced after the ciphertext was, the
-  failure has `:reason :manifest-stale` and says how to regenerate it."
-  [{:keys [manifest app secrets-file] environment-name :name :as env} target plaintext-file]
-  (let [f (io/file (str plaintext-file))
-        _ (when (> (.length f) age/max-plaintext-bytes)
+(defn- map-opening
+  "The index just past the `{` that opens the first form of `text`, when only
+  whitespace, commas, and `;` comments come before it. The map may carry a
+  namespace prefix (`#:db{`), which is how the pretty printer writes a map
+  whose keys share a namespace. Otherwise nil."
+  [^String text]
+  (loop [i 0]
+    (when (< i (count text))
+      (let [c (.charAt text i)]
+        (cond
+          (or (Character/isWhitespace c) (= \, c)) (recur (inc i))
+          (= \; c) (let [end (.indexOf text "\n" (int i))]
+                     (when-not (neg? end) (recur (inc end))))
+          (= \{ c) (inc i)
+          (= \# c) (some->> (re-find #"\A#:[^\s{}\[\]()\";,]+\s*\{" (subs text i))
+                            count
+                            (+ i)))))))
+
+(defn- metadata-lines
+  "The two map entries that carry `manifest-key` and `recipients-id`, as text."
+  [manifest-key recipients-id]
+  (str (pr-str manifest/store-key) " " (pr-str manifest-key) "\n "
+       (pr-str manifest/store-recipients) " " (pr-str recipients-id) "\n "))
+
+(def ^:private metadata-lines-re
+  "Matches `metadata-lines` output at the start of a string."
+  (re-pattern (str "\\A" (java.util.regex.Pattern/quote (pr-str manifest/store-key))
+                   " \"[0-9a-f]{64}\"\n "
+                   (java.util.regex.Pattern/quote (pr-str manifest/store-recipients))
+                   " \"[0-9a-z]+\"\n ")))
+
+(defn- with-metadata
+  "Return `user-text`, the text of a map, with `lines` (from `metadata-lines`)
+  written as its first entries. Nil when the text does not open with its map."
+  [user-text lines]
+  (when-let [opening (map-opening user-text)]
+    (str (subs user-text 0 opening) lines (subs user-text opening))))
+
+(defn- user-plaintext
+  "Return store or template text without the library's metadata. Text that
+  carries the lines `with-metadata` wrote comes back exactly as the user wrote
+  it. A map holding a reserved key anywhere else, as a store written by
+  another tool can, is rendered again without it, which drops its comments.
+  Any other text comes back unchanged."
+  [text]
+  (let [opening (map-opening text)
+        lines (when opening (re-find metadata-lines-re (subs text opening)))]
+    (if lines
+      (str (subs text 0 opening) (subs text (+ opening (count lines))))
+      (let [{:keys [ok? value]} (safe-edn/parse text)]
+        (if (and ok? (map? value) (some manifest/reserved-keys (keys value)))
+          (render-secrets (manifest/user-data value))
+          text)))))
+
+(defn- read-edited!
+  "The text an editor left in private temp file `tmp`, bounded by
+  `age/max-plaintext-bytes`."
+  [secrets-file tmp]
+  (let [f (io/file (str tmp))]
+    (when (> (.length f) age/max-plaintext-bytes)
+      (input-too-large! (str "The plaintext for " secrets-file)
+                        age/max-plaintext-bytes (.length f)
+                        {:secrets-file (str secrets-file)}))
+    (slurp f :encoding "UTF-8")))
+
+(defn- store-plaintext!
+  "Validate `user-text` and return `[value plaintext]`: the user's map, and
+  the text to encrypt, which is `user-text` with the store's metadata written
+  in. Fails, before anything is encrypted, on a plaintext past
+  `age/max-plaintext-bytes`, which is checked before it is parsed, and on text
+  that is not one EDN map or that holds a reserved key."
+  [secrets-file target user-text manifest-key]
+  (let [unchanged "\n    Ciphertext and manifest were left unchanged."
+        lines (metadata-lines manifest-key (manifest/recipients-id (:recipients target)))
+        size (+ (utf8-length user-text) (utf8-length lines))
+        _ (when (> size age/max-plaintext-bytes)
             (input-too-large! (str "The plaintext for " secrets-file)
-                              age/max-plaintext-bytes (.length f)
+                              age/max-plaintext-bytes size
                               {:secrets-file (str secrets-file)}))
-        value (validate-plaintext! secrets-file (slurp f :encoding "UTF-8"))
+        value (validate-plaintext! secrets-file user-text)
+        _ (when-not (map? value)
+            (fail! (str "Secrets must be one EDN map, but the plaintext is a value of type "
+                        (name (manifest/value-type value)) "." unchanged)
+                   {:secrets-file (str secrets-file) :reason :secrets-not-a-map}))
+        _ (when-let [reserved (seq (filter manifest/reserved-keys (keys value)))]
+            (fail! (str "The plaintext holds " (str/join " and " (map pr-str reserved))
+                        ", which the library reserves for its own metadata.\n"
+                        "    Remove it; the store keeps its own." unchanged)
+                   {:secrets-file (str secrets-file) :reason :reserved-key
+                    :key (vec reserved)}))
+        plaintext (or (with-metadata user-text lines)
+                      (fail! (str "The secrets map must be the first form in the plaintext."
+                                  " Only whitespace and ; comments may come before its {."
+                                  unchanged)
+                             {:secrets-file (str secrets-file)
+                              :reason :secrets-map-not-first}))]
+    [value plaintext]))
+
+(defn- write-secrets!
+  "Validate `user-text`, the store's plaintext without library metadata, write
+  it with `manifest-key` into private temp file `tmp`, encrypt that to the
+  already-resolved `target` recipient spec, and replace the ciphertext and
+  then the manifest, each atomically.
+
+  `tmp` is the caller's own private temp file, so the keyed plaintext is on
+  disk only inside the scope that deletes it. Validation, encryption, and
+  manifest rendering all finish before anything is replaced, so a failure
+  there leaves both files as they were. The pair is not one transaction: the
+  ciphertext is authoritative and the manifest is derived from it. If the
+  manifest cannot be replaced after the ciphertext was, the failure has
+  `:reason :manifest-stale` and says how to regenerate it."
+  [{:keys [manifest app secrets-file] environment-name :name} target tmp user-text manifest-key]
+  (let [[value plaintext] (store-plaintext! secrets-file target user-text manifest-key)
         staging (fs/staging-file secrets-file)]
     (try
-      (age/encrypt-file! target plaintext-file staging)
+      (spit tmp plaintext :encoding "UTF-8")
+      (age/encrypt-file! target tmp staging)
       (let [manifest-text (when (string? manifest)
                             (manifest/render {:app app :ciphertext-sha (sha256 staging)}
-                                             (manifest/entries value (manifest-hmac-key env))))]
+                                             (manifest/entries value manifest-key)))]
         (fs/atomic-move! staging secrets-file)
         (when manifest-text
           (try
@@ -910,7 +1060,9 @@
 (defn new!
   "Create an encrypted secrets file from its template using $VISUAL, $EDITOR,
   or vim. Returns the secrets-file path, or :aborted when an existing file is
-  kept. Plaintext is held in an owner-only temp file during editing."
+  kept. Plaintext is held in an owner-only temp file during editing. The new
+  store gets its own manifest key: a key in the template is dropped, never
+  copied."
   [config env-arg]
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
@@ -928,17 +1080,21 @@
           (do (info "Aborted.") :aborted)
           (with-plaintext-temp
             (fn [tmp]
-              (spit tmp (template-content env))
+              (spit tmp (user-plaintext (template-content env)))
               (info "Opening" (editor) "…")
               (run-editor! tmp)
               (info "Encrypting…")
-              (write-secrets! env target tmp)
+              (write-secrets! env target tmp (read-edited! secrets-file tmp)
+                              (manifest-key-for :create env nil target))
               (report-written! env "Encrypted secrets written:" secrets-file)
               secrets-file)))))))
 
 (defn edit!
   "Edit an existing secrets file through an owner-only plaintext temp file.
-  Re-encrypts only when the plaintext changes. Returns the secrets-file path."
+  Re-encrypts only when the plaintext changes. Returns the secrets-file path.
+  The editor shows the plaintext without the store's reserved metadata keys,
+  which are put back on save; a plaintext that comes back holding one is
+  refused."
   [config env-arg]
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
@@ -955,15 +1111,21 @@
           (with-plaintext-temp
             (fn [tmp]
               (info "Decrypting" secrets-file "…")
-              (decrypt-to-temp! env tmp)
-              (let [before (sha256 tmp)]
+              (let [text (decrypt-text! env)
+                    store (parsed-store! env text)
+                    ;; A store without a usable key fails before the editor opens.
+                    _ (require-manifest-key! env store)
+                    before (user-plaintext text)]
+                (spit tmp before :encoding "UTF-8")
                 (run-editor! tmp)
-                (if (= before (sha256 tmp))
-                  (warn "No changes — leaving" secrets-file "untouched.")
-                  (do
-                    (info "Re-encrypting…")
-                    (write-secrets! env target tmp)
-                    (report-written! env "Secrets updated:" secrets-file))))
+                (let [after (read-edited! secrets-file tmp)]
+                  (if (= before after)
+                    (warn "No changes — leaving" secrets-file "untouched.")
+                    (do
+                      (info "Re-encrypting…")
+                      (write-secrets! env target tmp after
+                                      (manifest-key-for :update env store target))
+                      (report-written! env "Secrets updated:" secrets-file)))))
               secrets-file)))))))
 
 (defn- read-set-value!
@@ -1030,14 +1192,17 @@
                       raw)]
           (with-plaintext-temp
             (fn [tmp]
-              (let [current (if exists?
-                              (do (info "Decrypting" secrets-file "…")
-                                  (decrypt-secrets! env))
-                              (do (info "No secrets file at" secrets-file "— creating it.")
-                                  {}))]
-                (spit tmp (render-secrets (assoc-in current path value)))
+              (let [store (if exists?
+                            (do (info "Decrypting" secrets-file "…")
+                                (parsed-store! env (decrypt-text! env)))
+                            (info "No secrets file at" secrets-file "— creating it."))
+                    manifest-key (manifest-key-for (if exists? :update :create)
+                                                   env store target)
+                    current (or (manifest/user-data store) {})]
                 (info (if exists? "Re-encrypting…" "Encrypting…"))
-                (write-secrets! env target tmp)
+                (write-secrets! env target tmp
+                                (render-secrets (assoc-in current path value))
+                                manifest-key)
                 (report-written! env "Set" (pr-str path) "in" secrets-file)
                 secrets-file))))))))
 
@@ -1067,7 +1232,9 @@
                   :environment environment-name}))
         (let [target (encrypt-target! env)]
           (info "Decrypting" secrets-file "…")
-          (let [current (decrypt-secrets! env)]
+          (let [store (parsed-store! env (decrypt-text! env))
+                manifest-key (manifest-key-for :update env store target)
+                current (manifest/user-data store)]
             (when (= ::missing (get-in current path ::missing))
               (fail! (str "No such key: " (pr-str path) " in " secrets-file)
                      {:secrets-file secrets-file :key path}))
@@ -1078,9 +1245,8 @@
                             (dissoc current k))]
               (with-plaintext-temp
                 (fn [tmp]
-                  (spit tmp (render-secrets updated))
                   (info "Re-encrypting…")
-                  (write-secrets! env target tmp)
+                  (write-secrets! env target tmp (render-secrets updated) manifest-key)
                   (report-written! env "Removed" (pr-str path) "from" secrets-file)
                   secrets-file)))))))))
 
@@ -1114,7 +1280,12 @@
   Use after adding or removing a recipient (an `edit` with no change is a no-op
   and would not pick up recipient changes). The recipient list is snapshotted
   before the decryption, so it is exactly the list the command was started
-  against. Rewrites the manifest too. Returns the secrets-file path."
+  against. Returns the secrets-file path.
+
+  Every run generates a new manifest key and rewrites the manifest, so every
+  `:vhash` changes once and a removed recipient's copy of the old key says
+  nothing about values published afterwards. The existing key is not read,
+  which makes this the repair for a store whose key is missing or malformed."
   [config env-arg]
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
@@ -1131,9 +1302,10 @@
           (with-plaintext-temp
             (fn [tmp]
               (info "Decrypting" secrets-file "…")
-              (decrypt-to-temp! env tmp)
-              (info "Re-encrypting to current recipients…")
-              (write-secrets! env target tmp)
+              (let [user-text (user-plaintext (decrypt-text! env))]
+                (info "Re-encrypting to current recipients…")
+                (write-secrets! env target tmp user-text
+                                (manifest-key-for :reencrypt env nil target)))
               (report-written! env "Re-encrypted:" secrets-file)
               secrets-file)))))))
 
@@ -1245,36 +1417,16 @@
 
 (defn- read-supported-manifest
   "The committed manifest at `manifest-path` as `{:committed value}`, or a
-  `{:problem …}` naming why it cannot be compared at all.
-
-  Three gates, each rejecting rather than diffing. The structure gate wants a
-  map, with a map under `:keys` when that is present. The `:version` gate keeps
-  a hash from one manifest version from being read as another's. The `:app`
-  gate catches a manifest copied from another project: `:app` is the one field
-  the manifest records about which store it describes, and without the check a
-  manifest for another app whose key paths happen to agree is diffed as a
-  shape. Team manifests carry no `:vhash`, so a refreshed `:ciphertext-sha`
-  would otherwise verify clean. This detects an operator's wrong-file mistake,
-  not a forged manifest (see `doc/threat-model.md`, B1)."
+  `{:problem …}` naming why it cannot be compared at all: it is not EDN, or
+  `manifest/problem` finds it incomplete. Both the keyless and the keyed check
+  start here, so neither compares anything against an incomplete manifest."
   [expected-app manifest-path]
-  (let [parsed (safe-edn/parse (read-manifest-bounded! manifest-path))
-        value (:value parsed)]
-    (cond
-      (not (:ok? parsed))
+  (let [parsed (safe-edn/parse (read-manifest-bounded! manifest-path))]
+    (if-not (:ok? parsed)
       {:problem {:reason :manifest-invalid-edn :failure (safe-edn/failure-data parsed)}}
-
-      (or (not (map? value))
-          (and (contains? value :keys) (not (map? (:keys value)))))
-      {:problem {:reason :manifest-malformed}}
-
-      (not= 2 (:version value))
-      {:problem {:reason :unsupported-version :version (:version value)}}
-
-      (not= expected-app (:app value))
-      {:problem {:reason :wrong-app :app (:app value)}}
-
-      :else
-      {:committed value})))
+      (if-let [problem (manifest/problem expected-app (:value parsed))]
+        {:problem problem}
+        {:committed (:value parsed)}))))
 
 ;;; A verification is computed as a *finding*: `:status` (:ok, :ok-keyless,
 ;;; :drift, or :missing), a `:reason`, and whatever the report needs. It is
@@ -1285,21 +1437,18 @@
   "Freshness without a key: the manifest's recorded `:ciphertext-sha` against
   `actual-sha`, the digest of the ciphertext on disk."
   [committed actual-sha]
-  (let [recorded (:ciphertext-sha committed)]
-    (cond
-      (nil? recorded) {:status :missing :reason :no-ciphertext-sha}
-      (= recorded actual-sha) {:status :ok-keyless :reason :ciphertext-agrees}
-      :else {:status :drift :reason :ciphertext-changed})))
+  (if (= (:ciphertext-sha committed) actual-sha)
+    {:status :ok-keyless :reason :ciphertext-agrees}
+    {:status :drift :reason :ciphertext-changed}))
 
 (defn- keyed-finding
   "Full agreement: the committed entries against `fresh`, the entries of the
-  decrypted store, plus the recorded `:ciphertext-sha` against `actual-sha`
-  when one is recorded. Either disagreement is drift; both are reported."
+  decrypted store, plus the recorded `:ciphertext-sha` against `actual-sha`.
+  Either disagreement is drift; both are reported."
   [committed fresh actual-sha]
   (let [diff (manifest/diff (:keys committed) fresh)
         stale-entries? (not (every? empty? (vals diff)))
-        recorded (:ciphertext-sha committed)
-        stale-sha? (boolean (and recorded (not= recorded actual-sha)))]
+        stale-sha? (not= (:ciphertext-sha committed) actual-sha)]
     (if (or stale-entries? stale-sha?)
       {:status :drift
        :reason :stale
@@ -1312,6 +1461,9 @@
   returning its finding. When the environment's identity file does not exist,
   which can only be the absent app default, it compares the manifest's
   recorded :ciphertext-sha against the actual ciphertext (freshness only).
+  With an identity it decrypts the store and compares its entries, hashed
+  under the store's manifest key. A store without a well-formed key is drift,
+  reported with the message `require-manifest-key!` gives.
 
   This establishes *agreement* between the two committed artifacts, which is drift
   detection, and never who authored either of them; see [[verify!]]."
@@ -1340,16 +1492,17 @@
           (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
             (if ok?
               (keyed-finding committed
-                             (manifest/entries value (manifest-hmac-key env))
+                             (manifest/entries value (require-manifest-key! env value))
                              (sha256 secrets-file))
               {:status :drift
                :reason :secrets-invalid-edn
                :failure (safe-edn/failure-data parsed)}))))
       (catch clojure.lang.ExceptionInfo e
-        ;; A manifest or store past its size bound is a problem with this
-        ;; environment, so the other environments are still verified.
-        (if (#{:input-too-large :plaintext-too-large} (:reason (ex-data e)))
-          {:status :drift :reason :too-large :message (ex-message e)}
+        ;; A manifest or store past its size bound, and a store without a
+        ;; well-formed manifest key, cannot agree with any manifest.
+        (if (#{:input-too-large :plaintext-too-large :invalid-manifest-key}
+             (:reason (ex-data e)))
+          {:status :drift :reason :store-problem :message (ex-message e)}
           (throw e))))))
 
 (defn- diff-lines
@@ -1362,7 +1515,7 @@
 
 (defn- finding-lines
   "The report for one environment's finding."
-  [{:keys [app secrets-file manifest] environment-name :name :as env}
+  [{:keys [app secrets-file manifest] environment-name :name}
    {:keys [reason] :as finding}]
   (let [label (name environment-name)
         regenerate [:line (str "    Regenerate it with:  bb secrets reencrypt "
@@ -1382,7 +1535,8 @@
       [[:oops label "— manifest is not valid EDN:" (edn-failure-message (:failure finding))]]
 
       :manifest-malformed
-      [[:oops label "— manifest is malformed: expected a map, with a map under :keys."]
+      [[:oops label "— manifest is incomplete: expected a map with a :ciphertext-sha"
+        "and a :keys map whose every entry has a :type and a :vhash."]
        regenerate]
 
       :unsupported-version
@@ -1397,10 +1551,6 @@
        [:line "    It belongs to a different store."]
        regenerate]
 
-      :no-ciphertext-sha
-      [[:warn label (str "— no identity at " (:identity-file env))
-        "and the manifest records no :ciphertext-sha; cannot verify."]]
-
       :ciphertext-agrees
       [[:ok label "— ciphertext agrees with the manifest"
         "(freshness only: no key, so values are not checked)."]]
@@ -1410,7 +1560,7 @@
         (str "(" manifest ").")]
        regenerate]
 
-      :too-large
+      :store-problem
       [[:oops label "—" (:message finding)]]
 
       :secrets-invalid-edn
@@ -1435,22 +1585,28 @@
   secrets. With no env, verifies all of them. Never exits: returns
   {:results {env-name status} :exit code}, where each status is :ok,
   :ok-keyless, :drift, or :missing. The exit code is 1 on drift and 0 when
-  everything agrees. It is 2 when a secrets file or manifest is missing, or
-  when a keyless run meets a manifest that records no :ciphertext-sha.
+  everything agrees. It is 2 when a secrets file or manifest is missing.
 
-  Full verification decrypts and compares manifest entries. Keyless
-  verification compares the ciphertext hash and does not require age. It
-  applies only when no identity was designated and the app's default key file
-  is absent. An identity designated by :identity-file, a configured :key-file,
-  or SECRETS_AGE_IDENTITY_FILE that does not exist throws `:no-identity`.
+  Every manifest has to be complete before anything is compared: the supported
+  `:version`, this project's `:app`, a `:ciphertext-sha`, and a `:keys` map
+  whose every entry has a `:type` and a `:vhash`. Anything else is drift, with
+  or without an identity. Keyless verification then compares the ciphertext
+  hash and does not require age. It applies only when no identity was
+  designated and the app's default key file is absent. Full verification
+  decrypts and also compares the store's entries, hashed under the store's
+  manifest key, so a changed value fails it in solo and team stores alike.
+
+  A store whose manifest key is missing or malformed is drift: it cannot agree
+  with any manifest, and the report says that `reencrypt` generates a new key.
+
+  An identity designated by :identity-file, a configured :key-file, or
+  SECRETS_AGE_IDENTITY_FILE that does not exist throws `:no-identity`.
 
   A pass means the ciphertext and the manifest agree, which detects drift and
   a manifest from the wrong store. It does not establish authorship, even when
-  run with an identity: age does not sign, so no run of this can say who wrote
-  either artifact. In single-key mode the `:vhash`es make a changed value fail
-  a keyed run, because they are keyed by the private identity; team manifests
-  carry no `:vhash`, so a same-shape value change there is invisible to
-  `verify`. Authenticity rests on the repository and deployment channel; see
+  run with an identity: age does not sign, and everyone who can decrypt the
+  store holds its manifest key, so no run of this can say who wrote either
+  artifact. Authenticity rests on the repository and deployment channel; see
   `doc/threat-model.md`."
   [config env-arg]
   (let [envs (if env-arg
@@ -1535,23 +1691,20 @@
         {:state :unreadable :count nil :valid? nil}))))
 
 (defn- manifest-state
-  "Report whether a configured manifest supports a keyless freshness check.
-  Manifest contents and parse errors are deliberately omitted."
-  [manifest artifact]
+  "Report whether a configured manifest is complete, which a keyless
+  freshness check needs. Manifest contents and parse errors are deliberately
+  omitted."
+  [app manifest artifact]
   (cond
     (not (string? manifest)) {:state :disabled}
     (not (:exists? artifact)) {:state :missing}
     :else
     (try
-      (let [{:keys [ok? value]} (safe-edn/parse (read-manifest-bounded! manifest))]
-        (cond
-          (not ok?) {:state :invalid}
-          (not (map? value)) {:state :invalid}
-          (not= 2 (:version value)) {:state :unsupported}
-          (not (and (string? (:ciphertext-sha value))
-                    (not (str/blank? (:ciphertext-sha value)))))
-          {:state :missing-ciphertext-sha}
-          :else {:state :ready}))
+      (let [{:keys [problem]} (read-supported-manifest app manifest)]
+        (case (:reason problem)
+          nil {:state :ready}
+          :unsupported-version {:state :unsupported}
+          {:state :invalid}))
       (catch clojure.lang.ExceptionInfo e
         (or (bounded-state e) {:state :invalid}))
       (catch Exception _ {:state :invalid}))))
@@ -1616,7 +1769,7 @@
         identity (identity-state env identity-problem)
         age (age-state)
         recipients (recipient-state env (:recipients artifacts))
-        manifest-capability (manifest-state manifest (:manifest artifacts))
+        manifest-capability (manifest-state (:app env) manifest (:manifest artifacts))
         verify (doctor-verification-capability age identity artifacts manifest-capability)
         status (doctor-status age identity artifacts recipients manifest-capability verify)]
     {:configuration {:valid? true :reason nil}

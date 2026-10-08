@@ -1,7 +1,8 @@
 (ns com.kirahowe.secrets.cli-property-test
   "Properties of the management CLI's pure edges: the quoting every suggested
   command goes through, the argv adapter, the key-path parser, the recipients
-  reader, and the plaintext renderer."
+  reader, the plaintext renderer, and the store metadata written into the
+  plaintext."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as str]
@@ -11,6 +12,7 @@
             [clojure.test.check.properties :as prop]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.generators :as g]
+            [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]))
 
 (def ^:private shell-quote @#'cli/shell-quote)
@@ -21,6 +23,9 @@
 (def ^:private operand-token? @#'cli/operand-token?)
 (def ^:private recipient-entries @#'cli/recipient-entries)
 (def ^:private render-secrets @#'cli/render-secrets)
+(def ^:private with-metadata @#'cli/with-metadata)
+(def ^:private metadata-lines @#'cli/metadata-lines)
+(def ^:private user-plaintext @#'cli/user-plaintext)
 ;;;; Fixtures
 
 (def ^:private ^:dynamic *dir* nil)
@@ -232,3 +237,52 @@
     (= {:ok? true :value m}
        (safe-edn/parse (binding [*print-length* length *print-level* level]
                          (render-secrets m))))))
+
+;;;; Store metadata in the plaintext
+
+(def ^:private manifest-key
+  (gen/fmap str/join (gen/vector (gen/elements (vec "0123456789abcdef")) 64)))
+
+(def ^:private comment-text
+  "A `;` comment line holding the characters a scanner could mistake for
+  structure."
+  (gen/fmap #(str ";" (str/replace % #"[\r\n]" " ") "\n") g/delimiter-text))
+
+(def ^:private preamble
+  "What a store's plaintext may hold before its map: blanks, commas, and
+  comments."
+  (gen/fmap str/join (gen/vector (gen/one-of [(gen/elements [" " "\n" "\t" "," "\r\n"])
+                                              comment-text])
+                                 0 5)))
+
+(defspec store-metadata-goes-in-and-comes-out-without-touching-the-users-text 200
+  (prop/for-all [m g/secrets-map
+                 before preamble
+                 after preamble
+                 k manifest-key
+                 recorded (gen/one-of [(gen/return "identity") manifest-key])]
+    (let [text (str before (render-secrets m) after)
+          keyed (with-metadata text (metadata-lines k recorded))]
+      (and (= {:ok? true
+               :value (assoc m manifest/store-key k manifest/store-recipients recorded)}
+              (safe-edn/parse keyed))
+           (= text (user-plaintext keyed))
+           (= text (user-plaintext text))))))
+
+(defspec a-reserved-key-written-anywhere-else-is-still-taken-out 100
+  (prop/for-all [m g/secrets-map
+                 k (gen/one-of [manifest-key (gen/return nil) g/text])
+                 reserved (gen/elements (vec manifest/reserved-keys))]
+    (= {:ok? true :value m}
+       (safe-edn/parse (user-plaintext (render-secrets (assoc m reserved k)))))))
+
+(defspec text-that-does-not-open-with-a-map-gets-no-metadata 100
+  (prop/for-all [v (gen/one-of [g/scalar (gen/vector g/scalar) (gen/set g/scalar)])
+                 k manifest-key]
+    (nil? (with-metadata (pr-str v) (metadata-lines k "identity")))))
+
+(defspec a-path-at-or-under-a-reserved-key-is-refused 100
+  (prop/for-all [reserved (gen/elements (vec manifest/reserved-keys))
+                 more (gen/vector (gen/one-of [gen/keyword gen/string-alphanumeric]) 0 3)]
+    (and (refused? (pr-str (into [reserved] more)))
+         (or (seq more) (refused? (pr-str reserved))))))

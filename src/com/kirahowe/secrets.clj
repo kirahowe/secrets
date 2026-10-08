@@ -55,6 +55,7 @@
             [clojure.string :as str]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]))
 
@@ -296,11 +297,14 @@
   #{:edn-empty :edn-extra-values :edn-too-deep :edn-malformed})
 
 (defn- read-secrets-edn
-  "Parse decrypted `plaintext` under the shared, content-free EDN policy."
+  "Parse decrypted `plaintext` under the shared, content-free EDN policy and
+  return the user's data. This is the one place decrypted EDN becomes a
+  returned value, so it is where the library's reserved metadata keys
+  ([[com.kirahowe.secrets.manifest/reserved-keys]]) are dropped."
   [plaintext]
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
     (if ok?
-      value
+      (manifest/user-data value)
       (throw (ex-info (edn-failure-message parsed)
                       (safe-edn/failure-data parsed))))))
 
@@ -337,7 +341,9 @@
     #(load-with-identity source %)))
 
 (defn load-secrets
-  "Decrypt an age-encrypted EDN source and return its value.
+  "Decrypt an age-encrypted EDN source and return its value. The manifest key
+  and the other reserved `:com.kirahowe.secrets/…` metadata the CLI keeps at
+  the top level of a store are library data and are never returned.
 
   `source` is local-only: a filesystem path string, File, Path, local `file:`
   URL/URI/string, or a `jar:file:` classpath resource URL/URI/string.

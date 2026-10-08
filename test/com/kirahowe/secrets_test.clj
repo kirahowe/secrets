@@ -1718,17 +1718,30 @@
            :auth {:admins #{"a@b.com" "c@d.com"}}
            :retries 3
            :flag true}
-        e (manifest/entries m nil)]
+        e (manifest/entries m (manifest/generate-key))]
     (is (= :string (:type (e [:database/url]))))
     (is (= :set (:type (e [:auth :admins]))))
     (is (= 2 (:count (e [:auth :admins]))))
     (is (= :integer (:type (e [:retries]))))
     (is (= :boolean (:type (e [:flag]))))
-    (is (not (contains? (e [:database/url]) :vhash)) "no hmac key ⇒ no vhash")
+    (is (every? #(re-matches #"[0-9a-f]{16}" (:vhash %)) (vals e))
+        "every leaf has a value hash")
+    (testing "there is no manifest without value hashes"
+      (doseq [not-a-key [nil "" "abc" 42 (str/upper-case (manifest/generate-key))]]
+        (is (= :invalid-manifest-key
+               (:reason (ex-data (try (manifest/entries m not-a-key)
+                                      (catch clojure.lang.ExceptionInfo e e))))))))
+    (testing "the store's reserved keys get no entry"
+      (let [k (manifest/generate-key)]
+        (is (= (manifest/entries m k)
+               (manifest/entries (assoc m
+                                        manifest/store-key k
+                                        manifest/store-recipients "identity")
+                                 k)))))
     (is (not (contains? (e [:database/url]) :count)) "scalars have no :count")))
 
 (deftest manifest-vhash-detects-value-change-test
-  (let [hk (manifest/hmac-key (slurp *key*))]
+  (let [hk (manifest/generate-key)]
     (is (contains? (get (manifest/entries {:k "v1"} hk) [:k]) :vhash))
     (is (= (manifest/entries {:k "v1"} hk)
            (manifest/entries {:k "v1"} hk))
@@ -1746,7 +1759,7 @@
   (:vhash (get (manifest/entries {:x v} hkey) [:x])))
 
 (deftest manifest-encoding-is-injective-test
-  (let [hk (manifest/hmac-key (slurp *key*))
+  (let [hk (manifest/generate-key)
         vh #(leaf-vhash hk %)]
     (testing "the collisions the v1 encoding produced"
       (are [left right] (not= (vh left) (vh right))
@@ -1808,7 +1821,7 @@
   ;; EDN-readable one: among values the reader can produce, `pr-str` is
   ;; unambiguous, so no such pair exists to test with.
   (let [spaced (symbol "a b")
-        e (manifest/entries {'a {'b 1} spaced 2} nil)]
+        e (manifest/entries {'a {'b 1} spaced 2} (manifest/generate-key))]
     (is (= 2 (count e)) "two distinct paths stay two entries")
     (is (= #{'[a b] [spaced]} (set (keys e))))
     (is (= "[a b]" (pr-str '[a b]) (pr-str [spaced]))
@@ -1817,60 +1830,75 @@
 (deftest manifest-entry-order-is-total-and-stable-test
   (let [m {:b 2 :a {:d 4 :c 3} :e #{1} :f "x" :g nil}
         shuffled #(apply array-map (mapcat identity (shuffle (vec m))))
-        paths (keys (manifest/entries m nil))]
+        k (manifest/generate-key)
+        paths (keys (manifest/entries m k))]
     (is (= #{[:a :c] [:a :d] [:b] [:e] [:f] [:g]} (set paths))
         "no path is lost to a comparator that calls two of them equal")
     (dotimes [_ 20]
-      (is (= paths (keys (manifest/entries (shuffled) nil)))
+      (is (= paths (keys (manifest/entries (shuffled) k)))
           "and the order does not depend on the input map's iteration order"))))
 
 (deftest manifest-render-round-trips-test
-  (let [e (manifest/entries {:a 1 :b {:c "x"} :d #{:e}} nil)
-        sha "a3f1c2d4e5b6978012345678901234567890123456789012345678901234abcd"]
-    (testing "with a :ciphertext-sha it round-trips through the EDN"
-      (let [parsed (edn/read-string (manifest/render {:app "myapp" :ciphertext-sha sha} e))]
-        (is (= 2 (:version parsed)))
-        (is (= "myapp" (:app parsed)))
-        (is (= sha (:ciphertext-sha parsed)))
-        (is (= e (:keys parsed)) "renders to EDN that reads back to the same entries")))
-    (testing "omitted/nil :ciphertext-sha leaves the key out entirely"
-      (doseq [hdr [{:app "myapp"} {:app "myapp" :ciphertext-sha nil}]]
-        (let [parsed (edn/read-string (manifest/render hdr e))]
-          (is (not (contains? parsed :ciphertext-sha)))
-          (is (= e (:keys parsed))))))))
+  (let [e (manifest/entries {:a 1 :b {:c "x"} :d #{:e}} (manifest/generate-key))
+        sha "a3f1c2d4e5b6978012345678901234567890123456789012345678901234abcd"
+        parsed (edn/read-string (manifest/render {:app "myapp" :ciphertext-sha sha} e))]
+    (is (= 3 (:version parsed)))
+    (is (= "myapp" (:app parsed)))
+    (is (= sha (:ciphertext-sha parsed)))
+    (is (= e (:keys parsed)) "renders to EDN that reads back to the same entries")
+    (is (nil? (manifest/problem "myapp" parsed)) "and what it renders is a complete manifest")))
 
-(deftest manifest-hmac-key-comment-insensitive-test
-  (let [secret "AGE-SECRET-KEY-1QQPXZ6EXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLEEXAMPLE"
-        a (str "# created: 2026-01-01\n# public key: age1aaa\n"
-               secret "\n")
-        b (str "\n# created: 2026-07-14\n# public key: age1bbb\n  "
-               secret "  \n\n")
-        c (str "# created: 2026-01-01\n" secret "DIFFERENT\n")]
-    (is (java.util.Arrays/equals (manifest/hmac-key a) (manifest/hmac-key b))
-        "same secret line ⇒ same key, regardless of comments and whitespace")
-    (is (not (java.util.Arrays/equals (manifest/hmac-key a) (manifest/hmac-key c)))
-        "a different secret line ⇒ a different key")
-    (testing "no AGE-SECRET-KEY line at all (e.g. an SSH identity) still works"
-      (let [ssh "-----BEGIN OPENSSH PRIVATE KEY-----\nabc\n-----END OPENSSH PRIVATE KEY-----"]
-        (is (java.util.Arrays/equals (manifest/hmac-key ssh)
-                                     (manifest/hmac-key (str "\n" ssh "\n")))
-            "fallback path is stable (and whitespace-insensitive)")
-        (is (not (java.util.Arrays/equals (manifest/hmac-key ssh)
-                                          (manifest/hmac-key a))))))))
+(deftest manifest-key-generation-test
+  (let [ks (repeatedly 50 manifest/generate-key)]
+    (is (every? manifest/valid-key? ks))
+    (is (= 50 (count (set ks))) "each call draws a new key")
+    (is (not-any? manifest/valid-key?
+                  [nil "" 42 :k (subs (first ks) 1) (str (first ks) "0")
+                   (str/upper-case (first ks)) (str/replace (first ks) #"." "g")]))))
+
+(deftest manifest-recipients-id-test
+  (is (= "identity" (manifest/recipients-id nil)) "single-key mode records a fixed word")
+  (is (= (manifest/recipients-id ["age1b" "age1a"])
+         (manifest/recipients-id ["age1a" "age1b" "age1a"]))
+      "order and repeats do not matter")
+  (is (not= (manifest/recipients-id ["age1a" "age1b"]) (manifest/recipients-id ["age1a"]))
+      "removing a recipient changes it")
+  (is (not= (manifest/recipients-id []) (manifest/recipients-id nil))))
 
 (deftest manifest-diff-test
-  (testing "structure-only diff (nil key): sees add/remove/retype, not value edits"
-    (let [a (manifest/entries {:x 1 :y "str"} nil)
-          b (manifest/entries {:y 5 :z 3} nil)      ; :y string → integer
-          d (manifest/diff a b)]
-      (is (= [[:z]] (:added d)))
-      (is (= [[:x]] (:removed d)))
-      (is (= [[:y]] (:changed d)) "y retyped string → integer")))
-  (testing "with a key, a same-type value edit shows up as :changed"
-    (let [hk (manifest/hmac-key (slurp *key*))
-          a (manifest/entries {:token "old"} hk)
-          b (manifest/entries {:token "new"} hk)]
-      (is (= [[:token]] (:changed (manifest/diff a b)))))))
+  (let [k (manifest/generate-key)]
+    (testing "an added, a removed, and a retyped key"
+      (let [a (manifest/entries {:x 1 :y "str"} k)
+            b (manifest/entries {:y 5 :z 3} k)      ; :y string → integer
+            d (manifest/diff a b)]
+        (is (= [[:z]] (:added d)))
+        (is (= [[:x]] (:removed d)))
+        (is (= [[:y]] (:changed d)) "y retyped string → integer")))
+    (testing "a same-type value edit shows up as :changed"
+      (let [a (manifest/entries {:token "old"} k)
+            b (manifest/entries {:token "new"} k)]
+        (is (= [[:token]] (:changed (manifest/diff a b))))))))
+
+(deftest load-secrets-drops-reserved-keys-test
+  ;; A store carries the library's metadata at its top level. Whatever a store
+  ;; holds under those keys, loading returns only the user's data.
+  (let [user {:database/url "jdbc:x" :nested {:com.kirahowe.secrets/manifest-key "user data"}}]
+    (doseq [metadata [{manifest/store-key (manifest/generate-key)
+                       manifest/store-recipients "identity"}
+                      {manifest/store-key nil}
+                      {manifest/store-recipients 42}]]
+      (let [enc (encrypt-edn! (merge user metadata))
+            loaded (secrets/load-secrets enc *key*)
+            readers (secrets/reader-literals {:file enc :identity-file *key*})]
+        (is (= user loaded) "a reserved key nested deeper is the user's own and is kept")
+        (doseq [reserved manifest/reserved-keys]
+          (is (not (contains? loaded reserved)))
+          (is (= ::absent (secrets/get-secret loaded reserved ::absent)))
+          (is (nil? ((readers 'secret/opt) reserved)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is missing from the secrets file"
+                                ((readers 'secret/req) reserved))))))
+    (testing "a store that is not a map loads as it is"
+      (is (= [1 2] (secrets/load-secrets (encrypt-edn! [1 2]) *key*))))))
 
 (deftest blank-identity-variable-fails-through-with-identity-test
   (let [resolve-under (fn [environment identity-or-opts]

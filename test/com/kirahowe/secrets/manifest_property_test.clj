@@ -1,11 +1,12 @@
 (ns com.kirahowe.secrets.manifest-property-test
   "Properties of the manifest: the value encoding tells different values apart
   and ignores how equal ones were built, `entries` keeps every leaf, `render`
-  reads back, `diff` partitions the key paths, and the HMAC key sees only key
-  material."
+  reads back, `diff` partitions the key paths, and a value's hash depends on
+  the store's manifest key and on nothing about how the value was built."
   (:require [clojure.edn :as edn]
             [clojure.set :as set]
             [clojure.string :as str]
+            [clojure.test :refer [deftest is]]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
@@ -13,6 +14,19 @@
             [com.kirahowe.secrets.manifest :as manifest]))
 
 (def ^:private encode @#'manifest/encode)
+
+(def ^:private hex-chars (vec "0123456789abcdef"))
+
+(def ^:private sha256-hex
+  (gen/fmap str/join (gen/vector (gen/elements hex-chars) 64)))
+
+(def ^:private manifest-key
+  "A manifest key: 64 lowercase hex characters, each drawn independently."
+  sha256-hex)
+
+(deftest generated-manifest-keys-have-the-shape-the-properties-assume
+  (is (every? manifest/valid-key? (gen/sample manifest-key 20)))
+  (is (every? #(re-matches #"[0-9a-f]{64}" %) (repeatedly 20 manifest/generate-key))))
 
 ;;;; Encoding
 
@@ -76,42 +90,70 @@
 
 (defn- describes?
   "True when descriptor `d` says of `v` what the manifest promises: its type,
-  a count only for a collection, and a 16-hex-digit hash only under a key."
-  [v hkey d]
+  a count only for a collection, and a 16-hex-digit hash."
+  [v d]
   (and (= (manifest/value-type v) (:type d))
        (= (coll? v) (contains? d :count))
        (or (not (coll? v)) (= (count v) (:count d)))
-       (= (some? hkey) (contains? d :vhash))
-       (or (nil? hkey) (boolean (re-matches #"[0-9a-f]{16}" (:vhash d))))))
-
-(def ^:private optional-key
-  (gen/one-of [(gen/return nil) g/age-secret-key]))
+       (boolean (re-matches #"[0-9a-f]{16}" (str (:vhash d))))))
 
 (defspec entries-keep-every-leaf-in-one-order 200
   (prop/for-all [v g/secrets
-                 key optional-key]
-    (let [hkey (some-> key manifest/hmac-key)
-          e (manifest/entries v hkey)
+                 k manifest-key]
+    (let [e (manifest/entries v k)
           expected (leaves [] v)]
       (and (= (count expected) (count e))
            (= (set (map first expected)) (set (keys e)))
-           (every? (fn [[path leaf]] (describes? leaf hkey (get e path))) expected)
-           (= (keys e) (keys (manifest/entries (rebuilt v) hkey)))))))
+           (every? (fn [[path leaf]] (describes? leaf (get e path))) expected)
+           (= (keys e) (keys (manifest/entries (rebuilt v) k)))))))
+
+(defspec reserved-keys-get-no-entry 100
+  (prop/for-all [m g/secrets-map
+                 k manifest-key
+                 recorded (gen/one-of [(gen/return nil) g/text sha256-hex])]
+    (= (manifest/entries m k)
+       (manifest/entries (assoc m manifest/store-key k manifest/store-recipients recorded) k))))
 
 ;;;; Render
 
-(def ^:private sha256-hex
-  (gen/fmap str/join (gen/vector (gen/elements (vec "0123456789abcdef")) 64)))
-
-(defspec render-reads-back-as-the-same-entries 100
+(defspec render-reads-back-as-a-complete-manifest 100
   (prop/for-all [v g/secrets
+                 k manifest-key
                  app g/text
-                 sha (gen/one-of [(gen/return nil) sha256-hex])]
-    (let [e (manifest/entries v nil)
+                 sha sha256-hex]
+    (let [e (manifest/entries v k)
           parsed (edn/read-string (manifest/render {:app app :ciphertext-sha sha} e))]
-      (= (cond-> {:version 2 :app app :keys e}
-           sha (assoc :ciphertext-sha sha))
-         parsed))))
+      (and (= {:version 3 :app app :ciphertext-sha sha :keys e} parsed)
+           (nil? (manifest/problem app parsed))))))
+
+(def ^:private damage
+  "One way a complete manifest can stop being complete."
+  (gen/elements [#(dissoc % :keys)
+                 #(assoc % :keys (vec (:keys %)))
+                 #(assoc % :keys nil)
+                 #(dissoc % :ciphertext-sha)
+                 #(assoc % :ciphertext-sha (subs (:ciphertext-sha %) 1))
+                 #(update % :keys update-vals (fn [d] (dissoc d :vhash)))
+                 #(update % :keys update-vals (fn [d] (dissoc d :type)))
+                 #(update % :keys update-vals (fn [d] (update d :vhash str "0")))
+                 #(update % :keys update-vals :type)
+                 #(update % :version dec)
+                 #(update % :version inc)
+                 #(dissoc % :version)
+                 #(update % :app str "x")
+                 vector]))
+
+(defspec a-damaged-manifest-is-never-complete 200
+  (prop/for-all [m (gen/such-that seq g/secrets-map)
+                 k manifest-key
+                 sha sha256-hex
+                 damaged damage]
+    (let [complete {:version manifest/supported-version
+                    :app "app"
+                    :ciphertext-sha sha
+                    :keys (into {} (manifest/entries m k))}]
+      (and (nil? (manifest/problem "app" complete))
+           (some? (:reason (manifest/problem "app" (damaged complete))))))))
 
 ;;;; Diff
 
@@ -139,10 +181,11 @@
 
 (defspec diff-partitions-the-key-paths 200
   (prop/for-all [a g/secrets-map
-                 mutations (gen/vector mutation 0 4)]
+                 mutations (gen/vector mutation 0 4)
+                 k manifest-key]
     (let [b (reduce mutate a mutations)
-          before (manifest/entries a nil)
-          after (manifest/entries b nil)
+          before (manifest/entries a k)
+          after (manifest/entries b k)
           {:keys [added removed changed]} (manifest/diff before after)
           backwards (manifest/diff after before)
           bks (set (keys before))
@@ -158,18 +201,47 @@
            (= (count after) (+ (count added) (count changed) (count unchanged)))
            (every? sorted-by-rendering? [added removed changed])))))
 
-;;;; HMAC key
+;;;; Value hashes
 
-(def ^:private two-identities
-  "Two renderings of one key, and a rendering of another key."
-  (gen/let [key g/age-secret-key
-            other (gen/such-that #(not= key %) g/age-secret-key)
-            a (g/decorated-identity key)
-            b (g/decorated-identity key)
-            c (g/decorated-identity other)]
-    {:a a :b b :c c}))
+(defn- vhashes
+  "The `:vhash` of every leaf of `v` under `k`, by path."
+  [v k]
+  (update-vals (manifest/entries v k) :vhash))
 
-(defspec hmac-key-sees-only-the-secret-key-line 100
-  (prop/for-all [{:keys [a b c]} two-identities]
-    (and (= (vec (manifest/hmac-key a)) (vec (manifest/hmac-key b)))
-         (not= (vec (manifest/hmac-key a)) (vec (manifest/hmac-key c))))))
+(defspec one-key-hashes-equal-values-equally-however-they-were-built 200
+  (prop/for-all [v g/secrets
+                 k manifest-key]
+    (= (vhashes v k) (vhashes (rebuilt v) k))))
+
+(defspec one-key-hashes-a-value-the-same-at-every-path 100
+  (prop/for-all [v g/value
+                 k manifest-key
+                 a g/secret-key
+                 b g/secret-key]
+    ;; Wrapped in a vector so the value is one leaf whatever it is.
+    (= (get (vhashes {a [v]} k) [a])
+       (get (vhashes {b [v]} k) [b]))))
+
+(defspec independent-keys-give-unrelated-hashes 200
+  (prop/for-all [m (gen/such-that seq g/secrets-map)
+                 k manifest-key
+                 other manifest-key]
+    (let [mine (vhashes m k)
+          theirs (vhashes m other)]
+      (or (= k other)
+          ;; Same paths, and no leaf's hash under one key appears anywhere
+          ;; under the other, so holding one key identifies nothing hashed
+          ;; under the other.
+          (and (= (keys mine) (keys theirs))
+               (empty? (set/intersection (set (vals mine)) (set (vals theirs)))))))))
+
+(defspec a-changed-value-changes-its-hash-and-no-other 200
+  (prop/for-all [m (gen/such-that seq g/secrets-map)
+                 k manifest-key
+                 i gen/nat
+                 replacement g/scalar]
+    (let [path (nth (keys (manifest/entries m k)) (mod i (count (manifest/entries m k))))
+          before (vhashes m k)
+          after (vhashes (assoc-in m path [::replaced replacement]) k)]
+      (and (not= (before path) (after path))
+           (= (dissoc before path) (dissoc after path))))))
