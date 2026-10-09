@@ -13,16 +13,17 @@
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.generators :as g]
             [com.kirahowe.secrets.manifest :as manifest]
-            [com.kirahowe.secrets.safe-edn :as safe-edn]))
+            [com.kirahowe.secrets.safe-edn :as safe-edn]
+            [com.kirahowe.secrets.store :as store]))
 
-(def ^:private shell-quote @#'cli/shell-quote)
+(def ^:private shell-quote @#'store/shell-quote)
 (def ^:private strip-trailing-newline @#'cli/strip-trailing-newline)
 (def ^:private parse-key-path @#'cli/parse-key-path)
-(def ^:private recipient-entries @#'cli/recipient-entries)
+(def ^:private recipient-entries @#'store/recipient-entries)
 (def ^:private render-secrets @#'cli/render-secrets)
-(def ^:private with-metadata @#'cli/with-metadata)
-(def ^:private metadata-line @#'cli/metadata-line)
-(def ^:private user-plaintext @#'cli/user-plaintext)
+(def ^:private with-metadata @#'store/with-metadata)
+(def ^:private metadata-line @#'store/metadata-line)
+(def ^:private user-plaintext @#'store/user-plaintext)
 ;;;; Fixtures
 
 (def ^:private ^:dynamic *dir* nil)

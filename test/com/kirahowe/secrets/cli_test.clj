@@ -187,8 +187,12 @@
 (defn- file-bytes [path]
   (vec (java.nio.file.Files/readAllBytes (.toPath (io/file path)))))
 
-(defn- cli-private [sym]
-  (ns-resolve 'com.kirahowe.secrets.cli sym))
+(defn- cli-private
+  "The var named `sym` in the CLI namespace, or in the store namespace beneath
+  it."
+  [sym]
+  (or (ns-resolve 'com.kirahowe.secrets.cli sym)
+      (ns-resolve 'com.kirahowe.secrets.store sym)))
 
 (defn- with-identity-environment
   "Run `f` with exactly `environment` as the runtime's identity environment.
