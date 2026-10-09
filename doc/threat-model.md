@@ -240,15 +240,13 @@ contract" below.
 
 ## Architecture questions still open
 
-The review also identified candidates beyond the manifest. Four of them are
+The review also identified candidates beyond the manifest. Most of them are
 decided and recorded under "Other chosen contracts": the initializer, Aero
-loading, the general-purpose file commands, and the input bounds. These remain
-bounded work items to evaluate individually, not instructions to implement
-them all:
+loading, the general-purpose file commands, the input bounds, the source
+forms, and the split between the store and the CLI. These remain bounded work
+items to evaluate individually, not instructions to implement them all:
 
 - Evaluate a common recipient-based encryption path for solo and team use.
-- Narrow overlapping source/argument forms, and put store operations beneath
-  prompts and CLI rendering.
 - Make normalization pure. Canonical path checks still use the filesystem, so
   this remains a separate simplification from the identity contract.
 - Reduce duplicated build/documentation policy and verification. Moving code to
@@ -288,9 +286,10 @@ cost of removing shared identity state. The plaintext temporary file that
 `load-secrets` owns this scope automatically. CLI normalization validates and
 canonicalizes configured paths without selecting an environment identity or
 materializing one. A CLI command selects its environment, resolves its
-identity, validates that resolved path against the configured artifact roles,
-and then owns the operation scope. There is no identity cache or reset
-lifecycle.
+identity, and then owns the operation scope. A path that came from
+`SECRETS_AGE_IDENTITY_FILE` was not in the config when its paths were checked,
+so the command checks it against the rule that no file serves two purposes.
+There is no identity cache or reset lifecycle.
 
 ## Chosen manifest contract
 
@@ -301,9 +300,10 @@ the version of the store format, separate from the manifest's. `:manifest-key`
 is a random 256-bit key, written as 64 lowercase hex characters drawn from
 `SecureRandom`. `:recipients` records the recipient set the store was last
 encrypted to. Each manifest entry carries a `:vhash`: the first 64 bits of
-HMAC-SHA-256 over the value's unambiguous encoding, keyed by the manifest key. Nothing is derived from an age identity. A solo
-store and a team store produce the same kind of manifest, and every recipient
-of a store computes the same hashes.
+HMAC-SHA-256 over the value's unambiguous encoding, keyed by the manifest key.
+Nothing is derived from an age identity. A solo store and a team store produce
+the same kind of manifest, and every recipient of a store computes the same
+hashes.
 
 A `:vhash` marks change. At 64 bits it can collide, so an unchanged hash is
 strong evidence of an unchanged value and not proof. The hash is keyed by the
@@ -328,7 +328,8 @@ so that it matches the file afterwards: everyone who can decrypt a store can
 write its metadata. `reencrypt` is the revocation step. It renews the key
 every time and does not read the record. A retained key still tests guesses
 against every manifest published before the renewal, as B2 says of old
-ciphertext. One function in `cli.clj` holds the rule for the key's lifetime.
+ciphertext. One function, `manifest-key-for` in `store.clj`, holds the rule
+for the key's lifetime.
 
 Validity. A store's plaintext is one EDN map, because the metadata lives in
 it. Version 1 metadata is a map with exactly the three fields above: `:version
@@ -394,14 +395,38 @@ built, which is a value the application owns.
 General-purpose commands. The CLI manages one configured store per
 environment. It has no commands that encrypt or decrypt an arbitrary file:
 that is what `age` does, and those commands needed their own bounds, streaming,
-and plaintext publication. `decrypt-bytes` is the one decryption primitive,
-and plaintext reaches disk only in the private temporary file a command owns.
+and plaintext publication. Decryption is one call to `age` that returns the
+plaintext as a string in memory, and plaintext reaches disk only in the
+private temporary file a command owns.
+
+Sources. `load-secrets` reads a filesystem path, given as a String, a File, or
+a Path, or the classpath resource URL that `clojure.java.io/resource` returns,
+with the scheme `file:` or `jar:file:`. Everything else is refused before it
+is opened. A URI-shaped string is refused by the rule the identity paths use,
+and described by its scheme alone (A2, A3).
 
 Bounds. Each size and depth bound is a constant in the namespace that enforces
-it: 16 MiB of ciphertext, 8 MiB of plaintext, EDN depth 100, 256 KiB of
-recipients file, 1 MiB of manifest. They exist to stop an accidental input
-(A2), nobody needs to tune that, and so there is no `:limits` configuration.
-The CLI refuses to write a plaintext that decryption would refuse to read.
+it. Reading refuses a ciphertext past 16 MiB before it is decrypted. age does
+not compress, so that bounds the plaintext too, and decryption needs no bound
+of its own. The CLI refuses to write a plaintext past 8 MiB, which encrypts to
+well under what a read accepts, so every store the CLI writes can be read
+back. EDN nests at most 100 deep, a recipients file holds at most 256 KiB, and
+a manifest at most 1 MiB. The bounds exist to stop an accidental input (A2),
+nobody needs to tune that, and so there is no `:limits` configuration.
+
+Store and CLI. `store.clj` holds what a store is: config validation,
+recipients, the store's metadata and manifest key, writing, and verifying. It
+prompts for nothing and prints nothing. `cli.clj` holds the prompts, the
+editor, the reports, and command dispatch. Commands dispatch from a table and
+the library's only runtime dependency is Clojure. A usage error never repeats
+the argument that caused it, because a value typed in the wrong place is the
+likeliest thing to be there (A3).
+
+Exit codes. For `verify` and `doctor`, 1 means drift or a warning and nothing
+else, and 2 means the command could not do its job: a missing file, an
+identity or decryption failure, an unknown environment, or an invalid
+configuration. A CI job can then tell a stale manifest from a missing key.
+Every other command exits 0 or 1.
 
 File permissions. The ciphertext, manifest, and recipients file are committed
 and shipped, so they get the permissions any new file gets. Only identities
@@ -409,7 +434,12 @@ and temporary plaintext are private (A4).
 
 Configuration. A key the config or an environment does not define is an error
 that names the key and not its value, so a misspelled key cannot silently
-configure nothing.
+configure nothing. Every environment setting is a path string, and `:manifest`
+may also be `false`. Across all environments a file is a secrets file, a
+manifest, a template, an identity, or a recipients file, and only one of them.
+Environments may share a template, an identity, or a recipients file. Two
+environments share a secrets file or a manifest only when they share both,
+which makes them one store under two names (A2).
 
 ## How to decide what to change
 
