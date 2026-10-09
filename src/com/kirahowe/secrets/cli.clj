@@ -181,8 +181,8 @@
    :secrets-age-identity "SECRETS_AGE_IDENTITY"
    :secrets-age-identity-b64 "SECRETS_AGE_IDENTITY_B64"
    :identity-file ":identity-file"
-   :configured-key-file "configured key path"
-   :default-key-file "default key path"})
+   :configured-key-file "key file"
+   :default-key-file "key file"})
 
 (defn- require-path!
   "Reject a blank path, a URI-shaped path, and key contents in a path field,
@@ -438,14 +438,9 @@
                {:environment env-key}))))
 
 (defn- with-environment-identity
-  "Hold one resolved identity through the command's decryption and hashing.
-
-  A `:key-file` equal to the app default is passed as the default, not as a
-  designated file, so its absence leaves keyless operations possible."
+  "Hold one resolved identity through the command's decryption and hashing."
   [config env f]
-  (secrets/with-identity (cond-> env
-                           (= (:key-file env) (secrets/default-key-file (:app env)))
-                           (dissoc :key-file))
+  (secrets/with-identity env
     (fn [identity]
       (let [resolved (merge env identity)]
         (validate-artifact-roles!

@@ -356,8 +356,7 @@
   "Each way to designate an identity file, and the `:identity-source` it reports."
   {:string :identity-file
    :opts :identity-file
-   :env :secrets-age-identity-file
-   :key-file :configured-key-file})
+   :env :secrets-age-identity-file})
 
 (defspec a-designated-identity-that-does-not-exist-is-refused-by-name 200
   (prop/for-all [path missing-path-text
@@ -371,8 +370,7 @@
           arg (case via
                 :string value
                 :opts {:identity-file value}
-                :env nil
-                :key-file {:key-file value})
+                :env nil)
           environment (when (= :env via) {"SECRETS_AGE_IDENTITY_FILE" value})
           e (thrown #(with-env environment
                        (fn [] (secrets/with-identity arg (fn [_] (reset! called? true))))))]
@@ -383,11 +381,14 @@
            (str/includes? (ex-message e) expanded)
            (not @called?)))))
 
-(defspec an-app-default-identity-need-not-exist 50
-  (prop/for-all [app word]
-    (let [seen (with-env {} #(secrets/with-identity {:app (str "kira-missing-" app)} identity))]
+(defspec a-default-key-location-need-not-exist 50
+  (prop/for-all [app word
+                 path missing-path-text]
+    (let [seen (with-env {} #(secrets/with-identity {:app (str "kira-missing-" app)} identity))
+          configured (with-env {} #(secrets/with-identity {:key-file path :app app} identity))]
       (and (= :default-key-file (:identity-source seen))
-           (= (secrets/default-key-file (str "kira-missing-" app)) (:identity-file seen))))))
+           (= (secrets/default-key-file (str "kira-missing-" app)) (:identity-file seen))
+           (= {:identity-file path :identity-source :configured-key-file} configured)))))
 
 ;;;; get-secret
 

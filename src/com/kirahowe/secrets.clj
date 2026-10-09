@@ -32,8 +32,8 @@
     3. $SECRETS_AGE_IDENTITY_B64, canonical base64-encoded key file contents.
        ASCII space, horizontal tab, carriage return, and line feed are permitted
        for wrapping; every other nonalphabet character or malformed encoding throws.
-    4. ~/.config/<app>/key.txt, the local developer default, used only when an
-       app name is known (an `:app` option or app argument).
+    4. the project's default key location: a `:key-file` option, or
+       ~/.config/<app>/key.txt when an app name is known (an `:app` option).
   When none of these yields an identity, resolution returns nil and loading
   throws with the options above rather than guessing a path.
 
@@ -45,8 +45,8 @@
 
   A path you designate has to exist. An explicit path, `:identity-file`, or
   $SECRETS_AGE_IDENTITY_FILE that names a missing file fails with
-  `:no-identity`, naming the source and the path. Only the app default in 4
-  may be absent, and then no identity is available.
+  `:no-identity`, naming the source and the path. Only the default location
+  in 4 may be absent, and then no identity is available.
 
   Sources 2 and 3 are written to a private temporary file only while an
   operation needs them, then deleted before that operation returns. If the
@@ -163,9 +163,10 @@
 (defn- identity-candidate
   "Choose an identity without materializing injected contents.
 
-  Every path has `~` expanded here, so one rule covers each source. A path the
-  caller or the environment named is `:designated?`: it has to exist. The app
-  default is not, so its absence means only that no identity is available."
+  Every path has `~` expanded here, so one rule covers each source. An
+  explicit path and SECRETS_AGE_IDENTITY_FILE are `:designated?`: the file has
+  to exist. `:key-file` and the app default are where a key is expected by
+  default, so their absence means only that no identity is available."
   [identity-or-opts]
   (let [opts (if (map? identity-or-opts) identity-or-opts {})
         explicit (if (map? identity-or-opts) (:identity-file opts) identity-or-opts)
@@ -183,7 +184,8 @@
           {:contents (decode-b64-identity contents)
            :identity-source :secrets-age-identity-b64})
         (when-let [path (:key-file opts)]
-          (designated path :configured-key-file))
+          {:identity-file (expand-home path)
+           :identity-source :configured-key-file})
         (when-let [app (:app opts)]
           {:identity-file (default-key-file app)
            :identity-source :default-key-file})
@@ -214,11 +216,9 @@
   (when-not (identity-file-exists? path)
     (throw (ex-info (str (identity-source-subject identity-source)
                          " names an age identity file that does not exist: " path)
-                    (cond-> {:reason :no-identity
-                             :identity-file path
-                             :identity-source identity-source}
-                      (= :configured-key-file identity-source)
-                      (assoc :hint "Create it with `bb secrets keygen`."))))))
+                    {:reason :no-identity
+                     :identity-file path
+                     :identity-source identity-source}))))
 
 (defn with-identity
   "Call `f` with an operation-owned identity descriptor.
@@ -228,12 +228,13 @@
   explicit path, then SECRETS_AGE_IDENTITY_FILE/raw/base64, then `:key-file`,
   then an `:app` default. Every path has a leading `~` expanded.
 
-  An explicit path, SECRETS_AGE_IDENTITY_FILE, and `:key-file` each designate
-  a file. Before `f` runs, a designated path that is URI-shaped or holds key
-  contents throws `:disallowed-identity`, and one that does not exist throws
-  `:no-identity` naming its source and the path. The `:app` default is not a
-  designation: `f` receives its path whether or not the file exists, and a
-  nil path when there is no app, so keyless operations stay possible.
+  Before `f` runs, a path that is URI-shaped or holds key contents throws
+  `:disallowed-identity`. An explicit path and SECRETS_AGE_IDENTITY_FILE each
+  designate a file, and one that does not exist throws `:no-identity` naming
+  its source and the path. `:key-file` and the `:app` default are default
+  locations, not designations: `f` receives the path whether or not the file
+  exists, and a nil path when there is neither, so keyless operations stay
+  possible.
 
   A raw or base64 identity is written to a private temporary file for this
   call only, through [[com.kirahowe.secrets.fs/with-private-temp-file]], which
@@ -498,8 +499,8 @@
                     identity (key) is available, or when the key is missing
                     from the decrypted map.
     #secret/opt k → optional: nil in all three of those cases.
-  \"No identity is available\" means none was designated and the `:app` default
-  key file is absent. A designated identity file that does not exist makes both
+  \"No identity is available\" means none was designated and the default key
+  file is absent. A designated identity file that does not exist makes both
   tags throw `:no-identity`, as does a decryption that fails."
   [opts]
   (let [loaded (delay (reader-loaded-state opts))

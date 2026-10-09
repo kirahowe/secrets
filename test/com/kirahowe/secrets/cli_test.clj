@@ -466,11 +466,13 @@
                 :config (test-config {:identity-file configured-key})
                 :path configured-key}
                {:source :configured-key-file
-                :label "configured key path"
+                :label "key file"
                 :config (test-config {:key-file configured-key})
                 :path configured-key}
-               {:source :default-key-file
-                :label "default key path"
+               ;; An environment without a :key-file gets the app default as
+               ;; its key file, so the two report alike.
+               {:source :configured-key-file
+                :label "key file"
                 :config default-config
                 :path *key*}]
         secret-line (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
@@ -539,7 +541,7 @@
                                         nil))))]
         (is (= 1 (:exit result)))
         (is (= {:state :ready :keyless? true :full? false} (:verify result)))
-        (is (str/includes? out (str "Identity: default key path — " missing " — missing\n")))))
+        (is (str/includes? out (str "Identity: key file — " missing " — missing\n")))))
     (testing "a designated identity that does not exist is a problem, as it is for verify"
       (doseq [[label spec-config environment subject]
               [["SECRETS_AGE_IDENTITY_FILE" config
@@ -548,10 +550,7 @@
                [":identity-file"
                 (assoc-in config [:environments :dev :identity-file]
                           (str *dir* "/missing-identity"))
-                {} "The explicit identity path"]
-               [":key-file"
-                (assoc-in config [:environments :dev :key-file] (str *dir* "/missing-identity"))
-                {} "The configured :key-file"]]]
+                {} "The explicit identity path"]]]
         (testing label
           (let [{:keys [result out]} (doctor-under spec-config nil {:environment environment})]
             (is (= 2 (:exit result)))
@@ -1003,9 +1002,7 @@
           (is (= :ok-keyless (:dev results)))))
       (testing "a designated identity that does not exist is an error, never keyless"
         (doseq [[label run]
-                [["a configured :key-file"
-                  #(verify (cli/normalize-config (test-config {:key-file missing})) "dev")]
-                 ["an :identity-file"
+                [["an :identity-file"
                   #(verify (cli/normalize-config (test-config {:identity-file missing})) "dev")]
                  ["SECRETS_AGE_IDENTITY_FILE"
                   #(with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" missing}
@@ -1014,11 +1011,37 @@
             (let [e (try (run) (catch clojure.lang.ExceptionInfo e e))]
               (is (= :no-identity (:reason (ex-data e))))
               (is (str/includes? (str (ex-message e)) missing))))))
+      (testing "a configured :key-file that does not exist is keyless, like the app default"
+        (let [{:keys [result out]}
+              (capture-verify (cli/normalize-config (test-config {:key-file missing})) "dev")]
+          (is (= {:results {:dev :ok-keyless} :exit 0} result))
+          (is (str/includes? out "freshness only"))))
       (testing "tampered ciphertext → drift, still without any key"
         (encrypt-edn! {:a 2})
         (let [{:keys [results exit]} (keyless-verify)]
           (is (= 1 exit))
           (is (= :drift (:dev results))))))))
+
+(deftest a-configured-key-file-that-does-not-exist-is-not-a-designation-test
+  ;; :key-file says where the project keeps its key by default, the same role
+  ;; as ~/.config/<app>/key.txt. Its absence means no identity is available.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [missing (str *dir* "/no-such-key.txt")
+          config (cli/normalize-config (test-config {:key-file missing}))
+          enc (encrypt-edn! {:a 1})]
+      (testing "the optional reader is nil and the required one says no identity"
+        (let [readers (secrets/reader-literals {:file enc :key-file missing})]
+          (is (nil? ((readers 'secret/opt) :a)))
+          (is (= :no-identity
+                 (:reason (ex-data (try ((readers 'secret/req) :a)
+                                        (catch clojure.lang.ExceptionInfo e e))))))))
+      (testing "a command that needs the key names the path and keygen"
+        (let [e (try (with-out-str (cli/reencrypt! config "dev")) nil
+                     (catch clojure.lang.ExceptionInfo e e))]
+          (is (= :no-identity (:reason (ex-data e))))
+          (is (str/includes? (ex-message e) missing))
+          (is (str/includes? (ex-message e) "bb secrets keygen 'dev'")))))))
 
 (defn- keyless-config
   "A config with no designated identity, for use under `under-default-key-file`
@@ -3317,7 +3340,8 @@
           config (fn [envs] (cli/normalize-config {:app "cli-test" :environments envs}))
           good {:good (env "good" *key*) :fine (env "fine" *key*)}
           all (config (assoc good
-                             :no-identity (env "no-identity" missing)
+                             :no-identity (assoc (env "no-identity" *key*)
+                                                 :identity-file missing)
                              :wrong-key (env "wrong-key" other-key)))]
       (age/keygen! other-key)
       (doseq [n ["good" "fine" "wrong-key"]]
@@ -3327,9 +3351,8 @@
         (let [{:keys [result out err]} (capture-verify all nil)]
           (is (= {:good :ok :fine :ok :no-identity :error :wrong-key :error} (:results result)))
           (is (= 2 (:exit result)))
-          (is (str/includes? err (str "no-identity — The configured :key-file names an age"
+          (is (str/includes? err (str "no-identity — The explicit identity path names an age"
                                       " identity file that does not exist: " missing)))
-          (is (str/includes? out "Create it with `bb secrets keygen`."))
           (is (str/includes? err "wrong-key —"))
           (is (= 2 (count (re-seq #"manifest matches" out))))))
       (testing "an environment named on the command line still throws"

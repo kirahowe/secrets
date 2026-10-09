@@ -833,15 +833,12 @@
                  (ex-data e)))
           (is (= (str subject " names an age identity file that does not exist: " missing)
                  (ex-message e))))))
-    (testing "a configured :key-file is designated too, and the app default is not"
+    (testing "a :key-file and the app default are default locations, not designations"
       (with-redefs-fn (assoc (test-env/getenv-redefs {})
                              #'secrets/default-key-file (constantly missing))
         (fn []
-          (let [e (try (secrets/with-identity {:key-file missing :app "load-test"} identity)
-                       (catch clojure.lang.ExceptionInfo e e))]
-            (is (= :no-identity (:reason (ex-data e))))
-            (is (= :configured-key-file (:identity-source (ex-data e))))
-            (is (str/includes? (ex-message e) "The configured :key-file names")))
+          (is (= {:identity-file missing :identity-source :configured-key-file}
+                 (secrets/with-identity {:key-file missing :app "load-test"} identity)))
           (is (= {:identity-file missing :identity-source :default-key-file}
                  (secrets/with-identity {:app "load-test"} identity))))))))
 

@@ -263,14 +263,15 @@ path or `:identity-file` first, then `SECRETS_AGE_IDENTITY_FILE`,
 `SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then the CLI's
 configured `:key-file` or its app default.
 
-An explicit path and `SECRETS_AGE_IDENTITY_FILE` each designate a file, and a
-designated file that does not exist is an error. When nothing is designated
-and no key file is present, no identity is available, which is what leaves
-keyless verification and a `nil` optional secret possible. A missing
-designated file used to mean
-"no identity", so a typo in a deployment passed a keyless check. Every identity
-path has a leading `~` expanded. A URI-shaped path, and key contents in a path
-setting, are refused without being echoed (A2, A3).
+An explicit path, `:identity-file`, and `SECRETS_AGE_IDENTITY_FILE` each
+designate a file, and a designated file that does not exist is an error, so a
+typo in a deployment cannot pass a keyless check. A configured `:key-file` and
+the app default are the project's default key location and not a designation.
+When no file is there, no identity is available: keyless verification still
+runs and `#secret/opt` reads nil, while a command that needs the key says
+where it looked. Every identity path has a leading `~` expanded. A URI-shaped
+path, and key contents in a path setting, are refused without being echoed
+(A2, A3).
 
 Raw and base64 identities are materialized for each operation in an exclusive
 0600 temporary file. The operation deletes it with an ordinary delete and
