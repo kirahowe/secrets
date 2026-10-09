@@ -328,9 +328,10 @@ base64-encoded, are refused the same way and are not echoed.
 
 `age` reads identities from files, so the contents from 3 and 4 are written to
 an owner-only temporary file for the one operation and deleted when it ends.
-If the delete fails, the error names the file that remains. A process that
-crashes mid-operation can leave that file behind, and deleting a file does not
-erase it from the disk. Use `SECRETS_AGE_IDENTITY_FILE` with a mounted secret
+If the delete fails, the error names the file that remains. A process ended
+by Ctrl-C, a closed terminal, or `SIGTERM` deletes the file on its way out.
+One that crashes or is killed with `SIGKILL` can leave it behind, and deleting
+a file does not erase it from the disk. Use `SECRETS_AGE_IDENTITY_FILE` with a mounted secret
 when the platform offers one.
 
 ### Size bounds

@@ -110,7 +110,8 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
 - The ciphertext, manifest, and recipients file are written with ordinary file
   permissions instead of 0600.
 - Temporary plaintext and identity files are deleted with an ordinary delete,
-  and a delete that fails is reported with the path.
+  and a delete that fails is reported with the path. Ctrl-C, a closed
+  terminal, or `SIGTERM` during a command deletes them too.
 
 ### Removed
 - The `bb secrets encrypt` and `bb secrets decrypt` commands, and

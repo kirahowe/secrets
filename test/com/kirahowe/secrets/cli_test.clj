@@ -3896,3 +3896,58 @@
         e (test-env/thrown #(with-out-str (cli/recipients! config "dev")))]
     (is (= :no-file (:reason (ex-data e))))
     (is (str/includes? (ex-message e) (str "Recipients file " *dir* " could not be read")))))
+
+;;;; A signal while the editor is open
+
+(defn- cli-command
+  "The argv that runs `cli/run!` with `config` and `args` in a new process of
+  the runtime this suite is running on."
+  [config args]
+  (let [form (str "(require '[com.kirahowe.secrets.cli :as cli]) "
+                  "(cli/run! '" (pr-str config) " " (pr-str args) ")")]
+    (if (System/getProperty "babashka.version")
+      ["bb" "-cp" "src" "-e" form]
+      [(str (System/getProperty "java.home") "/bin/java")
+       "-cp" (System/getProperty "java.class.path") "clojure.main" "-e" form])))
+
+(deftest a-signal-during-edit-deletes-the-plaintext-temp-file-test
+  (if (or (age-env-set?) (not (posix-sh?)))
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set, or there is no /bin/sh")
+    (let [config (test-config)
+          seen (io/file *dir* "editor-saw")
+          pid-file (io/file *dir* "editor-pid")
+          editor (io/file *dir* "editor.sh")
+          _ (spit editor (str "#!/bin/sh\n"
+                              "echo $$ > '" pid-file "'\n"
+                              "printf %s \"$1\" > '" seen "'\n"
+                              "exec sleep 120\n"))
+          _ (.setExecutable editor true true)
+          _ (with-out-str
+              (with-in-str "plaintext-held-open"
+                (cli/set-secret! (cli/normalize-config config) "dev" ":k")))
+          builder (doto (ProcessBuilder. ^java.util.List (cli-command config ["edit"]))
+                    (.redirectErrorStream true)
+                    (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)
+                    (.redirectInput (java.lang.ProcessBuilder$Redirect/from (io/file "/dev/null"))))
+          _ (doto (.environment builder)
+              (.put "EDITOR" (str editor))
+              (.put "VISUAL" (str editor)))
+          process (.start builder)]
+      (try
+        (loop [tries 600]
+          (when (and (pos? tries) (.isAlive process) (zero? (.length seen)))
+            (Thread/sleep 100)
+            (recur (dec tries))))
+        (is (pos? (.length seen)) "the editor was opened on the plaintext")
+        (when (pos? (.length seen))
+          (let [plaintext (io/file (slurp seen))]
+            (is (str/includes? (slurp plaintext) "plaintext-held-open"))
+            (is (= test-env/owner-only-names (test-env/permission-names plaintext)))
+            ;; `destroy` sends SIGTERM, as closing the terminal sends SIGHUP.
+            (.destroy process)
+            (is (.waitFor process 30 java.util.concurrent.TimeUnit/SECONDS))
+            (is (not (.exists plaintext)) "the shutdown hook deleted it")))
+        (finally
+          (.destroyForcibly process)
+          (when (pos? (.length pid-file))
+            (shell/sh "kill" (str/trim (slurp pid-file)))))))))

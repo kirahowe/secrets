@@ -281,9 +281,11 @@ checks the deletion on both success and failure. It does not try to overwrite
 the file first: that protects nothing on a copy-on-write or flash filesystem.
 Caller-owned paths are never deleted. A cleanup failure carries structured
 error data with the temporary path so an operator can remove the remaining file.
-Paths are permitted diagnostic metadata; identity contents are never included. A process
-crash can leave a temporary file behind, and deletion is not secure erasure on
-every filesystem. The extra temporary-file write per operation is the accepted
+Paths are permitted diagnostic metadata; identity contents are never included. A
+shutdown hook deletes the private temporary files that are live when SIGINT,
+SIGTERM, or SIGHUP ends the process, so Ctrl-C or a closed terminal during
+`edit` leaves no plaintext. A crash or SIGKILL can still leave a temporary
+file behind, and deletion is not secure erasure on every filesystem. The extra temporary-file write per operation is the accepted
 cost of removing shared identity state. The plaintext temporary file that
 `new`, `edit`, `set`, `rm`, and `reencrypt` use follows the same rule.
 

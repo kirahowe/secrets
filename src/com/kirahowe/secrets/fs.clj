@@ -76,17 +76,27 @@
    (create-owner-only
     #(java.nio.file.Files/createTempFile (->path dir) prefix suffix owner-only))))
 
+(defonce ^:private live-temp-files
+  ;; The private temp files in use now. Ctrl-C or a closed terminal ends the
+  ;; process inside `with-private-temp-file`, and this hook deletes them then.
+  (let [live (atom #{})]
+    (.addShutdownHook (Runtime/getRuntime)
+                      (Thread. (fn [] (run! #(.delete ^java.io.File %) @live))))
+    live))
+
 (defn- try-delete!
   "Delete `file` and return true when it is gone."
   [^java.io.File file]
   (try (.delete file) (catch Exception _ nil))
+  (swap! live-temp-files disj file)
   (not (.exists file)))
 
 (defn with-private-temp-file
   "Create a private temporary file as [[owner-only-temp-file!]] does, call `f`
   with it, delete it, and return what `f` returned.
 
-  The file is deleted whether `f` returns or throws. When the delete fails and
+  The file is deleted whether `f` returns or throws, and by a shutdown hook
+  when a signal ends the process first. When the delete fails and
   the file still exists, the operator has to remove it, so the path is
   reported under `:remaining-file` in an `ex-info` with `:reason
   :private-file-remains`. After a failed `f` that `ex-info` carries the
@@ -97,6 +107,7 @@
         path (.getAbsolutePath ^java.io.File file)
         remains (str "A private temporary file could not be deleted. Remove it: " path)
         result (try
+                 (swap! live-temp-files conj file)
                  (f file)
                  (catch Throwable t
                    (throw (if (try-delete! file)
