@@ -1,5 +1,7 @@
 (ns com.kirahowe.secrets.manifest
-  "Pure functions for the plaintext manifest that ships next to each encrypted
+  "Implementation namespace; not part of the public API and may change without notice.
+
+  Pure functions for the plaintext manifest that ships next to each encrypted
   secrets file (`secrets.edn.age` → `secrets.edn.manifest`), and for the
   library metadata a store carries to produce it.
 
@@ -228,7 +230,7 @@
 
 ;;;; The manifest file
 
-(def supported-version
+(def ^:private supported-version
   "The one manifest `:version` this library writes and reads."
   3)
 

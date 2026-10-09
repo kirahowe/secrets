@@ -157,7 +157,7 @@
                  space (gen/elements ["" " " "\t"])]
     (let [padded (str space s)
           e (acquire-failure padded)]
-      (and (nil? (source/locator-scheme padded))
+      (and (nil? (#'source/locator-scheme padded))
            (= {:kind :file :path padded} (source/descriptor padded))
            (not= :disallowed-source (:reason (ex-data e)))))))
 
@@ -169,9 +169,9 @@
     (every? (fn [[name expected-scheme]]
               (let [refused (acquire-failure (str space name))
                     kept (acquire-failure (str "./" name))]
-                (and (= expected-scheme (source/locator-scheme (str space name)))
+                (and (= expected-scheme (#'source/locator-scheme (str space name)))
                      (= :disallowed-source (:reason (ex-data refused)))
-                     (nil? (source/locator-scheme (str "./" name)))
+                     (nil? (#'source/locator-scheme (str "./" name)))
                      (= :no-file (:reason (ex-data kept))))))
             [[(str scheme ":" rest-of-name) scheme]
              [(str drive ":" rest-of-name) (str/lower-case (str drive))]])))

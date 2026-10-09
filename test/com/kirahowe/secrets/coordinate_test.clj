@@ -49,28 +49,28 @@
 (deftest a-checkout-at-the-release-tag-is-pinned-by-tag-and-commit-test
   (let [asked (atom [])]
     (is (= {'io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha commit}}
-           (init/library-dependency checkout-url coordinates
-                                    (fake-git asked commit ["latest" "v0.1.0"]))))
+           (#'init/library-dependency checkout-url coordinates
+                                      (fake-git asked commit ["latest" "v0.1.0"]))))
     (is (= ["/checkout/src/com/kirahowe/secrets"] (distinct @asked))
         "git is asked in the directory the resource was loaded from")))
 
 (deftest a-checkout-off-the-release-tag-is-pinned-by-commit-alone-test
   (testing "no tag at all"
     (is (= {'io.github.kirahowe/secrets {:git/sha commit}}
-           (init/library-dependency checkout-url coordinates (fake-git (atom []) commit [])))))
+           (#'init/library-dependency checkout-url coordinates (fake-git (atom []) commit [])))))
   (testing "a tag for some other version is not the release tag"
     (is (= {'io.github.kirahowe/secrets {:git/sha commit}}
-           (init/library-dependency checkout-url coordinates
-                                    (fake-git (atom []) commit ["v0.0.9"]))))))
+           (#'init/library-dependency checkout-url coordinates
+                                      (fake-git (atom []) commit ["v0.0.9"]))))))
 
 (deftest the-jar-is-pinned-by-its-maven-version-test
   (is (= {'com.kirahowe/secrets {:mvn/version "0.1.0"}}
-         (init/library-dependency jar-url coordinates
-                                  (fn [& _] (throw (AssertionError. "git must not run")))))))
+         (#'init/library-dependency jar-url coordinates
+                                    (fn [& _] (throw (AssertionError. "git must not run")))))))
 
 (deftest a-source-tree-outside-git-is-refused-test
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not a git repository"
-                        (init/library-dependency checkout-url coordinates no-repository))))
+                        (#'init/library-dependency checkout-url coordinates no-repository))))
 
 ;;;; This repository
 

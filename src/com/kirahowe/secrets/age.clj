@@ -1,5 +1,7 @@
 (ns com.kirahowe.secrets.age
-  "A thin wrapper over the `age` CLI (https://age-encryption.org).
+  "Implementation namespace; not part of the public API and may change without notice.
+
+  A thin wrapper over the `age` CLI (https://age-encryption.org).
 
   Every function shells out to the `age` / `age-keygen` binaries, so this
   namespace loads and runs identically under JVM Clojure and babashka. It holds
@@ -241,7 +243,7 @@
   ["age" "-d" "-i" (path-arg :identity identity-file)
    "--" (path-arg :input encrypted-file)])
 
-(defn decrypt-bytes
+(defn- decrypt-bytes
   "Decrypt `encrypted-file` with `identity-file` and return the plaintext as a
   byte array. The plaintext is binary safe and is held in memory only.
 
@@ -275,7 +277,6 @@
 
 (defn decrypt
   "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
-  UTF-8 string. Use `decrypt-bytes` for binary plaintexts. The plaintext bound
-  and failures are those of [[decrypt-bytes]]."
+  UTF-8 string. The plaintext bound and failures are those of `decrypt-bytes`."
   [identity-file encrypted-file]
   (String. (decrypt-bytes identity-file encrypted-file) "UTF-8"))

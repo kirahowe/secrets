@@ -80,12 +80,6 @@
     (.delete (io/file plain))
     enc))
 
-(defn- encrypt-raw-edn!
-  "Encrypt exactly `m` out-of-band, so the store holds only the metadata `m`
-  itself carries."
-  [m]
-  (encrypt-text! (pr-str m)))
-
 (defn- metadata-line
   "The first line of a store's map as the library writes it, typed out here so
   the tests state the format instead of asking the source for it."
@@ -3656,7 +3650,8 @@
       (doseq [k [:name :app]]
         (let [e (failure {k "other"})]
           (is (= :unknown-config-key (:reason (ex-data e))))
-          (is (= "Known keys: :identity-file, :key-file, :manifest, :recipients-file, :secrets-file, :template."
+          (is (= (str "Known keys: :identity-file, :key-file, :manifest, :recipients-file,"
+                      " :secrets-file, :template.")
                  (str/trim (last (str/split-lines (ex-message e)))))))))
     (testing "a default environment that is not configured"
       (doseq [default [:prod "dev" 5]]

@@ -198,7 +198,7 @@
         (with-cwd-entry entry-name
           (fn [ct]
             (io/copy (io/file enc) ct)
-            (let [plaintext (String. (age/decrypt-bytes *key* (str ct)) "UTF-8")]
+            (let [plaintext (String. (#'age/decrypt-bytes *key* (str ct)) "UTF-8")]
               (is (= payload plaintext) "the authenticated plaintext is returned")
               (is (seq plaintext) "age's empty option output is never plaintext")
               (is (not (re-find #"^v?\d+\.\d+\.\d+" plaintext))
@@ -297,7 +297,7 @@
                                      (fn [argv & _]
                                        (swap! calls conj (vec argv))
                                        {:exit 0 :err ""})]
-                         (age/decrypt-bytes identity-file in))
+                         (#'age/decrypt-bytes identity-file in))
                        (first @calls))]
     (testing "the encrypt terminator sits immediately before the input operand"
       (let [argv (encrypt-argv "key.txt" "-in.edn" "out.age")]
@@ -331,7 +331,7 @@
     (testing "a blank or nil decrypt input is refused, never taken as stdin"
       (doseq [in ["" "   " nil]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/decrypt-bytes *key* in))
+                              (#'age/decrypt-bytes *key* in))
             (str "input " (pr-str in) " names no file"))))
     (testing "a blank identity file is refused on both paths"
       (let [out (str *dir* "/blank-identity.age")]
@@ -339,7 +339,7 @@
                               (age/encrypt-file! "" plain out)))
         (is (not (.exists (io/file out))) "nothing is written for a blank identity")
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/decrypt-bytes "" enc)))))
+                              (#'age/decrypt-bytes "" enc)))))
     (testing "a blank output, a blank recipients file and a nil identity fail closed"
       (let [out (str *dir* "/blank-role.age")]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
@@ -376,10 +376,10 @@
          ["whitespace encrypt output" #(age/encrypt-file! "key" "plain" "   ")]
          ["nil encrypt input" #(age/encrypt-file! "key" nil "out")]
          ["whitespace encrypt input" #(age/encrypt-file! "key" "   " "out")]
-         ["nil decrypt identity" #(age/decrypt-bytes nil "cipher")]
-         ["whitespace decrypt identity" #(age/decrypt-bytes "   " "cipher")]
-         ["nil decrypt input" #(age/decrypt-bytes "key" nil)]
-         ["whitespace decrypt input" #(age/decrypt-bytes "key" "   ")]]]
+         ["nil decrypt identity" #(#'age/decrypt-bytes nil "cipher")]
+         ["whitespace decrypt identity" #(#'age/decrypt-bytes "   " "cipher")]
+         ["nil decrypt input" #(#'age/decrypt-bytes "key" nil)]
+         ["whitespace decrypt input" #(#'age/decrypt-bytes "key" "   ")]]]
     (with-redefs [shell/sh (fn [& _]
                              (swap! shell-calls inc)
                              (throw (ex-info "subprocess ran" {})))
@@ -961,7 +961,7 @@
           enc (str *dir* "/bin.dat.age")]
       (io/copy payload plain)
       (age/encrypt-file! *key* plain enc)
-      (is (java.util.Arrays/equals payload (age/decrypt-bytes *key* enc))))))
+      (is (java.util.Arrays/equals payload (#'age/decrypt-bytes *key* enc))))))
 
 ;;;; Atomic moves
 
@@ -1207,10 +1207,10 @@
     (testing "the bound is 8 MiB"
       (is (= 8388608 age/max-plaintext-bytes)))
     (testing "a plaintext exactly at the bound decrypts and loads"
-      (is (= limit (alength (bounded #(age/decrypt-bytes *key* exact)))))
+      (is (= limit (alength (bounded #(#'age/decrypt-bytes *key* exact)))))
       (is (string? (:pad (bounded #(secrets/load-secrets exact {:identity-file *key*}))))))
     (testing "one byte over is refused without disclosing any plaintext"
-      (let [e (bounded #(try (age/decrypt-bytes *key* over)
+      (let [e (bounded #(try (#'age/decrypt-bytes *key* over)
                              (catch clojure.lang.ExceptionInfo e e)))
             data (ex-data e)]
         (is (= {:reason :plaintext-too-large
@@ -1550,7 +1550,7 @@
           (is (not (.exists ^java.io.File @created))))))))
 
 (deftest locator-scheme-test
-  (are [s scheme] (= scheme (source/locator-scheme s))
+  (are [s scheme] (= scheme (#'source/locator-scheme s))
     "https://user:pw@host/key" "https"
     "HTTPS://host/key" "https"
     "jar:file:/app.jar!/store.age" "jar"

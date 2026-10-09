@@ -1,5 +1,7 @@
 (ns com.kirahowe.secrets.safe-edn
-  "Exact-one, depth-bounded, content-free parsing for EDN that may hold secrets.
+  "Implementation namespace; not part of the public API and may change without notice.
+
+  Exact-one, depth-bounded, content-free parsing for EDN that may hold secrets.
 
   `clojure.edn/read-string` alone does not fit: parser messages can echo secret
   tokens, it accepts the first value and ignores trailing ones, and a mistaken

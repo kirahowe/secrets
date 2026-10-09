@@ -37,7 +37,7 @@
   (edn/read-string (slurp (io/resource "com/kirahowe/secrets/coordinate.edn"))))
 
 (def ^:private template "secrets/secrets.edn.example")
-(def ^:private reader-task (init/task-spec (init/proposed-config {:app "reader"})))
+(def ^:private reader-task (#'init/task-spec (#'init/proposed-config {:app "reader"})))
 
 (defn- file [path] (io/file *dir* path))
 
@@ -65,26 +65,26 @@
 
 (deftest parses-required-options-and-defaults-test
   (testing "default and explicit options"
-    (is (= {:app "reader" :env "dev"} (init/parse-args ["--app" "reader"])))
+    (is (= {:app "reader" :env "dev"} (#'init/parse-args ["--app" "reader"])))
     (is (= {:app "reader" :env "prod" :keygen? true :apply? true}
-           (init/parse-args ["--app" "reader" "--env" "prod" "--keygen" "--apply"]))))
+           (#'init/parse-args ["--app" "reader" "--env" "prod" "--keygen" "--apply"]))))
   (testing "unknown options"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown option: --aply"
-                          (init/parse-args ["--app" "reader" "--aply"]))
+                          (#'init/parse-args ["--app" "reader" "--aply"]))
         "a near miss for --apply is refused, never ignored"))
   (testing "required values"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"required" (init/parse-args [])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"required" (#'init/parse-args [])))
     (are [option following]
          (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing value"
-                           (init/parse-args [option following]))
+                           (#'init/parse-args [option following]))
       "--app" "--keygen"
       "--env" "--apply"))
   (testing "positional arguments are rejected"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected argument: extra"
-                          (init/parse-args ["--app" "reader" "extra"]))))
+                          (#'init/parse-args ["--app" "reader" "extra"]))))
   (testing "standalone help aliases"
     (doseq [flag ["-h" "--help"]]
-      (is (= {:env "dev" :help? true} (init/parse-args [flag]))
+      (is (= {:env "dev" :help? true} (#'init/parse-args [flag]))
           "help must not demand an app name")
       (let [out (with-redefs-fn {#'init/exit! (fn [_])}
                   #(with-out-str (init/-main flag)))]
@@ -101,7 +101,7 @@
                             (run!! {:env bad :apply? true})))
       (is (empty? (files)))))
   (testing "the refusal does not echo the rejected value"
-    (let [message (try (init/proposed-config {:app "ap\u001b[31mp"})
+    (let [message (try (#'init/proposed-config {:app "ap\u001b[31mp"})
                        (catch clojure.lang.ExceptionInfo e (ex-message e)))]
       (is (not (str/includes? message "\u001b"))))))
 
@@ -115,7 +115,7 @@
 ;;;; The proposed configuration
 
 (deftest the-cli-derives-the-paths-the-initializer-uses-test
-  (let [{:keys [config key-file]} (init/plan {:root *dir* :app "reader" :keygen? true})
+  (let [{:keys [config key-file]} (#'init/plan {:root *dir* :app "reader" :keygen? true})
         environment (get-in (cli/normalize-config config) [:environments :dev])]
     (is (= {:app "reader"
             :default-environment :dev
@@ -252,10 +252,10 @@
 
 (deftest a-file-that-appears-after-the-plan-is-not-overwritten-test
   (testing "a public file"
-    (let [proposal (init/plan {:root *dir* :app "reader"})]
+    (let [proposal (#'init/plan {:root *dir* :app "reader"})]
       (io/make-parents (file template))
       (spit (file template) "mine")
-      (let [e (try (init/apply-plan! proposal) nil
+      (let [e (try (#'init/apply-plan! proposal) nil
                    (catch clojure.lang.ExceptionInfo e e))]
         (is (some? e))
         (is (str/includes? (ex-message e) (str template " already exists")))
@@ -264,19 +264,19 @@
         (is (= "mine" (slurp (file template)))))))
   (testing "a symbolic link is not written through"
     (.delete (file "bb.edn"))
-    (let [proposal (init/plan {:root *dir* :app "reader"})
+    (let [proposal (#'init/plan {:root *dir* :app "reader"})
           outside (file "outside.edn")]
       (Files/createSymbolicLink (.toPath (file "bb.edn")) (.toPath outside)
                                 (make-array FileAttribute 0))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"bb.edn already exists"
-                            (init/apply-plan! proposal)))
+                            (#'init/apply-plan! proposal)))
       (is (not (.exists outside)))))
   (testing "an identity"
-    (let [proposal (init/plan {:root *dir* :app "reader" :keygen? true})]
+    (let [proposal (#'init/plan {:root *dir* :app "reader" :keygen? true})]
       (io/make-parents (io/file *key-file*))
       (spit *key-file* "my key")
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"key.txt already exists"
-                            (init/apply-plan! proposal)))
+                            (#'init/apply-plan! proposal)))
       (is (= "my key" (slurp *key-file*))))))
 
 (deftest an-existing-identity-is-kept-test

@@ -147,7 +147,7 @@
                  k manifest-key
                  sha sha256-hex
                  damaged damage]
-    (let [complete {:version manifest/supported-version
+    (let [complete {:version @#'manifest/supported-version
                     :app "app"
                     :ciphertext-sha sha
                     :keys (into {} (manifest/entries m k))}]

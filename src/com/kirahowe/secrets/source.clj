@@ -1,5 +1,7 @@
 (ns com.kirahowe.secrets.source
-  "Local-only, bounded acquisition of encrypted secrets sources.
+  "Implementation namespace; not part of the public API and may change without notice.
+
+  Local-only, bounded acquisition of encrypted secrets sources.
 
   Source values may themselves contain credentials, so diagnostics cross this
   boundary only as allowlisted descriptors. Acquisition accepts filesystem
@@ -40,7 +42,7 @@
   "One-line remediation appended to no-secrets-file errors."
   "Create it with `bb secrets new`.")
 
-(defn locator-scheme
+(defn- locator-scheme
   "Return the lower-case URI scheme that string `s` begins with after
   surrounding whitespace is trimmed, or nil when `s` is a plain filesystem
   path. A Windows drive path such as `C:\\keys` is a path. A bare relative

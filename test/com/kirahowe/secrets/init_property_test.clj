@@ -40,7 +40,7 @@
 
 (defn- refused-without-echo? [opts marker]
   (try
-    (init/proposed-config opts)
+    (#'init/proposed-config opts)
     false
     (catch clojure.lang.ExceptionInfo e
       (and (str/includes? (ex-message e) "plain name")
@@ -55,8 +55,8 @@
 (defspec plain-names-give-a-task-that-reads-back-and-normalizes 100
   (prop/for-all [app plain-name
                  env plain-name]
-    (let [config (init/proposed-config {:app app :env env})
-          task (init/task-spec config)
+    (let [config (#'init/proposed-config {:app app :env env})
+          task (#'init/task-spec config)
           self-dependency (#'init/self-dependency app)
           environment (get-in (cli/normalize-config config) [:environments (keyword env)])]
       (and (= task (edn/read-string (pr-str task)))
@@ -69,7 +69,7 @@
   (prop/for-all [app plain-name
                  env plain-name
                  flags (gen/vector (gen/elements ["--keygen" "--apply"]) 0 2)]
-    (let [opts (init/parse-args (into ["--app" app "--env" env] (distinct flags)))
+    (let [opts (#'init/parse-args (into ["--app" app "--env" env] (distinct flags)))
           flag-set (set flags)]
       (and (= app (:app opts))
            (= env (:env opts))

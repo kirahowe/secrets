@@ -64,7 +64,7 @@
                       {:reason :git-failed :dir (str dir) :args (vec args) :exit exit})))
     (str/trim out)))
 
-(defn library-dependency
+(defn- library-dependency
   "The dependency that resolves to the library that is running, as the single
   `{lib coordinate}` entry a project's `:deps` needs, given the `url` its
   coordinate resource was loaded from.
@@ -122,7 +122,7 @@
                          "underscores, starting with a letter")
                     {:reason :usage :option option}))))
 
-(defn parse-args
+(defn- parse-args
   "Parse initializer options, including standalone `-h` and `--help`. The names
   are checked when [[proposed-config]] uses them."
   [args]
@@ -145,7 +145,7 @@
 
 ;;;; What a project needs
 
-(defn proposed-config
+(defn- proposed-config
   "The secrets configuration a new project starts with: one environment whose
   ciphertext is `secrets/secrets.edn.age`. The CLI derives the template and
   manifest paths beside it and the identity path from the app name. Throws when
@@ -157,7 +157,7 @@
    :default-environment (keyword env)
    :environments {(keyword env) {:secrets-file "secrets/secrets.edn.age"}}})
 
-(defn task-spec
+(defn- task-spec
   "Build the `bb.edn` task specification for a secrets configuration."
   [config]
   {:doc "Manage encrypted secrets"
@@ -262,7 +262,7 @@
     {:path path :action :exists}
     {:path path :action :create :content content}))
 
-(defn plan
+(defn- plan
   "Decide, without writing anything, what initializing a project would do.
 
   Returns `:root`, the proposed `:config`, and `:files`, one map per file with
@@ -317,7 +317,7 @@
                          (str " Created before stopping: " (str/join ", " created) ".")))
                   {:reason :file-exists :path (str path) :created created})))
 
-(defn apply-plan!
+(defn- apply-plan!
   "Create every `:create` file of `plan`, in order, and return `:created`, the
   paths written, and `:public-key` when an identity was generated.
 
@@ -399,8 +399,9 @@
 (defn init!
   "Print what initializing the project does and, with `:apply?`, do it.
 
-  Takes the options [[parse-args]] returns, plus `:root`, the project directory,
-  which defaults to the current one. Without `:apply?` nothing is written.
+  Takes `:app`, the application name, and optionally `:env` (default \"dev\"),
+  `:keygen?`, `:apply?`, and `:root`, the project directory, which defaults to
+  the current one. Without `:apply?` nothing is written.
   Returns `:status`, `:preview` or `:applied`, and after applying the `:created`
   paths."
   [{:keys [apply? keygen?] :as opts}]

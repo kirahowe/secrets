@@ -1,5 +1,7 @@
 (ns com.kirahowe.secrets.fs
-  "Filesystem primitives: private temporary files and atomic replacement.")
+  "Implementation namespace; not part of the public API and may change without notice.
+
+  Filesystem primitives: private temporary files and atomic replacement.")
 
 (defn- ->path
   ^java.nio.file.Path [x]
