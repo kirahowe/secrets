@@ -43,8 +43,11 @@ directory empty. After `--apply`, check that `bb.edn` and
 `secrets/secrets.edn.example` exist, that `~/.config/verifydemo/key.txt` has
 mode 0600, and that the public key is printed with the backup warning. A
 third run must report all three under "Already there, left as they are".
-`--team`, or any other option than `--app`, `--env`, `--keygen`, `--apply`,
-and `--help`, must be refused as unknown.
+
+Usage errors exit 1 with one line and must not repeat the argument:
+`--app=verifydemo`, `--team`, and a stray word each give "Unknown option or
+argument.", `--app` alone gives "Missing value: --app NAME", and an app name
+with a space is refused as not a plain name.
 
 **Release-critical:** the scaffolded `bb.edn` pins the commit `<checkout>` is
 at: `{:git/tag "v<version>" :git/sha <HEAD>}` when HEAD is the release tag and
@@ -81,62 +84,105 @@ printf %s old-value | bb -cp <v0.1.0>/src -e \
   "(require '[com.kirahowe.secrets.cli :as cli]) (cli/run! <config> [\"set\" \":example/api-key\"])"
 ```
 
-The store then carries a `:version 1` manifest and no manifest key. Back on
+The store then carries a `:version 1` manifest and no store metadata. Back on
 the current code:
 
 - `verify` must exit 1 and report version 1 as unsupported, naming
   `bb secrets reencrypt <env>`.
-- `set` must fail and say the store has no manifest key, naming the same
-  command.
+- `set` must exit 1 and say the store has no store metadata
+  (`:com.kirahowe.secrets/store`), naming the same command.
 - `reencrypt` must succeed and write a `:version 3` manifest.
-- `verify` must then exit 0.
+- `verify` and `doctor` must then exit 0.
 
 ## Phase 3: CLI surface
 
-Run every command and check output and exit codes.
+Run every command and check output and exit codes. `verify` and `doctor` exit
+1 only for drift or a warning and 2 for anything that stopped them. Every
+other command exits 0 or 1. `bb secrets help` states this, and the statement
+must match what you see.
 
-- `bb secrets`, `bb secrets --help`, `bb secrets help set`, `bb secrets set -h`.
-  The command list must be `keygen`, `new`, `edit`, `set`, `rm`, `verify`,
-  `doctor`, `show-key`, `add-recipient`, `recipients`, `reencrypt`, `help`.
+- `bb secrets`, `bb secrets --help`, `bb secrets help`, `bb secrets help set`,
+  and `bb secrets set -h`. The command list must be `keygen`, `new`, `edit`,
+  `set`, `rm`, `verify`, `doctor`, `show-key`, `add-recipient`, `recipients`,
+  `reencrypt`, `help`.
+- Usage errors, each one line that does not repeat the argument: an unknown
+  command (exit 1), `edit <unknown-env>` (exit 1), `verify <unknown-env>`
+  (exit 2), `edit --edn` and `set :k --bogus` ("Unknown option."), and
+  `set dev :a :b` ("Too many arguments."). `set -- :dash/x` must store the
+  key, and `rm -- :dash/x` must remove it.
 - `set` from stdin (a string), `set --edn` (a set literal), blank stdin
-  (refused), a surplus argument (refused without echoing it), and a key under
-  `:com.kirahowe.secrets/manifest-key` (refused as reserved).
+  (refused), the key `:com.kirahowe.secrets/store` (refused as reserved), and
+  a path through a string value such as `'[:example/api-key :under]'`
+  (refused: "Cannot reach"). `rm` of that same path must be refused the same
+  way.
 - `set` and `rm` with a vector path key (`'[:r2 :account-id]'`).
 - `rm` an existing key. `rm` a missing key must fail with exit 1.
 - `edit` and `new` with a scripted editor. An unchanged `edit` must leave the
   store untouched. An edit that keeps comments must show them again on the
-  next `edit`. The editor must never see the library's reserved metadata. An
-  edited plaintext that is a vector, is malformed, or holds reserved metadata
-  must be refused and leave the files unchanged. `new` with no template must seed the
-  editor from the built-in commented placeholder, and with a template, from
-  the template.
-- `show-key`, and `doctor`. `doctor` must print the identity's source and
-  path and no file contents.
+  next `edit`. The editor must never see `:com.kirahowe.secrets/store`. An
+  edited plaintext that is a vector, is malformed, or holds that key must be
+  refused and leave the files unchanged. `new` with no template must seed
+  the editor from the built-in commented placeholder, and with a template,
+  from the template.
+- The decrypted store (`age -d -i <key> <store>`) must hold one metadata
+  line, `:com.kirahowe.secrets/store {:version 1 :manifest-key … :recipients
+  …}`, as the first entry of the map.
+- `show-key`, and `doctor`. A healthy solo store prints the environment, the
+  `age` version, the secrets file and manifest as "(present)", the identity's
+  source and path, "Status: healthy", and exits 0. No line holds file
+  contents. A project without a template must still be healthy.
 - Manifest: version 3, with a `:vhash` on every entry.
 - Drift, each exiting 1: change `:ciphertext-sha` in the manifest, change a
   `:vhash`, change `:version`. Restore between each. Delete the manifest:
-  exit 2. `reencrypt` regenerates it.
-- A store without a manifest key: encrypt `{:a 1}` over the ciphertext with
-  `age -e -i <key>`. `verify` exits 1, `set` and `edit` fail, `reencrypt`
-  repairs it.
+  `verify` exits 2 and names `reencrypt`, `doctor` warns and exits 1, and
+  `reencrypt` writes it again.
+- A store without metadata: encrypt `{:a 1}` over the ciphertext with
+  `age -e -i <key>`. `verify` exits 1, `set` and `edit` exit 1 with the same
+  message, and `reencrypt` repairs it. Then encrypt `[1 2]` over it: `verify`
+  exits 1 and names `bb secrets new`, and `reencrypt` is refused.
 - Keyless: move `~/.config/<app>/key.txt` away. `verify` must pass as
-  "freshness only" with exit 0, a changed `:ciphertext-sha` must exit 1, and
-  `set` must fail for lack of an identity. Move the key back.
-- Config: an unknown top-level key (`:limits`) and an unknown environment key
-  must each be refused by name, and `doctor` must exit 2 for the first.
+  "freshness only" with exit 0, a changed `:ciphertext-sha` must exit 1,
+  `doctor` must warn that there is no identity and exit 1, and `set` must
+  exit 1 for lack of an identity. With `SECRETS_AGE_IDENTITY` set to the
+  key's contents, `verify` and `doctor` must both exit 0, and `doctor` must
+  name the variable and print no path. Move the key back.
+- Identity failures: `SECRETS_AGE_IDENTITY=""` and
+  `SECRETS_AGE_IDENTITY_FILE=/nope/key.txt` must each make `verify`,
+  `verify <env>`, and `doctor` exit 2, and `edit` exit 1, with a message
+  naming the variable.
+- Config, each refused by `verify` with exit 2 and by `edit` with exit 1: an
+  unknown top-level key (`:limits`), an unknown environment key,
+  `:manifest true`, `:key-file 42`, an environment whose value is a string,
+  `:environments` as a vector, a `:default-environment` that is not
+  configured, a URL as `:secrets-file`, a missing `:app`, one manifest named
+  by two environments with different secrets files, and a `:key-file` equal
+  to the `:secrets-file`. `doctor` must print the problem and exit 2. Two
+  environments sharing a template must be accepted. With two environments
+  and no default, `edit` and `keygen` must fail with "Missing environment."
 - Team flow, in a config with a `:recipients-file` and a `:key-file` inside
-  scratch: `keygen`, `add-recipient` (must not recommend `reencrypt` yet),
-  first `set`, `recipients`, `add-recipient <other-key>` (must recommend
-  `reencrypt`). A `set` at that point must say the recipients changed and
-  that it is generating a new manifest key. The other key must then pass
-  `verify` through `SECRETS_AGE_IDENTITY_FILE`. Remove the other key's line,
-  `reencrypt`, and check that every `:vhash` changed and that the removed key
-  now fails `verify` with a decryption error. An invalid line in the
-  recipients file must be marked by `recipients` and refused by `reencrypt`.
-- `SECRETS_AGE_IDENTITY_FILE` naming a file that does not exist:
-  `verify <env>` must fail with a message naming the variable and the path,
-  and `verify` with no environment must report it for each environment, keep
-  going, and exit 2.
+  scratch:
+  - `keygen` prints the path and the public key, and nothing about other
+    environments. `add-recipient` must not recommend `reencrypt` yet. Then
+    the first `set`, and `recipients`. `doctor` must show the recipients
+    file and "Recipients: 1" and be healthy.
+  - `add-recipient <other-key>` must recommend `reencrypt`, and `verify`
+    must now exit 1 with "recipients changed since the last encryption".
+  - A `set` at that point must say the recipients changed and that it is
+    generating a new manifest key. The other key must then pass `verify`
+    through `SECRETS_AGE_IDENTITY_FILE`, and a `set` by that key must change
+    only the `:vhash` of the value it set.
+  - Remove the other key's line. `verify` must exit 1 with the same
+    recipients message, for both keys. After `reencrypt`, every `:vhash`
+    must have changed, `verify` must exit 0, and the removed key must make
+    `verify` exit 2 with a decryption failure.
+  - An invalid line in the recipients file must be marked by `recipients`,
+    refused by `reencrypt`, and make `doctor` exit 2.
+  - Move the configured `:key-file` away: `verify` must run keyless, and
+    `doctor` must warn and exit 1.
+- JVM: `clojure -Sdeps '{:deps {io.github.kirahowe/secrets {:local/root
+  "<checkout>"}}}' -M -e` calling `cli/run!` with `["verify"]` must print the
+  result and return within a few seconds, and with an unknown environment
+  must exit 2.
 
 ## Phase 4: runtime consumption
 
@@ -144,10 +190,9 @@ With the library `src` directly on Babashka's classpath
 (`bb -cp <checkout>/src script.clj`):
 
 - `load-secrets` and `get-secret` (keyword, vector path, 3-arity default)
-  with `{:app …}`. The loaded map must not contain any key in the
-  `com.kirahowe.secrets` namespace, and
-  `get-secret` with a path that continues into a string must return the
-  default.
+  with `{:app …}`. The loaded map must not contain
+  `:com.kirahowe.secrets/store`, and `get-secret` with a path that continues
+  into a string must return the default.
 - `merge-readers` and `reader-literals`: `#secret/req` present, `#secret/opt`
   absent (nil), `#secret/req` absent (throws naming the key), and a merged
   caller-supplied literal still works.
@@ -158,8 +203,12 @@ With the library `src` directly on Babashka's classpath
   and from `#secret/opt` too.
 - An identity path of `key:txt`, `https://…`, or key contents:
   `:disallowed-identity`, and the message must not repeat the value.
-- An `https://` source: `:disallowed-source`, with no userinfo or query in the
-  error.
+- A blank identity variable and a `_B64` value that is not base64:
+  `:invalid-identity`.
+- Sources: the `file:` URL of the store (`(.toURL (.toURI (io/file …)))`)
+  must load. An `https://` string, a `file:` string, an `https` `URL`, a
+  `java.net.URI`, and an input stream must each give `:disallowed-source`,
+  with the scheme or the class in the error and no userinfo or query.
 
 JVM smoke: the same `load-secrets` call via
 `clojure -Sdeps '{:deps {io.github.kirahowe/secrets {:local/root "<checkout>"}}}'`.
@@ -168,8 +217,10 @@ Aero, on the JVM and under Babashka with Aero on the classpath:
 `com.kirahowe.secrets.aero/read-config` with `{:secrets …}`, a `#profile`
 whose unselected branch names a key the store lacks, and
 `aero.core/read-config` on the same file, which must throw an error naming
-`com.kirahowe.secrets.aero/read-config`. The namespace's only public var must
-be `read-config`.
+`com.kirahowe.secrets.aero/read-config`. `read-config` with `{}` as its
+options must throw `:invalid-config` for a `#secret/req`, naming the
+`:secrets` option, and read nil for a `#secret/opt`. The namespace's only
+public var must be `read-config`.
 
 ## Phase 5: identity injection
 
@@ -216,7 +267,8 @@ not a recipient of the store under test:
 ## Phase 6: the library's own gates
 
 In the checkout: `bb test`, `clojure -M:test`, `bb lint`, `bb format:check`,
-and `bb book:build`. Capture test output to a file and read the exit code of
+and `bb book:build`. Wrap the long ones in `caffeinate -is timeout …`, because
+this Mac sleeps mid-run and inflates the timings. Capture test output to a file and read the exit code of
 the test command itself: a pipe through `tail` or `grep` replaces it with the
 filter's. Rerun a failure before concluding anything from it, since a
 generated property can fail on one seed.
