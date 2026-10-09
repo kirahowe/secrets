@@ -1894,7 +1894,7 @@
         missing-artifact?
         (or (some (fn [kind]
                     (not (get-in artifacts [kind :exists?])))
-                  [:ciphertext :template :key])
+                  [:ciphertext :key])
             (and (not= :disabled (:state manifest-capability))
                  (not manifest?))
             (= :missing (:state recipients)))

@@ -3659,3 +3659,14 @@
                      (catch Exception e e))]
           (is (= :invalid-config (:reason (ex-data e))))
           (is (str/includes? (str (ex-message e)) "must name one of its environments: dev")))))))
+
+(deftest doctor-does-not-warn-about-a-missing-template-test
+  ;; The template is optional: `new` falls back to a built-in one.
+  (let [config (complete-doctor-config)
+        template (str *dir* "/secrets.edn.example")]
+    (is (= 0 (:exit (:result (doctor-under config nil {})))))
+    (.delete (io/file template))
+    (let [{:keys [result out]} (doctor-under config nil {})]
+      (is (= :healthy (:status result)))
+      (is (= 0 (:exit result)))
+      (is (str/includes? out "Template: missing")))))
