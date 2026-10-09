@@ -4,8 +4,7 @@
   It creates the files a new setup needs and never modifies a file that already
   exists. For an existing `bb.edn` or `deps.edn` it prints what to add and
   leaves the file alone."
-  (:require [babashka.cli :as bbcli]
-            [clojure.edn :as edn]
+  (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [clojure.pprint :as pprint]
@@ -97,17 +96,14 @@
 
 ;;;; Options
 
-(def ^:private init-spec
-  [[:app {:coerce :string :desc "Application name"}]
-   [:env {:coerce :string :default "dev" :desc "Environment name"}]
-   [:keygen {:coerce :boolean :desc "Also generate an age identity"}]
-   [:apply {:coerce :boolean :desc "Create the files instead of previewing"}]
-   [:help {:alias :h :coerce :boolean :desc "Show this help"}]])
-
-(def ^:private boolean-option-names
-  {:keygen :keygen?
-   :apply :apply?
-   :help :help?})
+(def ^:private options
+  "Every option: its flags, the key it sets, the name of the value it takes
+  (nil for a switch), and its help line."
+  [[#{"--app"} :app "NAME" "Application name (required)"]
+   [#{"--env"} :env "NAME" "Environment name (default: dev)"]
+   [#{"--keygen"} :keygen? nil "Also generate an age identity"]
+   [#{"--apply"} :apply? nil "Create the files instead of previewing"]
+   [#{"-h" "--help"} :help? nil "Show this help"]])
 
 (def ^:private plain-name #"[A-Za-z][A-Za-z0-9._-]*")
 
@@ -124,23 +120,29 @@
 
 (defn- parse-args
   "Parse initializer options, including standalone `-h` and `--help`. The names
-  are checked when [[proposed-config]] uses them."
+  are checked when [[proposed-config]] uses them. An argument that is not an
+  option is refused without being repeated."
   [args]
-  (let [parsed (bbcli/parse-opts args {:spec init-spec
-                                       :restrict true
-                                       :restrict-args true
-                                       :no-keyword-opts true
-                                       :error-fn (fn [{:keys [msg]}]
-                                                   (throw (ex-info msg {:reason :usage})))})
-        opts (reduce-kv (fn [m option result]
-                          (if (true? (get parsed option))
-                            (assoc m result true)
-                            m))
-                        (apply dissoc parsed (keys boolean-option-names))
-                        boolean-option-names)]
-    (when-not (:help? opts)
-      (when-not (and (string? (:app opts)) (not (str/blank? (:app opts))))
-        (throw (ex-info "--app <name> is required" {:reason :usage}))))
+  (let [usage! #(throw (ex-info % {:reason :usage}))
+        opts (loop [opts {:env "dev"}
+                    [arg & more] args]
+               (if (nil? arg)
+                 opts
+                 (let [[_ k value-name] (some #(when (contains? (first %) arg) %) options)]
+                   (cond
+                     (nil? k)
+                     (usage! "Unknown option or argument.")
+
+                     (nil? value-name)
+                     (recur (assoc opts k true) more)
+
+                     (or (empty? more) (str/starts-with? (first more) "-"))
+                     (usage! (str "Missing value: " arg " " value-name))
+
+                     :else
+                     (recur (assoc opts k (first more)) (rest more))))))]
+    (when-not (or (:help? opts) (:app opts))
+      (usage! "--app <name> is required"))
     opts))
 
 ;;;; What a project needs
@@ -425,7 +427,10 @@
    "it creates the missing files. It never modifies a file that already exists."
    ""
    "Options:"
-   (bbcli/format-opts {:spec init-spec})])
+   (str/join "\n" (for [[flags _ value-name text] options]
+                    (format "  %-13s %s"
+                            (str (str/join ", " (sort-by count flags)) (when value-name (str " " value-name)))
+                            text)))])
 
 (defn- print-init-error!
   "One line for failure `e`: an `ex-info`'s message, or any other exception's

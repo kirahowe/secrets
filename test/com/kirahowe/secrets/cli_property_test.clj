@@ -18,9 +18,6 @@
 (def ^:private shell-quote @#'cli/shell-quote)
 (def ^:private strip-trailing-newline @#'cli/strip-trailing-newline)
 (def ^:private parse-key-path @#'cli/parse-key-path)
-(def ^:private normalize-argv @#'cli/normalize-argv)
-(def ^:private operand @#'cli/operand)
-(def ^:private operand-token? @#'cli/operand-token?)
 (def ^:private recipient-entries @#'cli/recipient-entries)
 (def ^:private render-secrets @#'cli/render-secrets)
 (def ^:private with-metadata @#'cli/with-metadata)
@@ -164,36 +161,6 @@
                  blank (gen/elements ["" " " "\n" "\t "])]
     (and (refused? (pr-str v))
          (refused? blank))))
-
-;;;; argv
-
-(def ^:private command
-  "A command word: a real one in any case, or a made-up one that is not all
-  digits, since a digit string is what an operand index looks like."
-  (gen/one-of [(gen/elements ["set" "SET" "Set" "rm" "edit" "verify" "doctor" "help"])
-               (gen/such-that #(not (re-matches #"\d+" %))
-                              (gen/not-empty gen/string-alphanumeric))]))
-
-(def ^:private token
-  "An argv element, weighted toward the ones that mean something to an
-  option parser: the terminator, the help and `--edn` flags, dash-leading
-  values, and decimal strings that look like operand indexes."
-  (gen/frequency [[3 (gen/elements ["--" "-h" "--help" "--edn" "-" "--verbose" "-x" "0" "1" ":k"])]
-                  [1 g/text]]))
-
-(defspec normalize-argv-hides-every-operand-from-the-option-parser 200
-  (prop/for-all [cmd command
-                 args (gen/vector token 0 8)]
-    (let [{:keys [argv operands]} (normalize-argv (into [cmd] args))
-          [before after] (split-with #(not= "--" %) args)
-          known (cond-> #{"-h" "--help"} (= "set" (str/lower-case cmd)) (conj "--edn"))
-          indexes (filter operand-token? (rest argv))
-          options (remove operand-token? (rest argv))]
-      (and (= (str/lower-case cmd) (first argv))
-           (= (into (vec (remove known before)) (next after)) operands)
-           (every? known options)
-           (= (count (filter known before)) (count options))
-           (= operands (mapv #(operand operands %) indexes))))))
 
 ;;;; Recipients files
 

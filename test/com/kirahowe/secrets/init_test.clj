@@ -69,18 +69,21 @@
     (is (= {:app "reader" :env "prod" :keygen? true :apply? true}
            (#'init/parse-args ["--app" "reader" "--env" "prod" "--keygen" "--apply"]))))
   (testing "unknown options"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown option: --aply"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^Unknown option or argument\.$"
                           (#'init/parse-args ["--app" "reader" "--aply"]))
-        "a near miss for --apply is refused, never ignored"))
+        "a near miss for --apply is refused, never ignored, and not repeated")
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^Unknown option or argument\.$"
+                          (#'init/parse-args ["--app=reader"]))))
   (testing "required values"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"required" (#'init/parse-args [])))
     (are [option following]
          (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing value"
-                           (#'init/parse-args [option following]))
+                           (#'init/parse-args (remove nil? [option following])))
       "--app" "--keygen"
-      "--env" "--apply"))
+      "--env" "--apply"
+      "--app" nil))
   (testing "positional arguments are rejected"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unexpected argument: extra"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"^Unknown option or argument\.$"
                           (#'init/parse-args ["--app" "reader" "extra"]))))
   (testing "standalone help aliases"
     (doseq [flag ["-h" "--help"]]
@@ -89,7 +92,12 @@
       (let [out (with-redefs-fn {#'init/exit! (fn [_])}
                   #(with-out-str (init/-main flag)))]
         (is (str/includes? out "Usage: -m com.kirahowe.secrets.init --app NAME [options]"))
-        (is (str/includes? out "--apply"))
+        (doseq [line ["  --app NAME    Application name (required)"
+                      "  --env NAME    Environment name (default: dev)"
+                      "  --keygen      Also generate an age identity"
+                      "  --apply       Create the files instead of previewing"
+                      "  -h, --help    Show this help"]]
+          (is (str/includes? out (str line "\n"))))
         (is (str/includes? out "never modifies a file that already exists"))))))
 
 (deftest names-must-be-plain-test

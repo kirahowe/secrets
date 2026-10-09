@@ -1,9 +1,8 @@
 {:paths ["src"]
 
- ;;; Babashka has babashka.cli built in for direct-classpath, Java-free smoke.
- ;;; This runtime coordinate supplies transitive and JVM Clojure consumers.
- :deps {org.clojure/clojure {:mvn/version "1.12.4"}
-         org.babashka/cli {:mvn/version "0.12.86"}}
+ ;;; Clojure is the only runtime dependency, so the library loads under
+ ;;; Babashka from the classpath alone.
+ :deps {org.clojure/clojure {:mvn/version "1.12.4"}}
 
  :aliases
  ;;; The :test alias adds "build" so the release guards

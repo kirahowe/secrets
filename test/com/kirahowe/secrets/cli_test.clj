@@ -387,8 +387,10 @@
               (str left " and " right " alias the same canonical path")))))))
 
 (deftest unknown-environment-throws-test
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown environment"
-                        (cli/recipients! (cli/normalize-config (test-config)) "nope"))))
+  (let [e (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown environment\. One of: dev"
+                                (cli/recipients! (cli/normalize-config (test-config)) "nope")))]
+    (is (= {:reason :usage} (ex-data e)))
+    (is (not (str/includes? (ex-message e) "nope")))))
 
 ;;;; Doctor
 
@@ -470,7 +472,7 @@
             {:app "x" :environments {:dev {:secrets-file "s.age" :template "s.age"
                                            :manifest "s.manifest"}}}
             "dev" "s.age"]
-           ["an unknown environment" (test-config) "nowhere" "Unknown environment: nowhere"]]]
+           ["an unknown environment" (test-config) "nowhere" "Unknown environment. One of: dev"]]]
     (testing label
       (let [{:keys [result out err]} (doctor-under config env-arg {})]
         (is (= #{:problems :exit} (set (keys result))))
@@ -1320,26 +1322,16 @@
         (is (= ciphertext-before (file-bytes encrypted)))
         (is (= manifest-before (slurp manifest-path)))))))
 
-;;;; CLI flag extraction boundary
+;;;; Dispatch
 
-;;; The same defect as the age boundary above, one layer out: the CLI's own
-;;; parser used to strip `--edn` from every command's arguments, so a file
-;;; named `--edn` was removed before positional dispatch. `--edn` is `set`'s
-;;; flag alone now, and `--` ends the options for every command.
-
-(defn- management-invocation [args]
-  (shell/sh "bb" "-cp" "src" "-e"
-            (str "(require '[com.kirahowe.secrets.cli :as cli]) "
-                 "(cli/run! {:deliberately :invalid} " (pr-str args) ")")))
-
-(defn- management-help [args]
-  (let [{:keys [exit out err]} (management-invocation args)]
-    (when-not (zero? exit)
-      (throw (ex-info "Management help subprocess failed" {:args args :error err})))
-    out))
+(defn- help-text
+  "What `run!` prints for `args`. The config is deliberately invalid: help
+  must not need a valid one."
+  [args]
+  (with-out-str (cli/run! {:deliberately :invalid} args)))
 
 (defn- dispatched
-  "Record the exact operands a successful `run!` invocation gives its leaf."
+  "Record the exact arguments a successful `run!` invocation gives its command."
   [config args]
   (let [seen (atom nil)
         record (fn [_config & more] (reset! seen (vec more)) {:exit 0})]
@@ -1357,54 +1349,91 @@
       (with-out-str (cli/run! config args)))
     @seen))
 
-(deftest help-aliases-and-command-scoping-test
-  (let [empty-help (management-help [])
-        long-help (management-help ["--help"])
-        short-help (management-help ["-h"])
-        help-command (management-help ["help"])]
-    (is (= empty-help long-help short-help help-command))
-    (is (str/includes? long-help "Usage: bb secrets [options] <command>"))
-    (is (str/includes? long-help "help           Show global or command-specific help"))
-    (is (str/includes? long-help "Run \"bb secrets <command> --help\"")))
-  (let [via-help (management-help ["help" "SET"])
-        via-long-flag (management-help ["set" "--help"])
-        via-short-flag (management-help ["set" "key" "-h"])]
-    (is (= via-help via-long-flag via-short-flag))
-    (is (str/starts-with? via-help
-                          "Usage: bb secrets set [options] <env-or-key> [<key>]"))
-    (is (str/includes? via-help
-                       "Parse the value as EDN instead of storing it verbatim as a string")))
-  (let [out (management-help ["help" "keygen"])]
-    (is (str/starts-with? out "Usage: bb secrets keygen [options] [<env>]"))
-    (is (str/includes? out "Generate an age key for an environment"))))
+(def ^:private command-usages
+  {"keygen" "bb secrets keygen [env]"
+   "new" "bb secrets new [env]"
+   "edit" "bb secrets edit [env]"
+   "set" "bb secrets set [env] <key> [--edn]"
+   "rm" "bb secrets rm [env] <key>"
+   "verify" "bb secrets verify [env]"
+   "doctor" "bb secrets doctor [env]"
+   "show-key" "bb secrets show-key [env]"
+   "add-recipient" "bb secrets add-recipient [env] [public-key]"
+   "recipients" "bb secrets recipients [env]"
+   "reencrypt" "bb secrets reencrypt [env]"
+   "help" "bb secrets help [command]"})
 
-(deftest command-errors-are-rendered-at-the-run-boundary-test
-  (let [missing (management-invocation ["set"])
-        surplus (management-invocation ["keygen" "dev" "extra"])
-        unknown (management-invocation ["wat"])
-        terminated-long-help (management-invocation ["help" "--" "--help"])
-        terminated-short-help (management-invocation ["help" "--" "-h"])]
-    (is (= 1 (:exit missing) (:exit surplus) (:exit unknown)
-           (:exit terminated-long-help) (:exit terminated-short-help)))
-    (is (str/includes? (:err missing) "Required argument: <env-or-key>"))
-    (is (str/includes? (:err surplus) "Unexpected argument: extra"))
-    (is (str/includes? (:err unknown) "Unknown command: wat"))
-    (testing "the store commands are the whole surface: no general file commands"
-      (doseq [command ["encrypt" "decrypt"]]
-        (let [{:keys [exit err]} (management-invocation [command "dev" "note.txt"])]
-          (is (= 1 exit) command)
-          (is (str/includes? err (str "Unknown command: " command)) command))))
-    (is (str/includes? (:err terminated-long-help) "Unknown command: --help"))
-    (is (str/includes? (:err terminated-short-help) "Unknown command: -h"))))
+(deftest help-is-generated-for-every-command-test
+  (let [global (help-text [])]
+    (is (= global (help-text ["--help"]) (help-text ["-h"]) (help-text ["help"])))
+    (is (str/includes? global "Usage: bb secrets <command> [arguments]"))
+    (is (str/includes? global "-- ends the options"))
+    (doseq [[command usage] command-usages]
+      (testing command
+        (is (str/includes? global (str "\n  " (-> (subs usage (count "bb secrets "))
+                                                  (str/replace " [--edn]" ""))
+                                       " ")))
+        (let [text (help-text [command "--help"])]
+          (is (= text
+                 (help-text ["help" (str/upper-case command)])
+                 (help-text [command "anything" "surplus" "-h"])))
+          (is (str/starts-with? text (str "Usage: " usage "\n")))
+          (is (str/includes? text "  -h, --help   Show this help.\n"))))))
+  (is (str/includes? (help-text ["set" "-h"])
+                     "  --edn        Parse the value as EDN instead of storing it verbatim")))
 
-(deftest help-flags-after-the-terminator-remain-operands-test
+(deftest usage-errors-print-the-usage-and-never-the-argument-test
+  (let [marker "hunter2-MARKER"
+        config (test-config)]
+    (doseq [[args fragment]
+            [[["wat"] "Unknown command. Run `bb secrets help` for the list."]
+             [[marker] "Unknown command."]
+             [["help" marker] "Unknown command."]
+             [["help" "--" "--help"] "Unknown command."]
+             ;; The store commands are the whole surface.
+             [["encrypt" "dev" "note.txt"] "Unknown command."]
+             [["decrypt" "dev" "note.txt"] "Unknown command."]
+             [["keygen" "dev" marker] "Too many arguments. Usage: bb secrets keygen [env]"]
+             [["rm" "dev" ":k" marker] "Too many arguments. Usage: bb secrets rm [env] <key>"]
+             [["add-recipient" "dev" "age1x" marker] "Too many arguments."]
+             [["set"] "Missing argument. Usage: bb secrets set [env] <key> [--edn]"]
+             [["rm"] "Missing argument. Usage: bb secrets rm [env] <key>"]
+             [["rm" "--edn" ":k"] "Unknown option. Usage: bb secrets rm [env] <key>"]
+             [["verify" (str "--" marker)] "Unknown option. Usage: bb secrets verify [env]"]
+             [["doctor" "-x"] "Unknown option."]
+             [["set" "dev" ":k" (str "--value=" marker)] "Unknown option."]
+             [["recipients" marker] "Unknown environment. One of: dev"]
+             [["reencrypt" "--" (str "-" marker)] "Unknown environment. One of: dev"]]]
+      (testing (pr-str args)
+        (let [{:keys [failure] :as captured}
+              (capture-failure #((cli-private 'dispatch!) config args))]
+          (is (= :usage (get-in failure [:data :reason])))
+          (is (str/includes? (str (:message failure)) fragment))
+          (assert-redacted! marker captured))))))
+
+(deftest arguments-reach-their-command-test
   (let [config (test-config)]
-    (is (= ["--help"] (dispatched config ["keygen" "--" "--help"])))
-    (is (= [nil "--help" false]
-           (dispatched config ["set" "--" "--help"])))))
-
-(deftest command-names-are-case-insensitive-test
-  (is (= ["prod"] (dispatched (test-config) ["KEYGEN" "prod"]))))
+    (doseq [[args expected note]
+            [[["keygen"] [nil] "an omitted [env] is nil"]
+             [["keygen" "dev"] ["dev"] "an explicit [env] is positional"]
+             [["KEYGEN" "prod"] ["prod"] "command names are case insensitive"]
+             [["doctor" "prod"] ["prod"] "doctor takes [env] too"]
+             [["rm" ":k"] [nil ":k"] "one argument is the key"]
+             [["rm" "dev" ":k"] ["dev" ":k"] "two are the environment and the key"]
+             [["set" ":k"] [nil ":k" false] "set without --edn"]
+             [["set" "--edn" "dev" ":k"] ["dev" ":k" true] "--edn before the arguments"]
+             [["set" "dev" "--edn" ":k"] ["dev" ":k" true] "--edn between them"]
+             [["set" "dev" ":k" "--edn"] ["dev" ":k" true] "--edn after them"]
+             [["add-recipient" "dev"] ["dev" nil] "the first argument is the environment"]
+             [["add-recipient" "dev" "age1x"] ["dev" "age1x"] "the second is the key"]
+             ;; Everything after the terminator is positional.
+             [["keygen" "--" "--help"] ["--help"] "a help flag after --"]
+             [["keygen" "--" "dev"] ["dev"] "an ordinary argument after --"]
+             [["set" "--" "--edn"] [nil "--edn" false] "set's own flag after --"]
+             [["set" "--edn" "--" "-k"] [nil "-k" true] "a flag before -- still counts"]
+             [["rm" "dev" "--" "-k"] ["dev" "-k"] "a dash-leading key after --"]]]
+      (testing (str (str/join " " args) ": " note)
+        (is (= expected (dispatched config args)))))))
 
 (deftest set-edn-still-works-everywhere-it-did-test
   ;; Every position the dispatch accepts the flag in today: before or after an
@@ -1427,32 +1456,6 @@
       (testing "the terminator leaves set's own positional arguments alone"
         (with-out-str (with-in-str "plain" (cli/run! config ["set" "dev" "--" ":past-terminator"])))
         (is (= "plain" (stored :past-terminator)))))))
-
-(deftest other-commands-do-not-consume-a-flag-they-do-not-define-test
-  (let [config (test-config)]
-    (doseq [[args expected note]
-            [;; The two cases the issue confirmed.
-             [["rm" "--edn"] [nil "--edn"] "rm reads it as the key"]
-             [["rm" "dev" "--edn"] ["dev" "--edn"] "rm reads it as the key"]
-             [["add-recipient" "--edn"] ["--edn" nil] "add-recipient reads it as [env]"]
-             [["add-recipient" "dev" "--edn"] ["dev" "--edn"] "add-recipient reads it as [key]"]
-             [["keygen" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
-             [["new" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
-             [["edit" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
-             [["verify" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
-             [["show-key" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
-             [["recipients" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
-             [["reencrypt" "--edn"] ["--edn"] "single-argument commands read it as [env]"]
-             [["doctor" "--edn"] ["--edn"] "doctor dispatches before normalization"]
-             ;; [env] positional and optional, unchanged.
-             [["keygen"] [nil] "an omitted [env] is still nil at the boundary"]
-             [["keygen" "dev"] ["dev"] "an explicit [env] is still positional"]
-             ;; The terminator is consumed by every command, not passed on.
-             [["rm" "--" "--edn"] [nil "--edn"] "terminated, with [env] omitted"]
-             [["rm" "dev" "--" "--edn"] ["dev" "--edn"] "terminated, [env] given"]
-             [["keygen" "--" "dev"] ["dev"] "terminated single-argument command"]]]
-      (testing (str (str/join " " args) " — " note)
-        (is (= expected (dispatched config args)))))))
 
 (deftest default-environment-still-resolves-without-env-test
   ;; What the original global extraction was protecting: [env] is positional
