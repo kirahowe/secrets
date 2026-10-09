@@ -157,10 +157,10 @@
   back unchanged.
 
   Requires a non-blank :app and at least one environment, each a map with a
-  :secrets-file. Every environment setting is a path string, and :manifest
-  may also be false. A secrets path not ending in `.age` requires explicit
-  :template and :manifest values. No file may serve two purposes across the
-  environments (see `reject-shared-paths!`). A key the config or an environment
+  :secrets-file. Every environment setting is a path string with a leading
+  `~` expanded, and :manifest may also be false. A secrets path not ending in
+  `.age` requires explicit :template and :manifest values. No file may serve
+  two purposes across the environments. A key the config or an environment
   does not define is rejected by name, so a misspelled key cannot be silently
   ignored. Does not select an environment identity or create private files.
   Throws ex-info on invalid input."
@@ -172,7 +172,6 @@
   {:secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
    :secrets-age-identity "SECRETS_AGE_IDENTITY"
    :secrets-age-identity-b64 "SECRETS_AGE_IDENTITY_B64"
-   :identity-file ":identity-file"
    :configured-key-file "key file"
    :default-key-file "key file"})
 

@@ -122,7 +122,9 @@
 ;; 2. `SECRETS_AGE_IDENTITY_FILE`, a path;
 ;; 3. `SECRETS_AGE_IDENTITY`, the key file's contents;
 ;; 4. `SECRETS_AGE_IDENTITY_B64`, the contents in base64;
-;; 5. `~/.config/<app>/key.txt`, when an app is named.
+;; 5. a `:key-file` option, which is how the CLI passes an environment's
+;;    configured key file;
+;; 6. `~/.config/<app>/key.txt`, when an app is named.
 ;;
 ;; With no explicit path and no app, the environment variables are the only
 ;; sources. There is no default key path when no app is named, which keeps

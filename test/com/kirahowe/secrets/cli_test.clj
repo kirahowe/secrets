@@ -251,7 +251,7 @@
 
 (defn- under-default-key-file
   [path f]
-  (with-redefs-fn {#'secrets/default-key-file (constantly path)} f))
+  (with-redefs-fn {#'fs/default-key-file (constantly path)} f))
 
 (defn- capture-doctor
   [config env-arg]
@@ -266,7 +266,7 @@
   "Run doctor with process boundaries replaced, including the app default key
   path so tests do not depend on the developer's home or environment."
   [config env-arg {:keys [environment version] :as opts}]
-  (with-redefs-fn {#'secrets/default-key-file (fn [_] *key*)
+  (with-redefs-fn {#'fs/default-key-file (fn [_] *key*)
                    #'age/version (fn [] (if (contains? opts :version)
                                           version
                                           "age test-version"))}
@@ -330,21 +330,25 @@
         (is (empty? paths)
             "resolving config neither reads injected contents nor writes a temp file")))))
 
-(deftest explicit-cli-identity-wins-over-every-injected-environment-source-test
-  (let [config (cli/normalize-config (test-config {:identity-file *key*}))]
-    (doseq [environment [{"SECRETS_AGE_IDENTITY_FILE" (str *dir* "/not-a-key")}
-                         {"SECRETS_AGE_IDENTITY" "not the fixture identity"}
-                         {"SECRETS_AGE_IDENTITY_B64" "bm90IHRoZSBmaXh0dXJlIGlkZW50aXR5"}]]
-      (let [{:keys [paths]}
-            (observe-injected-identities
-             #(with-identity-environment environment
-                (fn []
-                  (with-out-str
-                    (with-in-str "chosen-explicitly"
-                      (cli/set-secret! config "dev" ":identity/precedence" false))))))]
-        (is (empty? paths) "an explicit path is caller-owned and needs no temp file")
-        (is (= {:identity/precedence "chosen-explicitly"}
-               (secrets/load-secrets (str *dir* "/secrets.edn.age") *key*)))))))
+(deftest identity-file-is-not-a-config-key-test
+  (testing "a config that sets :identity-file is rejected by name"
+    (let [e (test-env/thrown #(cli/normalize-config (test-config {:identity-file *key*})))]
+      (is (= {:reason :unknown-config-key :unknown-keys [:identity-file]} (ex-data e)))
+      (is (not (str/includes? (ex-message e) *key*)))))
+  (testing "SECRETS_AGE_IDENTITY_FILE is the first source a command uses"
+    (let [config (cli/normalize-config (test-config {:key-file (str *dir* "/not-a-key")}))]
+      (doseq [environment [{"SECRETS_AGE_IDENTITY" "not the fixture identity"}
+                           {"SECRETS_AGE_IDENTITY_B64" "bm90IHRoZSBmaXh0dXJlIGlkZW50aXR5"}]]
+        (let [{:keys [paths]}
+              (observe-injected-identities
+               #(with-identity-environment (assoc environment "SECRETS_AGE_IDENTITY_FILE" *key*)
+                  (fn []
+                    (with-out-str
+                      (with-in-str "chosen-by-path"
+                        (cli/set-secret! config "dev" ":identity/precedence"))))))]
+          (is (empty? paths) "a path is caller-owned and needs no temp file")
+          (is (= {:identity/precedence "chosen-by-path"}
+                 (secrets/load-secrets (str *dir* "/secrets.edn.age") *key*))))))))
 
 (deftest normalize-config-validation-test
   (testing "no :environments"
@@ -449,7 +453,7 @@
       (let [missing (str *dir* "/missing-default-key.txt")
             config (update-in (complete-doctor-config) [:environments :dev] dissoc :key-file)
             {:keys [result out]}
-            (with-redefs-fn {#'secrets/default-key-file (constantly missing)
+            (with-redefs-fn {#'fs/default-key-file (constantly missing)
                              #'age/version (constantly "age test-version")}
               #(with-identity-environment {} (fn [] (capture-doctor config nil))))]
         (is (= 1 (:exit result)))
@@ -507,10 +511,6 @@
              {:source :secrets-age-identity-b64
               :label "SECRETS_AGE_IDENTITY_B64"
               :environment {"SECRETS_AGE_IDENTITY_B64" b64-value}}
-             {:source :identity-file
-              :label ":identity-file"
-              :config (complete-doctor-config {:identity-file other})
-              :path other}
              {:source :configured-key-file
               :label "key file"
               :config (complete-doctor-config {:key-file other})
@@ -534,10 +534,6 @@
             [["a designated variable path that does not exist" config
               {"SECRETS_AGE_IDENTITY_FILE" missing}
               (str "SECRETS_AGE_IDENTITY_FILE names an age identity file that does not exist: "
-                   missing)]
-             ["a designated :identity-file that does not exist"
-              (assoc-in config [:environments :dev :identity-file] missing) {}
-              (str "The explicit identity path names an age identity file that does not exist: "
                    missing)]
              ["a blank variable" config {"SECRETS_AGE_IDENTITY" ""}
               "SECRETS_AGE_IDENTITY is set but empty"]
@@ -850,12 +846,10 @@
 
 (deftest caller-owned-cli-identity-files-survive-operations-test
   (let [ciphertext (str *dir* "/secrets.edn.age")
-        explicit (cli/normalize-config (test-config {:identity-file *key*}))
         from-environment (cli/normalize-config (test-config))]
     (encrypt-edn! {:caller-owned true})
     (doseq [[label config environment]
-            [["explicit :identity-file" explicit {"SECRETS_AGE_IDENTITY" "wrong"}]
-             ["SECRETS_AGE_IDENTITY_FILE" from-environment
+            [["SECRETS_AGE_IDENTITY_FILE" from-environment
               {"SECRETS_AGE_IDENTITY_FILE" *key*}]]]
       (let [{:keys [paths]}
             (observe-injected-identities
@@ -1058,9 +1052,7 @@
           (is (= :ok-keyless (:dev results)))))
       (testing "a designated identity that does not exist is an error, never keyless"
         (doseq [[label run-verify]
-                [["an :identity-file"
-                  #(verify (cli/normalize-config (test-config {:identity-file missing})) "dev")]
-                 ["SECRETS_AGE_IDENTITY_FILE"
+                [["SECRETS_AGE_IDENTITY_FILE"
                   #(with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" missing}
                      (fn [] (verify config "dev")))]]]
           (testing label
@@ -2147,8 +2139,8 @@
                 (catch clojure.lang.ExceptionInfo e e))]
         (is (= {:reason :disallowed-source :scheme "https"}
                (select-keys (ex-data e) [:reason :scheme])))))
-    (testing "identity roles share the runtime's reason and wording"
-      (doseq [field [:key-file :identity-file]]
+    (testing "the key file shares the runtime's reason and wording"
+      (doseq [field [:key-file]]
         (let [e (try (cli/normalize-config (config {field "key:txt"}))
                      nil
                      (catch clojure.lang.ExceptionInfo e e))]
@@ -2470,15 +2462,13 @@
         (is (= #{:secrets-fle :manfest} (set (:unknown-keys (ex-data e)))))
         (is (str/includes? (ex-message e) "Environment dev has an unknown key"))
         (is (str/includes? (ex-message e) ":secrets-fle"))
-        (doseq [known [:secrets-file :key-file :identity-file :template :manifest
-                       :recipients-file]]
+        (doseq [known [:secrets-file :key-file :template :manifest :recipients-file]]
           (is (str/includes? (ex-message e) (str known)) known))
         (is (not (str/includes? (ex-message e) "elsewhere.age"))
             "the message names the key and never its value")))
     (testing "every documented key is accepted"
       (is (map? (cli/normalize-config
-                 (test-config {:identity-file *key*
-                               :template (str *dir* "/t.example")
+                 (test-config {:template (str *dir* "/t.example")
                                :manifest (str *dir* "/m.manifest")
                                :recipients-file (str *dir* "/r.txt")})))))))
 
@@ -2534,15 +2524,9 @@
 
 (deftest incompatible-artifact-roles-are-rejected-test
   (doseq [[label environments tokens]
-          [["the resolved identity equals the manifest in one environment"
-            {:dev {:secrets-file "s.age" :manifest "id.txt" :identity-file "id.txt"}}
-            ["dev :identity-file and dev :manifest"]]
-           ["the resolved identity equals the ciphertext"
-            {:dev {:secrets-file "s.age" :identity-file "s.age"}}
-            ["dev :identity-file and dev :secrets-file"]]
-           ["the resolved identity equals the template"
-            {:dev {:secrets-file "s.age" :identity-file "s.example"}}
-            ["dev :identity-file and dev :template"]]
+          [["the key file equals the manifest in one environment"
+            {:dev {:secrets-file "s.age" :manifest "id.txt" :key-file "id.txt"}}
+            ["dev :key-file and dev :manifest"]]
            ["dev ciphertext equals the prod key file"
             {:dev {:secrets-file "shared.age" :key-file "dev-key.txt"}
              :prod {:secrets-file "prod.age" :key-file "shared.age"}}
@@ -2575,15 +2559,6 @@
                     {:app "x"
                      :environments {:dev {:secrets-file (str *dir* "/dev/s.age")}
                                     :prod {:secrets-file (str *dir* "/prod/s.age")}}})))))
-    (testing "an explicit :identity-file equal to the environment's own :key-file"
-      (let [env (-> {:app "x"
-                     :environments {:dev {:secrets-file "s.age"
-                                          :key-file "k.txt"
-                                          :identity-file "./k.txt"}}}
-                    normalize-without-env-identity
-                    (get-in [:environments :dev]))]
-        (is (= "./k.txt" (:identity-file env))
-            "an explicit identity aliasing the key file is kept, not rejected")))
     (testing "one recipients file shared by two environments"
       (is (nil? (normalize-failure
                  {:app "x"
@@ -2659,8 +2634,7 @@
                 :default-environment :dev
                 :environments {:dev {:secrets-file ciphertext
                                      :manifest identity-file
-                                     :identity-file identity-file
-                                     :key-file key-file}}}]
+                                     :key-file identity-file}}}]
     (doseq [[label command]
             [["keygen" #(cli/keygen! (normalize-without-env-identity config) "dev")]
              ["set" #(cli/set-secret! (normalize-without-env-identity config) "dev" ":a")]]]
@@ -2758,7 +2732,7 @@
                   :environments {:dev (merge {:secrets-file (str *dir* "/s.age")}
                                              {field key-line})}})]
     (testing "every path role refuses key contents, naming the field and never the value"
-      (doseq [field [:key-file :identity-file :template :manifest :recipients-file]]
+      (doseq [field [:key-file :template :manifest :recipients-file]]
         (let [{:keys [failure] :as captured}
               (capture-failure #(cli/normalize-config (config field)))]
           (is (= (str "Environment dev " field " holds age key contents where a local"
@@ -3300,32 +3274,32 @@
 (deftest verify-continues-past-an-environment-that-throws-test
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
-    (let [missing (str *dir* "/no-such-key.txt")
+    (let [bad-recipients (str *dir* "/bad-recipients.txt")
           other-key (str *dir* "/other-key.txt")
           env (fn [n key-file] {:secrets-file (str *dir* "/" n ".edn.age") :key-file key-file})
           config (fn [envs] (cli/normalize-config {:app "cli-test" :environments envs}))
           good {:good (env "good" *key*) :fine (env "fine" *key*)}
           all (config (assoc good
-                             :no-identity (assoc (env "no-identity" *key*)
-                                                 :identity-file missing)
+                             :bad-recipients (assoc (env "bad-recipients" *key*)
+                                                    :recipients-file bad-recipients)
                              :wrong-key (env "wrong-key" other-key)))]
       (age/keygen! other-key)
-      (doseq [n ["good" "fine" "wrong-key"]]
+      (spit bad-recipients "not-a-recipient\n")
+      (doseq [n ["good" "fine" "wrong-key" "bad-recipients"]]
         (with-out-str
           (with-in-str "v" (cli/set-secret! (config {(keyword n) (env n *key*)}) n ":k"))))
       (testing "each failing environment is reported and the others are verified"
         (let [{:keys [result out err]} (capture-verify all nil)]
-          (is (= {:good :ok :fine :ok :no-identity :error :wrong-key :error} (:results result)))
+          (is (= {:good :ok :fine :ok :bad-recipients :error :wrong-key :error}
+                 (:results result)))
           (is (= 2 (:exit result)))
-          (is (str/includes? err (str "no-identity: The explicit identity path names an age"
-                                      " identity file that does not exist: " missing)))
+          (is (str/includes? err "bad-recipients: Not a valid age recipient on line 1 of"))
           (is (str/includes? err "wrong-key:"))
           (is (= 2 (count (re-seq #"manifest matches" out))))))
       (testing "an environment named on the command line reports the same finding"
-        (let [{:keys [result err]} (capture-verify all "no-identity")]
-          (is (= {:results {:no-identity :error} :exit 2} result))
-          (is (str/includes? err (str "no-identity: The explicit identity path names an age"
-                                      " identity file that does not exist: " missing))))
+        (let [{:keys [result err]} (capture-verify all "bad-recipients")]
+          (is (= {:results {:bad-recipients :error} :exit 2} result))
+          (is (str/includes? err "bad-recipients: Not a valid age recipient on line 1 of")))
         (is (= {:results {:wrong-key :error} :exit 2} (verify all "wrong-key"))))
       (testing "only an unknown environment throws"
         (is (= :usage (:reason (ex-data (try (verify all "nowhere")
@@ -3333,7 +3307,7 @@
       (testing "exit 1 means drift and nothing else"
         (spit (str *dir* "/fine.edn.manifest") "{:version 3}")
         (let [{:keys [result]} (capture-verify all nil)]
-          (is (= {:good :ok :fine :drift :no-identity :error :wrong-key :error}
+          (is (= {:good :ok :fine :drift :bad-recipients :error :wrong-key :error}
                  (:results result)))
           (is (= 2 (:exit result)) "a failure beside the drift is still a failure"))
         (is (= {:results {:fine :drift} :exit 1} (verify all "fine")))
@@ -3480,8 +3454,8 @@
                  ["a missing secrets file" 2 (env "absent")]
                  ["a store the key cannot decrypt" 2 (env "wrong-key" :key-file other-key)]
                  ["a manifest that cannot be read" 2 (env "unreadable" :manifest directory)]
-                 ["a designated identity that does not exist" 2
-                  (env "designated" :identity-file missing)]
+                 ["a designated identity that does not exist" 2 (env "ok")
+                  {:env {"SECRETS_AGE_IDENTITY_FILE" missing}}]
                  ["a blank identity variable" 2 (env "ok") {:env {"SECRETS_AGE_IDENTITY" ""}}]
                  ["an identity variable that is not base64" 2 (env "ok")
                   {:env {"SECRETS_AGE_IDENTITY_B64" "not base64!"}}]]
@@ -3589,7 +3563,6 @@
                              [:manifest :none "keyword"]
                              [:key-file 42 "integer"]
                              [:key-file nil "nil"]
-                             [:identity-file :env "keyword"]
                              [:template false "boolean"]
                              [:recipients-file ["team.txt"] "vector"]
                              [:secrets-file 'secrets.edn.age "symbol"]]]
@@ -3608,8 +3581,7 @@
       (doseq [k [:name :app]]
         (let [e (failure {k "other"})]
           (is (= :unknown-config-key (:reason (ex-data e))))
-          (is (= (str "Known keys: :identity-file, :key-file, :manifest, :recipients-file,"
-                      " :secrets-file, :template.")
+          (is (= "Known keys: :key-file, :manifest, :recipients-file, :secrets-file, :template."
                  (str/trim (last (str/split-lines (ex-message e)))))))))
     (testing "a default environment that is not configured"
       (doseq [default [:prod "dev" 5]]
@@ -3719,6 +3691,25 @@
       (is (str/includes? (help-text ["set" "--help"])
                          "The prompt needs stdin and stdout both to be terminals")))))
 
+;;;; SECRETS_AGE_IDENTITY_FILE naming another artifact
+
+(deftest an-identity-variable-that-names-an-artifact-is-called-by-its-name-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          env (get-in config [:environments :dev])]
+      (store-through-stdin! config)
+      (spit (:template env) "{}")
+      (doseq [setting [:secrets-file :manifest :template]]
+        (testing setting
+          (with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" (get env setting)}
+            #(let [{:keys [result err]} (capture-verify config "dev")]
+               (is (= {:results {:dev :error} :exit 2} result))
+               (is (str/includes? err (str "SECRETS_AGE_IDENTITY_FILE and dev " setting
+                                           " name the same file")))
+               (is (not (str/includes? err ":identity-file"))
+                   "no setting of that name exists to point the operator at"))))))))
+
 ;;;; add-recipient with one argument
 
 (deftest add-recipient-with-one-argument-test
@@ -3739,6 +3730,31 @@
     (testing "the help states the rule"
       (is (str/includes? (help-text ["add-recipient" "--help"])
                          "a public key goes to the default environment")))))
+
+;;;; One rule for ~
+
+(deftest every-path-setting-expands-home-test
+  (with-redefs-fn {#'fs/user-home (constantly *dir*)}
+    #(let [paths [:secrets-file :key-file :template :manifest :recipients-file]
+           normalized (fn [env]
+                        (-> (cli/normalize-config {:app "x" :environments {:dev env}})
+                            (get-in [:environments :dev])
+                            (select-keys paths)))]
+       (is (= {:secrets-file (str *dir* "/s.edn.age")
+               :key-file (str *dir* "/k.txt")
+               :template (str *dir* "/t.example")
+               :manifest (str *dir* "/m.manifest")
+               :recipients-file (str *dir* "/r.txt")}
+              (normalized {:secrets-file "~/s.edn.age"
+                           :key-file "~/k.txt"
+                           :template "~/t.example"
+                           :manifest "~/m.manifest"
+                           :recipients-file "~/r.txt"})))
+       (testing "the derived names follow the expanded secrets file"
+         (is (= {:template (str *dir* "/s.edn.example") :manifest (str *dir* "/s.edn.manifest")}
+                (select-keys (normalized {:secrets-file "~/s.edn.age"}) [:template :manifest]))))
+       (testing "only a leading ~ or ~/ is the home directory"
+         (is (= "~bob/s.edn.age" (:secrets-file (normalized {:secrets-file "~bob/s.edn.age"}))))))))
 
 ;;;; Command names
 

@@ -61,27 +61,6 @@
 
 (def ^:private not-found ::not-found)
 
-(defn- user-home
-  "Return the current user's home directory."
-  []
-  (System/getProperty "user.home"))
-
-(defn expand-home
-  "Return `path` as a string, with the user's home directory in place of the
-  `~` when it is exactly `~` or begins with `~/`. Every other string, such as
-  `~bob/x`, is returned unchanged."
-  [path]
-  (let [s (str path)]
-    (if (or (= s "~") (str/starts-with? s "~/"))
-      (str (user-home) (subs s 1))
-      s)))
-
-(defn default-key-file
-  "Return the default identity path for `app`: `~/.config/<app>/key.txt` with
-  the home directory expanded."
-  [app]
-  (expand-home (str "~/.config/" app "/key.txt")))
-
 ;;;; Identity resolution
 
 (def ^:private identity-b64-whitespace-re
@@ -163,7 +142,7 @@
   (let [opts (if (map? identity-or-opts) identity-or-opts {})
         explicit (if (map? identity-or-opts) (:identity-file opts) identity-or-opts)
         designated (fn [path source]
-                     {:identity-file (expand-home path)
+                     {:identity-file (fs/expand-home path)
                       :identity-source source
                       :designated? true})]
     (or (when explicit
@@ -176,10 +155,10 @@
           {:contents (decode-b64-identity contents)
            :identity-source :secrets-age-identity-b64})
         (when-let [path (:key-file opts)]
-          {:identity-file (expand-home path)
+          {:identity-file (fs/expand-home path)
            :identity-source :configured-key-file})
         (when-let [app (:app opts)]
-          {:identity-file (default-key-file app)
+          {:identity-file (fs/default-key-file app)
            :identity-source :default-key-file})
         {:identity-file nil :identity-source nil})))
 
@@ -333,10 +312,11 @@
   `clojure.java.io/resource` returns, whose scheme is `file:` or `jar:file:`.
   Anything else is rejected with `:disallowed-source` before it is opened.
   `identity-or-opts` is an identity path or an options map:
-    :identity-file  explicit identity path (wins over :app and the env vars)
+    :identity-file  explicit identity path (wins over the env vars)
+    :key-file       the project's key path, used when no env var is set
     :app            app name for the default ~/.config/<app>/key.txt
-  Without an explicit identity or app, only the SECRETS_AGE_IDENTITY*
-  environment variables are used.
+  Without one of these, only the SECRETS_AGE_IDENTITY* environment variables
+  are used.
 
   Missing or invalid inputs throw ex-info with a :reason:
     :no-identity        no identity resolves, the app default key file is
@@ -468,6 +448,7 @@
                    here, with the same credential-free `:source` descriptor a
                    load failure carries.
     :app           app name for the default key path ~/.config/<app>/key.txt.
+    :key-file      the project's key path, used when no env var is set.
     :identity-file explicit identity path (overrides resolution).
 
   The source is resolved and decrypted at most once, when the first tag is

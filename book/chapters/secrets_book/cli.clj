@@ -72,10 +72,9 @@
 
 ;; In that output, `:template` and `:manifest` are derived from the secrets
 ;; file name. `:key-file` is the path where `keygen` writes and `show-key`
-;; reads, while `:identity-file` is an optional explicit path for commands
-;; that decrypt. Normalization validates the configured paths. It does not
-;; read the identity environment variables or create any file. Each command
-;; resolves its identity when it runs: `:identity-file`, then the environment
+;; reads. Normalization validates the configured paths and expands a leading
+;; `~` in each. It does not read the identity environment variables or create
+;; any file. Each command resolves its identity when it runs: the environment
 ;; variables, then `:key-file` or the app default. The
 ;; [runtime chapter](secrets_book.runtime.html#how-the-key-is-found) has the
 ;; full rule.

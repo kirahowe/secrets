@@ -8,7 +8,6 @@
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
-            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
@@ -297,7 +296,7 @@
                             library)
                           task])
         deps-edn (when deps-owns? (edn-file root "deps.edn" [library]))
-        key-file (secrets/default-key-file app)
+        key-file (fs/default-key-file app)
         files (cond-> (filterv some? [deps-edn
                                       bb-edn
                                       (plain-file root template-path template-content)])

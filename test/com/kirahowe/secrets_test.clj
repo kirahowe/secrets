@@ -64,14 +64,17 @@
 (deftest expand-home-test
   (let [home (System/getProperty "user.home")]
     (testing "only ~ and a leading ~/ name the home directory"
-      (is (= home (secrets/expand-home "~")))
-      (is (= (str home "/x") (secrets/expand-home "~/x")))
-      (is (= (str home "/.config/x") (secrets/expand-home "~/.config/x"))))
+      (is (= home (fs/expand-home "~")))
+      (is (= (str home "/x") (fs/expand-home "~/x")))
+      (is (= (str home "/.config/x") (fs/expand-home "~/.config/x"))))
     (testing "every other string is returned unchanged"
       (doseq [path ["~bob/x" "~~" "a~/x" "/abs/path" "" " "]]
-        (is (= path (secrets/expand-home path)) (pr-str path))))
+        (is (= path (fs/expand-home path)) (pr-str path))))
     (testing "nil becomes the empty string"
-      (is (= "" (secrets/expand-home nil))))))
+      (is (= "" (fs/expand-home nil))))
+    (testing "the runtime namespace does not publish the path helpers"
+      (is (nil? (ns-resolve 'com.kirahowe.secrets 'expand-home)))
+      (is (nil? (ns-resolve 'com.kirahowe.secrets 'default-key-file))))))
 
 (deftest age-version-test
   (testing "successful stdout is trimmed"
@@ -416,7 +419,7 @@
         read-tag (fn [readers tag] (edn/read-string {:readers readers} (str tag " :k")))]
     (testing "no identity designated and the app default absent: opt is nil, req throws"
       (with-redefs-fn (assoc (test-env/getenv-redefs {})
-                             #'secrets/default-key-file (constantly missing))
+                             #'fs/default-key-file (constantly missing))
         (fn []
           (let [readers (secrets/reader-literals {:file enc :app "reader-test"})]
             (is (nil? (read-tag readers "#secret/opt")))
@@ -739,7 +742,7 @@
         key-in-home (io/file home "keys" "k.txt")]
     (io/make-parents key-in-home)
     (spit key-in-home (slurp *key*))
-    (with-redefs-fn {#'secrets/user-home (constantly (str home))}
+    (with-redefs-fn {#'fs/user-home (constantly (str home))}
       (fn []
         (testing "every identity path source expands a leading ~"
           (is (= {:k "v"} (secrets/load-secrets enc "~/keys/k.txt")))
@@ -782,7 +785,7 @@
         missing (str *dir* "/no-such-key.txt")
         failure (fn [environment identity-or-opts]
                   (with-redefs-fn (assoc (test-env/getenv-redefs environment)
-                                         #'secrets/default-key-file (constantly missing))
+                                         #'fs/default-key-file (constantly missing))
                     #(try (secrets/load-secrets enc identity-or-opts)
                           nil
                           (catch clojure.lang.ExceptionInfo e e))))]
@@ -804,7 +807,7 @@
                  (ex-message e))))))
     (testing "a :key-file and the app default are default locations, not designations"
       (with-redefs-fn (assoc (test-env/getenv-redefs {})
-                             #'secrets/default-key-file (constantly missing))
+                             #'fs/default-key-file (constantly missing))
         (fn []
           (is (= {:identity-file missing :identity-source :configured-key-file}
                  (secrets/with-identity {:key-file missing :app "load-test"} identity)))
@@ -1446,11 +1449,11 @@
 
 (deftest default-key-file-test
   (is (= (str (System/getProperty "user.home") "/.config/myapp/key.txt")
-         (secrets/default-key-file "myapp")))
+         (fs/default-key-file "myapp")))
   (testing "an :app option resolves to it when no identity variable is set"
     (with-redefs-fn (test-env/getenv-redefs {})
       (fn []
-        (is (= {:identity-file (secrets/default-key-file "myapp")
+        (is (= {:identity-file (fs/default-key-file "myapp")
                 :identity-source :default-key-file}
                (secrets/with-identity {:app "myapp"} identity)))))))
 

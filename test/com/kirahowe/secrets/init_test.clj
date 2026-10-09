@@ -3,9 +3,9 @@
             [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer [are deftest is testing use-fixtures]]
-            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
+            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.init :as init]
             [com.kirahowe.secrets.store :as store])
   (:import [java.nio.file Files LinkOption]
@@ -26,7 +26,7 @@
     (binding [*dir* dir
               *key-file* (str home "/.config/reader/key.txt")]
       (try
-        (with-redefs [secrets/default-key-file (fn [app] (str home "/.config/" app "/key.txt"))]
+        (with-redefs [fs/default-key-file (fn [app] (str home "/.config/" app "/key.txt"))]
           (test-fn))
         (finally
           (doseq [root [dir home]]

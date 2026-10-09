@@ -71,10 +71,10 @@
   returning `path` otherwise.
 
   CLI artifacts are local filesystem paths. The failure names the environment
-  and field and never the value. `:key-file` and `:identity-file` fail with
-  `:reason :disallowed-identity`, as the runtime's identity paths do, and
-  every other field with `:disallowed-source`. Non-string values such as
-  `:manifest false` keep their meaning."
+  and field and never the value. `:key-file` fails with `:reason
+  :disallowed-identity`, as the runtime's identity paths do, and every other
+  field with `:disallowed-source`. Non-string values such as `:manifest false`
+  keep their meaning."
   [env kind path]
   (when (and (string? path) (str/blank? path))
     (fail! :invalid-config
@@ -83,9 +83,7 @@
                 "    An empty path resolves to the working directory, not a file.")
            {:environment env :field kind :path path}))
   (when-let [problem (and (string? path) (source/path-problem path))]
-    (fail! (if (#{:key-file :identity-file} kind)
-             :disallowed-identity
-             :disallowed-source)
+    (fail! (if (= :key-file kind) :disallowed-identity :disallowed-source)
            (source/path-problem-message (str "Environment " (name env) " " kind)
                                         "a local filesystem path"
                                         problem)
@@ -94,8 +92,9 @@
   path)
 
 (def ^:private path-purposes
-  "What each path setting of an environment is for. `:key-file` and
-  `:identity-file` both name an identity, so one file may be both."
+  "What each path setting of an environment is for. `:identity-file` is not
+  a setting: it is the path SECRETS_AGE_IDENTITY_FILE gave a running command.
+  It and `:key-file` both name an identity, so one file may be both."
   {:secrets-file :secrets-file
    :manifest :manifest
    :template :template
@@ -122,7 +121,9 @@
                    [setting purpose] path-purposes
                    :let [path (get env setting)]
                    :when (string? path)]
-               {:label (str (name (:name env)) " " setting)
+               {:label (if (= :identity-file setting)
+                         "SECRETS_AGE_IDENTITY_FILE"
+                         (str (name (:name env)) " " setting))
                 :purpose purpose
                 :path path
                 :canonical (canonical-path path)
@@ -167,7 +168,7 @@
 
 (def ^:private environment-keys
   "Every key an environment's config may hold. Each names a path."
-  #{:secrets-file :key-file :identity-file :template :manifest :recipients-file})
+  #{:secrets-file :key-file :template :manifest :recipients-file})
 
 (defn- reject-unknown-keys!
   "Fail when map `m` holds a key outside `known`, naming the key and the known
@@ -181,9 +182,7 @@
            {:unknown-keys (vec unknown)})))
 
 (defn- normalize-environment
-  [app environment-name
-   {:keys [secrets-file key-file identity-file template manifest recipients-file]
-    :as env-config}]
+  [app environment-name env-config]
   (let [label (name environment-name)]
     (reject-unknown-keys! (str "Environment " label) environment-keys env-config)
     (doseq [[k v] env-config]
@@ -193,51 +192,38 @@
                     (when (= :manifest k) ", or false to keep no manifest")
                     ", not a value of type " (name (manifest/value-type v)) ".")
                {:environment environment-name :field k})))
-    (when-not secrets-file
+    (when-not (:secrets-file env-config)
       (fail! :invalid-config
              (str "Environment " label " has no :secrets-file (a path string is required).")
              {:environment environment-name}))
-    (require-path! environment-name :secrets-file secrets-file)
-    (when (and (not (str/ends-with? secrets-file ".age"))
-               (not (and (contains? env-config :template)
-                         (contains? env-config :manifest))))
-      (fail! :invalid-config
-             (str "Environment " label " :secrets-file (" secrets-file
-                  ") does not end in .age, so the\n"
-                  "    derived :template/:manifest names would collide with, and overwrite, "
-                  "the\n"
-                  "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
-                  "    explicitly.")
-             {:environment environment-name
-              :secrets-file secrets-file})))
-  (let [key-file (if key-file
-                   (secrets/expand-home key-file)
-                   (secrets/default-key-file app))
-        explicit-identity (some-> identity-file secrets/expand-home)
-        template (if (contains? env-config :template)
-                   template
-                   (str/replace secrets-file #"\.age$" ".example"))
-        manifest (if (contains? env-config :manifest)
-                   manifest
-                   (str/replace secrets-file #"\.age$" ".manifest"))
-        recipients-file (some-> recipients-file secrets/expand-home)]
-    (doseq [[kind path] [[:key-file key-file]
-                         [:identity-file explicit-identity]
-                         [:template template]
-                         [:manifest manifest]
-                         [:recipients-file recipients-file]]]
-      (require-path! environment-name kind path))
-    (assoc env-config
-           :name environment-name
-           :app app
-           :secrets-file secrets-file
-           :key-file key-file
-           :identity-file explicit-identity
-           ;; An explicit :manifest false is kept. Absent values are derived
-           ;; from the secrets file.
-           :template template
-           :manifest manifest
-           :recipients-file recipients-file)))
+    ;; One rule for every path setting: a leading `~` is the home directory.
+    (let [{:keys [secrets-file] :as paths}
+          (update-vals env-config #(if (string? %) (fs/expand-home %) %))
+          derived #(str/replace secrets-file #"\.age$" %)
+          ;; An explicit :manifest false is kept. Absent values are derived
+          ;; from the secrets file.
+          env (merge {:key-file (fs/default-key-file app)
+                      :template (derived ".example")
+                      :manifest (derived ".manifest")
+                      :recipients-file nil}
+                     paths
+                     {:name environment-name :app app})]
+      (require-path! environment-name :secrets-file secrets-file)
+      (when (and (not (str/ends-with? secrets-file ".age"))
+                 (not (and (contains? env-config :template)
+                           (contains? env-config :manifest))))
+        (fail! :invalid-config
+               (str "Environment " label " :secrets-file (" secrets-file
+                    ") does not end in .age, so the\n"
+                    "    derived :template/:manifest names would collide with, and overwrite, "
+                    "the\n"
+                    "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
+                    "    explicitly.")
+               {:environment environment-name
+                :secrets-file secrets-file}))
+      (doseq [kind [:key-file :template :manifest :recipients-file]]
+        (require-path! environment-name kind (get env kind)))
+      env)))
 
 (defn normalize-config
   "Validate a secrets config as it is written in `bb.edn` and return it with
@@ -246,9 +232,9 @@
   back unchanged.
 
   Requires a non-blank :app and at least one environment, each a map with a
-  :secrets-file. Every environment setting is a path string, and :manifest
-  may also be false. A secrets path not ending in `.age` requires explicit
-  :template and :manifest values. No file may serve two purposes across the
+  :secrets-file. Every environment setting is a path string with a leading
+  `~` expanded, and :manifest may also be false. A secrets path not ending in
+  `.age` requires explicit :template and :manifest values. No file may serve two purposes across the
   environments (see `reject-shared-paths!`). A key the config or an environment
   does not define is rejected by name, so a misspelled key cannot be silently
   ignored. Does not select an environment identity or create private files.

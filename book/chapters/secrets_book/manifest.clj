@@ -215,8 +215,8 @@
 ;; CI job with no key, and without `age` installed, can therefore detect a
 ;; ciphertext that changed without its manifest.
 
-;; "No identity is available" means that none was named, by `:identity-file`
-;; or an identity environment variable, and no key file is present. A named
+;; "No identity is available" means that none was named by an identity
+;; environment variable and no key file is present. A named
 ;; identity that doesn't exist is an error. This config, for the same app and
 ;; store, has no key file to find:
 

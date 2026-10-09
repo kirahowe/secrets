@@ -258,8 +258,11 @@ Identity resolution is scoped to one operation. `with-identity` accepts an
 identity path or options and calls its function with
 `{:identity-file path :identity-source source}`. Resolution uses an explicit
 path or `:identity-file` first, then `SECRETS_AGE_IDENTITY_FILE`,
-`SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then the CLI's
-configured `:key-file` or its app default.
+`SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then a `:key-file` or
+the app default. `:identity-file` is a runtime option of `load-secrets`, the
+readers, and `with-identity`. The CLI config has no such key, so a command's
+identity comes from the three variables and then the environment's
+`:key-file` or the app default.
 
 An explicit path, `:identity-file`, and `SECRETS_AGE_IDENTITY_FILE` each
 designate a file, and a designated file that does not exist is an error, so a
@@ -435,8 +438,8 @@ and temporary plaintext are private (A4).
 
 Configuration. A key the config or an environment does not define is an error
 that names the key and not its value, so a misspelled key cannot silently
-configure nothing. Every environment setting is a path string, and `:manifest`
-may also be `false`. Across all environments a file is a secrets file, a
+configure nothing. Every environment setting is a path string with a leading
+`~` expanded, and `:manifest` may also be `false`. Across all environments a file is a secrets file, a
 manifest, a template, an identity, or a recipients file, and only one of them.
 Environments may share a template, an identity, or a recipients file. Two
 environments share a secrets file or a manifest only when they share both,

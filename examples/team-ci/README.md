@@ -25,9 +25,9 @@ records a value.
 The `fixture` environment configures a `:key-file`,
 `.local/fixture-identity.txt`, which does not exist in a checkout. A key file
 says where the key normally lives, so when no file is there `verify` checks
-without a key and passes as "freshness only". An identity that is named, by
-`:identity-file` or an identity variable, has to exist, and a missing one
-makes `verify` exit 2.
+without a key and passes as "freshness only". An identity that is named by
+`SECRETS_AGE_IDENTITY_FILE` has to exist, and a missing one makes `verify`
+exit 2.
 
 ## Disposable Alice and Bob workflow
 

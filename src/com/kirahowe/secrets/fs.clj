@@ -2,7 +2,26 @@
   "Implementation namespace; not part of the public API and may change without notice.
 
   Filesystem and subprocess primitives: home-relative paths, private temporary
-  files, atomic replacement, and running a program.")
+  files, atomic replacement, and running a program."
+  (:require [clojure.string :as str]))
+
+(defn- user-home [] (System/getProperty "user.home"))
+
+(defn expand-home
+  "Return `path` as a string, with the user's home directory in place of the
+  `~` when it is exactly `~` or begins with `~/`. Every other string, such as
+  `~bob/x`, is returned unchanged."
+  [path]
+  (let [s (str path)]
+    (if (or (= s "~") (str/starts-with? s "~/"))
+      (str (user-home) (subs s 1))
+      s)))
+
+(defn default-key-file
+  "Return the default identity path for `app`: `~/.config/<app>/key.txt` with
+  the home directory expanded."
+  [app]
+  (expand-home (str "~/.config/" app "/key.txt")))
 
 (defn sh
   "Run the program `argv` with no input, in directory `dir` when one is given,

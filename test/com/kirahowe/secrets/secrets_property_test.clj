@@ -76,9 +76,9 @@
                  name word
                  other (gen/elements ["/" "x" " " "./"])]
     (let [home (System/getProperty "user.home")]
-      (and (= home (secrets/expand-home "~"))
-           (= (str home "/" rest-of-path) (secrets/expand-home (str "~/" rest-of-path)))
-           (every? #(= % (secrets/expand-home %))
+      (and (= home (fs/expand-home "~"))
+           (= (str home "/" rest-of-path) (fs/expand-home (str "~/" rest-of-path)))
+           (every? #(= % (fs/expand-home %))
                    [(str "~" name "/" rest-of-path)
                     (str "~" name)
                     (str "~~/" rest-of-path)
@@ -128,7 +128,7 @@
                       [(and key-file? (not bare-explicit?))
                        {:path key-file :source :configured-key-file}]
                       [(and app? (not bare-explicit?))
-                       {:path (secrets/default-key-file app) :source :default-key-file}]]]
+                       {:path (fs/default-key-file app) :source :default-key-file}]]]
       {:arg (if bare-explicit?
               explicit
               (cond-> {}
@@ -387,7 +387,7 @@
     (let [seen (with-env {} #(secrets/with-identity {:app (str "kira-missing-" app)} identity))
           configured (with-env {} #(secrets/with-identity {:key-file path :app app} identity))]
       (and (= :default-key-file (:identity-source seen))
-           (= (secrets/default-key-file (str "kira-missing-" app)) (:identity-file seen))
+           (= (fs/default-key-file (str "kira-missing-" app)) (:identity-file seen))
            (= {:identity-file path :identity-source :configured-key-file} configured)))))
 
 ;;;; get-secret

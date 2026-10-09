@@ -62,9 +62,7 @@
                get-secret
                reader-literals
                merge-readers
-               with-identity
-               expand-home
-               default-key-file])
+               with-identity])
 
 ;; ## com.kirahowe.secrets.aero
 
@@ -122,7 +120,6 @@
 ;; |-----|----------|---------|
 ;; | `:secrets-file` | yes | path to the ciphertext; must end in `.age` unless both `:template` and `:manifest` are explicit |
 ;; | `:key-file` | no | where the key normally lives: `keygen` writes it, `show-key` reads it, and commands use it when no identity is named; default `~/.config/<app>/key.txt` |
-;; | `:identity-file` | no | explicit identity for commands that decrypt; used before the environment variables, and it has to exist |
 ;; | `:template` | no | what `new` opens; default `<secrets-file>` with `.example` in place of `.age` |
 ;; | `:manifest` | no | manifest path, or `false` to keep none; default `<secrets-file>` with `.manifest` in place of `.age` |
 ;; | `:recipients-file` | no | committed list of age public keys; enables team mode |

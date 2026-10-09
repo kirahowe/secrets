@@ -49,8 +49,15 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
   error where `verify` used to fall back to a keyless check and `#secret/opt`
   used to return `nil`.
 - Identity paths are local paths. A URI-shaped value, a bare `name:rest`, and
-  key contents in a path setting are refused with `:disallowed-identity`
-  without being echoed. A leading `~` is expanded for every identity path.
+  key contents in a path setting, raw or base64-encoded, are refused with
+  `:disallowed-identity` without being echoed. A leading `~` is expanded for
+  every identity path and every path setting in the CLI config.
+- `:identity-file` is not a key of the CLI config, and a config that sets it
+  is rejected as an unknown key. A command takes its identity from
+  `SECRETS_AGE_IDENTITY_FILE`, `SECRETS_AGE_IDENTITY`,
+  `SECRETS_AGE_IDENTITY_B64`, and then the environment's `:key-file` or the
+  app default. `:identity-file` is still an option of `load-secrets`, the
+  reader literals, and `with-identity`.
 - `load-secrets` and the reader literals accept only local sources: a path as
   a string, a `File`, or a `Path`, or the classpath resource `URL` that
   `io/resource` returns, including one inside a jar. Every other URL, a
@@ -104,7 +111,8 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
   `age/decrypt-bytes` are gone, and `age/encrypt-file!` takes a map.
 - `com.kirahowe.secrets/identity-from-env`, `resolve-identity-file`, and
   `identity-available?`. Use `with-identity`.
-- `com.kirahowe.secrets/owner-only-temp-file!`.
+- `com.kirahowe.secrets/owner-only-temp-file!`, `expand-home`, and
+  `default-key-file`.
 - `com.kirahowe.secrets.aero/register!` and `reset-cache!`.
 
 ## [0.1.0] - 2026-08-21

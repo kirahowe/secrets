@@ -156,7 +156,6 @@ that omits its environment argument uses `:default-environment`.
 | `:template` | What `new` opens in the editor. Default: the secrets file with `.example` in place of `.age`. |
 | `:manifest` | Path to the manifest, or `false` to keep none. Default: the secrets file with `.manifest` in place of `.age`. |
 | `:key-file` | Where `keygen` writes and `show-key` reads. Default: `~/.config/<app>/key.txt`. |
-| `:identity-file` | An explicit identity for commands that decrypt. It wins over the environment variables. |
 | `:recipients-file` | A committed file of age public keys, one per line. When set, the store is encrypted to all of them. |
 
 The config is validated before a command runs:
@@ -166,8 +165,8 @@ The config is validated before a command runs:
 - `:environments` is a map from a keyword to a map, and `:default-environment`
   has to name one of them.
 - Every environment setting is a string holding a local filesystem path, and
-  `:manifest` may also be `false`. A leading `~` is expanded in `:key-file`,
-  `:identity-file`, and `:recipients-file`.
+  `:manifest` may also be `false`. A leading `~` is expanded in every one of
+  them.
 - No file may serve two purposes. Environments may share a template, a key or
   identity file, or a recipients file. Two environments may name the same
   secrets file or manifest only when they name both the same, which makes
@@ -198,7 +197,7 @@ Anything else, such as an HTTP URL or a `file:` string, is refused with
 `:reason :disallowed-source` before it is opened.
 
 The second argument chooses the identity. It is a path, or a map with
-`:identity-file` or `:app`. [Identity resolution](#identity-resolution) gives
+`:identity-file`, `:key-file`, or `:app`. [Identity resolution](#identity-resolution) gives
 the full order.
 
 A vector path walks maps by key and vectors by integer index. It does not
@@ -301,11 +300,13 @@ Every operation that decrypts resolves its identity when it runs, from the
 first of these that applies:
 
 1. An explicit path: the second argument of `load-secrets`, or `:identity-file`
-   in the options or in the environment's config.
+   in the options. The CLI config has no such key: a command's identity comes
+   from 2 to 6.
 2. `SECRETS_AGE_IDENTITY_FILE`, a path to the key file.
 3. `SECRETS_AGE_IDENTITY`, the key file's contents.
 4. `SECRETS_AGE_IDENTITY_B64`, the key file's contents in base64.
-5. The environment's configured `:key-file` (CLI only).
+5. A `:key-file`: the environment's configured one in the CLI, or a
+   `:key-file` option at runtime.
 6. `~/.config/<app>/key.txt`, when an app name is known.
 
 A path from 1 or 2 names a specific file, and it is an error (`:no-identity`)
@@ -362,8 +363,8 @@ Without an identity, it checks that the manifest is complete and that the
 SHA-256 it records is the digest of the ciphertext. This needs no key and no
 `age`, so any CI job can run it. It applies when no identity was named and no
 key file is present, which is the usual state of a CI runner. An identity
-named by `:identity-file` or an identity variable has to exist: a missing one
-is an error, not a reason to skip the comparison.
+named by `SECRETS_AGE_IDENTITY_FILE` has to exist: a missing one is an error,
+not a reason to skip the comparison.
 
 With an identity, it also decrypts the store and compares every key path,
 type, and value hash with the manifest. It reports drift as well when the
@@ -636,7 +637,6 @@ Exit codes:
 - `(reader-literals opts)`, `(merge-readers readers opts)`
 - `(with-identity identity-or-opts f)` calls `f` with
   `{:identity-file path :identity-source source}` for one operation
-- `(expand-home path)`, `(default-key-file app)`
 
 `com.kirahowe.secrets.aero` has `(read-config source opts)`.
 
