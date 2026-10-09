@@ -299,8 +299,8 @@
 (defn- read-secrets-edn
   "Parse decrypted `plaintext` under the shared, content-free EDN policy and
   return the user's data. This is the one place decrypted EDN becomes a
-  returned value, so it is where the library's reserved metadata keys
-  ([[com.kirahowe.secrets.manifest/reserved-keys]]) are dropped."
+  returned value, so it is where the library's reserved metadata key
+  ([[com.kirahowe.secrets.manifest/store-key]]) is dropped."
   [plaintext]
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
     (if ok?
@@ -341,9 +341,9 @@
     #(load-with-identity source %)))
 
 (defn load-secrets
-  "Decrypt an age-encrypted EDN source and return its value. The manifest key
-  and the other reserved `:com.kirahowe.secrets/…` metadata the CLI keeps at
-  the top level of a store are library data and are never returned.
+  "Decrypt an age-encrypted EDN source and return its value. The reserved
+  top-level key `:com.kirahowe.secrets/store`, under which the CLI keeps a
+  store's metadata, is library data and is never returned.
 
   `source` is local-only: a filesystem path string, File, Path, local `file:`
   URL/URI/string, or a `jar:file:` classpath resource URL/URI/string.

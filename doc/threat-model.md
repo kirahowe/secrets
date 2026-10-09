@@ -293,11 +293,14 @@ lifecycle.
 
 ## Chosen manifest contract
 
-Every store holds a random 256-bit manifest key inside its encrypted EDN, under
-the reserved top-level key `:com.kirahowe.secrets/manifest-key`, as 64 lowercase
-hex characters drawn from `SecureRandom`. Each manifest entry carries a
-`:vhash`: the first 64 bits of HMAC-SHA-256 over the value's unambiguous
-encoding, keyed by that key. Nothing is derived from an age identity. A solo
+Every store holds the library's metadata inside its encrypted EDN, under the one
+reserved top-level key `:com.kirahowe.secrets/store`. The metadata is a map,
+`{:version 1 :manifest-key "<64 hex>" :recipients "<record>"}`. `:version` is
+the version of the store format, separate from the manifest's. `:manifest-key`
+is a random 256-bit key, written as 64 lowercase hex characters drawn from
+`SecureRandom`. `:recipients` records the recipient set the store was last
+encrypted to. Each manifest entry carries a `:vhash`: the first 64 bits of
+HMAC-SHA-256 over the value's unambiguous encoding, keyed by the manifest key. Nothing is derived from an age identity. A solo
 store and a team store produce the same kind of manifest, and every recipient
 of a store computes the same hashes.
 
@@ -308,9 +311,9 @@ hashes, and a reader of the manifest can see that.
 
 Lifecycle. Creating a store generates its key: `new`, or `set` when no store
 exists yet. `edit`, `set`, and `rm` keep the key. `reencrypt` always generates
-a new one, so every `:vhash` changes once. A second reserved key,
-`:com.kirahowe.secrets/manifest-recipients`, records a digest of the recipient
-set the store was last encrypted to. `edit`, `set`, and `rm` encrypt to the
+a new one, so every `:vhash` changes once. The metadata's `:recipients` is a
+digest of the recipient set the store was last encrypted to. `edit`, `set`,
+and `rm` encrypt to the
 recipients file as it reads when they run, so when that set differs from the
 recorded one they generate a new key as `reencrypt` does. Removing a recipient
 therefore renews the key on the next write of any kind, and a removed
@@ -318,12 +321,16 @@ recipient's retained key says nothing about values published after it (A5).
 It still tests guesses against every manifest published before, as B2 says of
 old ciphertext. One function in `cli.clj` holds this rule.
 
-Validity. A store's plaintext is one EDN map, because the key lives in it. A
-store whose manifest key is missing or is not 64 lowercase hex characters is
-an error on every command that writes the store, and drift on a `verify` that
-has an identity. The message says what is wrong and that `reencrypt` generates
-a new key, and `reencrypt` repairs exactly that case. There is no manifest
-without value hashes. A manifest is valid only if it is a map with `:version
+Validity. A store's plaintext is one EDN map, because the metadata lives in
+it. Version 1 metadata is a map with exactly the three fields above: `:version
+1`, a manifest key of 64 lowercase hex characters, and a `:recipients` string.
+A store whose metadata is missing, malformed, or of another `:version` is an
+error on every command that writes the store, and drift on a `verify` that has
+an identity. The message says which of those it is and that `reencrypt` writes
+a current store, and `reencrypt` repairs each of them without reading the old
+metadata. An existing store that is not a map gets a message that says so and
+names `new`, the command that replaces it. There is no manifest without value
+hashes. A manifest is valid only if it is a map with `:version
 3`, the project's `:app`, a `:ciphertext-sha`, and a `:keys` map in which every
 entry has a `:type` and a `:vhash`. Anything else is a manifest problem: drift,
 exit 1, with or without an identity. Keyless verification checks that
@@ -331,13 +338,13 @@ structure and the ciphertext digest. Verification with an identity also
 compares the decrypted store's entries. Every other `:version` is unsupported
 and the report says to run `reencrypt`.
 
-Ownership. The two reserved keys are library metadata and never user data.
+Ownership. The reserved key is library metadata and never user data.
 `load-secrets`, the reader literals, and `get-secret` on a loaded store never
-return them. `edit` shows the plaintext without them and puts them back on
-save, and refuses a plaintext in which the user typed one. `set` and `rm`
-refuse a path at or under one. `new` drops any reserved key its template
-holds and generates a fresh key, so two stores created from one template never
-share a key. The manifest lists no entry for either.
+return it. `edit` shows the plaintext without it and puts it back on save, and
+refuses a plaintext in which the user typed it. `set` and `rm` refuse a path
+at or under it. `new` drops the metadata line its template holds and generates
+a fresh key, so two stores created from one template never share a key. The
+manifest lists no entry for it.
 
 Tradeoffs accepted:
 
@@ -347,11 +354,12 @@ Tradeoffs accepted:
   against every manifest published while that key was in use.
 - A recipient change makes every `:vhash` change in one commit, so that commit's
   manifest diff shows which paths exist and not which values changed.
-- The library writes its metadata as the first lines of the store's map, which
-  must be the first form in the plaintext after whitespace and comments. A
-  store written by another tool with a reserved key somewhere else is still
-  read, and its comments are dropped the next time `edit` or `reencrypt`
-  rewrites it.
+- The library writes its metadata as the first line of the store's map, which
+  must be the first form in the plaintext after whitespace and comments, and
+  takes only that line back out. The reserved key anywhere else was put there
+  by hand. Such a store still loads and verifies, but `edit`, `reencrypt`, and
+  `new` from such a template refuse the key as they refuse one typed in the
+  editor.
 - Solo mode records the fixed word `identity` as its recipient set, because the
   identity that decrypts a solo store is the one it is encrypted to. Moving a
   store between solo and team mode renews the key.

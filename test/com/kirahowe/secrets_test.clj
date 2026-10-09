@@ -1731,12 +1731,12 @@
         (is (= :invalid-manifest-key
                (:reason (ex-data (try (manifest/entries m not-a-key)
                                       (catch clojure.lang.ExceptionInfo e e))))))))
-    (testing "the store's reserved keys get no entry"
+    (testing "the store's reserved key gets no entry"
       (let [k (manifest/generate-key)]
         (is (= (manifest/entries m k)
                (manifest/entries (assoc m
-                                        manifest/store-key k
-                                        manifest/store-recipients "identity")
+                                        :com.kirahowe.secrets/store
+                                        {:version 1 :manifest-key k :recipients "identity"})
                                  k)))))
     (is (not (contains? (e [:database/url]) :count)) "scalars have no :count")))
 
@@ -1850,11 +1850,8 @@
 
 (deftest manifest-key-generation-test
   (let [ks (repeatedly 50 manifest/generate-key)]
-    (is (every? manifest/valid-key? ks))
-    (is (= 50 (count (set ks))) "each call draws a new key")
-    (is (not-any? manifest/valid-key?
-                  [nil "" 42 :k (subs (first ks) 1) (str (first ks) "0")
-                   (str/upper-case (first ks)) (str/replace (first ks) #"." "g")]))))
+    (is (every? #(re-matches #"[0-9a-f]{64}" %) ks))
+    (is (= 50 (count (set ks))) "each call draws a new key")))
 
 (deftest manifest-recipients-id-test
   (is (= "identity" (manifest/recipients-id nil)) "single-key mode records a fixed word")
@@ -1879,24 +1876,24 @@
             b (manifest/entries {:token "new"} k)]
         (is (= [[:token]] (:changed (manifest/diff a b))))))))
 
-(deftest load-secrets-drops-reserved-keys-test
+(deftest load-secrets-drops-the-reserved-key-test
   ;; A store carries the library's metadata at its top level. Whatever a store
-  ;; holds under those keys, loading returns only the user's data.
-  (let [user {:database/url "jdbc:x" :nested {:com.kirahowe.secrets/manifest-key "user data"}}]
-    (doseq [metadata [{manifest/store-key (manifest/generate-key)
-                       manifest/store-recipients "identity"}
-                      {manifest/store-key nil}
-                      {manifest/store-recipients 42}]]
-      (let [enc (encrypt-edn! (merge user metadata))
+  ;; holds under that key, loading returns only the user's data.
+  (let [reserved :com.kirahowe.secrets/store
+        user {:database/url "jdbc:x" :nested {reserved "user data"}}]
+    (doseq [metadata [{:version 1 :manifest-key (manifest/generate-key) :recipients "identity"}
+                      {:version 2}
+                      nil
+                      42]]
+      (let [enc (encrypt-edn! (assoc user reserved metadata))
             loaded (secrets/load-secrets enc *key*)
             readers (secrets/reader-literals {:file enc :identity-file *key*})]
-        (is (= user loaded) "a reserved key nested deeper is the user's own and is kept")
-        (doseq [reserved manifest/reserved-keys]
-          (is (not (contains? loaded reserved)))
-          (is (= ::absent (secrets/get-secret loaded reserved ::absent)))
-          (is (nil? ((readers 'secret/opt) reserved)))
-          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is missing from the secrets file"
-                                ((readers 'secret/req) reserved))))))
+        (is (= user loaded) "the reserved key nested deeper is the user's own and is kept")
+        (is (= ::absent (secrets/get-secret loaded reserved ::absent)))
+        (is (= ::absent (secrets/get-secret loaded [reserved :manifest-key] ::absent)))
+        (is (nil? ((readers 'secret/opt) reserved)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is missing from the secrets file"
+                              ((readers 'secret/req) reserved)))))
     (testing "a store that is not a map loads as it is"
       (is (= [1 2] (secrets/load-secrets (encrypt-edn! [1 2]) *key*))))))
 

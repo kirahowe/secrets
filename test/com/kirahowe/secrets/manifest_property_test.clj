@@ -25,7 +25,6 @@
   sha256-hex)
 
 (deftest generated-manifest-keys-have-the-shape-the-properties-assume
-  (is (every? manifest/valid-key? (gen/sample manifest-key 20)))
   (is (every? #(re-matches #"[0-9a-f]{64}" %) (repeatedly 20 manifest/generate-key))))
 
 ;;;; Encoding
@@ -107,12 +106,12 @@
            (every? (fn [[path leaf]] (describes? leaf (get e path))) expected)
            (= (keys e) (keys (manifest/entries (rebuilt v) k)))))))
 
-(defspec reserved-keys-get-no-entry 100
+(defspec the-reserved-key-gets-no-entry 100
   (prop/for-all [m g/secrets-map
                  k manifest-key
-                 recorded (gen/one-of [(gen/return nil) g/text sha256-hex])]
+                 metadata (gen/one-of [(gen/return nil) g/text g/secrets-map])]
     (= (manifest/entries m k)
-       (manifest/entries (assoc m manifest/store-key k manifest/store-recipients recorded) k))))
+       (manifest/entries (assoc m manifest/store-key metadata) k))))
 
 ;;;; Render
 

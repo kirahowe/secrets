@@ -64,25 +64,41 @@
                                 :key-file *key*}
                                env-overrides)}}))
 
-(defn- encrypt-raw-edn!
-  "Encrypt exactly `m` to the config's secrets file out-of-band (no manifest
-  written), so the store holds only the metadata `m` itself carries."
-  [m]
+(defn- encrypt-text!
+  "Encrypt exactly `text` to the config's secrets file out-of-band (no
+  manifest written)."
+  [text]
   (let [plain (str *dir* "/plain.edn")
         enc (str *dir* "/secrets.edn.age")]
-    (spit plain (pr-str m))
+    (spit plain text)
     (age/encrypt-file! *key* plain enc)
     (.delete (io/file plain))
     enc))
 
-(defn- encrypt-edn!
-  "Encrypt `m` to the config's secrets file out-of-band (no manifest written),
-  as a teammate bypassing the CLI would: the store carries a well-formed
-  manifest key and the single-key recipients record, written by hand."
+(defn- encrypt-raw-edn!
+  "Encrypt exactly `m` out-of-band, so the store holds only the metadata `m`
+  itself carries."
   [m]
-  (encrypt-raw-edn! (assoc m
-                           manifest/store-key (manifest/generate-key)
-                           manifest/store-recipients (manifest/recipients-id nil))))
+  (encrypt-text! (pr-str m)))
+
+(defn- metadata-line
+  "The first line of a store's map as the library writes it, typed out here so
+  the tests state the format instead of asking the source for it."
+  [metadata]
+  (str ":com.kirahowe.secrets/store " metadata "\n "))
+
+(defn- current-metadata
+  "Well-formed metadata text for a single-key store."
+  []
+  (str "{:version 1 :manifest-key " (pr-str (manifest/generate-key))
+       " :recipients \"identity\"}"))
+
+(defn- encrypt-edn!
+  "Encrypt `m` out-of-band (no manifest written), as a teammate bypassing the
+  CLI would: the store carries well-formed metadata on the library's line."
+  [m]
+  (encrypt-text! (str "{" (metadata-line (current-metadata))
+                      (subs (binding [*print-namespace-maps* false] (pr-str m)) 1))))
 
 (defn- new-store!
   "Create the store through `cli/new!`, with an editor that writes `text`."
@@ -114,7 +130,13 @@
   "The manifest key the store at `path` holds, read as a recipient who
   decrypts it with `identity` reads it."
   [path identity]
-  (get (edn/read-string (store-text path identity)) manifest/store-key))
+  (get-in (edn/read-string (store-text path identity))
+          [:com.kirahowe.secrets/store :manifest-key]))
+
+(defn- manifest-key?
+  "True when `x` has the shape of a manifest key: 64 lowercase hex characters."
+  [x]
+  (boolean (and (string? x) (re-matches #"[0-9a-f]{64}" x))))
 
 (defn- verify
   "Run verify! with its chatter (stdout and stderr — drift goes to *err*)
@@ -1123,16 +1145,21 @@
             (spit (:recipients-file env-config) (str recipient "\n")))
           (.delete (io/file ciphertext))
           (new-store! config "dev" "{:db/url \"postgres://prod.internal/app\"}")
-          (let [committed (manifest-of manifest-path)]
+          (let [committed (manifest-of manifest-path)
+                recorded (get-in (edn/read-string (store-text ciphertext *key*))
+                                 [:com.kirahowe.secrets/store :recipients])]
             (is (= 0 (:exit (verify config "dev"))))
-            (testing "a same-shape payload with no manifest key"
+            (testing "a same-shape payload with no store metadata"
               (forge! committed {:db/url "postgres://attacker.example/app"})
               (let [{:keys [result err]} (capture-verify config "dev")]
                 (is (= {:results {:dev :drift} :exit 1} result))
-                (is (str/includes? err "has no manifest key"))))
+                (is (str/includes? err "has no store metadata"))))
             (testing "a same-shape payload with a key the forger made up"
               (forge! committed {:db/url "postgres://attacker.example/app"
-                                 manifest/store-key (manifest/generate-key)})
+                                 :com.kirahowe.secrets/store
+                                 {:version 1
+                                  :manifest-key (manifest/generate-key)
+                                  :recipients recorded}})
               (let [{:keys [result out err]} (capture-verify config "dev")]
                 (is (= {:results {:dev :drift} :exit 1} result))
                 (is (str/includes? (str out err) "value or type changed"))))))))))
@@ -2300,9 +2327,9 @@
           exact-plaintext (str "{:a 1}" (apply str (repeat 26 " ")))
           manifest-key (manifest/generate-key)
           ;; The bound is on what is encrypted: the user's text plus the
-          ;; store's metadata lines.
+          ;; store's metadata line.
           limit (+ (count exact-plaintext)
-                   (count ((cli-private 'metadata-lines)
+                   (count ((cli-private 'metadata-line)
                            manifest-key (manifest/recipients-id nil))))
           bounded (fn [n f] (with-bound #'age/max-plaintext-bytes n f))
           config (cli/normalize-config (test-config {:manifest false}))
@@ -2905,11 +2932,12 @@
             (is (every? #(re-matches #"[0-9a-f]{16}" (:vhash %)) (vals (:keys m))) n)
             (is (= 0 (:exit (verify config n)))))))
       (testing "stores created from one template never share a key"
-        (is (every? manifest/valid-key? (map key-for ["solo" "team" "copy"])))
+        (is (every? manifest-key? (map key-for ["solo" "team" "copy"])))
         (is (= 3 (count (set (map key-for ["solo" "team" "copy"]))))
             "none of them is the template's key either")
         (is (not (contains? (set (map key-for ["solo" "team" "copy"]))
-                            (get (edn/read-string (slurp template)) manifest/store-key)))))
+                            (get-in (edn/read-string (slurp template))
+                                    [:com.kirahowe.secrets/store :manifest-key])))))
       (testing "so equal values hash differently in each"
         (let [hashes (fn [n] (update-vals (:keys (manifest-for n)) :vhash))]
           (doseq [path [[:db :url] [:db :port] [:admins] [:empty]]]
@@ -2920,19 +2948,20 @@
                (secrets/load-secrets (str *dir* "/solo.edn.age") *key*)
                (secrets/load-secrets (str *dir* "/team.edn.age") *key*)))))))
 
-(deftest a-template-with-a-reserved-key-anywhere-is-accepted-and-not-copied-test
+(deftest a-template-with-the-reserved-key-off-the-librarys-line-is-refused-test
+  ;; Only the line the library writes is taken out of a template. The reserved
+  ;; key typed anywhere else is refused, as it is when typed in the editor.
   (let [template (str *dir* "/hand.example")
-        config (cli/normalize-config (test-config {:template template}))
-        template-key (manifest/generate-key)
-        presented (atom nil)]
-    (spit template (str "{:a 1 " manifest/store-key " \"" template-key "\"}"))
-    (with-out-str
-      (with-redefs-fn {(cli-private 'run-editor!) #(reset! presented (slurp %))}
-        #(cli/new! config "dev")))
-    (is (not (str/includes? @presented "manifest-key")) "the editor never shows the key")
-    (is (= {:a 1} (edn/read-string @presented)))
-    (is (not= template-key (store-manifest-key (str *dir* "/secrets.edn.age") *key*)))
-    (is (= 0 (:exit (verify config "dev"))))))
+        config (cli/normalize-config (test-config {:template template}))]
+    (spit template (str "{:a 1 :com.kirahowe.secrets/store " (current-metadata) "}"))
+    (let [e (try (with-out-str
+                   (with-redefs-fn {(cli-private 'run-editor!) (fn [_])}
+                     #(cli/new! config "dev")))
+                 nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :reserved-key (:reason (ex-data e))))
+      (is (str/includes? (ex-message e) "which the library reserves"))
+      (is (not (.exists (io/file (str *dir* "/secrets.edn.age"))))))))
 
 (deftest recipients-of-a-team-store-agree-on-unchanged-values-test
   (if (age-env-set?)
@@ -3037,15 +3066,16 @@
           ciphertext (str *dir* "/secrets.edn.age")
           user-data {:database/url "jdbc:x" :nested {:token "t"}}]
       (new-store! config "dev" (pr-str user-data))
-      (is (manifest/valid-key? (store-manifest-key ciphertext *key*))
+      (is (manifest-key? (store-manifest-key ciphertext *key*))
           "the store on disk does hold the key")
       (let [loaded (secrets/load-secrets ciphertext *key*)
             readers (secrets/reader-literals {:file ciphertext :identity-file *key*})
             req (readers 'secret/req)
             opt (readers 'secret/opt)]
         (is (= user-data loaded))
-        (doseq [reserved manifest/reserved-keys
-                path [reserved [reserved]]]
+        (doseq [path [:com.kirahowe.secrets/store
+                      [:com.kirahowe.secrets/store]
+                      [:com.kirahowe.secrets/store :manifest-key]]]
           (testing (pr-str path)
             (is (nil? (secrets/get-secret loaded path)))
             (is (= ::absent (secrets/get-secret loaded path ::absent)))
@@ -3070,7 +3100,7 @@
             untouched? #(and (= bytes-before (file-bytes ciphertext))
                              (= manifest-before (slurp manifest-path)))]
         (testing "set and rm refuse a path at or under a reserved key"
-          (doseq [reserved manifest/reserved-keys
+          (doseq [reserved [:com.kirahowe.secrets/store]
                   path [(pr-str reserved) (pr-str [reserved]) (pr-str [reserved :x])]
                   [label command] [["set" #(with-in-str "chosen-by-the-user"
                                              (cli/set-secret! config "dev" path false))]
@@ -3090,9 +3120,9 @@
             (is (= ";; the team's notes\n{:a 1 ; inline note\n :b {:c 2}}\n" @presented))
             (is (untouched?) "and an edit that changes nothing writes nothing")))
         (testing "a plaintext that comes back holding a reserved key is refused"
-          (doseq [reserved manifest/reserved-keys
-                  typed [(str "{:a 1 " reserved " \"" (manifest/generate-key) "\"}")
-                         (str "{:a 1 " reserved " nil}")]]
+          (doseq [typed [(str "{:a 1 :com.kirahowe.secrets/store " (current-metadata) "}")
+                         "{:a 1 :com.kirahowe.secrets/store nil}"
+                         (str "{" (metadata-line (current-metadata)) ":a 1}")]]
             (let [e (failure #(with-redefs-fn {(cli-private 'run-editor!)
                                                (fn [path] (spit path typed))}
                                 (fn [] (cli/edit! config "dev"))))]
@@ -3103,11 +3133,14 @@
           (edit-store! config "dev" #(str/replace % ":a 1" ":a 10"))
           (is (= manifest-key (store-manifest-key ciphertext *key*)))
           (is (= {:a 10 :b {:c 2}} (secrets/load-secrets ciphertext *key*)))
-          (is (= ";; the team's notes\n{:a 10 ; inline note\n :b {:c 2}}\n"
-                 ((cli-private 'user-plaintext) (store-text ciphertext *key*))))
+          (let [presented (atom nil)]
+            (with-out-str
+              (with-redefs-fn {(cli-private 'run-editor!) #(reset! presented (slurp %))}
+                #(cli/edit! config "dev")))
+            (is (= ";; the team's notes\n{:a 10 ; inline note\n :b {:c 2}}\n" @presented)))
           (is (= 0 (:exit (verify config "dev")))))))))
 
-(deftest a-store-without-a-well-formed-manifest-key-fails-until-reencrypt-test
+(deftest a-store-without-usable-metadata-fails-until-reencrypt-test
   ;; Setting the key to nil once produced a manifest with no value hashes that
   ;; still verified. Every such store is an error now, on writes and on verify.
   (if (age-env-set?)
@@ -3116,20 +3149,44 @@
           ciphertext (str *dir* "/secrets.edn.age")
           manifest-path (str *dir* "/secrets.edn.manifest")
           failure (fn [f] (try (with-out-str (f)) nil (catch clojure.lang.ExceptionInfo e e)))
-          short-key "0123456789abcdef"]
-      (doseq [[label store problem]
-              [["missing" {:a 1} :missing]
-               ["nil" {:a 1 manifest/store-key nil} :missing]
-               ["short" {:a 1 manifest/store-key short-key} :malformed]
-               ["upper case" {:a 1 manifest/store-key (str/upper-case (manifest/generate-key))}
+          good-key (manifest/generate-key)
+          short-key "0123456789abcdef"
+          metadata (fn [overrides]
+                     (pr-str (merge {:version 1 :manifest-key good-key :recipients "identity"}
+                                    overrides)))
+          store (fn [metadata-text] (str "{" (metadata-line metadata-text) ":a 1}"))
+          messages {:missing "has no store metadata"
+                    :malformed "holds malformed store metadata"
+                    :unsupported-version "is in store format version 2, which"}]
+      (doseq [[label text problem]
+              [["missing" "{:a 1}" :missing]
+               ["nil" (store "nil") :missing]
+               ["not a map" (store (pr-str good-key)) :malformed]
+               ["the two keys this key replaced"
+                (str "{:com.kirahowe.secrets/manifest-key " (pr-str good-key)
+                     " :com.kirahowe.secrets/manifest-recipients \"identity\" :a 1}")
+                :missing]
+               ["no version" (store (pr-str {:manifest-key good-key :recipients "identity"}))
                 :malformed]
-               ["not a string" {:a 1 manifest/store-key 42} :malformed]
-               ["a keyword" {:a 1 manifest/store-key :none} :malformed]]]
+               ["a version that is not a number" (store (metadata {:version "1"})) :malformed]
+               ["a later version" (store (metadata {:version 2})) :unsupported-version]
+               ["a later version with other fields" (store "{:version 2 :hmac \"x\"}")
+                :unsupported-version]
+               ["a short key" (store (metadata {:manifest-key short-key})) :malformed]
+               ["an upper-case key" (store (metadata {:manifest-key (str/upper-case good-key)}))
+                :malformed]
+               ["a key that is not a string" (store (metadata {:manifest-key 42})) :malformed]
+               ["no recipients record" (store (pr-str {:version 1 :manifest-key good-key}))
+                :malformed]
+               ["a recipients record that is not a string" (store (metadata {:recipients 42}))
+                :malformed]
+               ["a field this version does not define" (store (metadata {:extra true}))
+                :malformed]]]
         (testing label
           ;; A complete manifest first, so verify gets as far as the store.
           (encrypt-edn! {:a 1})
           (with-out-str (cli/reencrypt! config "dev"))
-          (encrypt-raw-edn! store)
+          (encrypt-text! text)
           (let [bytes-before (file-bytes ciphertext)
                 manifest-before (slurp manifest-path)]
             (doseq [[command run]
@@ -3140,14 +3197,10 @@
                                 (fn [] (cli/edit! config "dev")))]]]
               (testing command
                 (let [e (failure run)]
-                  (is (= {:reason :invalid-manifest-key :problem problem}
+                  (is (= {:reason :invalid-store :problem problem}
                          (select-keys (ex-data e) [:reason :problem])))
-                  (is (str/includes? (ex-message e)
-                                     (if (= :missing problem)
-                                       "has no manifest key"
-                                       "holds a malformed manifest key")))
-                  (is (str/includes? (ex-message e)
-                                     "Generate a new one with:  bb secrets reencrypt 'dev'"))
+                  (is (str/includes? (ex-message e) (messages problem)))
+                  (is (str/includes? (ex-message e) "bb secrets reencrypt 'dev'"))
                   (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) short-key))
                       "the failure never carries the value found")
                   (is (= bytes-before (file-bytes ciphertext)))
@@ -3155,16 +3208,59 @@
             (testing "verify"
               (let [{:keys [result err]} (capture-verify config "dev")]
                 (is (= {:results {:dev :drift} :exit 1} result))
-                (is (str/includes? err "manifest key"))
+                (is (str/includes? err (messages problem)))
                 (is (str/includes? err "bb secrets reencrypt 'dev'"))))
-            (testing "reencrypt repairs it"
-              (with-out-str (cli/reencrypt! config "dev"))
-              (is (manifest/valid-key? (store-manifest-key ciphertext *key*)))
-              (is (= {:a 1} (secrets/load-secrets ciphertext *key*)))
-              (is (every? :vhash (vals (:keys (manifest-of manifest-path)))))
-              (is (= 0 (:exit (verify config "dev"))))
-              (set-value! config ":b" "v")
-              (is (= {:a 1 :b "v"} (secrets/load-secrets ciphertext *key*))))))))))
+            (testing "loading returns the user's data and never the metadata"
+              (is (not (contains? (secrets/load-secrets ciphertext *key*)
+                                  :com.kirahowe.secrets/store))))
+            ;; reencrypt takes out the line the library writes, a flat map, and
+            ;; any other shape was put there by hand.
+            (when (or (= "missing" label) (str/includes? text "/store {"))
+              (testing "reencrypt writes a current store"
+                (with-out-str (cli/reencrypt! config "dev"))
+                (is (= {:version 1 :recipients "identity"}
+                       (dissoc (:com.kirahowe.secrets/store
+                                (edn/read-string (store-text ciphertext *key*)))
+                               :manifest-key)))
+                (is (manifest-key? (store-manifest-key ciphertext *key*)))
+                (is (not= good-key (store-manifest-key ciphertext *key*)))
+                (is (= {:a 1} (secrets/load-secrets ciphertext *key*)))
+                (is (every? :vhash (vals (:keys (manifest-of manifest-path)))))
+                (is (= 0 (:exit (verify config "dev"))))
+                (set-value! config ":b" "v")
+                (is (= {:a 1 :b "v"} (secrets/load-secrets ciphertext *key*)))))))))))
+
+(deftest an-existing-store-that-is-not-a-map-says-so-test
+  ;; The message once said the manifest key was missing and to run reencrypt,
+  ;; which then refused the store for not being a map.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          failure (fn [f] (try (with-out-str (f)) nil (catch clojure.lang.ExceptionInfo e e)))]
+      (encrypt-edn! {:a 1})
+      (with-out-str (cli/reencrypt! config "dev"))
+      (encrypt-text! "[\"planted-value\" 2]")
+      (doseq [[command run]
+              [["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b" false))]
+               ["rm" #(cli/remove-secret! config "dev" ":a")]
+               ["edit" #(with-redefs-fn {(cli-private 'run-editor!) (fn [_])}
+                          (fn [] (cli/edit! config "dev")))]]]
+        (testing command
+          (let [e (failure run)]
+            (is (= {:reason :invalid-store :problem :not-a-map}
+                   (select-keys (ex-data e) [:reason :problem])))
+            (is (str/includes? (ex-message e)
+                               "holds a value of type vector where one EDN map is required"))
+            (is (str/includes? (ex-message e) "Replace it with:  bb secrets new 'dev'"))
+            (is (not (str/includes? (ex-message e) "reencrypt")))
+            (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e)))
+                                    "planted-value"))))))
+      (testing "verify"
+        (let [{:keys [result err]} (capture-verify config "dev")]
+          (is (= {:results {:dev :drift} :exit 1} result))
+          (is (str/includes? err "where one EDN map is required"))
+          (is (not (str/includes? err "reencrypt")))
+          (is (not (str/includes? err "planted-value"))))))))
 
 (deftest a-store-that-is-not-a-map-is-refused-test
   (let [config (cli/normalize-config (test-config))]
@@ -3205,7 +3301,7 @@
                  (with-out-str (with-redefs [age/encrypt-file! failing-encrypt] (run)))))
             (let [[{:keys [path text]}] @plaintexts]
               (is (= 1 (count @plaintexts)))
-              (is (str/includes? text (str manifest/store-key))
+              (is (str/includes? text ":com.kirahowe.secrets/store {:version 1 ")
                   "the failure came after the keyed plaintext was on disk")
               (is (re-matches #"secrets-.*\.edn" (.getName (io/file path)))
                   "in the command's own private temp file, not a second one")

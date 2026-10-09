@@ -683,27 +683,38 @@
 
 ;;;; Manifest
 
-(defn- require-manifest-key!
-  "Return the manifest key held by decrypted store value `store`, or fail
-  saying whether it is missing or malformed and that `reencrypt` generates a
-  new one. The failure never carries the value found."
+(defn- require-store-metadata!
+  "Return the metadata map held by decrypted store value `store`, or fail
+  saying what is wrong with it and which command writes a usable store. The
+  failure never carries the value found."
   [{:keys [secrets-file] environment-name :name} store]
-  (let [found (when (map? store) (get store manifest/store-key ::missing))]
-    (if (manifest/valid-key? found)
-      found
-      (let [problem (if (or (nil? found) (= ::missing found)) :missing :malformed)]
-        (fail! (str "The store " secrets-file
-                    (if (= :missing problem)
-                      " has no manifest key"
-                      " holds a malformed manifest key")
-                    " (" (pr-str manifest/store-key) "), so its manifest cannot be"
-                    " written or checked.\n"
-                    "    Generate a new one with:  bb secrets reencrypt "
-                    (shell-quote (name environment-name)))
-               {:reason :invalid-manifest-key
-                :problem problem
-                :secrets-file (str secrets-file)
-                :environment environment-name})))))
+  (if-let [problem (manifest/store-problem store)]
+    (let [label (shell-quote (name environment-name))
+          reserved (pr-str manifest/store-key)
+          reencrypt (str "\n    Write a current one with:  bb secrets reencrypt " label)]
+      (fail! (str "The store " secrets-file
+                  (case problem
+                    :not-a-map
+                    (str " holds a value of type " (name (manifest/value-type store))
+                         " where one EDN map is required, so no command can read or"
+                         " change it.\n    Replace it with:  bb secrets new " label)
+                    :missing
+                    (str " has no store metadata (" reserved "), so its manifest cannot"
+                         " be written or checked." reencrypt)
+                    :malformed
+                    (str " holds malformed store metadata (" reserved "), so its"
+                         " manifest cannot be written or checked." reencrypt)
+                    :unsupported-version
+                    (str " is in store format version "
+                         (:version (get store manifest/store-key))
+                         ", which this version of the library does not support.\n"
+                         "    Upgrade the library, or write a current one with:"
+                         "  bb secrets reencrypt " label)))
+             {:reason :invalid-store
+              :problem problem
+              :secrets-file (str secrets-file)
+              :environment environment-name}))
+    (get store manifest/store-key)))
 
 (defn- manifest-key-for
   "Return the manifest key a write of this store carries. This is the one rule
@@ -712,20 +723,19 @@
 
   - `:create` (`new`, and `set` when no store exists) generates a key.
   - `:reencrypt` always generates a key, so every `:vhash` changes once. It
-    does not read the existing key, which is how it repairs a store whose key
-    is missing or malformed.
+    does not read the existing metadata, which is how it repairs a store whose
+    metadata is missing, malformed, or of another version.
   - `:update` (`edit`, `set`, `rm`) keeps the key of `store`, the decrypted
-    value, and fails when that key is missing or malformed. These commands
-    encrypt to the recipients as they read now, so when `target` is not the
-    recipient set the store records, they generate a key instead. A removed
-    recipient's retained key then says nothing about values published by this
-    write or any later one."
+    value, and fails when its metadata is not usable. These commands encrypt
+    to the recipients as they read now, so when `target` is not the recipient
+    set the store records, they generate a key instead. A removed recipient's
+    retained key then says nothing about values published by this write or
+    any later one."
   [operation env store target]
   (if (= :update operation)
-    (let [existing (require-manifest-key! env store)]
-      (if (= (manifest/recipients-id (:recipients target))
-             (get store manifest/store-recipients))
-        existing
+    (let [{:keys [manifest-key recipients]} (require-store-metadata! env store)]
+      (if (= (manifest/recipients-id (:recipients target)) recipients)
+        manifest-key
         (do (info "Recipients changed since the last write:"
                   "generating a new manifest key, so every value hash changes once.")
             (manifest/generate-key))))
@@ -782,8 +792,8 @@
   `get-in` / `update-in` expect: a bare keyword becomes a one-element path,
   a vector of keywords/strings is a nested path. Rejects anything else,
   including a missing argument, with a `fail!` naming both accepted forms, so
-  a typo'd path is caught before any file is touched. A path at or under one
-  of the store's reserved metadata keys is rejected too. The failure names the
+  a typo'd path is caught before any file is touched. A path at or under the
+  store's reserved metadata key is rejected too. The failure names the
   rejected value's type and never the value: `set` receives the key where a
   mistyped command line may have put the secret."
   [s]
@@ -804,7 +814,7 @@
                   "([:a :b]).")
              (when-not ok? (safe-edn/failure-data parsed))))
     (let [path (if (keyword? value) [value] value)]
-      (when (manifest/reserved-keys (first path))
+      (when (= manifest/store-key (first path))
         (fail! (str "The key " (pr-str (first path)) " is reserved for the library's own"
                     " metadata. `set` and `rm` do not read, change, or remove it.")
                {:reason :reserved-key :key path}))
@@ -844,8 +854,8 @@
       (finally (.delete staging)))))
 
 ;;; A store's plaintext is the user's text with the library's metadata written
-;;; as the first lines of its map. `with-metadata` puts those lines in and
-;;; `user-plaintext` takes them out, so the user's text, comments included,
+;;; as the first line of its map. `with-metadata` puts that line in and
+;;; `user-plaintext` takes it out, so the user's text, comments included,
 ;;; round-trips byte for byte and never shows the metadata.
 
 (defn- map-opening
@@ -866,41 +876,36 @@
                             count
                             (+ i)))))))
 
-(defn- metadata-lines
-  "The two map entries that carry `manifest-key` and `recipients-id`, as text."
+(defn- metadata-line
+  "The map entry that carries the store's metadata, as one line of text."
   [manifest-key recipients-id]
-  (str (pr-str manifest/store-key) " " (pr-str manifest-key) "\n "
-       (pr-str manifest/store-recipients) " " (pr-str recipients-id) "\n "))
+  (str (pr-str manifest/store-key)
+       " {:version " manifest/store-version
+       " :manifest-key " (pr-str manifest-key)
+       " :recipients " (pr-str recipients-id) "}\n "))
 
-(def ^:private metadata-lines-re
-  "Matches `metadata-lines` output at the start of a string."
+(def ^:private metadata-line-re
+  "Matches the library's metadata line at the start of a string, whatever flat
+  map it holds, so the line of another store version is taken out too."
   (re-pattern (str "\\A" (java.util.regex.Pattern/quote (pr-str manifest/store-key))
-                   " \"[0-9a-f]{64}\"\n "
-                   (java.util.regex.Pattern/quote (pr-str manifest/store-recipients))
-                   " \"[0-9a-z]+\"\n ")))
+                   " \\{[^{}\\n]*\\}\\n ")))
 
 (defn- with-metadata
-  "Return `user-text`, the text of a map, with `lines` (from `metadata-lines`)
-  written as its first entries. Nil when the text does not open with its map."
-  [user-text lines]
+  "Return `user-text`, the text of a map, with `line` (from `metadata-line`)
+  written as its first entry. Nil when the text does not open with its map."
+  [user-text line]
   (when-let [opening (map-opening user-text)]
-    (str (subs user-text 0 opening) lines (subs user-text opening))))
+    (str (subs user-text 0 opening) line (subs user-text opening))))
 
 (defn- user-plaintext
-  "Return store or template text without the library's metadata. Text that
-  carries the lines `with-metadata` wrote comes back exactly as the user wrote
-  it. A map holding a reserved key anywhere else, as a store written by
-  another tool can, is rendered again without it, which drops its comments.
-  Any other text comes back unchanged."
+  "Return store or template text without the library's metadata line, exactly
+  as the user wrote it. Text without that line comes back unchanged."
   [text]
   (let [opening (map-opening text)
-        lines (when opening (re-find metadata-lines-re (subs text opening)))]
-    (if lines
-      (str (subs text 0 opening) (subs text (+ opening (count lines))))
-      (let [{:keys [ok? value]} (safe-edn/parse text)]
-        (if (and ok? (map? value) (some manifest/reserved-keys (keys value)))
-          (render-secrets (manifest/user-data value))
-          text)))))
+        line (when opening (re-find metadata-line-re (subs text opening)))]
+    (if line
+      (str (subs text 0 opening) (subs text (+ opening (count line))))
+      text)))
 
 (defn- read-edited!
   "The text an editor left in private temp file `tmp`, bounded by
@@ -918,11 +923,11 @@
   the text to encrypt, which is `user-text` with the store's metadata written
   in. Fails, before anything is encrypted, on a plaintext past
   `age/max-plaintext-bytes`, which is checked before it is parsed, and on text
-  that is not one EDN map or that holds a reserved key."
+  that is not one EDN map or that holds the reserved key."
   [secrets-file target user-text manifest-key]
   (let [unchanged "\n    Ciphertext and manifest were left unchanged."
-        lines (metadata-lines manifest-key (manifest/recipients-id (:recipients target)))
-        size (+ (utf8-length user-text) (utf8-length lines))
+        line (metadata-line manifest-key (manifest/recipients-id (:recipients target)))
+        size (+ (utf8-length user-text) (utf8-length line))
         _ (when (> size age/max-plaintext-bytes)
             (input-too-large! (str "The plaintext for " secrets-file)
                               age/max-plaintext-bytes size
@@ -932,13 +937,13 @@
             (fail! (str "Secrets must be one EDN map, but the plaintext is a value of type "
                         (name (manifest/value-type value)) "." unchanged)
                    {:secrets-file (str secrets-file) :reason :secrets-not-a-map}))
-        _ (when-let [reserved (seq (filter manifest/reserved-keys (keys value)))]
-            (fail! (str "The plaintext holds " (str/join " and " (map pr-str reserved))
+        _ (when (contains? value manifest/store-key)
+            (fail! (str "The plaintext holds " (pr-str manifest/store-key)
                         ", which the library reserves for its own metadata.\n"
                         "    Remove it; the store keeps its own." unchanged)
                    {:secrets-file (str secrets-file) :reason :reserved-key
-                    :key (vec reserved)}))
-        plaintext (or (with-metadata user-text lines)
+                    :key [manifest/store-key]}))
+        plaintext (or (with-metadata user-text line)
                       (fail! (str "The secrets map must be the first form in the plaintext."
                                   " Only whitespace and ; comments may come before its {."
                                   unchanged)
@@ -1085,8 +1090,8 @@
   "Create an encrypted secrets file from its template using $VISUAL, $EDITOR,
   or vim. Returns the secrets-file path, or :aborted when an existing file is
   kept. Plaintext is held in an owner-only temp file during editing. The new
-  store gets its own manifest key: a key in the template is dropped, never
-  copied."
+  store gets its own manifest key. The library's metadata line in a template is
+  dropped, never copied."
   [config env-arg]
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
@@ -1116,8 +1121,8 @@
 (defn edit!
   "Edit an existing secrets file through an owner-only plaintext temp file.
   Re-encrypts only when the plaintext changes. Returns the secrets-file path.
-  The editor shows the plaintext without the store's reserved metadata keys,
-  which are put back on save; a plaintext that comes back holding one is
+  The editor shows the plaintext without the store's metadata, which is put
+  back on save. A plaintext that comes back holding the reserved key is
   refused."
   [config env-arg]
   (with-environment-identity config (resolve-env config env-arg)
@@ -1137,8 +1142,8 @@
               (info "Decrypting" secrets-file "…")
               (let [text (decrypt-text! env)
                     store (parsed-store! env text)
-                    ;; A store without a usable key fails before the editor opens.
-                    _ (require-manifest-key! env store)
+                    ;; A store without usable metadata fails before the editor opens.
+                    _ (require-store-metadata! env store)
                     before (user-plaintext text)]
                 (spit tmp before :encoding "UTF-8")
                 (run-editor! tmp)
@@ -1308,8 +1313,9 @@
 
   Every run generates a new manifest key and rewrites the manifest, so every
   `:vhash` changes once and a removed recipient's copy of the old key says
-  nothing about values published afterwards. The existing key is not read,
-  which makes this the repair for a store whose key is missing or malformed."
+  nothing about values published afterwards. The existing metadata is not
+  read, which makes this the repair for a store whose metadata is missing,
+  malformed, or of another version."
   [config env-arg]
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
@@ -1516,7 +1522,8 @@
           (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
             (if ok?
               (keyed-finding committed
-                             (manifest/entries value (require-manifest-key! env value))
+                             (manifest/entries
+                              value (:manifest-key (require-store-metadata! env value)))
                              (sha256 secrets-file))
               {:status :drift
                :reason :secrets-invalid-edn
@@ -1524,7 +1531,7 @@
       (catch clojure.lang.ExceptionInfo e
         ;; A manifest or store past its size bound, and a store without a
         ;; well-formed manifest key, cannot agree with any manifest.
-        (if (#{:input-too-large :plaintext-too-large :invalid-manifest-key}
+        (if (#{:input-too-large :plaintext-too-large :invalid-store}
              (:reason (ex-data e)))
           {:status :drift :reason :store-problem :message (ex-message e)}
           (throw e))))))

@@ -10,7 +10,7 @@
   diffs opaquely.
 
   A `:vhash` is an HMAC keyed by the store's manifest key: 256 random bits
-  held inside the encrypted EDN under `store-key`. Everyone who can decrypt the
+  held inside the encrypted EDN, in the metadata under `store-key`. Everyone who can decrypt the
   store computes the same hashes, and someone who has only the repository
   cannot test guesses of a low-entropy value against them. Solo and team stores
   work the same way.
@@ -27,24 +27,21 @@
 ;;;; Store metadata
 
 (def store-key
-  "The reserved top-level key under which a store holds its manifest key."
-  :com.kirahowe.secrets/manifest-key)
+  "The one reserved top-level key of a store. Its value is the library's
+  metadata, a map `{:version 1 :manifest-key \"<64 hex>\" :recipients
+  \"<record>\"}`, and is never user data."
+  :com.kirahowe.secrets/store)
 
-(def store-recipients
-  "The reserved top-level key under which a store records the `recipients-id`
-  of the recipient set it was last encrypted to."
-  :com.kirahowe.secrets/manifest-recipients)
-
-(def reserved-keys
-  "The top-level keys of a store that are library metadata and never user data."
-  #{store-key store-recipients})
+(def store-version
+  "The one store metadata `:version` this library writes and reads."
+  1)
 
 (defn user-data
-  "Return decrypted store `value` without the library's `reserved-keys`. A
-  value that is not a map is returned unchanged."
+  "Return decrypted store `value` without the library's `store-key`. A value
+  that is not a map is returned unchanged."
   [value]
   (if (map? value)
-    (apply dissoc value reserved-keys)
+    (dissoc value store-key)
     value))
 
 (defn- hex ^String [bs]
@@ -58,11 +55,32 @@
     (.nextBytes (java.security.SecureRandom.) bs)
     (hex bs)))
 
-(defn valid-key?
+(defn- valid-key?
   "True when `x` is a well-formed manifest key: a string of 64 lowercase hex
   characters."
   [x]
   (boolean (and (string? x) (re-matches #"[0-9a-f]{64}" x))))
+
+(defn store-problem
+  "Return nil when decrypted store `value` is a map whose `store-key` holds
+  well-formed metadata of the `store-version`, and otherwise a keyword saying
+  why not: `:not-a-map`, `:missing`, `:unsupported-version` (an integer
+  `:version` other than this one), or `:malformed`."
+  [value]
+  (let [found (when (map? value) (get value store-key))]
+    (cond
+      (not (map? value)) :not-a-map
+      (nil? found) :missing
+      (not (map? found)) :malformed
+
+      (and (integer? (:version found)) (not= store-version (:version found)))
+      :unsupported-version
+
+      (not (and (= #{:version :manifest-key :recipients} (set (keys found)))
+                (= store-version (:version found))
+                (valid-key? (:manifest-key found))
+                (string? (:recipients found))))
+      :malformed)))
 
 (defn recipients-id
   "Return the string a store records for the recipient set it is encrypted to:
@@ -200,7 +218,7 @@
   "Map a store's value to an ordered {path-vector -> descriptor} manifest map.
   Recurses into non-empty maps; every other value is a leaf with its `:type`,
   a `:count` when it is a collection, and its `:vhash` under `manifest-key`.
-  The store's `reserved-keys` get no entry. Throws when `manifest-key` is not
+  The store's `store-key` gets no entry. Throws when `manifest-key` is not
   a well-formed key."
   [secrets manifest-key]
   (collect-leaves (sorted-map-by (fn [a b] (compare (encode a) (encode b))))

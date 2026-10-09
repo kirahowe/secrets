@@ -24,7 +24,7 @@
 (def ^:private recipient-entries @#'cli/recipient-entries)
 (def ^:private render-secrets @#'cli/render-secrets)
 (def ^:private with-metadata @#'cli/with-metadata)
-(def ^:private metadata-lines @#'cli/metadata-lines)
+(def ^:private metadata-line @#'cli/metadata-line)
 (def ^:private user-plaintext @#'cli/user-plaintext)
 ;;;; Fixtures
 
@@ -262,27 +262,31 @@
                  k manifest-key
                  recorded (gen/one-of [(gen/return "identity") manifest-key])]
     (let [text (str before (render-secrets m) after)
-          keyed (with-metadata text (metadata-lines k recorded))]
+          keyed (with-metadata text (metadata-line k recorded))]
       (and (= {:ok? true
-               :value (assoc m manifest/store-key k manifest/store-recipients recorded)}
+               :value (assoc m manifest/store-key
+                             {:version 1 :manifest-key k :recipients recorded})}
               (safe-edn/parse keyed))
+           (nil? (manifest/store-problem (:value (safe-edn/parse keyed))))
            (= text (user-plaintext keyed))
            (= text (user-plaintext text))))))
 
-(defspec a-reserved-key-written-anywhere-else-is-still-taken-out 100
-  (prop/for-all [m g/secrets-map
-                 k (gen/one-of [manifest-key (gen/return nil) g/text])
-                 reserved (gen/elements (vec manifest/reserved-keys))]
-    (= {:ok? true :value m}
-       (safe-edn/parse (user-plaintext (render-secrets (assoc m reserved k)))))))
+(defspec the-reserved-key-written-anywhere-else-is-left-in-the-text 100
+  ;; Only the library's own first line is taken out. The key anywhere else
+  ;; stays, so the write that follows refuses it instead of losing text.
+  (prop/for-all [m (gen/such-that seq g/secrets-map)
+                 k (gen/one-of [manifest-key (gen/return nil) g/encodable-text])]
+    (let [text (str (subs (render-secrets m) 0 (dec (count (str/trimr (render-secrets m)))))
+                    " " (pr-str manifest/store-key) " " (pr-str k) "}")]
+      (= text (user-plaintext text)))))
 
 (defspec text-that-does-not-open-with-a-map-gets-no-metadata 100
   (prop/for-all [v (gen/one-of [g/scalar (gen/vector g/scalar) (gen/set g/scalar)])
                  k manifest-key]
-    (nil? (with-metadata (pr-str v) (metadata-lines k "identity")))))
+    (nil? (with-metadata (pr-str v) (metadata-line k "identity")))))
 
 (defspec a-path-at-or-under-a-reserved-key-is-refused 100
-  (prop/for-all [reserved (gen/elements (vec manifest/reserved-keys))
+  (prop/for-all [reserved (gen/return manifest/store-key)
                  more (gen/vector (gen/one-of [gen/keyword gen/string-alphanumeric]) 0 3)]
     (and (refused? (pr-str (into [reserved] more)))
          (or (seq more) (refused? (pr-str reserved))))))
