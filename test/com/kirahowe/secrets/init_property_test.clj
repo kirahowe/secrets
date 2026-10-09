@@ -19,21 +19,38 @@
                              0 15)]
     (str/join (cons head tail))))
 
-(def ^:private not-plain-name
-  (gen/such-that #(not (re-matches #"[A-Za-z][A-Za-z0-9._-]*" %)) g/text 100))
+(defn- plain-name? [s]
+  (boolean (re-matches #"[A-Za-z][A-Za-z0-9._-]*" s)))
 
-(defn- refused-without-echo? [opts text]
+(def ^:private not-plain-name
+  "Text the initializer refuses, paired with what to look for in the refusal.
+  Half the cases plant `g/marker` in the text, and the marker is what must not
+  be echoed: arbitrary short text such as a comma can be part of the fixed
+  message by chance. The other half is any refused text and checks the refusal
+  alone."
+  (gen/one-of
+   [(gen/such-that (comp not plain-name? first)
+                   (gen/let [before g/text
+                             marker g/marker
+                             after g/text]
+                     [(str before marker after) marker])
+                   100)
+    (gen/fmap (fn [text] [text nil])
+              (gen/such-that (comp not plain-name?) g/text 100))]))
+
+(defn- refused-without-echo? [opts marker]
   (try
     (init/proposed-config opts)
     false
     (catch clojure.lang.ExceptionInfo e
       (and (str/includes? (ex-message e) "plain name")
-           (or (str/blank? text) (not (str/includes? (ex-message e) text)))))))
+           (not (and marker (str/includes? (str (ex-message e) (pr-str (ex-data e)))
+                                           marker)))))))
 
 (defspec a-name-that-is-not-plain-is-refused-without-being-echoed 200
-  (prop/for-all [text not-plain-name]
-    (and (refused-without-echo? {:app text} text)
-         (refused-without-echo? {:app "reader" :env text} text))))
+  (prop/for-all [[text marker] not-plain-name]
+    (and (refused-without-echo? {:app text} marker)
+         (refused-without-echo? {:app "reader" :env text} marker))))
 
 (defspec plain-names-give-a-task-that-reads-back-and-normalizes 100
   (prop/for-all [app plain-name
