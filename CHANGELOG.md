@@ -13,16 +13,17 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
   and, with `--apply`, creates a `bb.edn` with the `secrets` task, a template,
   and with `--keygen` an identity. It never edits a file that exists: for an
   existing `bb.edn` or `deps.edn` it prints the entries to add.
-- `bb secrets doctor`, which reports the state of `age`, the configured files,
-  the resolved identity and where it came from, and the recipients, without
-  printing any contents.
+- `bb secrets doctor`, a short report on the setup: whether `age` is
+  installed, which files exist, the resolved identity and where it came from,
+  and how many recipients a team store has. It prints no file contents.
 - Value hashes in every manifest, team stores included. Each store holds a
   random 256-bit manifest key inside its encrypted EDN, and every manifest
   entry carries a `:vhash` keyed by it.
 - Manifest key renewal. `reencrypt` always generates a new key, and `edit`,
   `set`, and `rm` do when the recipients file no longer matches the set the
   store was last encrypted to, so a removed recipient's copy of the old key
-  says nothing about values published afterwards.
+  says nothing about values published afterwards. A `verify` that has an
+  identity reports a changed recipients file as drift until `reencrypt` runs.
 - `com.kirahowe.secrets/with-identity`, which resolves an identity for one
   operation and deletes a temporary identity file when the operation ends.
 - `com.kirahowe.secrets.aero/read-config`, which reads an Aero config whose
@@ -30,17 +31,19 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
 - A hidden prompt for `bb secrets set` when it runs from a terminal.
 - `-h`, `--help`, and `bb secrets help <command>` for every command, and `--`
   to end the options.
+- A `:reason` keyword in the data of every `ex-info` the library throws.
 - Fixed bounds that catch an accidental huge or deeply nested input: 16 MiB of
   ciphertext, 8 MiB of plaintext, EDN depth 100, 256 KiB of recipients file,
   and 1 MiB of manifest.
 
 ### Changed
-- The manifest format is `:version 3`. `verify` reports a `v0.1.0` manifest as
-  unsupported, and a store written by `v0.1.0` has no manifest key, so `edit`,
-  `set`, and `rm` fail on it. Run `bb secrets reencrypt <env>` once per
-  environment to fix both.
-- A store's plaintext must be one EDN map. The library keeps its own metadata
-  in it as reserved top-level data in the `:com.kirahowe.secrets` namespace.
+- The manifest format is `:version 3`, and a store carries metadata of its
+  own. `verify` reports a `v0.1.0` manifest as unsupported, and a store
+  written by `v0.1.0` has no metadata, so `edit`, `set`, and `rm` fail on it.
+  Run `bb secrets reencrypt <env>` once per environment to fix both. The same
+  goes for a store written by any earlier pre-release code.
+- A store's plaintext must be one EDN map. The library keeps its metadata in
+  it under the reserved top-level key `:com.kirahowe.secrets/store`.
 - An identity named by a path argument, `:identity-file`, or
   `SECRETS_AGE_IDENTITY_FILE` has to exist. A missing one is a `:no-identity`
   error where `verify` used to fall back to a keyless check and `#secret/opt`
@@ -48,20 +51,29 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
 - Identity paths are local paths. A URI-shaped value, a bare `name:rest`, and
   key contents in a path setting are refused with `:disallowed-identity`
   without being echoed. A leading `~` is expanded for every identity path.
-- `load-secrets` and the reader literals accept only local sources: a path, a
-  `File` or `Path`, or a classpath resource, including one inside a jar. HTTP
-  and other remote URLs, and input streams, are refused with
+- `load-secrets` and the reader literals accept only local sources: a path as
+  a string, a `File`, or a `Path`, or the classpath resource `URL` that
+  `io/resource` returns, including one inside a jar. Every other URL, a
+  URI-shaped string, and an input stream are refused with
   `:disallowed-source`.
 - `get-secret` with a vector path walks maps and vectors only. A path that
   continues into a string, set, or list is not found.
 - Aero configs with secret tags have to be read with
   `com.kirahowe.secrets.aero/read-config`, passing the options under
   `:secrets`. `aero.core/read-config` alone throws on a secret tag.
-- The CLI config rejects a key it does not know, at the top level and in an
-  environment.
-- With no environment argument, `verify` reports an environment it cannot
-  check and continues with the others. It exits 1 for drift and 2 for an
-  environment it could not check.
+- The CLI config is validated before a command runs. A key it does not know
+  is rejected, every environment setting has to be a path string (`:manifest`
+  may also be `false`), `:default-environment` has to name a configured
+  environment, and no file may serve two purposes across the environments.
+- `verify` exits 1 only for drift. It exits 2 when anything else stopped it:
+  a missing file, an identity or decryption failure, an unknown environment,
+  or an invalid configuration. With no environment argument it reports an
+  environment it cannot check and continues with the others.
+- A dash-leading argument before `--` is an option for every command. An
+  unknown command, option, or environment is refused without being repeated.
+- `set` and `rm` refuse a path that passes through a value that is not a map.
+- `keygen` needs an environment or a default one, and prints only the key it
+  wrote.
 - A manifest has to be complete before `verify` compares anything, with or
   without an identity: `:version 3`, this project's `:app`, a
   `:ciphertext-sha`, and a `:type` and `:vhash` on every entry.
@@ -76,7 +88,9 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
 ### Removed
 - The `bb secrets encrypt` and `bb secrets decrypt` commands, and
   `cli/encrypt!` and `cli/decrypt!`. Use `age` for arbitrary files.
-- `com.kirahowe.secrets.age/decrypt-to-file!`.
+- `com.kirahowe.secrets.age` and `com.kirahowe.secrets.manifest` as public
+  API. They are implementation namespaces now. `age/decrypt-to-file!` and
+  `age/decrypt-bytes` are gone, and `age/encrypt-file!` takes a map.
 - `com.kirahowe.secrets/identity-from-env`, `resolve-identity-file`, and
   `identity-available?`. Use `with-identity`.
 - `com.kirahowe.secrets/owner-only-temp-file!`.
