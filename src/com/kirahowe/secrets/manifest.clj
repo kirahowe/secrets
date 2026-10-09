@@ -21,9 +21,9 @@
   ciphertext contains, never who produced it. See `doc/threat-model.md` in the
   repository.
 
-  Everything here depends only on `clojure.core` and the platform's
-  `java.security`/`javax.crypto`, so it loads and runs identically under JVM
-  Clojure and babashka."
+  Everything here uses only `clojure.core`, `clojure.string`, and the
+  platform's `java.security` and `javax.crypto`, so it loads and runs the same
+  under JVM Clojure and babashka."
   (:require [clojure.string :as str]))
 
 ;;;; Store metadata
@@ -146,27 +146,11 @@
   (str tag \: (count payload) \: payload))
 
 (defn- encode
-  "Return the canonical manifest encoding of `v` as a `String`: exactly one
-  `frame` per value, nested for collections. Because every frame declares the
-  length of its payload in code units, and every character the framing itself
-  uses (the tag, the digits, `:`) is a single code unit, a delimiter character
-  *inside* a value can never be read as structure, so nothing needs escaping;
-  because every frame carries its `tags` entry, `[[1]]` and `[(1)]` differ. Map
-  entries (each the key frame followed by the value frame) and set elements are
-  sorted with `compare` so hash-map and hash-set iteration order cannot leak in;
-  vector and list elements keep their order, which is significant.
-
-  The encoding is unambiguous: two values the EDN reader can produce share an
-  encoding only when they are equal. `vhash` feeds this string to the HMAC as
-  `utf16-bytes`, a lossless code-unit stream, so that holds for every Java
-  String and not only for the ones a charset encoder round-trips. Within a
-  single scalar tag it rests on `pr-str`, which is exact for every value the
-  EDN reader can produce: a `Float` and a `Double` of the same magnitude would
-  encode alike, but `clojure.edn` only ever produces `Double`. Likewise
-  `:other` is a best-effort tag for values EDN cannot produce.
-
-  The `:vhash` is a different matter. It is a 64-bit truncation of the HMAC, so
-  two different values can share one."
+  "Return the canonical encoding of `v` as a `String`: one `frame` per value,
+  nested for collections. Map entries and set elements are sorted, and vector
+  and list elements keep their order. Every frame carries its type tag and
+  its length, so two values the EDN reader can produce share an encoding only
+  when they are equal."
   ^String [v]
   (let [t (value-type v)
         tag (tags t)]
@@ -177,12 +161,9 @@
       (frame tag (pr-str v)))))
 
 (defn- utf16-bytes
-  "Return the code units of `s` as big-endian byte pairs. A charset encoder is
-  deliberately not used: every JDK charset substitutes an unpaired surrogate
-  (`?` under UTF-8, U+FFFD under UTF-16BE), so two distinct Strings would encode
-  to the same bytes, and `clojure.edn` reads a lone surrogate back, so such a
-  String can reach here from a real secrets file. Copying the code units out
-  directly is lossless for any Java String."
+  "Return the UTF-16 code units of `s` as big-endian byte pairs. No charset
+  encoder is used, because each one replaces an unpaired surrogate, which
+  `clojure.edn` can read, and two different strings would then hash alike."
   ^bytes [^String s]
   (let [n (count s)
         out (byte-array (* 2 n))]

@@ -123,18 +123,10 @@
    "SECRETS_AGE_IDENTITY_B64" "the base64-encoded age key file contents"})
 
 (defn- identity-env-value
-  "The value of identity variable `k`, or nil when it is unset. A variable that
-  is set but blank throws rather than resolving. Takes the value rather than
-  reading it, so the rule is testable without setting process environment.
-
-  CI runners expand a missing or misnamed secret to the empty string
-  (`SECRETS_AGE_IDENTITY: ${{ secrets.AGE_KEY }}` with no such secret, and the
-  docker-compose equivalent), so blank means a broken deployment, not an absent
-  one. Neither alternative is safe: using the value resolves to an empty key
-  file and fails far downstream as \"wrong key, or you are not a recipient\",
-  and skipping to the next source would silently fall back to
-  ~/.config/<app>/key.txt, succeeding on a developer machine with the *local*
-  key while the deployment it was meant to configure is broken."
+  "Return `v`, the value of identity variable `k`, or nil when it is unset.
+  A value that is set but blank throws `:invalid-identity`: CI expands a
+  missing secret to the empty string, and falling through to the next source
+  would use a developer's local key while the deployment stays broken."
   [k v]
   (when (and v (str/blank? v))
     (throw (ex-info (str k " is set but empty. Unset it to fall back to the next"

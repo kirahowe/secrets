@@ -70,15 +70,9 @@
 
 (defn- path-arg
   "Render `p`, the path argument playing `role`, as an age argument that can
-  only mean a filesystem path.
-
-  An option terminator is not enough on its own: age reads a positional `-`
-  (and an `-i`/`-R` value of `-`) from stdin and writes `-o -` to stdout, and a
-  blank path resolves to stdin rather than to a file. `./` names the same file
-  without the ambiguity; an absolute path never begins with `-`. Blank fails
-  closed naming its role, the way a blank identity variable does. A blank
-  input would otherwise exit 0 with a ciphertext of nothing, and CI is where
-  an unset variable expands to nothing."
+  only name a file. A path that starts with `-` gets `./` in front, because
+  age reads `-` as stdin or stdout and a dash-leading name as an option. A
+  blank path throws `:blank-path` naming its role."
   ^String [role p]
   (let [s (str p)]
     (when (str/blank? s)

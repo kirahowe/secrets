@@ -51,10 +51,12 @@
   plaintext temp file and deletes it afterward; a failed delete is an error
   that names the remaining path.
 
-  The command fns are a REPL-safe API: they return data (a path, a results
-  map, or :aborted) and signal failures by throwing `ex-info` instead of
-  exiting. `run!`, the CLI entry point, is the only fn here that prints
-  error data and calls System/exit."
+  The command functions are the API for a REPL or a program: they return data
+  (a path, a results map, or :aborted), throw `ex-info` with a `:reason` on
+  failure, and never exit. `verify!` and `doctor!` report most failures in
+  their result, with the exit code under `:exit`. `run!` is the entry point of
+  a process. It alone prints a failure and exits: 1 on failure, and for
+  `verify` and `doctor` 1 on drift or a warning and 2 on any failure."
   (:refer-clojure :exclude [run!])
   (:require [babashka.cli :as bbcli]
             [clojure.java.io :as io]
@@ -75,14 +77,9 @@
 ;;; to the operator, so the rendering is where it has to be fixed.
 
 (defn- shell-quote
-  "Render `s` as a single POSIX `sh` word: wrap it in `'`, splicing each
-  embedded `'` as `'\\''`. The empty string renders as `''`, one empty word.
-
-  Single quotes rather than backslash-escaping because inside `'…'` every
-  character except `'` is literal. There is no metacharacter set to keep up to
-  date and no interaction with `$`, backticks, `\\`, newlines, or globs.
-  Escaping would need a character class that is correct for every shell and
-  every position, while this needs the one rule."
+  "Render `s` as a single POSIX `sh` word: wrapped in `'`, with each embedded
+  `'` written as `'\\''`. The empty string renders as `''`. Inside single
+  quotes every other character is literal, so no escaping rule is needed."
   [s]
   (str "'" (str/replace (str s) "'" "'\\''") "'"))
 
@@ -527,25 +524,10 @@
       text)))
 
 (defn- editor-value
-  "The editor command to run, from the `VISUAL` value `visual` and the `EDITOR`
-  value `editor`, falling back to `vim`. A variable that is set but blank counts
-  as unset and falls through to the next source, so an empty `VISUAL` cannot
-  shadow a working `EDITOR` or the default. Takes the values rather than reading
-  them, so the rule is testable without setting process environment.
-
-  Only leading and trailing blankness disqualifies a value: internal whitespace
-  is meaningful, and `\"code --wait\"` or `\"emacsclient -t\"` comes back intact,
-  arguments and all. Whitespace-only is rejected alongside empty because the
-  shell drops both identically, which would leave the file being edited as the
-  command word of [[editor-argv]].
-
-  This is deliberately the opposite of `identity-env-value`, which throws on a
-  set-but-blank identity variable. There every outcome is wrong but plausible:
-  the blank value resolves to an empty key file, and falling through reaches the
-  developer's local key while the deployment that variable was meant to
-  configure stays broken. A blank editor variable has no such failure mode: the
-  operator either watches the fallback editor open or gets a failure that leaves
-  the store untouched, so falling through is safe here."
+  "The editor command to run: the `VISUAL` value `visual`, else the `EDITOR`
+  value `editor`, else `vim`. A blank value counts as unset, so an empty
+  `VISUAL` cannot hide a working `EDITOR`. A value is returned whole, with
+  any arguments it carries."
   [visual editor]
   (or (first (remove str/blank? [visual editor])) "vim"))
 
@@ -1505,9 +1487,10 @@
 
 (defn recipients!
   "List the recipients an environment encrypts to. Returns them as an eager seq
-  (nil in single-key mode). Read-only and non-failing: a line encryption would
-  reject is listed but marked, because listing it as a plain recipient would
-  read as an assurance the write path does not give it."
+  (nil in single-key mode). Read-only. A line that encryption would reject is
+  listed and marked as invalid instead of failing the listing. Throws for an
+  unknown environment and for a recipients file that is too large or cannot
+  be read."
   [config env-arg]
   (let [{:keys [recipients-file] environment-name :name :as env}
         (resolve-env config env-arg)
@@ -2023,8 +2006,9 @@
 (defn doctor!
   "Diagnose one selected or default environment. Accepts raw config,
   normalizes and validates it, prints one line per diagnostic, and returns a
-  structured result containing :exit (0 healthy, 1 warning or action needed, 2
-  invalid). It never exits.
+  structured result containing :exit: 0 healthy, 1 warning, 2 for an invalid
+  configuration, identity, or recipients file. It never exits. A missing
+  template is reported and is not a warning.
 
   The report names the resolved identity's source and its path. An identity
   injected as contents is named by its variable and has no path. A failed
