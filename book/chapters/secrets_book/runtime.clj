@@ -34,7 +34,7 @@
                        :llm/api-key "sk-not-real"
                        :r2 {:account-id "abc123"
                             :secret "shhh"}}))
-  (age/encrypt-file! key-file plain (str dir "/secrets.edn.age"))
+  (age/encrypt-file! {:identity-file key-file} plain (str dir "/secrets.edn.age"))
   (io/delete-file plain))
 
 ;; ## Loading the map
@@ -45,27 +45,28 @@
 (secrets/load-secrets (str dir "/secrets.edn.age") key-file)
 
 ;; It also accepts a `java.io.File`, a `java.nio.file.Path`, or a classpath
-;; resource, which is what `clojure.java.io/resource` returns. A resource
-;; inside an uberjar works too: the library copies that ciphertext to an
+;; resource, given as the `URL` that `clojure.java.io/resource` returns. That
+;; URL is a `file:` one on a directory classpath and a `jar:file:` one inside
+;; an uberjar. For the jar case the library copies the ciphertext to an
 ;; owner-only temp file so `age` can read it. The
 ;; [production chapter](secrets_book.production.html) demonstrates the jar case.
 ;; Here is the same call with a `File`:
 
 (secrets/load-secrets (io/file (str dir "/secrets.edn.age")) key-file)
 
-;; Sources are local only. HTTP(S) and other remote sources are rejected
-;; before anything is opened, so loading secrets never turns into a network
-;; request because someone passed in a URL. The error describes the source
-;; without its userinfo or query string:
+;; Sources are local only. Every other URL, a URI-shaped string, and anything
+;; else is rejected before it is opened, so loading secrets never turns into a
+;; network request because someone passed in a URL. The error names the
+;; scheme and nothing else of the value:
 
 (try
   (secrets/load-secrets "https://user:password@example.com/secrets.edn.age?token=1"
                         key-file)
   (catch Exception e (ex-data e)))
 
-;; A store written by the CLI also holds metadata of the library's own, in the
-;; `:com.kirahowe.secrets` namespace. `load-secrets` leaves it out, so the map
-;; you get back is your data and nothing else. The
+;; A store written by the CLI also holds metadata of the library's own, under
+;; the reserved key `:com.kirahowe.secrets/store`. `load-secrets` leaves it
+;; out, so the map you get back is your data and nothing else. The
 ;; [manifest chapter](secrets_book.manifest.html#the-stores-manifest-key) shows
 ;; this.
 
@@ -177,13 +178,21 @@
 
 ;; ## Size bounds
 
-;; Secret stores are small, so the runtime bounds each stage while the bytes
-;; are moving: 16 MiB of ciphertext, 8 MiB of plaintext, and EDN nested 100
-;; collections deep. A source past a bound throws with `:reason`
-;; `:source-too-large`, `:plaintext-too-large`, or `:edn-too-deep`, and the
-;; numeric `:limit`. The bounds are fixed. They catch an accident, such as a
-;; path that names the wrong file. They are not a defence against a hostile
-;; source.
+;; Secret stores are small. Loading refuses a ciphertext past 16 MiB before
+;; it decrypts, with `:reason :source-too-large`. age doesn't compress, so
+;; that bounds the plaintext too. EDN nested more than 100 collections deep is
+;; refused with `:edn-too-deep`. Both carry the numeric `:limit`. The bounds
+;; are fixed. They catch an accident, such as a path that names the wrong
+;; file. They are not a defence against a hostile source.
+
+;; ## Failures
+
+;; Every failure is an `ex-info` whose data has a `:reason` keyword. The
+;; [reference](secrets_book.reference.html#failure-reasons) lists the reasons
+;; worth branching on. For loading they are `:no-identity`,
+;; `:invalid-identity`, `:disallowed-identity`, `:no-file`,
+;; `:disallowed-source`, `:source-too-large`, `:decrypt-failed`,
+;; `:age-not-installed`, and the EDN reasons.
 
 ;; ## Reader literals
 
@@ -326,6 +335,14 @@
 ;; tag, and a config without secret tags never opens it. Nothing is kept
 ;; between calls. There is no registration and no cache to reset: a second
 ;; read sees an edited store, and a read that failed can be retried.
+
+;; `read-config` takes both arguments. Without a `:secrets` option there is no
+;; store, so a required secret fails and says which option is missing, and an
+;; optional one reads nil:
+
+(try
+  (secrets-aero/read-config config-file {})
+  (catch Exception e (ex-message e)))
 
 ;; A config with secret tags read through `aero.core/read-config` directly
 ;; fails with an error that names the function to use:

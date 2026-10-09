@@ -113,7 +113,7 @@
       enc (str dir "/secrets.edn.age")
       jar (str dir "/app.jar")]
   (spit plain (pr-str {:from :inside-the-jar}))
-  (age/encrypt-file! key-file plain enc)
+  (age/encrypt-file! {:identity-file key-file} plain enc)
   (with-open [zos (java.util.zip.ZipOutputStream. (io/output-stream jar))]
     (.putNextEntry zos (java.util.zip.ZipEntry. "secrets.edn.age"))
     (io/copy (io/file enc) zos)
@@ -166,18 +166,21 @@
 
 ;; When no identity is available, `verify` checks that each manifest is
 ;; complete and that its recorded `:ciphertext-sha` is the digest of the file.
-;; It exits with 0, 1, or 2. Exit 1 indicates drift and should fail the build.
-;; Exit 2 means a ciphertext or manifest is missing, or an environment could
-;; not be checked. In a new repository, this usually means someone forgot to
-;; commit the manifest. The
+;; It exits with 0, 1, or 2. Exit 1 means the only problem is drift, and
+;; should fail the build. Exit 2 means something else stopped the check: a
+;; missing ciphertext or manifest, an identity or decryption failure, an
+;; unknown environment, or an invalid configuration. In a new repository, a 2
+;; usually means someone forgot to commit the manifest. The
 ;; [team-ci example](https://github.com/kirahowe/secrets/tree/main/examples/team-ci)
 ;; commits such a fixture and uses it as a gate.
 
 ;; The keyless check runs when no identity was named and no key file is
-;; present, which is the normal state of a CI runner. An identity you name has
-;; to exist: a job that sets `SECRETS_AGE_IDENTITY_FILE` to a path that isn't
-;; there, or sets an identity variable to an empty string, fails with an error
-;; instead of passing keyless.
+;; present, which is the normal state of a CI runner. A configured `:key-file`
+;; only says where the key normally lives, so an environment can set one and
+;; still be checked keyless on a machine that doesn't have the file. An
+;; identity you name has to exist: a job that sets `SECRETS_AGE_IDENTITY_FILE`
+;; to a path that isn't there, or sets an identity variable to an empty
+;; string, exits 2 instead of passing keyless.
 ;;
 ;; With no environment argument, `verify` checks every environment and keeps
 ;; going past one it can't check, so one misconfigured environment doesn't
@@ -190,8 +193,9 @@
 ;; token.
 
 ;; The full job also decrypts the store and compares every key path, type, and
-;; value hash with the manifest, for solo and team stores alike. Give the
-;; runner a dedicated deploy identity and install `age`:
+;; value hash with the manifest, for solo and team stores alike. In a team
+;; store it reports a recipients file that changed without a `reencrypt` as
+;; drift too. Give the runner a dedicated deploy identity and install `age`:
 
 ;; ```yaml
 ;; verify-secrets:

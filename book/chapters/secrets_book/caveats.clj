@@ -37,10 +37,11 @@
 ;; secret values at their upstream services, because anyone with the old key
 ;; can still read the old ciphertexts.
 
-;; Similarly, removing a teammate's recipient and re-encrypting only stops
-;; access to new ciphertexts. They can still read everything committed while
-;; they were a recipient. If their past access is a concern, rotate the secret
-;; values as well.
+;; Similarly, removing a teammate's line from the recipients file and running
+;; `reencrypt` only stops access to new ciphertexts. Until `reencrypt` runs,
+;; removing the line stops nothing. They can still read everything committed
+;; while they were a recipient. If their past access is a concern, rotate the
+;; secret values as well.
 
 ;; Rotating those values is a manual process. This library can't rotate a
 ;; database password or expire an API key for you. If you need scheduled
@@ -141,8 +142,9 @@
 ;; rename. A single file is never left half written, but the pair is not one
 ;; transaction and nothing is rolled back. An interruption between the two
 ;; leaves a new ciphertext beside an old manifest. `verify` reports that, and
-;; `bb secrets reencrypt` regenerates the manifest. The library makes no claim
-;; about what survives a power loss.
+;; `bb secrets reencrypt` regenerates the manifest. It can also leave a
+;; staging file named `.<target>.<uuid>.tmp` beside the target, which is safe
+;; to delete. The library makes no claim about what survives a power loss.
 
 ;; ## Operational dependencies
 
@@ -153,9 +155,10 @@
 
 ;; Runtime loading only reads local sources. It accepts local files and
 ;; classpath resources, including one inside a jar, and it never fetches a
-;; ciphertext over HTTP. Fixed bounds apply to the ciphertext, the plaintext,
-;; EDN nesting, the recipients file, and the manifest. They are far above the
-;; size of a real secrets map and are not configurable.
+;; ciphertext over HTTP. Fixed bounds apply to the ciphertext a load reads,
+;; the plaintext the CLI writes, EDN nesting, the recipients file, and the
+;; manifest. They are far above the size of a real secrets map and are not
+;; configurable.
 
 ;; The library assumes POSIX file permissions. Private temporary files are
 ;; created owner-only, and where the filesystem can't do that the operation

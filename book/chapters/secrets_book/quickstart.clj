@@ -23,7 +23,7 @@
 ;; bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
 ;; ```
 
-;; The output is a preview. It lists the files the initializer would create and writes nothing. If the preview looks right, run the same command with `--apply`:
+;; The output is a preview. It lists the files the initializer would create and writes nothing. An option's value is a separate argument, so write `--app myapp` and not `--app=myapp`. If the preview looks right, run the same command with `--apply`:
 
 ;; ```sh
 ;; bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen --apply

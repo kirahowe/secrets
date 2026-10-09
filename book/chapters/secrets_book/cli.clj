@@ -24,6 +24,8 @@
 ;; | `--apply` | create the files instead of previewing |
 ;; | `--help` | show usage |
 
+;; An option's value is a separate argument: `--app myapp`, not `--app=myapp`.
+
 ;; Without `--apply` it prints what it would do and writes nothing. It only
 ;; ever creates files. What it does about `bb.edn` and `deps.edn` depends on
 ;; what the project already has:
@@ -111,26 +113,49 @@
                          :environments {:dev {:secrets-fle "s.edn.age"}}})
   (catch Exception e (ex-message e)))
 
-;; Normalization also turns every artifact path in every environment into a
-;; canonical path. Environments can share a key file, a recipients list, or a
-;; template. Other collisions are errors: a manifest can't also be a key, and
-;; two environments can't write the same ciphertext. Paths have to be local
+;; Every environment setting is a path, so each value has to be a string.
+;; `:manifest` may also be `false`, which keeps no manifest. `:manifest true`
+;; is an error, where it could have been read as a silent "off":
+
+(try
+  (cli/normalize-config {:app "myapp"
+                         :environments {:dev {:secrets-file "s.edn.age"
+                                              :manifest true}}})
+  (catch Exception e (ex-message e)))
+
+;; `:environments` has to be a map from a keyword to a map, and
+;; `:default-environment` has to name one of them. Paths have to be local
 ;; filesystem paths. A value that looks like a URI, and key contents pasted
 ;; where a path belongs, are refused without being printed.
+
+;; No file may serve two purposes. Across all environments, a file is a
+;; secrets file, a manifest, a template, an identity, or a recipients file,
+;; and only one of them. Paths are compared in canonical form, so `key.txt`
+;; and `./key.txt` are one file. Environments can share a template, a key or
+;; identity file, or a recipients list. Two environments can name the same
+;; secrets file or manifest only when they name both the same, which makes
+;; them one store under two names:
+
+(try
+  (cli/normalize-config
+   {:app "myapp"
+    :environments {:dev {:secrets-file "dev.edn.age" :manifest "shared.manifest"}
+                   :prod {:secrets-file "prod.edn.age" :manifest "shared.manifest"}}})
+  (catch Exception e (ex-message e)))
 
 ;; ## The commands
 
 ;; | Command | Args | What it does |
 ;; |---------|------|--------------|
-;; | `keygen` | `[env]` | generate the age key for an environment |
+;; | `keygen` | `[env]` | generate the age key for an environment and print its public key |
 ;; | `new` | `[env]` | create a secrets file from a template, using `$VISUAL`, `$EDITOR`, or `vim` |
 ;; | `edit` | `[env]` | decrypt, edit, re-encrypt |
 ;; | `set` | `[env] <key> [--edn]` | set a key's value from a hidden prompt or stdin (creates the file if missing) |
 ;; | `rm` | `[env] <key>` | remove a key (fails if the key or file is absent) |
 ;; | `verify` | `[env]` | check the committed manifest against the secrets |
-;; | `doctor` | `[env]` | diagnose configuration and verification readiness without revealing values |
+;; | `doctor` | `[env]` | report on the setup: age, the files, the identity, and the recipients |
 ;; | `show-key` | `[env]` | print public keys for sharing |
-;; | `add-recipient` | `[env] [key]` | add a public key to the recipients file |
+;; | `add-recipient` | `[env] [public-key]` | add a public key to the recipients file |
 ;; | `recipients` | `[env]` | list the configured recipient public keys |
 ;; | `reencrypt` | `[env]` | re-encrypt to the current recipients, with a new manifest key |
 ;; | `help` | `[command]` | show global or command-specific help |
@@ -147,8 +172,15 @@
 ;; bb secrets set --help
 ;; ```
 
-;; Everything after `--` is an operand, even when it looks like an option.
-;; That makes dash-leading key names unambiguous.
+;; Before a `--`, an argument that starts with a dash is an option, for every
+;; command, and an option the command doesn't define is an error. Everything
+;; after `--` is an argument, even when it looks like an option, so a key name
+;; may start with a dash.
+
+;; A usage error prints the command's usage and never repeats the argument
+;; that caused it. That covers an unknown command and an unknown environment
+;; too. A value typed in the wrong place is the likeliest thing to end up
+;; there, and it shouldn't be printed back to the terminal.
 
 ;; ### `new` and `edit`
 
@@ -162,9 +194,9 @@
 ;; Both encrypt the text you saved, so your comments survive. The store has to
 ;; be one EDN map, and that map has to be the first form in the file.
 
-;; The store also holds metadata of the library's own, as reserved top-level
-;; data in the `:com.kirahowe.secrets` namespace. The editor never shows it,
-;; and a plaintext that comes back with it typed in is refused. The
+;; The store also holds metadata of the library's own, under the reserved
+;; top-level key `:com.kirahowe.secrets/store`. The editor never shows it, and
+;; a plaintext that comes back with that key typed in is refused. The
 ;; [manifest chapter](secrets_book.manifest.html#the-stores-manifest-key)
 ;; explains what it is for.
 
@@ -190,8 +222,10 @@
 ;; If the environment's secrets file doesn't exist yet, `set` creates it. This
 ;; makes it possible to bootstrap a new environment from a script. `rm` fails
 ;; when the key or file is absent. For both commands, `<key>` can be an EDN
-;; keyword (`:some/key`) or a vector path (`[:a :b]`). Both commands re-render
-;; the EDN, so plaintext comments don't survive a `set` or `rm`.
+;; keyword (`:some/key`) or a vector path (`[:a :b]`). A path that passes
+;; through a value that isn't a map is refused, since there is nothing under a
+;; string or a set to change. Both commands re-render the EDN, so plaintext
+;; comments don't survive a `set` or `rm`.
 
 ;; ### What a write does {#what-a-write-does}
 
@@ -207,6 +241,11 @@
 ;; fails and says the manifest is stale. If the process dies between the two,
 ;; nothing reports it at the time. Either way `verify` shows the drift
 ;; afterwards, and `bb secrets reencrypt` regenerates the manifest.
+;;
+;; Each file is staged beside its target under a name like
+;; `.secrets.edn.age.<uuid>.tmp` and deleted when the command ends. A command
+;; that is killed can leave that file behind. It is safe to delete, and a
+;; `.*.tmp` line in `.gitignore` keeps it out of a commit.
 ;;
 ;; The ciphertext, the manifest, and the recipients file are written with
 ;; ordinary file permissions, since they are meant to be committed. In team
@@ -265,9 +304,13 @@
 (cli/verify! config "dev")
 
 ;; The `:exit` value is what `bb secrets verify` uses as its process status: 0
-;; when everything agrees, 1 for drift, and 2 when a ciphertext or manifest is
-;; missing or an environment could not be checked. With no environment
-;; argument it checks every environment and keeps going past one that fails.
+;; when everything agrees, and 1 when the only problem is drift. It is 2 when
+;; anything else stopped the check: a missing ciphertext or manifest, an
+;; identity that doesn't resolve, a store the identity can't decrypt, or a file
+;; that can't be read. Such a failure is reported in that environment's line
+;; and doesn't throw, and with no environment argument the other environments
+;; are still checked. A CI job can tell a stale manifest (1) from a missing
+;; key (2).
 
 ;; `remove-secret!` is `rm`:
 
@@ -281,20 +324,44 @@
 
 (show-file (str dir "/secrets.edn.manifest"))
 
-;; `doctor!` is for finding out why a command won't run. It reports on the age
-;; installation, the configured files, the identity it resolved and where that
-;; came from, and the recipients, without revealing any values. Its `:exit` is
-;; 0 when the setup is healthy, 1 for a warning, and 2 when the setup is
-;; invalid:
+;; `doctor!` is for finding out why a command won't run. It prints a short
+;; report: whether age is installed, which files exist, which identity it
+;; resolved and where that came from, and in team mode how many recipients
+;; there are. It doesn't open the store or the manifest, which is `verify`'s
+;; job, and it prints no file contents. It returns the report as a map:
 
-(:exit (cli/doctor! config "dev"))
+(select-keys (cli/doctor! config "dev") [:identity :warnings :problems :exit])
+
+;; A warning is something to act on that isn't an error, such as a file that
+;; isn't there yet, and makes `:exit` 1. Here the key file is moved away, as
+;; on a CI runner:
+
+(def no-key-config
+  (cli/normalize-config
+   {:app "cli-demo"
+    :default-environment :dev
+    :environments {:dev {:secrets-file (str dir "/secrets.edn.age")
+                         :key-file (str dir "/no-key-here.txt")}}}))
+
+(select-keys (cli/doctor! no-key-config "dev") [:warnings :problems :exit])
+
+;; A problem makes `:exit` 2: an identity that doesn't resolve, a recipients
+;; file that lists nobody or holds an invalid line, an invalid configuration,
+;; or an unknown environment.
+
+;; A configured `:key-file` says where the key normally lives. When no file is
+;; there, commands that need the key fail and say where they looked, and
+;; `verify` checks what it can without one:
+
+(cli/verify! no-key-config "dev")
 
 ;; ## Understanding errors {#errors-carry-their-remediation}
 
-;; Command functions throw `ex-info`. The message says what to do next, and
-;; the data may hold a `:hint`, `:install`, `:error`, or `:docs` entry that
-;; `run!` prints under it. At the REPL, you can read the same information from
-;; the exception:
+;; Command functions throw `ex-info`. The message says what to do next. The
+;; data always has a `:reason` keyword to branch on, and may hold a `:hint`,
+;; `:install`, `:error`, or `:docs` entry that `run!` prints under the
+;; message. At the REPL, you can read the same information from the
+;; exception:
 
 (try
   (cli/verify! config "nope")
@@ -305,9 +372,11 @@
 
 ;; Command functions print progress but do not call `System/exit`. They return
 ;; a path, a result map, or `:aborted` after a declined confirmation prompt.
-;; Only `run!`, the entry point wired into `bb.edn`, exits the process: with a
-;; non-zero status when a command throws, and with the status `verify` and
-;; `doctor` return.
+;; `verify!` and `doctor!` report most failures in their result, with the exit
+;; code under `:exit`. Only `run!`, the entry point wired into `bb.edn`, exits
+;; the process. It prints a failure as one line, without a stack trace, and
+;; exits 1, or 2 when the command was `verify` or `doctor`. `run!` works as
+;; the entry point of a JVM process as well as a Babashka task.
 
 ;; ## Size bounds
 

@@ -110,6 +110,12 @@
 
 (cli/add-recipient! alice "dev" bob-pub)
 
+;; Until that happens, the store is still encrypted to the earlier set. A
+;; `verify` that has an identity notices, because the store records the
+;; recipient set it was encrypted to, and reports the difference as drift:
+
+(cli/verify! alice "dev")
+
 (cli/reencrypt! alice "dev")
 
 ;; `reencrypt` also gives the store a new manifest key, so the hash below
@@ -148,9 +154,13 @@
 ;; ## Removing a person {#offboarding}
 
 ;; Remove the person's line from the recipients file, run `reencrypt`, and
-;; commit the recipients file, the ciphertext, and the manifest together:
+;; commit the recipients file, the ciphertext, and the manifest together.
+;; Editing the file does nothing by itself. Bob's key still decrypts the store
+;; until it is re-encrypted, and `verify` says so:
 
 (spit (str dir "/recipients.txt") (str alice-pub "\n"))
+
+(cli/verify! alice "dev")
 
 (cli/reencrypt! alice "dev")
 
@@ -184,6 +194,11 @@
 ;; and a write that finds a different set generates a new key too, and says
 ;; so. Removing a line from the recipients file therefore renews the key on
 ;; the next write of any kind, even if nobody runs `reencrypt`.
+
+;; That record is a guard against forgetting. It is not what removes someone.
+;; Everyone who can decrypt a store can also write its metadata, so a person
+;; about to be removed could change the record ahead of time. `reencrypt` is
+;; the removal step: it renews the key every time and never reads the record.
 
 ;; The old key still works against the manifests published while it was in
 ;; use, as Bob's identity still works against the old ciphertexts.

@@ -27,8 +27,8 @@
 
 (let [plain (str dir "/p.edn")]
   (spit plain (pr-str {:a 1}))
-  (age/encrypt-file! key-file plain (str dir "/one.age"))
-  (age/encrypt-file! key-file plain (str dir "/two.age"))
+  (age/encrypt-file! {:identity-file key-file} plain (str dir "/one.age"))
+  (age/encrypt-file! {:identity-file key-file} plain (str dir "/two.age"))
   (= (slurp (str dir "/one.age")) (slurp (str dir "/two.age"))))
 
 ;; If a pull request only changes `secrets.edn.age`, there is very little for a
@@ -121,9 +121,10 @@
 
 (keys (edn/read-string (age/decrypt key-file store)))
 
-;; The entries in the `:com.kirahowe.secrets` namespace hold the manifest key
-;; and a record of the recipient set the store was last encrypted to. They
-;; belong to the library. `load-secrets` never returns them:
+;; `:com.kirahowe.secrets/store` is the one key the library reserves. Its
+;; value is a small map: a format version, the manifest key, and a record of
+;; the recipient set the store was last encrypted to. `load-secrets` never
+;; returns it:
 
 (keys (secrets/load-secrets store key-file))
 
@@ -182,7 +183,7 @@
 
 (let [plain (str dir "/p2.edn")]
   (spit plain (str/replace (age/decrypt key-file store) "db/app" "db/other"))
-  (age/encrypt-file! key-file plain store)
+  (age/encrypt-file! {:identity-file key-file} plain store)
   (io/delete-file plain))
 
 (cli/verify! config "dev")
@@ -195,6 +196,10 @@
 ;; every entry. A manifest from another app, in another format version, or
 ;; with an entry that lacks a hash is reported as drift, with or without an
 ;; identity.
+
+;; In a team store, a `verify` with an identity also compares the recipients
+;; file with the recipient set the store records, and reports a difference as
+;; drift. The [teams chapter](secrets_book.teams.html) shows that.
 
 ;; `reencrypt` regenerates the manifest from the ciphertext:
 
@@ -235,25 +240,30 @@
 ;; [caveats chapter](secrets_book.caveats.html#no-signatures-the-repository-is-the-boundary)
 ;; explains what this means for trusting the repository.
 
-;; ## A store without a manifest key
+;; ## A store without metadata
 
-;; A store that has no well-formed manifest key can't have a manifest. This
-;; happens to a store written by another tool, or by a version of this library
-;; that predates the key. Here is one, encrypted with `age` directly:
+;; A store whose metadata is missing, malformed, or of another version can't
+;; have a manifest. This happens to a store written by another tool, or by an
+;; earlier version of this library. Here is one, encrypted with `age`
+;; directly:
 
 (let [plain (str dir "/p3.edn")]
   (spit plain (pr-str {:database/url "jdbc:postgresql://db/app"}))
-  (age/encrypt-file! key-file plain store)
+  (age/encrypt-file! {:identity-file key-file} plain store)
   (io/delete-file plain))
 
 (cli/verify! config "dev")
 
-;; `edit`, `set`, and `rm` fail on such a store with the same message.
-;; `reencrypt` doesn't read the existing key, so it is the repair:
+;; `edit`, `set`, and `rm` fail on such a store with the same message, which
+;; says what is wrong and names the repair. `reencrypt` doesn't read the
+;; existing metadata, so it writes a current store whatever was there:
 
 (cli/reencrypt! config "dev")
 
 (cli/verify! config "dev")
+
+;; A store that isn't a map at all can't hold metadata, and no command can
+;; repair it. Its message says so and names `bb secrets new`.
 
 ;; ## Format versioning
 
