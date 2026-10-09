@@ -147,7 +147,7 @@
     (= :object kind) (str "an instance of " class-name)
     (= :file kind) path
     path (str scheme ":" path)
-    :else (str "a " scheme ": URL")))
+    :else (str "a URL with the scheme " scheme)))
 
 (defn- local-source
   "Classify `source` without opening it: `{:file f}`, or `{:archive f :entry

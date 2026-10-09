@@ -908,7 +908,8 @@
                     spec)
               scheme (.getProtocol (java.net.URL. spec))]
           (is (= {:reason :disallowed-source :source {:kind :url :scheme scheme}} (ex-data e)))
-          (is (str/includes? (ex-message e) (str "a " scheme ": URL is not permitted")))
+          (is (str/includes? (ex-message e)
+                             (str "a URL with the scheme " scheme " is not permitted")))
           (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) "SENTINEL"))))))
     (testing "an allowed-looking caller URL cannot substitute its own I/O handler"
       (if (System/getProperty "babashka.version")
@@ -1942,3 +1943,25 @@
       (when finished?
         (is (= "loaded" (slurp (.getInputStream process))))
         (is (< (- (System/currentTimeMillis) started) 30000))))))
+
+;;;; A failed delete after a failure that is not an ex-info
+
+(deftest a-remaining-file-report-repeats-only-an-ex-info-message-test
+  (let [failure (fn [thrown]
+                  (with-redefs-fn {#'fs/try-delete! (constantly false)}
+                    #(let [file (atom nil)]
+                       (try
+                         (test-env/thrown
+                          (fn [] (fs/with-private-temp-file "secrets-" ".edn"
+                                   (fn [f] (reset! file f) (throw thrown)))))
+                         (finally (.delete ^java.io.File @file))))))]
+    (testing "an ex-info wrote its own message, which holds no file contents"
+      (let [e (failure (ex-info "the command's own message" {:reason :command}))]
+        (is (= :private-file-remains (:reason (ex-data e))))
+        (is (str/starts-with? (ex-message e) "the command's own message\n"))))
+    (testing "any other exception is named by its class, never by its message"
+      (let [e (failure (IllegalStateException. "MESSAGE-THAT-MAY-QUOTE-INPUT"))]
+        (is (= :private-file-remains (:reason (ex-data e))))
+        (is (str/starts-with? (ex-message e) "java.lang.IllegalStateException\n"))
+        (is (not (str/includes? (ex-message e) "MESSAGE-THAT-MAY-QUOTE-INPUT")))
+        (is (str/includes? (ex-message e) (:remaining-file (ex-data e))))))))

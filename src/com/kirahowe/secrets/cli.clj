@@ -1,62 +1,22 @@
 (ns com.kirahowe.secrets.cli
-  "The `bb secrets` management task.
+  "The `bb secrets` management task: the prompts, the editor, the reports, and
+  command dispatch over `com.kirahowe.secrets.store`.
 
       ;; bb.edn
-      {:deps  {com.kirahowe/secrets {:local/root \"../secrets\"}}
-       :tasks {secrets {:task (com.kirahowe.secrets.cli/run! my-config *command-line-args*)}}}
+      {:tasks {secrets {:requires ([com.kirahowe.secrets.cli :as cli])
+                        :task (cli/run! my-config *command-line-args*)}}}
 
-  `my-config` describes the encrypted files per environment:
+  `run!` is the entry point of a process. It alone prints a failure and exits:
+  1 on failure, and for `verify` and `doctor` 1 on drift or a warning and 2 on
+  any failure. `normalize-config` validates a config map. The README describes
+  the config keys and how a command resolves its identity.
 
-      {:app \"reader\"
-       :default-environment :prod
-       :environments
-       {:prod {:secrets-file \"env/prod/resources/secrets.edn.age\"}
-        :dev  {:secrets-file \"env/dev/resources/secrets.edn.age\"}}}
-
-  Per-environment defaults fill in automatically:
-    :key-file → ~/.config/<app>/key.txt   (one key per developer by default)
-    :template → <secrets-file>.example     (secrets.edn.age → secrets.edn.example)
-    :manifest → <secrets-file>.manifest    (secrets.edn.age → secrets.edn.manifest)
-
-  Identity resolution separates two concerns per environment:
-    :key-file      the durable configured/default path above. `keygen` writes
-                     here; `show-key` and `add-recipient` read the public key
-                     from it.
-    :identity-file what decrypt-side operations (edit, set, rm, reencrypt,
-                     verify) and single-key encryption use. Resolved in order:
-                       1. an explicit :identity-file
-                       2. $SECRETS_AGE_IDENTITY_FILE, a path to the key file
-                       3. $SECRETS_AGE_IDENTITY, raw key contents (written to a 0600 temp file)
-                       4. $SECRETS_AGE_IDENTITY_B64, base64-encoded key contents
-                       5. the environment's :key-file
-                     So CI holding only an SECRETS_AGE_IDENTITY* variable can encrypt,
-                     decrypt, and verify, while `keygen` still writes to the
-                     configured key path.
-
-  Optional per-environment keys:
-    :recipients-file  path to a committed file of age public keys (one per
-                      line). When set, the environment encrypts to all of them,
-                      so each teammate can decrypt with their own key.
-                      Absent ⇒ single-key mode (encrypt to own key).
-    :manifest false   disable the manifest for this environment.
-
-  Commands: keygen · new · edit · set · rm · verify · doctor · show-key ·
-  add-recipient · recipients · reencrypt · help.
-
-  By default, each environment commits `secrets.edn.age` (ciphertext) and
-  `secrets.edn.manifest` (key paths, types, counts, and a keyed hash per value).
-  The hashes are keyed by a random manifest key the store holds inside its
-  encrypted EDN; `store/manifest-key-for` states when that key is generated, kept,
-  and renewed. A store's plaintext is one EDN map. Editing uses an owner-only
-  plaintext temp file and deletes it afterward; a failed delete is an error
-  that names the remaining path.
-
-  The command functions are the API for a REPL or a program: they return data
-  (a path, a results map, or :aborted), throw `ex-info` with a `:reason` on
-  failure, and never exit. `verify!` and `doctor!` report most failures in
-  their result, with the exit code under `:exit`. `run!` is the entry point of
-  a process. It alone prints a failure and exits: 1 on failure, and for
-  `verify` and `doctor` 1 on drift or a warning and 2 on any failure."
+  The command functions are the API for a REPL or a program: `keygen!`,
+  `new!`, `edit!`, `set-secret!`, `remove-secret!`, `verify!`, `doctor!`,
+  `show-key!`, `add-recipient!`, `recipients!`, and `reencrypt!`. They return
+  data (a path, a results map, or :aborted), throw `ex-info` with a `:reason`
+  on failure, and never exit. `verify!` and `doctor!` report most failures in
+  their result, with the exit code under `:exit`."
   (:refer-clojure :exclude [run!])
   (:require [clojure.java.io :as io]
             [clojure.pprint :as pprint]
@@ -67,14 +27,17 @@
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.store :as store :refer [fail! shell-quote]]))
 
-;;;; Generated shell commands
-
-;;; Every command this namespace prints for an operator to paste is POSIX `sh`,
-;;; and every value interpolated into one goes through `shell-quote`. The CLI
-;;; never executes these strings itself; the hazard is the instruction handed
-;;; to the operator, so the rendering is where it has to be fixed.
-
 ;;;; Output
+
+;;; Everything a command reports is a *line*: a vector whose first element is
+;;; its level and whose remaining elements are segments, joined with one space
+;;; the way `println` joins its arguments. A segment is a string or a
+;;; `[style string]` pair to paint. Commands build lines as plain data (the
+;;; `*-lines` functions are pure) and `say!` is the one place a line is
+;;; painted and written out.
+;;;
+;;;   :line    stdout, no marker          :stderr  stderr, no marker
+;;;   :info •  :ok ✓  :warn ⚠  stdout     :oops ✗  stderr
 
 (def ^:private ansi
   {:reset "\033[0m" :bold "\033[1m" :dim "\033[2m"
@@ -258,14 +221,6 @@
       (store/read-file-bounded! f store/max-plaintext-bytes "Template" {:template (str template)})
       default-template)))
 
-(defn- require-age! []
-  (when-not (age/installed?)
-    (fail! :age-not-installed
-           (str "The `age` tool is not installed.\n"
-                "    macOS:  brew install age\n"
-                "    Ubuntu: apt install age\n"
-                "    Docs:   https://age-encryption.org"))))
-
 ;;;; Key paths and plaintext
 
 (def ^:private set-usage
@@ -412,7 +367,7 @@
   existing key is kept. An existing key requires confirmation before it is
   replaced."
   [config env-arg]
-  (require-age!)
+  (age/ensure-installed!)
   (let [{:keys [key-file recipients-file] environment-name :name}
         (store/resolve-env config env-arg)
         proceed? (or (not (.exists (io/file key-file)))
@@ -428,6 +383,18 @@
                             (age/keygen! key-file)))
         key-file))))
 
+(defn- require-secrets-file!
+  "Fail with `:no-file` unless the environment's secrets file exists, naming
+  the command that creates it. `more` is appended to the message."
+  [{:keys [secrets-file] environment-name :name} & more]
+  (when-not (.exists (io/file secrets-file))
+    (fail! :no-file
+           (apply str "No secrets file at " secrets-file "\n"
+                  "    Create one with:  bb secrets new "
+                  (shell-quote (name environment-name)) more)
+           {:secrets-file secrets-file
+            :environment environment-name})))
+
 (defn new!
   "Create an encrypted secrets file from its template using $VISUAL, $EDITOR,
   or vim. Returns the secrets-file path, or :aborted when an existing file is
@@ -437,7 +404,7 @@
   [config env-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
-      (require-age!)
+      (age/ensure-installed!)
       (let [{:keys [secrets-file] environment-name :name} env
             target (store/encrypt-target! env)
             proceed? (or (not (.exists (io/file secrets-file)))
@@ -469,16 +436,10 @@
   [config env-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
-      (require-age!)
-      (let [{:keys [secrets-file] environment-name :name} env]
+      (age/ensure-installed!)
+      (let [{:keys [secrets-file]} env]
         (store/require-identity! env)
-        (when-not (.exists (io/file secrets-file))
-          (fail! :no-file
-                 (str "No secrets file at " secrets-file "\n"
-                      "    Create one with:  bb secrets new "
-                      (shell-quote (clojure.core/name environment-name)))
-                 {:secrets-file secrets-file
-                  :environment environment-name}))
+        (require-secrets-file! env)
         (let [target (store/encrypt-target! env)]
           (with-plaintext-temp
             (fn [tmp]
@@ -531,7 +492,7 @@
   [config env-arg key-arg & [{:keys [edn?]}]]
   (store/with-environment-identity config (with-set-usage #(store/resolve-env config env-arg))
     (fn [env]
-      (require-age!)
+      (age/ensure-installed!)
       (let [path (with-set-usage #(parse-key-path key-arg))
             {:keys [secrets-file]} env
             exists? (.exists (io/file secrets-file))]
@@ -591,23 +552,15 @@
   [config env-arg key-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
-      (require-age!)
+      (age/ensure-installed!)
       (let [path (parse-key-path key-arg)
             {:keys [secrets-file] environment-name :name} env]
         (store/require-identity! env)
-        (when-not (.exists (io/file secrets-file))
-          (fail! :no-file
-                 (str "No secrets file at " secrets-file "\n"
-                      "    Create one with:  bb secrets new "
-                      (shell-quote (clojure.core/name environment-name)) "\n"
-                      "    or:               bb secrets set "
-                      (shell-quote (clojure.core/name environment-name)) " "
-                  ;; A string `key-arg` already is the EDN text argv
-                  ;; carried; any other accepted value is printed to get
-                  ;; that text back.
-                      (shell-quote (if (string? key-arg) key-arg (pr-str key-arg))))
-                 {:secrets-file secrets-file
-                  :environment environment-name}))
+        ;; A string `key-arg` already is the EDN text argv carried; any other
+        ;; accepted value is printed to get that text back.
+        (require-secrets-file! env "\n    or:               bb secrets set "
+                               (shell-quote (name environment-name)) " "
+                               (shell-quote (if (string? key-arg) key-arg (pr-str key-arg))))
         (let [target (store/encrypt-target! env)]
           (info "Decrypting" secrets-file "…")
           (let [store (store/parse-secrets! secrets-file (store/decrypt-text! env) nil)
@@ -673,16 +626,10 @@
   [config env-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
-      (require-age!)
-      (let [{:keys [secrets-file] environment-name :name} env]
+      (age/ensure-installed!)
+      (let [{:keys [secrets-file]} env]
         (store/require-identity! env)
-        (when-not (.exists (io/file secrets-file))
-          (fail! :no-file
-                 (str "No secrets file at " secrets-file "\n"
-                      "    Create one with:  bb secrets new "
-                      (shell-quote (clojure.core/name environment-name)))
-                 {:secrets-file secrets-file
-                  :environment environment-name}))
+        (require-secrets-file! env)
         (let [target (store/encrypt-target! env)]
           (with-plaintext-temp
             (fn [tmp]
@@ -717,7 +664,6 @@
   adds the environment's own public key (from its key-file). Returns the
   recipient added (or already present)."
   [config env-arg pubkey]
-  (require-age!)
   (let [{:keys [recipients-file key-file secrets-file]
          environment-name :name :as env}
         (store/resolve-env config env-arg)
@@ -745,19 +691,8 @@
             (do
               (info "Already a recipient of" (str environment-label ":") pub)
               pub)
-            (let [current (:content snapshot)
-                  content (str current
-                               (when (and (seq current)
-                                          (not (str/ends-with? current "\n")))
-                                 "\n")
-                               pub "\n")]
-              (when (> (store/utf8-length content) store/max-recipients-bytes)
-                (store/input-too-large!
-                 (str "The updated recipients file " recipients-file)
-                 store/max-recipients-bytes (store/utf8-length content)
-                 {:recipients-file (str recipients-file)
-                  :environment environment-name}))
-              (store/replace-file! recipients-file content)
+            (do
+              (store/append-recipient! env (:content snapshot) pub)
               (say! (recipient-added-lines environment-label recipients-file pub
                                            (.exists (io/file secrets-file))))
               pub)))))))
@@ -825,7 +760,8 @@
        [:line (str "    Write it with:  bb secrets reencrypt " quoted)]]
 
       :manifest-invalid-edn
-      [[:oops label "manifest is not valid EDN:" (safe-edn/failure-message (:failure finding))]]
+      [[:oops label "manifest is not valid EDN:" (safe-edn/failure-message (:failure finding))]
+       regenerate]
 
       :manifest-malformed
       [[:oops label "manifest is incomplete: expected a map with a :ciphertext-sha"

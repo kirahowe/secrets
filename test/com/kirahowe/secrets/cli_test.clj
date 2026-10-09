@@ -3951,3 +3951,40 @@
           (.destroyForcibly process)
           (when (pos? (.length pid-file))
             (shell/sh "kill" (str/trim (slurp pid-file)))))))))
+
+;;;; Residue
+
+(deftest a-junk-ssh-line-is-refused-by-the-library-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [recipients (str *dir* "/recipients.txt")
+          config (cli/normalize-config (test-config {:recipients-file recipients}))
+          junk "ssh-ed25519 not*base64 SENTINEL-TAIL-OF-A-HAND-EDITED-LINE"]
+      (testing "an ssh line needs a base64 key, and may carry a comment"
+        (is (age/valid-recipient? "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9"))
+        (is (age/valid-recipient? "ssh-rsa AAAAB3NzaC1yc2E= me@host with spaces"))
+        (is (not (age/valid-recipient? junk)))
+        (is (not (age/valid-recipient? "ssh-ed25519 "))))
+      (spit recipients (str junk "\n"))
+      (let [argvs (atom nil)
+            captured (capture-failure
+                      #(reset! argvs (recorded-sh-argvs (fn [] (store-through-stdin! config)))))]
+        (is (not-any? #(some #{"-e" "-r"} %) (age-argvs @argvs)) "the line never reaches age")
+        (is (= :invalid-recipient
+               (:reason (ex-data (test-env/thrown #(store-through-stdin! config))))))
+        (assert-redacted! "SENTINEL-TAIL" captured))
+      (let [out (with-out-str (cli/recipients! config "dev"))]
+        (is (str/includes? out (pr-str (str (subs junk 0 16) "…"))))
+        (is (str/includes? out "invalid; encryption refuses this line"))
+        (is (not (str/includes? out "SENTINEL-TAIL")))))))
+
+(deftest an-invalid-edn-manifest-says-how-to-regenerate-it-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))]
+      (store-through-stdin! config)
+      (spit (str *dir* "/secrets.edn.manifest") "{:version 3\n :keys {[:a]}}\n")
+      (let [{:keys [result out err]} (capture-verify config "dev")]
+        (is (= {:results {:dev :drift} :exit 1} result))
+        (is (re-find #"manifest is not valid EDN: malformed EDN syntax at line 2, column \d+" err))
+        (is (str/includes? out "Regenerate it with:  bb secrets reencrypt 'dev'"))))))

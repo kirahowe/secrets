@@ -49,13 +49,14 @@
                      :docs "https://age-encryption.org"}))))
 
 (defn valid-recipient?
-  "Return true when `s` looks like an age recipient (an `age1…` public key, or
-  an `ssh-ed25519`/`ssh-rsa` line). This is not a full validation: `age` itself
-  is the authority; this just catches obvious typos before writing a keys file."
+  "Return true when `s` looks like an age recipient: an `age1…` public key, or
+  an `ssh-ed25519`/`ssh-rsa` line with a base64 key and an optional comment.
+  This is not a full validation: `age` itself is the authority; this just
+  catches a typo or a junk line before it is written or handed to `age`."
   [s]
   (let [s (str/trim (str s))]
     (boolean (or (re-matches #"age1[0-9a-z]{20,}" s)
-                 (re-matches #"ssh-(ed25519|rsa) .+" s)))))
+                 (re-matches #"ssh-(ed25519|rsa) [A-Za-z0-9+/]+={0,2}( .*)?" s)))))
 
 (defn- path-arg
   "Render `p`, the path argument playing `role`, as an age argument that can

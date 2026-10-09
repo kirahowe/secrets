@@ -100,8 +100,8 @@
   the file still exists, the operator has to remove it, so the path is
   reported under `:remaining-file` in an `ex-info` with `:reason
   :private-file-remains`. After a failed `f` that `ex-info` carries the
-  failure's message with the path added, the failure's other data, and the
-  failure as its cause."
+  failure's message (its class name, unless it is an `ex-info`) with the path
+  added, the failure's other data, and the failure as its cause."
   [prefix suffix f]
   (let [file (owner-only-temp-file! prefix suffix)
         path (.getAbsolutePath ^java.io.File file)
@@ -112,7 +112,10 @@
                  (catch Throwable t
                    (throw (if (try-delete! file)
                             t
-                            (ex-info (str (ex-message t) "\n" remains)
+                            (ex-info (str (if (instance? clojure.lang.ExceptionInfo t)
+                                            (ex-message t)
+                                            (.getName (class t)))
+                                          "\n" remains)
                                      (assoc (ex-data t)
                                             :reason :private-file-remains
                                             :remaining-file path)

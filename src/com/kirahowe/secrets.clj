@@ -463,7 +463,8 @@
     #secret/opt k → optional: nil in all three of those cases.
   \"No identity is available\" means none was designated and the default key
   file is absent. A designated identity file that does not exist makes both
-  tags throw `:no-identity`, as does a decryption that fails."
+  tags throw `:no-identity`, and a decryption that fails makes both throw
+  `:decrypt-failed`."
   [opts]
   (let [loaded (delay (reader-loaded-state opts))
         _ (validate-reader-source! opts)

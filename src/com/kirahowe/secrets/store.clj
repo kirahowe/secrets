@@ -24,16 +24,6 @@
   [s]
   (str "'" (str/replace (str s) "'" "'\\''") "'"))
 
-;;; Everything a command reports is a *line*: a vector whose first element is
-;;; its level and whose remaining elements are segments, joined with one space
-;;; the way `println` joins its arguments. A segment is a string or a
-;;; `[style string]` pair to paint. Commands build lines as plain data (the
-;;; `*-lines` functions below are pure) and `say!` is the one place a line is
-;;; painted and written out.
-;;;
-;;;   :line    stdout, no marker          :stderr  stderr, no marker
-;;;   :info •  :ok ✓  :warn ⚠  stdout     :oops ✗  stderr
-
 (defn fail!
   "Throw an `ex-info` for a user-facing failure, with `reason` as its
   `:reason`. `run!` prints the message plus any :hint, :install, :error, or
@@ -140,9 +130,9 @@
       (fail! :invalid-config
              (str (:label a) " and " (:label b) " name the same file: " (:path a)
                   (when (not= (:path a) (:path b)) (str " and " (:path b)))
-                  "\n    A file is a secrets file, a manifest, a template, an identity, or a"
-                  " recipients file, and only one of them. Two environments\n    share a"
-                  " secrets file or a manifest only when they share both.")
+                  "\n    A file is a secrets file, a manifest, a template, an identity, or"
+                  " a recipients file,\n    and only one of them. Two environments share a"
+                  " secrets file or a manifest only\n    when they share both.")
              {:settings [(:label a) (:label b)]}))))
 
 (def max-recipients-bytes
@@ -547,6 +537,23 @@
       (spit staging content)
       (fs/atomic-move! staging target)
       (finally (.delete staging)))))
+
+(defn append-recipient!
+  "Write the environment's recipients file with `pub` added as its last line.
+  `current` is the file's text as `recipient-file-snapshot` read it, or nil."
+  [{:keys [recipients-file] environment-name :name} current pub]
+  (let [content (str current
+                     (when (and (seq current)
+                                (not (str/ends-with? current "\n")))
+                       "\n")
+                     pub "\n")]
+    (when (> (utf8-length content) max-recipients-bytes)
+      (input-too-large!
+       (str "The updated recipients file " recipients-file)
+       max-recipients-bytes (utf8-length content)
+       {:recipients-file (str recipients-file)
+        :environment environment-name}))
+    (replace-file! recipients-file content)))
 
 ;;; A store's plaintext is the user's text with the library's metadata written
 ;;; as the first line of its map. `with-metadata` puts that line in and
