@@ -1509,13 +1509,6 @@
   (read-file-bounded! manifest-path max-manifest-bytes "Manifest"
                       {:manifest (str manifest-path)}))
 
-(defn- bounded-state
-  "The doctor state for a tripped size bound, or nil for any other failure."
-  [e]
-  (let [data (ex-data e)]
-    (when (= :input-too-large (:reason data))
-      (merge {:state :bounded} (select-keys data [:reason :limit :observed])))))
-
 (defn- read-supported-manifest
   "The committed manifest at `manifest-path` as `{:committed value}`, or a
   `{:problem …}` naming why it cannot be compared at all: it is not EDN, or
@@ -1768,271 +1761,128 @@
 
 ;;;; Doctor
 
-;;; Doctor results keep nil-valued fields. A fixed schema lets callers tell an
-;;; unavailable diagnostic from an omitted one.
-
-(defn- artifact-state
-  "Describe a configured artifact without reading it. Disabled and unconfigured
-  artifacts have no path; every configured path is canonical."
-  [path absent-state]
-  (if (string? path)
-    (let [f (io/file path)]
-      {:state :configured
-       :path (canonical-path path)
-       :exists? (boolean (.exists f))})
-    {:state absent-state
-     :path nil
-     :exists? false}))
-
-(defn- identity-state
-  "Describe the resolved identity: its `:source`, its `:path` unless it was
-  injected as contents, and whether it is `:usable?`, a readable regular file.
-  `problem` is the message of a failed resolution, or nil."
-  [{:keys [identity-file identity-source]} problem]
-  (let [injected? (#{:secrets-age-identity :secrets-age-identity-b64} identity-source)
-        f (some-> identity-file str io/file)]
-    {:source identity-source
-     :path (when-not injected? (some-> identity-file str))
-     :usable? (boolean (and f (not problem) (.isFile f) (.canRead f)))
-     :exists? (boolean (and f (.exists f)))
-     :problem problem}))
-
-(defn- recipient-state
-  "Summarize recipients without retaining any recipient line."
-  [env artifact]
-  (cond
-    (nil? (:recipients-file env))
-    {:state :unconfigured :count 0 :valid? nil}
-
-    (not (:exists? artifact))
-    {:state :missing :count nil :valid? nil}
-
-    :else
-    (try
-      (let [recipients (read-recipients env)
-            count-all (count recipients)
-            invalid-all (count (remove age/valid-recipient? recipients))]
-        (cond
-          (zero? count-all)
-          {:state :empty :count 0 :valid? false}
-
-          (pos? invalid-all)
-          {:state :invalid
-           :count count-all
-           :valid? false
-           :invalid-count invalid-all}
-
-          :else
-          {:state :valid :count count-all :valid? true}))
-      (catch clojure.lang.ExceptionInfo e
-        (or (bounded-state e)
-            {:state :unreadable :count nil :valid? nil}))
-      (catch Exception _
-        {:state :unreadable :count nil :valid? nil}))))
-
-(defn- manifest-state
-  "Report whether a configured manifest is complete, which a keyless
-  freshness check needs. Manifest contents and parse errors are deliberately
-  omitted."
-  [app manifest artifact]
-  (cond
-    (not (string? manifest)) {:state :disabled}
-    (not (:exists? artifact)) {:state :missing}
-    :else
-    (try
-      (let [{:keys [problem]} (read-supported-manifest app manifest)]
-        (case (:reason problem)
-          nil {:state :ready}
-          :unsupported-version {:state :unsupported}
-          {:state :invalid}))
-      (catch clojure.lang.ExceptionInfo e
-        (or (bounded-state e) {:state :invalid}))
-      (catch Exception _ {:state :invalid}))))
-
-(defn- age-state []
-  (let [version (age/version)]
-    {:available? (some? version)
-     :version version}))
-
-(defn- doctor-verification-capability
-  [age identity artifacts manifest-capability]
-  (let [ciphertext? (get-in artifacts [:ciphertext :exists?])
-        manifest? (get-in artifacts [:manifest :exists?])]
-    {:state (if (= :disabled (:state manifest-capability))
-              :skipped
-              (:state manifest-capability))
-     ;; `verify` fails on an identity problem before it compares anything.
-     :keyless? (boolean (and (not (:problem identity))
-                             ciphertext?
-                             (= :ready (:state manifest-capability))))
-     :full? (boolean (and (:available? age)
-                          (:usable? identity)
-                          ciphertext?
-                          manifest?))}))
-
-(defn- doctor-status
-  [age identity artifacts recipients manifest-capability verify]
-  (let [manifest? (get-in artifacts [:manifest :exists?])
-        invalid? (contains? #{:empty :invalid} (:state recipients))
-        missing-artifact?
-        (or (some (fn [kind]
-                    (not (get-in artifacts [kind :exists?])))
-                  [:ciphertext :key])
-            (and (not= :disabled (:state manifest-capability))
-                 (not manifest?))
-            (= :missing (:state recipients)))
-        invalid? (or invalid? (some? (:problem identity)))
-        warning? (or (not (:available? age))
-                     missing-artifact?
-                     (not (:usable? identity))
-                     (contains? #{:unreadable :bounded} (:state recipients))
-                     (and (not= :disabled (:state manifest-capability))
-                          (not= :ready (:state manifest-capability)))
-                     (and (not= :skipped (:state verify))
-                          (not (or (:keyless? verify) (:full? verify)))))]
-    (cond
-      invalid? :invalid
-      warning? :warning
-      :else :healthy)))
-
-(defn- doctor-report
-  "Diagnose normalized environment `env`. `identity-problem` is the message of
-  a failed identity resolution, or nil when `env` carries a resolved identity."
-  [{:keys [secrets-file manifest template key-file recipients-file]
-    environment-name :name :as env}
-   identity-problem]
-  (let [artifacts {:ciphertext (artifact-state secrets-file :unconfigured)
-                   :manifest (artifact-state manifest :disabled)
-                   :template (artifact-state template :unconfigured)
-                   :key (artifact-state key-file :unconfigured)
-                   :recipients (artifact-state recipients-file :unconfigured)}
-        identity (identity-state env identity-problem)
-        age (age-state)
-        recipients (recipient-state env (:recipients artifacts))
-        manifest-capability (manifest-state (:app env) manifest (:manifest artifacts))
-        verify (doctor-verification-capability age identity artifacts manifest-capability)
-        status (doctor-status age identity artifacts recipients manifest-capability verify)]
-    {:configuration {:valid? true :reason nil}
-     :age age
-     :environment environment-name
-     :artifacts artifacts
-     :identity identity
-     :encryption {:mode (if recipients-file :multi-recipient :single-key)
-                  :recipients recipients}
-     :verify verify
-     :status status
-     :exit (case status :healthy 0 :warning 1 :invalid 2)}))
-
 (def ^:private identity-failure-reasons
   "The reasons a failed identity resolution carries: a blank or undecodable
   variable, a path that is not a local path, and a designated file that does
   not exist."
   #{:invalid-identity :disallowed-identity :no-identity})
 
-(defn- doctor-data
-  [config env-arg]
-  (let [config (normalize-config config)
-        env (resolve-env config env-arg)]
-    (try
-      (with-environment-identity config env #(doctor-report % nil))
-      (catch clojure.lang.ExceptionInfo e
-        (if (identity-failure-reasons (:reason (ex-data e)))
-          (doctor-report (assoc env
-                                :identity-file (:identity-file (ex-data e))
-                                :identity-source (:identity-source (ex-data e)))
-                         (ex-message e))
-          (throw e))))))
-
-(defn- artifact-state-line
-  [label {:keys [state path exists?]}]
-  [:line (str label ": "
-              (case state
-                :disabled "disabled"
-                :unconfigured "unconfigured"
-                (str (if exists? "present" "missing") " — " path)))])
-
-(def ^:private artifact-labels
-  [[:ciphertext "Ciphertext"]
-   [:manifest "Manifest"]
-   [:template "Template"]
-   [:key "Key"]
-   [:recipients "Recipients file"]])
-
-(defn- identity-line
-  [{:keys [source path usable? exists? problem]}]
-  [:line "Identity:"
-   (str/join " — "
-             (remove nil?
-                     [(identity-source-display-label source)
-                      path
-                      (cond problem "invalid"
-                            usable? "usable"
-                            exists? "unusable"
-                            :else "missing")]))])
+(defn- doctor-report
+  "Diagnose normalized environment `env`. `identity-problem` is the message of
+  a failed identity resolution, or nil when `env` carries a resolved identity.
+  A warning is something an operator would act on that stops no command from
+  being tried: a file that is not there yet, or `age` not being installed. A
+  problem is an identity that does not resolve, or a recipients file that
+  lists nobody or holds a line age would refuse."
+  [{:keys [secrets-file manifest recipients-file identity-file identity-source]
+    environment-name :name :as env}
+   identity-problem]
+  (let [exists? #(boolean (and % (.exists (io/file (str %)))))
+        label (shell-quote (name environment-name))
+        version (age/version)
+        recipients (when (exists? recipients-file) (read-recipients env))
+        invalid (count (remove age/valid-recipient? recipients))
+        injected? (#{:secrets-age-identity :secrets-age-identity-b64} identity-source)
+        warnings
+        (cond-> []
+          (nil? version)
+          (conj "age is not installed, so nothing can be encrypted or decrypted.")
+          (not (exists? secrets-file))
+          (conj (str "No secrets file yet. Create it with:  bb secrets new " label))
+          (and (string? manifest) (exists? secrets-file) (not (exists? manifest)))
+          (conj (str "No manifest. Write it with:  bb secrets reencrypt " label))
+          (and recipients-file (not (exists? recipients-file)))
+          (conj (str "No recipients file yet. Start it with:  bb secrets add-recipient " label))
+          (not (or identity-problem (exists? identity-file)))
+          (conj (str "No identity, so only keyless verification works here."
+                     " Create a key with:  bb secrets keygen " label)))
+        problems
+        (cond-> []
+          identity-problem (conj identity-problem)
+          (and recipients (empty? recipients))
+          (conj (str "The recipients file lists nobody. Add a key with:"
+                     "  bb secrets add-recipient " label))
+          (pos? invalid)
+          (conj (str invalid " recipients file line(s) are not age recipients."
+                     " `bb secrets recipients " label "` marks them.")))]
+    (cond-> {:environment environment-name
+             :age version
+             :secrets-file {:path secrets-file :exists? (exists? secrets-file)}
+             :manifest (when (string? manifest)
+                         {:path manifest :exists? (exists? manifest)})
+             :identity {:source identity-source
+                        :path (when-not injected? identity-file)
+                        :exists? (exists? identity-file)}
+             :warnings warnings
+             :problems problems
+             :exit (cond (seq problems) 2 (seq warnings) 1 :else 0)}
+      recipients-file
+      (assoc :recipients-file {:path recipients-file
+                               :exists? (exists? recipients-file)
+                               :count (count recipients)}))))
 
 (defn- doctor-lines
-  "The `doctor` report: one stable line per diagnostic. It prints paths and
-  never file contents, recipient lines, or environment values."
-  [{:keys [configuration age environment artifacts identity encryption verify status]}]
-  (let [verify-label (fn [available?]
-                       (cond
-                         (= :skipped (:state verify)) "skipped"
-                         available? "available"
-                         :else "unavailable"))
-        {:keys [state valid? invalid-count] recipient-count :count} (:recipients encryption)]
-    (conj
-     (if-not (:valid? configuration)
-       (cond-> [[:line "Configuration: invalid"]]
-         (:reason configuration) (conj [:line "Reason:" (:reason configuration)]))
-       (-> [[:line "Age:" (if (:available? age)
-                            (str "available — " (:version age))
-                            "unavailable")]
-            [:line "Environment:" (name environment)]]
-           (into (map (fn [[kind label]] (artifact-state-line label (artifacts kind))))
-                 artifact-labels)
-           (conj (identity-line identity))
-           (into (when (:problem identity)
-                   [[:line "Identity problem:" (:problem identity)]]))
-           (conj [:line "Encryption mode:" (name (:mode encryption))]
-                 [:line "Recipients:"
-                  (str (name state)
-                       " — count " (if (nil? recipient-count) "unknown" recipient-count)
-                       " — valid " (if (nil? valid?) "unknown" valid?)
-                       (when invalid-count (str " — invalid count " invalid-count)))]
-                 [:line "Verify keyless:" (verify-label (:keyless? verify))]
-                 [:line "Verify full:" (verify-label (:full? verify))])))
-     [:line "Status:" (name status)])))
+  "The `doctor` report. It prints paths and counts, and never file contents,
+  recipient lines, or environment values."
+  [{:keys [environment age secrets-file manifest recipients-file identity warnings problems
+           exit]}]
+  (let [artifact (fn [{:keys [path exists?]}]
+                   (str path (if exists? " (present)" " (missing)")))]
+    (concat
+     (when environment
+       (cond-> [[:line "Environment:" (name environment)]
+                [:line "age:" (or age "not installed")]
+                [:line "Secrets file:" (artifact secrets-file)]
+                [:line "Manifest:" (if manifest (artifact manifest) "disabled")]]
+         recipients-file
+         (conj [:line "Recipients file:" (artifact recipients-file)]
+               [:line "Recipients:" (:count recipients-file)])
+         true
+         (conj [:line "Identity:"
+                (str (identity-source-display-label (:source identity))
+                     (when (:path identity) (str " " (:path identity)))
+                     (if (:exists? identity) " (present)" " (missing)"))])))
+     (for [warning warnings] [:line "Warning:" warning])
+     (for [problem problems] [:line "Problem:" problem])
+     [[:line "Status:" (case (int exit) 0 "healthy" 1 "warning" 2 "invalid")]]
+     (when (zero? exit)
+       [[:line "Run `bb secrets verify` to check the store against its manifest."]]))))
 
 (defn doctor!
-  "Diagnose one selected or default environment. Accepts raw config,
-  normalizes and validates it, prints one line per diagnostic, and returns a
-  structured result containing :exit: 0 healthy, 1 warning, 2 for an invalid
-  configuration, identity, or recipients file. It never exits. A missing
-  template is reported and is not a warning.
+  "Diagnose the setup of one selected or default environment. Accepts raw
+  config, prints a short report, and returns it as a map. It never exits.
 
-  The report names the resolved identity's source and its path. An identity
-  injected as contents is named by its variable and has no path. A failed
-  identity resolution, such as a blank variable, a path that is not a local
-  path, or a designated file that does not exist, is reported under
-  `Identity problem:` beside the rest of the diagnostics. A configuration that
-  does not normalize is reported as `Configuration: invalid` with its reason.
-  No line or returned value holds file contents, a recipient line, or an
-  environment variable's value."
+  The map holds `:environment`, `:age` (the installed version, or nil),
+  `:secrets-file` and `:manifest` (each `{:path :exists?}`, and `:manifest`
+  nil when disabled), `:recipients-file` in team mode (`{:path :exists?
+  :count}`), `:identity` (`{:source :path :exists?}`, with no path for an
+  identity injected as contents), `:warnings` and `:problems` (vectors of
+  messages), and `:exit`.
+
+  `:exit` is 0 when healthy. It is 1 on a warning: `age` is not installed, or
+  the secrets file, the manifest, the recipients file, or the key is not
+  there yet. It is 2 on a problem: an identity that does not resolve, a
+  recipients file that lists nobody or holds an invalid line, or anything
+  that stopped the diagnosis, such as an invalid configuration or an unknown
+  environment, in which case the map holds only `:problems` and `:exit`. A
+  missing template is not reported. `doctor` does not open the store or the
+  manifest: `verify` does that."
   [config env-arg]
   (let [result (try
-                 (doctor-data config env-arg)
+                 (let [config (normalize-config config)
+                       env (resolve-env config env-arg)]
+                   (try
+                     (with-environment-identity config env #(doctor-report % nil))
+                     (catch clojure.lang.ExceptionInfo e
+                       (if (identity-failure-reasons (:reason (ex-data e)))
+                         (doctor-report (merge env (select-keys (ex-data e)
+                                                                [:identity-file :identity-source]))
+                                        (ex-message e))
+                         (throw e)))))
                  (catch clojure.lang.ExceptionInfo e
                    (when (= :private-file-remains (:reason (ex-data e)))
                      (throw e))
-                   {:configuration {:valid? false :reason (ex-message e)}
-                    :age nil
-                    :environment nil
-                    :artifacts nil
-                    :identity nil
-                    :encryption nil
-                    :verify nil
-                    :status :invalid
-                    :exit 2}))]
+                   {:problems [(ex-message e)] :exit 2}))]
     (say! (doctor-lines result))
     result))
 

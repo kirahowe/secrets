@@ -392,193 +392,203 @@
 
 ;;;; Doctor
 
-(deftest doctor-healthy-warning-invalid-and-stable-output-test
-  (testing "a healthy configuration has stable output"
-    (let [config (complete-doctor-config)
-          {:keys [result out err]} (doctor-under config nil {})]
-      (is (= 0 (:exit result)))
-      (is (= :healthy (:status result)))
-      (is (= :dev (:environment result)))
-      (is (= {:available? true :version "age test-version"} (:age result)))
-      (is (true? (get-in result [:verify :keyless?])))
-      (is (true? (get-in result [:verify :full?])))
-      (is (= (.getCanonicalPath
-              (io/file (get-in config [:environments :dev :secrets-file])))
-             (get-in result [:artifacts :ciphertext :path])))
-      (is (str/starts-with? out "Age: available"))
-      (is (re-find #"(?m)^Age: available" out))
-      (is (re-find #"(?m)^Environment: dev$" out))
-      (is (re-find #"(?m)^Status: healthy$" out))
-      (is (= "" err))))
-  (testing "an unavailable age binary produces a warning"
-    (let [{:keys [result]} (doctor-under (test-config) nil {:version nil})]
-      (is (= 1 (:exit result)))
-      (is (= :warning (:status result)))
-      (is (false? (get-in result [:age :available?])))))
-  (testing "a configuration that does not normalize is reported with its reason"
-    (doseq [[label config fragment]
-            [["no :app" {:environments {:dev {:secrets-file "s.age"}}}
-              "secrets config has no :app"]
-             ["a blank path" {:app "x" :environments {:dev {:secrets-file "s.age" :template ""}}}
-              "has a blank :template"]
-             ["no .age extension" {:app "x" :environments {:dev {:secrets-file "s.txt"}}}
-              "does not end in .age"]
-             ["a URI-shaped path"
-              {:app "x" :environments {:dev {:secrets-file "https://example.com/s.age"}}}
-              "Environment dev :secrets-file must be a local filesystem path"]
-             ["a role collision"
-              {:app "x" :environments {:dev {:secrets-file "s.age" :template "s.age"
-                                             :manifest "s.manifest"}}}
-              "incompatible artifact roles"]]]
-      (testing label
-        (let [{:keys [result out err]} (doctor-under config "dev" {})]
-          (is (= 2 (:exit result)))
-          (is (= :invalid (:status result)))
-          (is (str/starts-with? out "Configuration: invalid\nReason: "))
-          (is (str/includes? out fragment))
-          (is (str/ends-with? out "Status: invalid\n"))
-          (is (= "" err)))))))
+(deftest doctor-reports-a-healthy-solo-store-test
+  (let [config (complete-doctor-config)
+        cipher (get-in config [:environments :dev :secrets-file])
+        manifest (str *dir* "/secrets.edn.manifest")
+        {:keys [result out err]} (doctor-under config nil {})]
+    (is (= {:environment :dev
+            :age "age test-version"
+            :secrets-file {:path cipher :exists? true}
+            :manifest {:path manifest :exists? true}
+            :identity {:source :configured-key-file :path *key* :exists? true}
+            :warnings []
+            :problems []
+            :exit 0}
+           result))
+    (is (= (str "Environment: dev\n"
+                "age: age test-version\n"
+                "Secrets file: " cipher " (present)\n"
+                "Manifest: " manifest " (present)\n"
+                "Identity: key file " *key* " (present)\n"
+                "Status: healthy\n"
+                "Run `bb secrets verify` to check the store against its manifest.\n")
+           out))
+    (is (= "" err))))
 
-(deftest doctor-prints-the-identity-source-and-path-test
-  (let [raw-value (slurp *key*)
-        b64-value (.encodeToString (java.util.Base64/getEncoder)
-                                   (.getBytes ^String raw-value "UTF-8"))
-        file-value (str *dir* "/env-named-key.txt")
-        _ (io/copy (io/file *key*) (io/file file-value))
-        configured-key (str *dir* "/configured-key.txt")
-        _ (io/copy (io/file *key*) (io/file configured-key))
-        default-config {:app "cli-test"
-                        :default-environment :dev
-                        :environments {:dev {:secrets-file (str *dir* "/default.edn.age")}}}
-        specs [{:source :secrets-age-identity-file
-                :label "SECRETS_AGE_IDENTITY_FILE"
-                :environment {"SECRETS_AGE_IDENTITY_FILE" file-value}
-                :path file-value}
-               {:source :secrets-age-identity
-                :label "SECRETS_AGE_IDENTITY"
-                :environment {"SECRETS_AGE_IDENTITY" raw-value}}
-               {:source :secrets-age-identity-b64
-                :label "SECRETS_AGE_IDENTITY_B64"
-                :environment {"SECRETS_AGE_IDENTITY_B64" b64-value}}
-               {:source :identity-file
-                :label ":identity-file"
-                :config (test-config {:identity-file configured-key})
-                :path configured-key}
-               {:source :configured-key-file
-                :label "key file"
-                :config (test-config {:key-file configured-key})
-                :path configured-key}
-               ;; An environment without a :key-file gets the app default as
-               ;; its key file, so the two report alike.
-               {:source :configured-key-file
-                :label "key file"
-                :config default-config
-                :path *key*}]
-        secret-line (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
-                                   (str/split-lines raw-value)))]
-    (doseq [{:keys [source config path label] :as spec} specs]
-      (testing (name source)
-        (let [{:keys [result out err]} (doctor-under (or config (test-config)) nil spec)
-              disclosed (str (pr-str result) out err)]
-          (is (= {:source source :path path :usable? true :exists? true :problem nil}
-                 (:identity result)))
-          (is (str/includes? out (str "Identity: " label
-                                      (when path (str " — " path))
-                                      " — usable\n")))
-          (when-not path
-            (is (not (str/includes? disclosed "/age-identity-"))
-                "an injected identity is named by its variable, never by a temp path"))
-          (is (not (str/includes? disclosed secret-line)))
-          (is (not (str/includes? disclosed b64-value))))))))
-
-(deftest doctor-recipient-modes-and-validity-test
-  (let [recipients (str *dir* "/recipients.txt")
-        config (complete-doctor-config {:recipients-file recipients})
-        valid-a "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        valid-b "age1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]
-    (testing "missing configured recipients is actionable, not invalid"
-      (let [{:keys [result]} (doctor-under config nil {})]
-        (is (= 1 (:exit result)))
-        (is (= :multi-recipient (get-in result [:encryption :mode])))
-        (is (= :missing (get-in result [:encryption :recipients :state])))))
-    (testing "empty and invalid configured recipients are invalid configuration"
-      (spit recipients "# no recipients\n")
-      (is (= [2 :empty]
-             ((juxt :exit #(get-in % [:encryption :recipients :state]))
-              (:result (doctor-under config nil {})))))
-      (spit recipients "not-an-age-recipient\n")
-      (let [result (:result (doctor-under config nil {}))]
-        (is (= 2 (:exit result)))
-        (is (= {:state :invalid :count 1 :valid? false :invalid-count 1}
-               (get-in result [:encryption :recipients])))))
-    (testing "valid recipients expose counts, never lines"
-      (spit recipients (str valid-a "\n" valid-b "\n"))
-      (let [{:keys [result out]} (doctor-under config nil {})]
-        (is (= 0 (:exit result)))
-        (is (= {:state :valid :count 2 :valid? true}
-               (get-in result [:encryption :recipients])))
-        (is (not (str/includes? (str (pr-str result) out) valid-a)))
-        (is (not (str/includes? (str (pr-str result) out) valid-b)))))
-    (testing "unconfigured recipients is explicit single-key mode"
-      (let [result (:result (doctor-under (complete-doctor-config) nil {}))]
-        (is (= :single-key (get-in result [:encryption :mode])))
-        (is (= {:state :unconfigured :count 0 :valid? nil}
-               (get-in result [:encryption :recipients])))))))
-
-(deftest doctor-keyless-full-and-disabled-manifest-capability-test
-  (let [config (complete-doctor-config)]
-    (testing "a complete setup supports keyless and full verification"
-      (is (= {:state :ready :keyless? true :full? true}
-             (:verify (:result (doctor-under config nil {}))))))
-    (testing "an absent default key leaves keyless verification available"
+(deftest doctor-warns-about-what-an-operator-would-act-on-test
+  (let [warned (fn [config opts]
+                 (let [{:keys [result out]} (doctor-under config nil opts)]
+                   (is (empty? (:problems result)))
+                   (is (str/includes? out "Status: warning\n"))
+                   [(:exit result) (str/join "\n" (:warnings result))]))]
+    (testing "no secrets file yet"
+      (let [[exit text] (warned (test-config) {})]
+        (is (= 1 exit))
+        (is (str/includes? text "bb secrets new 'dev'"))
+        (is (not (str/includes? text "manifest")) "one missing store is one warning")))
+    (testing "age is not installed"
+      (let [[exit text] (warned (complete-doctor-config) {:version nil})]
+        (is (= 1 exit))
+        (is (str/includes? text "age is not installed"))))
+    (testing "a secrets file without its manifest"
+      (let [config (complete-doctor-config)]
+        (.delete (io/file (str *dir* "/secrets.edn.manifest")))
+        (let [[exit text] (warned config {})]
+          (is (= 1 exit))
+          (is (str/includes? text "bb secrets reencrypt 'dev'")))))
+    (testing "no key at the default location, which is not a designation"
       (let [missing (str *dir* "/missing-default-key.txt")
+            config (update-in (complete-doctor-config) [:environments :dev] dissoc :key-file)
             {:keys [result out]}
             (with-redefs-fn {#'secrets/default-key-file (constantly missing)
                              #'age/version (constantly "age test-version")}
-              #(with-identity-environment {}
-                 (fn [] (capture-doctor (update-in config [:environments :dev] dissoc :key-file)
-                                        nil))))]
+              #(with-identity-environment {} (fn [] (capture-doctor config nil))))]
         (is (= 1 (:exit result)))
-        (is (= {:state :ready :keyless? true :full? false} (:verify result)))
-        (is (str/includes? out (str "Identity: key file — " missing " — missing\n")))))
-    (testing "a designated identity that does not exist is a problem, as it is for verify"
-      (doseq [[label spec-config environment subject]
-              [["SECRETS_AGE_IDENTITY_FILE" config
-                {"SECRETS_AGE_IDENTITY_FILE" (str *dir* "/missing-identity")}
-                "SECRETS_AGE_IDENTITY_FILE"]
-               [":identity-file"
-                (assoc-in config [:environments :dev :identity-file]
-                          (str *dir* "/missing-identity"))
-                {} "The explicit identity path"]]]
-        (testing label
-          (let [{:keys [result out]} (doctor-under spec-config nil {:environment environment})]
-            (is (= 2 (:exit result)))
-            (is (= :invalid (:status result)))
-            (is (= {:state :ready :keyless? false :full? false} (:verify result)))
-            (is (str/includes? out (str "Identity problem: " subject
-                                        " names an age identity file that does not exist: "
-                                        *dir* "/missing-identity")))
-            (is (str/includes? out "Ciphertext: present")
-                "the rest of the report is still printed")))))
-    (testing "an unavailable age binary preserves keyless verification"
-      (let [result (:result (doctor-under config nil {:version nil}))]
-        (is (= {:state :ready :keyless? true :full? false} (:verify result)))))
-    (testing "an incomplete manifest prevents keyless verification"
-      (spit (str *dir* "/secrets.edn.manifest") "{:version 3 :app \"cli-test\" :keys {}}")
-      (let [result (:result (doctor-under config nil {}))]
+        (is (= {:source :configured-key-file :path missing :exists? false} (:identity result)))
+        (is (str/includes? out (str "Identity: key file " missing " (missing)\n")))
+        (is (str/includes? out "bb secrets keygen 'dev'")))))
+  (testing "a missing template and a disabled manifest are not warnings"
+    (let [config (complete-doctor-config {:manifest false})]
+      (.delete (io/file (str *dir* "/secrets.edn.example")))
+      (let [{:keys [result out]} (doctor-under config nil {})]
+        (is (= 0 (:exit result)))
+        (is (nil? (:manifest result)))
+        (is (str/includes? out "Manifest: disabled\n"))
+        (is (not (re-find #"(?i)template" out)))))))
+
+(deftest doctor-reports-what-stopped-it-as-a-problem-test
+  (doseq [[label config env-arg fragment]
+          [["no :app" {:environments {:dev {:secrets-file "s.age"}}} "dev"
+            "secrets config has no :app"]
+           ["a blank path" {:app "x" :environments {:dev {:secrets-file "s.age" :template ""}}}
+            "dev" "has a blank :template"]
+           ["a URI-shaped path"
+            {:app "x" :environments {:dev {:secrets-file "https://example.com/s.age"}}} "dev"
+            "Environment dev :secrets-file must be a local filesystem path"]
+           ["one path in two roles"
+            {:app "x" :environments {:dev {:secrets-file "s.age" :template "s.age"
+                                           :manifest "s.manifest"}}}
+            "dev" "s.age"]
+           ["an unknown environment" (test-config) "nowhere" "Unknown environment: nowhere"]]]
+    (testing label
+      (let [{:keys [result out err]} (doctor-under config env-arg {})]
+        (is (= #{:problems :exit} (set (keys result))))
+        (is (= 2 (:exit result)))
+        (is (str/starts-with? out "Problem: "))
+        (is (str/includes? out fragment))
+        (is (str/ends-with? out "Status: invalid\n"))
+        (is (= "" err))))))
+
+(deftest doctor-names-the-identity-source-and-path-test
+  (let [raw-value (slurp *key*)
+        b64-value (.encodeToString (java.util.Base64/getEncoder)
+                                   (.getBytes ^String raw-value "UTF-8"))
+        other (str *dir* "/other-key.txt")
+        _ (io/copy (io/file *key*) (io/file other))
+        secret-line (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
+                                   (str/split-lines raw-value)))]
+    (doseq [{:keys [source label config path] :as spec}
+            [{:source :secrets-age-identity-file
+              :label "SECRETS_AGE_IDENTITY_FILE"
+              :environment {"SECRETS_AGE_IDENTITY_FILE" other}
+              :path other}
+             {:source :secrets-age-identity
+              :label "SECRETS_AGE_IDENTITY"
+              :environment {"SECRETS_AGE_IDENTITY" raw-value}}
+             {:source :secrets-age-identity-b64
+              :label "SECRETS_AGE_IDENTITY_B64"
+              :environment {"SECRETS_AGE_IDENTITY_B64" b64-value}}
+             {:source :identity-file
+              :label ":identity-file"
+              :config (complete-doctor-config {:identity-file other})
+              :path other}
+             {:source :configured-key-file
+              :label "key file"
+              :config (complete-doctor-config {:key-file other})
+              :path other}]]
+      (testing (name source)
+        (let [{:keys [result out err]} (doctor-under (or config (complete-doctor-config)) nil spec)
+              disclosed (str (pr-str result) out err)]
+          (is (= 0 (:exit result)))
+          (is (= {:source source :path path :exists? true} (:identity result)))
+          (is (str/includes? out (str "Identity: " label (when path (str " " path))
+                                      " (present)\n")))
+          (is (not (str/includes? disclosed "/age-identity-"))
+              "an injected identity is named by its variable, never by a temp path")
+          (is (not (str/includes? disclosed secret-line)))
+          (is (not (str/includes? disclosed b64-value))))))))
+
+(deftest doctor-reports-an-identity-that-does-not-resolve-test
+  (let [config (complete-doctor-config)
+        missing (str *dir* "/missing-identity")]
+    (doseq [[label spec-config environment fragment]
+            [["a designated variable path that does not exist" config
+              {"SECRETS_AGE_IDENTITY_FILE" missing}
+              (str "SECRETS_AGE_IDENTITY_FILE names an age identity file that does not exist: "
+                   missing)]
+             ["a designated :identity-file that does not exist"
+              (assoc-in config [:environments :dev :identity-file] missing) {}
+              (str "The explicit identity path names an age identity file that does not exist: "
+                   missing)]
+             ["a blank variable" config {"SECRETS_AGE_IDENTITY" ""}
+              "SECRETS_AGE_IDENTITY is set but empty"]
+             ["a variable that is not base64" config
+              {"SECRETS_AGE_IDENTITY_B64" "NOT-BASE64-SENTINEL!!"}
+              "SECRETS_AGE_IDENTITY_B64 is not valid base64"]
+             ["a relative name with a colon" config {"SECRETS_AGE_IDENTITY_FILE" "key:txt"}
+              (str "SECRETS_AGE_IDENTITY_FILE must be a local filesystem path, but its value"
+                   " starts with the URI scheme \"key\". For a relative file whose name"
+                   " contains a colon, write ./ before the name.")]
+             ["a URL" config {"SECRETS_AGE_IDENTITY_FILE" "https://user:pw-SENTINEL@example.com/k"}
+              "URI scheme \"https\""]
+             ["key contents" config {"SECRETS_AGE_IDENTITY_FILE" "AGE-SECRET-KEY-1SENTINEL"}
+              "holds age key contents"]]]
+      (testing label
+        (let [{:keys [result out]} (doctor-under spec-config nil {:environment environment})]
+          (is (= 2 (:exit result)))
+          (is (= 1 (count (:problems result))))
+          (is (str/includes? out (str "Problem: " (first (:problems result)) "\n")))
+          (is (str/includes? out fragment))
+          (is (str/includes? out "Secrets file: ") "the rest of the report is still printed")
+          (is (str/includes? out "Status: invalid\n"))
+          (is (not (str/includes? (str out (pr-str result)) "SENTINEL"))))))))
+
+(deftest doctor-counts-recipients-in-team-mode-test
+  (let [recipients (str *dir* "/recipients.txt")
+        config (complete-doctor-config {:recipients-file recipients})
+        valid-a "age1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        valid-b "age1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        run #(doctor-under config nil {})]
+    (testing "a recipients file that is not there yet is a warning"
+      (let [{:keys [result out]} (run)]
         (is (= 1 (:exit result)))
-        (is (= {:state :invalid :keyless? false :full? true}
-               (:verify result)))))
-    (testing "so does a manifest in another version"
-      (spit (str *dir* "/secrets.edn.manifest") "{:version 2}")
-      (is (= {:state :unsupported :keyless? false :full? true}
-             (:verify (:result (doctor-under config nil {})))))))
-  (testing "a disabled manifest skips verification"
-    (let [result (:result
-                  (doctor-under (complete-doctor-config {:manifest false}) nil {}))]
-      (is (= 0 (:exit result)))
-      (is (= {:state :skipped :keyless? false :full? false} (:verify result)))
-      (is (= :disabled (get-in result [:artifacts :manifest :state]))))))
+        (is (= {:path recipients :exists? false :count 0} (:recipients-file result)))
+        (is (str/includes? out "bb secrets add-recipient 'dev'"))))
+    (testing "one that lists nobody is a problem"
+      (spit recipients "# no recipients\n")
+      (let [{:keys [result out]} (run)]
+        (is (= 2 (:exit result)))
+        (is (str/includes? out "Problem: The recipients file lists nobody."))))
+    (testing "so is a line age would refuse, which is counted and never printed"
+      (spit recipients (str valid-a "\nnot-an-age-recipient-SENTINEL\n"))
+      (let [{:keys [result out]} (run)]
+        (is (= 2 (:exit result)))
+        (is (= 2 (get-in result [:recipients-file :count])))
+        (is (str/includes? out "Problem: 1 recipients file line(s) are not age recipients."))
+        (is (not (str/includes? (str out (pr-str result)) "SENTINEL")))))
+    (testing "valid recipients are counted, and their lines stay out of the report"
+      (spit recipients (str valid-a "\n" valid-b "\n"))
+      (let [{:keys [result out]} (run)]
+        (is (= 0 (:exit result)))
+        (is (= {:path recipients :exists? true :count 2} (:recipients-file result)))
+        (is (str/includes? out (str "Recipients file: " recipients " (present)\nRecipients: 2\n")))
+        (is (not (str/includes? (str (pr-str result) out) valid-a)))
+        (is (not (str/includes? (str (pr-str result) out) valid-b)))))
+    (testing "a solo store reports no recipients file"
+      (let [{:keys [result out]} (doctor-under (complete-doctor-config) nil {})]
+        (is (not (contains? result :recipients-file)))
+        (is (not (str/includes? out "Recipients")))))))
 
 (deftest run-dispatches-doctor-before-normalization-test
   (let [called (atom nil)]
@@ -682,14 +692,7 @@
         (let [{:keys [result err] :as captured} (capture-verify config "dev")]
           (is (= :drift (get-in result [:results :dev])))
           (is (str/includes? err "malformed EDN syntax"))
-          (assert-redacted! sentinel captured)))
-      (testing "doctor manifest diagnostics"
-        (let [doctor-config (complete-doctor-config)]
-          (spit manifest-path malformed)
-          (let [{:keys [result] :as captured}
-                (doctor-under doctor-config nil {})]
-            (is (= :invalid (get-in result [:verify :state])))
-            (assert-redacted! sentinel captured)))))))
+          (assert-redacted! sentinel captured))))))
 
 (deftest edit-rejects-invalid-edn-without-replacing-valid-files-test
   (if (age-env-set?)
@@ -2332,20 +2335,17 @@
                             (with-out-str (cli/recipients! config "dev"))
                             (catch clojure.lang.ExceptionInfo e e)))
               rendered (pr-str (ex-data e))
-              doctor (bounded #(:result (doctor-under
-                                         (test-config {:recipients-file recipients-file})
-                                         "dev" {})))
-              state (get-in doctor [:encryption :recipients])]
+              doctor (bounded #(doctor-under
+                                (test-config {:recipients-file recipients-file})
+                                "dev" {}))]
           (is (= {:reason :input-too-large
                   :limit (count exact-content)
                   :observed (inc (count exact-content))}
                  (select-keys (ex-data e) [:reason :limit :observed])))
           (is (not (str/includes? rendered sentinel)))
-          (is (= {:state :bounded
-                  :reason :input-too-large
-                  :limit (count exact-content)
-                  :observed (inc (count exact-content))}
-                 state)))))))
+          (is (= 2 (get-in doctor [:result :exit])))
+          (is (re-find #"Problem: Recipients file .* is larger than the 25 byte limit"
+                       (:out doctor))))))))
 
 (deftest plaintext-file-and-stdin-byte-boundaries-test
   (if (age-env-set?)
@@ -2780,7 +2780,7 @@
             (assert-redacted! key-line captured)
             (is (not (.exists (io/file key-line))))))))))
 
-(deftest a-colon-named-identity-variable-fails-the-command-and-doctor-test
+(deftest a-colon-named-identity-variable-fails-the-command-test
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (test-config)
@@ -2801,23 +2801,7 @@
           (testing "verify reports it as that environment's failure"
             (let [{:keys [result err]} (capture-verify (cli/normalize-config config) "dev")]
               (is (= {:results {:dev :error} :exit 2} result))
-              (is (str/includes? err expected))))
-          (testing "doctor reports it as an identity problem with the same reason"
-            (let [{:keys [result out]} (capture-doctor config "dev")]
-              (is (= 2 (:exit result)))
-              (is (str/includes? out "Identity: SECRETS_AGE_IDENTITY_FILE — invalid\n"))
-              (is (str/includes? out (str "Identity problem: " expected "\n")))
-              (is (not (str/includes? out "Configuration: invalid")))))))
-      (testing "a URL and key contents are reported the same way, without the value"
-        (doseq [[value fragment] [["https://user:pw-SENTINEL@example.com/k" "URI scheme \"https\""]
-                                  ["AGE-SECRET-KEY-1SENTINEL" "holds age key contents"]]]
-          (let [{:keys [result out]}
-                (with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" value}
-                  #(capture-doctor config "dev"))]
-            (is (= 2 (:exit result)))
-            (is (str/includes? out "Identity problem: SECRETS_AGE_IDENTITY_FILE "))
-            (is (str/includes? out fragment))
-            (is (not (str/includes? (str out (pr-str result)) "SENTINEL")))))))))
+              (is (str/includes? err expected)))))))))
 
 (deftest config-failures-carry-no-config-maps-test
   (let [marker "CONFIG-MARKER-9d31"
@@ -2830,27 +2814,6 @@
       {:app "a" :environments {:dev {:note marker}}}
       {:app "a" :note marker :environments {}}
       {:app " " :note marker :environments {:dev {:secrets-file "s.age"}}})))
-
-(deftest doctor-reports-an-identity-variable-error-test
-  (let [run (fn [variable value]
-              (with-identity-environment
-                {variable value}
-                #(capture-doctor (test-config) "dev")))]
-    (testing "a blank variable"
-      (let [{:keys [result out]} (run "SECRETS_AGE_IDENTITY" "")]
-        (is (= 2 (:exit result)))
-        (is (not (str/includes? out "Configuration: invalid")))
-        (is (str/includes? out "Identity problem: SECRETS_AGE_IDENTITY is set but empty"))))
-    (testing "invalid base64"
-      (let [marker "NOT-BASE64-MARKER!!"
-            {:keys [result out err]} (run "SECRETS_AGE_IDENTITY_B64" marker)]
-        (is (= 2 (:exit result)))
-        (is (str/includes? out "SECRETS_AGE_IDENTITY_B64 is not valid base64"))
-        (is (not (str/includes? (str out err) marker)))))
-    (testing "a valid configuration carries a nil reason"
-      (let [{:keys [result]} (doctor-under (test-config) nil {})]
-        (is (contains? (:configuration result) :reason))
-        (is (nil? (get-in result [:configuration :reason])))))))
 
 (deftest set-never-echoes-a-misplaced-value-test
   (let [marker "hunter2-MARKER"
@@ -3659,17 +3622,6 @@
                      (catch Exception e e))]
           (is (= :invalid-config (:reason (ex-data e))))
           (is (str/includes? (str (ex-message e)) "must name one of its environments: dev")))))))
-
-(deftest doctor-does-not-warn-about-a-missing-template-test
-  ;; The template is optional: `new` falls back to a built-in one.
-  (let [config (complete-doctor-config)
-        template (str *dir* "/secrets.edn.example")]
-    (is (= 0 (:exit (:result (doctor-under config nil {})))))
-    (.delete (io/file template))
-    (let [{:keys [result out]} (doctor-under config nil {})]
-      (is (= :healthy (:status result)))
-      (is (= 0 (:exit result)))
-      (is (str/includes? out "Template: missing")))))
 
 (deftest a-jvm-command-returns-promptly-test
   ;; `future` and `clojure.java.shell` leave agent threads that kept a JVM
