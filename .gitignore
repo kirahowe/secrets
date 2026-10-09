@@ -17,6 +17,9 @@ target/
 # Scratch space for the demo `bb secrets` task — never commit decrypted secrets.
 tmp/
 
+# Staging files a killed `bb secrets` write can leave beside its target.
+.*.tmp
+
 # Rendered documentation book (regenerate with `bb book:build`).
 book/rendered/
 

@@ -29,7 +29,8 @@ Longer explanations live in the book under `book/chapters`
 
 Install `age` (`brew install age`, `apt install age`) and, for the `bb secrets`
 task, [Babashka](https://babashka.org). Babashka resolves `:deps` entries
-through Java, so a JDK has to be on the `PATH` too.
+through Java, so a JDK has to be on the `PATH` too. The library's only
+runtime dependency is Clojure.
 
 Nothing is published to Clojars yet. Depend on the library through git:
 
@@ -84,9 +85,10 @@ the same version.
 The dependency it writes is the commit the checkout is at: `:git/tag` and
 `:git/sha` when that commit is the release tag, and `:git/sha` alone otherwise.
 A commit that is not a release tag has to be pushed before another machine can
-resolve it. `--env` names the environment (default `dev`), and `--keygen`
+resolve it. `--env NAME` names the environment (default `dev`), and `--keygen`
 generates the identity at `~/.config/myapp/key.txt`. Without `--keygen`, run
-`bb secrets keygen` later.
+`bb secrets keygen` later. An option's value is a separate argument:
+`--app myapp`, not `--app=myapp`.
 
 Back the identity up, for example in a password manager. It is not in git and
 cannot be recovered.
@@ -103,6 +105,10 @@ manifest, `secrets/secrets.edn.manifest`. Check that they agree, then commit
 
 ```sh
 bb secrets verify
+```
+
+```text
+✓ dev: manifest matches (secrets/secrets.edn.manifest)
 ```
 
 Read the value from the application:
@@ -123,7 +129,7 @@ bb secrets edit            # decrypt, open your editor, re-encrypt
 bb secrets set :some/key   # one value, from a hidden prompt or stdin
 bb secrets rm :old/key     # remove a value
 bb secrets verify          # check the manifest before committing
-bb secrets doctor          # diagnose the setup without printing values
+bb secrets doctor          # report on the setup without printing values
 bb secrets --help          # every command; `bb secrets help set` for one
 ```
 
@@ -153,12 +159,19 @@ that omits its environment argument uses `:default-environment`.
 | `:identity-file` | An explicit identity for commands that decrypt. It wins over the environment variables. |
 | `:recipients-file` | A committed file of age public keys, one per line. When set, the store is encrypted to all of them. |
 
-A key the library does not know, at the top level or in an environment, is an
-error that names it, so a misspelling cannot be ignored silently. Paths are
-local filesystem paths. A leading `~` is expanded in `:key-file`,
-`:identity-file`, and `:recipients-file`. Two environments may share a key
-file, a recipients file, or a template. Any other reuse of one path, such as
-two environments writing the same ciphertext, is refused.
+The config is validated before a command runs:
+
+- A key the library does not know, at the top level or in an environment, is
+  an error that names it, so a misspelling cannot be ignored silently.
+- `:environments` is a map from a keyword to a map, and `:default-environment`
+  has to name one of them.
+- Every environment setting is a string holding a local filesystem path, and
+  `:manifest` may also be `false`. A leading `~` is expanded in `:key-file`,
+  `:identity-file`, and `:recipients-file`.
+- No file may serve two purposes. Environments may share a template, a key or
+  identity file, or a recipients file. Two environments may name the same
+  secrets file or manifest only when they name both the same, which makes
+  them one store under two names.
 
 Each environment is a separate encrypted file. Environments share the app's
 default key unless one sets its own `:key-file`.
@@ -178,10 +191,11 @@ default key unless one sets its own `:key-file`.
 (secrets/get-secret m :missing/key "default")
 ```
 
-The source is a local file, given as a path string, a `File`, or a `Path`, or
-a classpath resource from `io/resource`, which also works inside an uberjar.
-A remote source, HTTP included, is refused with `:reason :disallowed-source`
-before it is opened.
+The source is a filesystem path, given as a string, a `File`, or a `Path`, or
+a classpath resource, given as the `URL` that `io/resource` returns. That URL
+is a `file:` or a `jar:file:` one, so a resource inside an uberjar works.
+Anything else, such as an HTTP URL or a `file:` string, is refused with
+`:reason :disallowed-source` before it is opened.
 
 The second argument chooses the identity. It is a path, or a map with
 `:identity-file` or `:app`. [Identity resolution](#identity-resolution) gives
@@ -191,13 +205,11 @@ A vector path walks maps by key and vectors by integer index. It does not
 index into a string, set, or list, so a path that continues past such a value
 is not found.
 
-Failures throw `ex-info` with a `:reason`: `:no-identity`,
-`:disallowed-identity`, `:no-file`, `:disallowed-source`, `:source-too-large`,
-`:plaintext-too-large`, or one of the EDN reasons (`:edn-empty`,
-`:edn-extra-values`, `:edn-too-deep`, `:edn-malformed`). A failure about the
-source carries `:source`, a description of it that leaves out userinfo, query,
-and fragment. An EDN parse failure carries at most a line and column, never
-the text.
+Every failure is an `ex-info` whose data has a `:reason` keyword.
+[Failure reasons](#failure-reasons) lists the ones worth branching on. A
+failure about the source carries `:source`, which describes it by path, or by
+scheme alone for a refused URL, and never repeats a refused value. An EDN
+parse failure carries at most a line and column, never the text.
 
 ### Reader literals
 
@@ -256,7 +268,9 @@ in place of `aero.core/read-config`:
 same way. Every other key goes to Aero. Each call decrypts the store at most
 once and keeps nothing afterwards, so the next call reads the store as it then
 is. A config with secret tags read through `aero.core/read-config` directly
-throws an error that names this function.
+throws an error that names this function. `read-config` takes both arguments.
+Without a `:secrets` option there is no store: `#secret/req` throws
+`:invalid-config`, naming the option, and `#secret/opt` reads `nil`.
 
 Aero evaluates only the branch a `#profile` selects, so a key one profile
 needs can be absent from the store another profile reads:
@@ -295,8 +309,10 @@ first of these that applies:
 6. `~/.config/<app>/key.txt`, when an app name is known.
 
 A path from 1 or 2 names a specific file, and it is an error (`:no-identity`)
-if that file does not exist. When nothing is named and no key file is
-present, no identity is available. An identity variable that is set
+if that file does not exist. 5 and 6 say where the key normally lives. When
+no file is there, no identity is available: `#secret/opt` reads `nil`,
+`verify` checks without a key, and a command that needs the key says where it
+looked. An identity variable that is set
 but empty is an error that names the variable: a CI runner expands a missing
 secret to the empty string, and falling through to another key would hide
 that. Unset the variable to fall back.
@@ -317,9 +333,10 @@ when the platform offers one.
 ### Size bounds
 
 Fixed bounds catch an accidental huge or deeply nested input, such as a path
-that names the wrong file: 16 MiB of ciphertext, 8 MiB of plaintext, EDN
-nested 100 collections deep, 256 KiB of recipients file, and 1 MiB of
-manifest. They are not configurable.
+that names the wrong file. Loading refuses a ciphertext past 16 MiB and EDN
+nested more than 100 collections deep. The CLI refuses to write a plaintext
+past 8 MiB, and to read a recipients file past 256 KiB or a manifest past
+1 MiB. They are not configurable.
 
 ## CI and production
 
@@ -338,9 +355,11 @@ CI.
 
 ### Verifying in CI
 
-`bb secrets verify` exits 0 when every manifest agrees with its ciphertext, 1
-on drift, and 2 when a ciphertext or manifest is missing or an environment
-could not be checked. It runs in one of two modes per environment.
+`bb secrets verify` exits 0 when every manifest agrees with its ciphertext
+and 1 when the only problem is drift. It exits 2 when anything else stopped
+it: a missing file, an identity or decryption failure, an unknown environment,
+or an invalid configuration. A CI job can therefore tell a stale manifest from
+a missing key. It runs in one of two modes per environment.
 
 Without an identity, it checks that the manifest is complete and that the
 SHA-256 it records is the digest of the ciphertext. This needs no key and no
@@ -350,11 +369,11 @@ named by `:identity-file` or an identity variable has to exist: a missing one
 is an error, not a reason to skip the comparison.
 
 With an identity, it also decrypts the store and compares every key path,
-type, and value hash with the manifest.
+type, and value hash with the manifest. It reports drift as well when the
+recipients file no longer matches the set the store was last encrypted to.
 
 With no environment argument, `verify` checks every environment and keeps
-going past one that fails. With one named, a failure to resolve the identity
-or to decrypt stops the command with an error.
+going past one that fails.
 
 A job that holds the identity should give it to the one step that needs it,
 keep unreviewed code out, and pin its actions:
@@ -411,7 +430,9 @@ bb secrets reencrypt prod
 
 To remove someone, delete their line from the recipients file and run
 `bb secrets reencrypt prod`. Commit the recipients file, the ciphertext, and
-the manifest together.
+the manifest together. Editing the recipients file changes nothing by itself:
+the store stays encrypted to the earlier set until it is re-encrypted, and a
+`verify` that has an identity reports that as drift.
 
 Removal stops that identity from decrypting ciphertext written afterwards. It
 does not take back anything already read, and the old ciphertext stays in git
@@ -421,7 +442,9 @@ credentials at their providers.
 `reencrypt` also gives the store a new manifest key, so every value hash in
 the manifest changes once. `edit`, `set`, and `rm` do the same when they find
 that the recipients file no longer matches the set the store was last
-encrypted to. [The manifest](#the-manifest) explains why.
+encrypted to. That catches a forgotten `reencrypt`. It is not the removal
+step: `reencrypt` is, because it always renews the key.
+[The manifest](#the-manifest) explains why.
 
 Each command reads the recipients file once, before it decrypts or opens an
 editor, and refuses a line that is not an age or SSH public key.
@@ -456,15 +479,21 @@ At 64 bits a hash can collide: an unchanged hash is strong evidence that a
 value did not change, not proof.
 
 The store keeps that key, and a record of the recipient set it was encrypted
-to, as reserved top-level data in the `:com.kirahowe.secrets` namespace that
-the library owns. `load-secrets`, the reader literals, and the editor never
-show it, and `set`, `rm`, and an edited plaintext cannot name it. A store's
+to, under one reserved top-level key, `:com.kirahowe.secrets/store`, that the
+library owns. `load-secrets`, the reader literals, and the editor never show
+it, and `set`, `rm`, and an edited plaintext cannot name it. A store's
 plaintext has to be one EDN map.
 
 `new`, or `set` when no store exists, generates the key. `edit`, `set`, and
 `rm` keep it. `reencrypt` always replaces it, and so does any write that finds
-the recipient set changed. A store whose key is missing or malformed fails
-every write and fails `verify`, and `reencrypt` repairs it.
+the recipient set changed.
+
+A store whose metadata is missing, malformed, or of another version fails
+`edit`, `set`, and `rm` and is drift for a `verify` that has an identity. The
+message says which it is and names `bb secrets reencrypt`, which writes
+current metadata without reading the old. That is the state of a store
+written by another tool or by an earlier version of this library. A store
+that is not a map at all is told to start over with `bb secrets new`.
 
 ### What the manifest discloses
 
@@ -494,8 +523,13 @@ replaces the ciphertext with an atomic rename, and then the manifest the same
 way. The two renames are not one transaction and nothing is rolled back. If
 the manifest cannot be replaced after the ciphertext was, the command says the
 manifest is stale, `verify` reports the drift, and `bb secrets reencrypt`
-regenerates it. A write that is killed can leave a `.secrets.edn.*.tmp` file
-beside the ciphertext, which is safe to delete.
+regenerates it.
+
+Each file is staged beside its target under a name of the form
+`.<target>.<uuid>.tmp`. That holds for the ciphertext, the manifest, the
+recipients file, and a generated key. A command deletes its staging file when
+it ends, but one that is killed can leave it behind. Such a file is safe to
+delete, and a `.*.tmp` line in `.gitignore` keeps it from being committed.
 
 The ciphertext, manifest, and recipients file are written with ordinary file
 permissions. Key files and the temporary plaintext that `new`, `edit`, `set`,
@@ -542,41 +576,58 @@ describes.
 ### Commands
 
 Every command takes the environment first and uses the default when it is
-omitted. `--` ends the options, so an operand may begin with a dash.
+omitted. Before a `--`, an argument that starts with a dash is an option, and
+one the command does not define is an error. Everything after `--` is an
+argument, so a key may begin with a dash. A usage error prints the command's
+usage and never the argument that caused it, which may be a value typed in the
+wrong place. That includes an unknown command and an unknown environment.
 
 | Command | What it does |
 | --- | --- |
-| `keygen [env]` | Generate an identity at the environment's `:key-file`. Asks before replacing one. |
+| `keygen [env]` | Generate an identity at the environment's `:key-file` and print its public key. Asks before replacing one. |
 | `new [env]` | Create the store from its template in `$VISUAL`, `$EDITOR`, or `vim`. |
 | `edit [env]` | Decrypt, open the editor, and re-encrypt if the text changed. Comments are kept. |
 | `set [env] <key> [--edn]` | Set one value from a hidden prompt, or from stdin when it is not a terminal. Creates the store if there is none. |
 | `rm [env] <key>` | Remove one key. Fails if the key or the store is absent. |
 | `verify [env]` | Check manifests against ciphertexts. With no `env`, checks every environment. |
-| `doctor [env]` | Report the state of `age`, the files, the identity, and the recipients. |
+| `doctor [env]` | Report on the setup: `age`, the files, the identity, and the recipients. |
 | `show-key [env]` | Print the public key of the configured `:key-file`. |
-| `add-recipient [env] [key]` | Append a public key to the recipients file. With no key, the environment's own. |
+| `add-recipient [env] [public-key]` | Append a public key to the recipients file. With no key, the environment's own. |
 | `recipients [env]` | List the recipients file. |
 | `reencrypt [env]` | Re-encrypt to the current recipients with a new manifest key. |
-| `help [command]` | Show help. |
+| `help [command]` | Show help. `<command> --help` does the same for one command. |
 
 `<key>` is a keyword (`:some/key`) or a vector path (`'[:a :b]'`). `set` never
 takes the value as an argument. Piped input loses one trailing newline, is
 stored as a string unless `--edn` parses it, and is refused when blank (use
-`--edn` with `""` for an empty string). `set` and `rm` rewrite the plaintext,
-so comments in it do not survive them.
+`--edn` with `""` for an empty string). `set` and `rm` refuse a path that
+passes through a value that is not a map. Both rewrite the plaintext, so
+comments in it do not survive them.
 
-`doctor` is for finding out why a command will not run: it says whether `age`
-is installed, which files exist, and which identity it resolved and from
-where. It prints paths and never file contents, recipient lines, or variable
-values. It exits 0 when healthy, 1 for a warning, and 2 for an invalid setup.
+`doctor` is for finding out why a command will not run. It does not open the
+store or the manifest, and it prints paths and counts, never file contents,
+recipient lines, or variable values. This is a team environment on a machine
+that has no key:
 
-Other commands exit 0 on success and 1 on failure.
+```text
+Environment: prod
+age: v1.3.2
+Secrets file: env/prod/secrets.edn.age (present)
+Manifest: env/prod/secrets.edn.manifest (present)
+Recipients file: env/prod/recipients.txt (present)
+Recipients: 1
+Identity: key file keys/alice.txt (missing)
+Warning: No identity, so only keyless verification works here. Create a key with:  bb secrets keygen 'prod'
+Status: warning
+```
 
-### Initializer
+Exit codes:
 
-`bb -m com.kirahowe.secrets.init --app NAME [--env NAME] [--keygen] [--apply]`,
-with `--help` for usage. It needs the library on the classpath: as a
-dependency in `bb.edn`, or with `-cp /path/to/secrets/src`.
+| Command | 0 | 1 | 2 |
+| --- | --- | --- | --- |
+| `verify` | every manifest agrees | the only problem is drift | anything else stopped it: a missing file, an identity or decryption failure, an unknown environment, an invalid configuration |
+| `doctor` | healthy | a warning: `age`, the secrets file, the manifest, the recipients file, or the key is not there | an invalid configuration, identity, or recipients file, or it could not run |
+| every other command | success | any failure | |
 
 ### API
 
@@ -595,14 +646,36 @@ dependency in `bb.edn`, or with `-cp /path/to/secrets/src`.
 config)`, and one function per command: `keygen!`, `new!`, `edit!`,
 `set-secret!`, `remove-secret!`, `verify!`, `doctor!`, `show-key!`,
 `add-recipient!`, `recipients!`, and `reencrypt!`. The command functions
-return data and throw `ex-info`. Only `run!` exits the process.
+return data, throw `ex-info`, and never exit. `verify!` and `doctor!` report
+most failures in their result, with the exit code under `:exit`. `run!` is the
+entry point of a process, on Babashka or the JVM, and the one place that
+exits.
 
-`com.kirahowe.secrets.init` has `-main`, `init!`, `plan`, and `apply-plan!`.
+`com.kirahowe.secrets.init` has `-main` and `(init! opts)`.
 
 Those four namespaces are the public API. `com.kirahowe.secrets.age`,
-`.manifest`, `.fs`, `.safe-edn`, and `.source` are implementation namespaces
-and can change without notice. The book's reference chapter lists every
-public API var with its docstring.
+`.manifest`, `.store`, `.fs`, `.safe-edn`, and `.source` are implementation
+namespaces and can change without notice. The book's reference chapter lists
+every public API var with its docstring.
+
+### Failure reasons
+
+Every `ex-info` the library throws has a `:reason` keyword in its data. These
+are the ones a caller can usefully branch on:
+
+| Reasons | Meaning |
+| --- | --- |
+| `:no-identity`, `:invalid-identity`, `:disallowed-identity` | No identity is available, or a named identity file is missing. An identity variable is blank or not base64. An identity path is URI-shaped or holds key contents. |
+| `:no-file`, `:disallowed-source`, `:source-too-large` | The source is nil, absent, or unreadable. It is not a local path or a classpath resource. It is past 16 MiB. |
+| `:decrypt-failed`, `:age-not-installed` | `age` could not decrypt with this identity. The `age` binary is not on the `PATH`. |
+| `:edn-empty`, `:edn-extra-values`, `:edn-malformed`, `:edn-too-deep` | The plaintext is not exactly one well-formed EDN value. |
+| `:missing-key` | `#secret/req` named a key the store does not have. The tag also throws `:no-file` and `:no-identity`. |
+| `:invalid-config`, `:unknown-config-key` | The CLI config, or the options of the Aero `read-config`, cannot be used. |
+| `:usage` | A command line the CLI cannot place: an unknown command, option, or environment, or a missing or surplus argument. |
+| `:invalid-store`, `:secrets-not-a-map`, `:reserved-key`, `:path-not-a-map`, `:no-such-key`, `:blank-value` | A write the CLI refused, and why. |
+| `:input-too-large`, `:invalid-recipient`, `:no-recipients`, `:unreadable-file` | A file the CLI was given is too large, holds an invalid recipient or none, or cannot be read. |
+| `:manifest-stale` | The ciphertext was replaced and the manifest was not. Run `reencrypt`. |
+| `:private-file-remains` | A private temporary file could not be deleted. `:remaining-file` holds its path. |
 
 ## Examples
 
