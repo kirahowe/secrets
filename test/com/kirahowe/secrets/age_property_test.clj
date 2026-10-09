@@ -2,12 +2,12 @@
   "Properties of the `age` wrapper. A path argument can only mean a file, and
   a blank one is refused naming its role. A recipient check accepts a real key
   and refuses damaged ones."
-  (:require [clojure.java.shell :as shell]
-            [clojure.string :as str]
+  (:require [clojure.string :as str]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [com.kirahowe.secrets.age :as age]
+            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.generators :as g]
             [com.kirahowe.secrets.test-env :refer [thrown]]))
 
@@ -33,7 +33,7 @@
   [recipients in out]
   (let [argv (atom nil)]
     (with-redefs [age/ensure-installed! (constantly nil)
-                  shell/sh (fn [& args] (reset! argv (vec args)) {:exit 0})]
+                  fs/sh (fn [& args] (reset! argv (vec (first args))) {:exit 0})]
       (age/encrypt-file! recipients in out))
     @argv))
 

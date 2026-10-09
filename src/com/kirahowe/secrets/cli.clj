@@ -123,16 +123,6 @@
 
 (defn- question-marker [] (paint (tty?) :yellow "?"))
 
-(defn- failure-message
-  "One line saying what failure `e` was, holding no file contents. An
-  `ex-info` gives its own message. Any other exception gives its class, plus
-  its message when it is an `IOException`, whose message names a path."
-  [e]
-  (cond
-    (instance? clojure.lang.ExceptionInfo e) (ex-message e)
-    (instance? java.io.IOException e) (str (.getName (class e)) ": " (ex-message e))
-    :else (str "Unexpected failure: " (.getName (class e)))))
-
 (defn- confirm!
   "Prompt y/N; true on \"y\", false otherwise. Never exits: callers decide
   what a declined prompt means."
@@ -925,7 +915,7 @@
                        (catch Exception e
                          [env {:status :error
                                :reason :error
-                               :message (failure-message e)
+                               :message (store/failure-message e)
                                :hint (:hint (ex-data e))}])))
         results (into {}
                       (map (fn [env]
@@ -1072,7 +1062,7 @@
   "Render the error and its remediation on stderr."
   [e]
   (let [data (ex-data e)]
-    (into [[:oops (failure-message e)]]
+    (into [[:oops (store/failure-message e)]]
           (for [k [:hint :install :error :docs]
                 :let [v (get data k)]
                 :when (and (some? v) (not (str/blank? (str v))))
@@ -1235,17 +1225,6 @@
   failure to run them at all is 2."
   #{"verify" "doctor"})
 
-(defn- exit!
-  "Leave the process boundary with exit `code`, returning only when it is 0.
-  On the JVM the agent threads that `future` and `clojure.java.shell` start
-  keep a finished process alive for a minute, so they are shut down here.
-  Babashka exits without that, and a task may go on to use them."
-  [code]
-  (when-not (System/getProperty "babashka.version")
-    (shutdown-agents))
-  (when (pos? code)
-    (System/exit code)))
-
 (defn run!
   "Dispatch `args` against `config` as the whole of a process: the entry point
   for a `bb` task or a JVM `-main`, not a function to call at a REPL, where
@@ -1255,8 +1234,7 @@
   A failure prints one line, and any hint the failure carries, on stderr, and
   never a stack trace. It exits 1, or 2 from `verify` and `doctor`, which
   keep 1 for drift and for a warning and otherwise exit with the `:exit` of
-  their result. On the JVM a successful run shuts down the agent thread
-  pools, so the process ends as soon as the command does."
+  their result."
   [config args]
   (let [status-command? (contains? status-commands (some-> (first args) str str/lower-case))
         exit (try
@@ -1265,4 +1243,4 @@
                (catch Exception e
                  (say! (error-lines e))
                  (if status-command? 2 1)))]
-    (exit! exit)))
+    (store/exit! exit)))

@@ -75,21 +75,21 @@
 
 (deftest age-version-test
   (testing "successful stdout is trimmed"
-    (with-redefs [shell/sh (fn [& args]
-                             (is (= ["age" "--version"] args))
-                             {:exit 0 :out "  age 1.2.3 \n" :err ""})]
+    (with-redefs [fs/sh (fn [& args]
+                          (is (= [["age" "--version"]] args))
+                          {:exit 0 :out "  age 1.2.3 \n" :err ""})]
       (is (= "age 1.2.3" (age/version)))))
   (testing "successful stderr is used when stdout is blank"
-    (with-redefs [shell/sh (fn [& _]
-                             {:exit 0 :out " \n" :err " age 1.2.3 \n"})]
+    (with-redefs [fs/sh (fn [& _]
+                          {:exit 0 :out " \n" :err " age 1.2.3 \n"})]
       (is (= "age 1.2.3" (age/version)))))
   (testing "nonzero exit returns nil even with stderr"
-    (with-redefs [shell/sh (fn [& _]
-                             {:exit 1 :out "" :err "age failed with sensitive detail"})]
+    (with-redefs [fs/sh (fn [& _]
+                          {:exit 1 :out "" :err "age failed with sensitive detail"})]
       (is (nil? (age/version)))))
   (testing "execution exceptions return nil"
-    (with-redefs [shell/sh (fn [& _]
-                             (throw (java.io.IOException. "age is unavailable")))]
+    (with-redefs [fs/sh (fn [& _]
+                          (throw (java.io.IOException. "age is unavailable")))]
       (is (nil? (age/version)))))
   (testing "installed status follows version presence"
     (with-redefs [age/version (constantly "age 1.2.3")]
@@ -263,19 +263,19 @@
 (deftest age-argv-shape-test
   (let [calls (atom [])
         recording (fn [result]
-                    (fn [& args]
-                      (let [argv (vec (take-while string? args))]
+                    (fn [argv & _]
+                      (let [argv (vec argv)]
                         (if (= ["age" "--version"] argv)
                           {:exit 0 :out "v1.3.1" :err ""}
                           (do (swap! calls conj argv) result)))))
         encrypt-argv (fn [recipients in out]
                        (reset! calls [])
-                       (with-redefs [shell/sh (recording {:exit 0 :err ""})]
+                       (with-redefs [fs/sh (recording {:exit 0 :err ""})]
                          (age/encrypt-file! recipients in out))
                        (first @calls))
         decrypt-argv (fn [identity-file in]
                        (reset! calls [])
-                       (with-redefs [shell/sh (recording {:exit 0 :out "" :err ""})]
+                       (with-redefs [fs/sh (recording {:exit 0 :out "" :err ""})]
                          (age/decrypt identity-file in))
                        (first @calls))]
     (testing "the encrypt terminator sits immediately before the input operand"
@@ -352,9 +352,9 @@
          ["whitespace decrypt identity" #(age/decrypt "   " "cipher")]
          ["nil decrypt input" #(age/decrypt "key" nil)]
          ["whitespace decrypt input" #(age/decrypt "key" "   ")]]]
-    (with-redefs [shell/sh (fn [& _]
-                             (swap! shell-calls inc)
-                             (throw (ex-info "subprocess ran" {})))]
+    (with-redefs [fs/sh (fn [& _]
+                          (swap! shell-calls inc)
+                          (throw (ex-info "subprocess ran" {})))]
       (doseq [[label invoke] invalid-calls]
         (reset! shell-calls 0)
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (invoke)) label)
@@ -1851,3 +1851,29 @@
       (is (= :decrypt-failed (reason-of #(secrets/load-secrets enc other-key)))))
     (testing "a designated identity that does not exist"
       (is (= :no-identity (reason-of #(secrets/load-secrets enc (str *dir* "/absent.txt"))))))))
+
+;;;; A JVM program that loads secrets and returns
+
+(deftest a-jvm-program-that-loads-secrets-exits-promptly-test
+  ;; `clojure.java.shell` left agent threads that kept a JVM alive for a
+  ;; minute after `-main` returned. Babashka never waited, so this runs on the
+  ;; JVM only, on the classpath of this run.
+  (when-not (System/getProperty "babashka.version")
+    (let [enc (encrypt-edn! {:k "loaded"})
+          form (str "(require '[com.kirahowe.secrets :as secrets]) "
+                    "(print (:k (secrets/load-secrets " (pr-str enc) " " (pr-str *key*) ")))")
+          started (System/currentTimeMillis)
+          process (-> (ProcessBuilder.
+                       ^java.util.List
+                       [(str (System/getProperty "java.home") "/bin/java")
+                        "-cp" (System/getProperty "java.class.path")
+                        "clojure.main" "-e" form])
+                      (.redirectErrorStream true)
+                      .start)
+          finished? (.waitFor process 30 java.util.concurrent.TimeUnit/SECONDS)]
+      (when-not finished?
+        (.destroyForcibly process))
+      (is finished? "the process ends when the program does")
+      (when finished?
+        (is (= "loaded" (slurp (.getInputStream process))))
+        (is (< (- (System/currentTimeMillis) started) 30000))))))

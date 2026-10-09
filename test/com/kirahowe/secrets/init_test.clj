@@ -4,8 +4,10 @@
             [clojure.string :as str]
             [clojure.test :refer [are deftest is testing use-fixtures]]
             [com.kirahowe.secrets :as secrets]
+            [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
-            [com.kirahowe.secrets.init :as init])
+            [com.kirahowe.secrets.init :as init]
+            [com.kirahowe.secrets.store :as store])
   (:import [java.nio.file Files LinkOption]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
@@ -89,7 +91,7 @@
     (doseq [flag ["-h" "--help"]]
       (is (= {:env "dev" :help? true} (#'init/parse-args [flag]))
           "help must not demand an app name")
-      (let [out (with-redefs-fn {#'init/exit! (fn [_])}
+      (let [out (with-redefs-fn {#'store/exit! (fn [_])}
                   #(with-out-str (init/-main flag)))]
         (is (str/includes? out "Usage: -m com.kirahowe.secrets.init --app NAME [options]"))
         (doseq [line ["  --app NAME    Application name (required)"
@@ -286,6 +288,37 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"key.txt already exists"
                             (#'init/apply-plan! proposal)))
       (is (= "my key" (slurp *key-file*))))))
+
+;;;; Failures name a path and what was created
+
+(deftest a-failure-part-way-names-the-path-and-the-files-created-test
+  (testing "a directory that cannot be written to"
+    (let [proposal (#'init/plan {:root *dir* :app "reader"})
+          read-only (PosixFilePermissions/fromString "r-xr-xr-x")
+          writable (PosixFilePermissions/fromString "rwxr-xr-x")]
+      (Files/setPosixFilePermissions (.toPath (io/file *dir*)) read-only)
+      (try
+        (let [e (try (#'init/apply-plan! proposal) nil (catch Exception e e))
+              line (with-out-str
+                     (binding [*err* *out*] (#'init/print-init-error! e)))]
+          (is (instance? clojure.lang.ExceptionInfo e))
+          (is (= {:path "bb.edn" :created []} (ex-data e)))
+          (is (str/includes? line "secrets init: java.nio.file.AccessDeniedException: "))
+          (is (str/includes? line (str (file "bb.edn"))) "the line names the path")
+          (is (not (str/includes? line "Unexpected failure"))))
+        (finally
+          (Files/setPosixFilePermissions (.toPath (io/file *dir*)) writable)))))
+  (testing "a key that cannot be generated after the project files were written"
+    (let [proposal (#'init/plan {:root *dir* :app "reader" :keygen? true})
+          e (with-redefs [age/keygen! (fn [_]
+                                        (throw (ex-info "age-keygen failed"
+                                                        {:reason :keygen-failed})))]
+              (try (#'init/apply-plan! proposal) nil (catch Exception e e)))]
+      (is (= (str "age-keygen failed\nCreated before stopping: bb.edn, " template ".")
+             (ex-message e)))
+      (is (= {:reason :keygen-failed :path *key-file* :created ["bb.edn" template]}
+             (ex-data e)))
+      (is (= ["bb.edn" template] (files)) "what it names is what is there"))))
 
 (deftest an-existing-identity-is-kept-test
   (io/make-parents (io/file *key-file*))

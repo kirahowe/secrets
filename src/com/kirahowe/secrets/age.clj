@@ -3,7 +3,7 @@
 
   A thin wrapper over the `age` CLI (https://age-encryption.org).
 
-  Every function shells out to the `age` / `age-keygen` binaries, so this
+  Every function runs the `age` / `age-keygen` binaries, so this
   namespace loads and runs identically under JVM Clojure and babashka. It holds
   no state and takes no opinion about *where* keys or secrets live. That is the
   caller's job (see `com.kirahowe.secrets` for runtime loading and `com.kirahowe.secrets.cli`
@@ -18,7 +18,6 @@
   design and authorizes *encryption*, not authorship, so nothing here, and
   nothing built on it, can establish who produced a ciphertext."
   (:require [clojure.java.io :as io]
-            [clojure.java.shell :as shell]
             [clojure.string :as str]
             [com.kirahowe.secrets.fs :as fs]))
 
@@ -28,7 +27,7 @@
   subprocess arguments, environment, and failure details are never exposed."
   []
   (try
-    (let [{:keys [exit out err]} (shell/sh "age" "--version")]
+    (let [{:keys [exit out err]} (fs/sh ["age" "--version"])]
       (when (zero? exit)
         (let [s (str/trim (if (str/blank? out) err out))]
           (when-not (str/blank? s) s))))
@@ -95,7 +94,7 @@
   (let [f (.getAbsoluteFile (io/file (path-arg :key path)))
         parent (.getParentFile f)
         {:keys [exit out err]} (try
-                                 (shell/sh "age-keygen")
+                                 (fs/sh ["age-keygen"])
                                  (catch java.io.IOException _
                                    {:exit 127 :err "age-keygen not found on PATH"}))]
     (when-not (zero? exit)
@@ -130,7 +129,7 @@
     ;; Local argument validation first: probing the environment must not be
     ;; able to mask a path that never named a file.
     (ensure-installed!)
-    (let [{:keys [exit err]} (apply shell/sh argv)]
+    (let [{:keys [exit err]} (fs/sh argv)]
       (when-not (zero? exit)
         (throw (ex-info "age encryption failed"
                         {:reason :encrypt-failed :out (str out) :error err})))
@@ -159,7 +158,7 @@
     ;; Local argument validation first: probing the environment must not be
     ;; able to mask a path that never named a file.
     (ensure-installed!)
-    (let [{:keys [exit out err]} (apply shell/sh argv)]
+    (let [{:keys [exit out err]} (fs/sh argv)]
       (when-not (zero? exit)
         (throw (ex-info "age decryption failed"
                         {:reason :decrypt-failed

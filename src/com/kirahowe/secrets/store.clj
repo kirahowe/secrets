@@ -41,6 +41,23 @@
   ([reason msg] (fail! reason msg nil))
   ([reason msg data] (throw (ex-info msg (assoc data :reason reason)))))
 
+(defn failure-message
+  "One line saying what failure `e` was, holding no file contents. An
+  `ex-info` gives its own message. Any other exception gives its class, plus
+  its message when it is an `IOException`, whose message names a path."
+  [e]
+  (cond
+    (instance? clojure.lang.ExceptionInfo e) (ex-message e)
+    (instance? java.io.IOException e) (str (.getName (class e)) ": " (ex-message e))
+    :else (str "Unexpected failure: " (.getName (class e)))))
+
+(defn exit!
+  "End the process with exit `code`, returning only when it is 0. The CLI and
+  the initializer leave through here, and it is the seam their tests replace."
+  [code]
+  (when (pos? code)
+    (System/exit code)))
+
 ;;;; Config
 
 (defn- canonical-path

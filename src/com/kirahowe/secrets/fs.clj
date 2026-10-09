@@ -1,7 +1,25 @@
 (ns com.kirahowe.secrets.fs
   "Implementation namespace; not part of the public API and may change without notice.
 
-  Filesystem primitives: private temporary files and atomic replacement.")
+  Filesystem and subprocess primitives: home-relative paths, private temporary
+  files, atomic replacement, and running a program.")
+
+(defn sh
+  "Run the program `argv` with no input, in directory `dir` when one is given,
+  and return `{:exit code :out stdout :err stderr}`. Standard error is read on
+  a daemon thread, so no thread outlives the call and keeps a JVM from
+  exiting. A program that cannot be started throws `java.io.IOException`."
+  [argv & [dir]]
+  (let [process (-> (ProcessBuilder. ^java.util.List (mapv str argv))
+                    (cond-> dir (.directory (java.io.File. (str dir))))
+                    .start)
+        err (promise)]
+    (doto (Thread. (fn [] (deliver err (slurp (.getErrorStream process) :encoding "UTF-8"))))
+      (.setDaemon true)
+      .start)
+    (.close (.getOutputStream process))
+    (let [out (slurp (.getInputStream process) :encoding "UTF-8")]
+      {:exit (.waitFor process) :out out :err @err})))
 
 (defn- ->path
   ^java.nio.file.Path [x]

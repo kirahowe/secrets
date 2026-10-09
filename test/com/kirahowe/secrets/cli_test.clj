@@ -47,7 +47,7 @@
   The subprocess tests cover the real one."
   [f]
   (with-redefs-fn {(ns-resolve 'com.kirahowe.secrets.cli 'tty?) (constantly false)
-                   (ns-resolve 'com.kirahowe.secrets.cli 'exit!) (fn [_])}
+                   (ns-resolve 'com.kirahowe.secrets.store 'exit!) (fn [_])}
     f))
 
 (use-fixtures :each with-no-terminal with-tmp-key)
@@ -2203,14 +2203,14 @@
 ;;;; Recipient snapshotting
 
 (defn- recorded-sh-argvs
-  "Every argv `clojure.java.shell/sh` receives while `f` runs, with the real
+  "Every argv `fs/sh` receives while `f` runs, with the real
   subprocesses still running. `f` may throw; the throw is asserted separately."
   [f]
   (let [calls (atom [])
-        real-sh shell/sh]
-    (with-redefs [shell/sh (fn [& args]
-                             (swap! calls conj (vec (take-while string? args)))
-                             (apply real-sh args))]
+        real-sh fs/sh]
+    (with-redefs [fs/sh (fn [& args]
+                          (swap! calls conj (vec (first args)))
+                          (apply real-sh args))]
       (try (f) (catch Exception _ nil)))
     @calls))
 
