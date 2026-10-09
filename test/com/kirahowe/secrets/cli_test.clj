@@ -924,18 +924,27 @@
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))
-          tmpdir (io/file (System/getProperty "java.io.tmpdir"))
-          plaintext-temps #(set (filter (fn [n] (re-matches #"secrets-.*\.edn" n))
-                                        (seq (.list tmpdir))))
-          before (plaintext-temps)
+          ;; The temp directory is shared with every other process that uses
+          ;; the library, so the test watches the files it creates itself.
+          plaintext-temps (atom [])
+          real-temp-file fs/owner-only-temp-file!
+          watching (fn [f]
+                     (with-redefs [fs/owner-only-temp-file!
+                                   (fn [& args]
+                                     (let [file (apply real-temp-file args)]
+                                       (when (= ["secrets-" ".edn"] (vec args))
+                                         (swap! plaintext-temps conj file))
+                                       file))]
+                       (f)))
           subprocesses (atom [])
-          real-sh shell/sh]
+          real-sh fs/sh]
       (testing "a successful command leaves no plaintext file and shells out to no eraser"
-        (with-redefs [shell/sh (fn [& args]
-                                 (swap! subprocesses conj (first args))
-                                 (apply real-sh args))]
-          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k" false))))
-        (is (= before (plaintext-temps)))
+        (with-redefs [fs/sh (fn [& args]
+                              (swap! subprocesses conj (ffirst args))
+                              (apply real-sh args))]
+          (watching #(with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k")))))
+        (is (= 1 (count @plaintext-temps)))
+        (is (not-any? #(.exists ^java.io.File %) @plaintext-temps))
         (is (empty? (filter #{"rm" "shred" "sh"} @subprocesses))))
       (testing "a failed delete after success is an error naming the plaintext file"
         (let [e (with-redefs-fn (failing-delete-of "secrets-")
@@ -946,7 +955,8 @@
               remaining (:remaining-file (ex-data e))]
           (try
             (is (= :private-file-remains (:reason (ex-data e))))
-            (is (contains? (plaintext-temps) (.getName (io/file remaining))))
+            (is (.exists (io/file remaining)))
+            (is (re-matches #"secrets-.*\.edn" (.getName (io/file remaining))))
             (is (str/includes? (ex-message e) remaining))
             (is (= "v2" (:k (secrets/load-secrets (str *dir* "/secrets.edn.age") *key*)))
                 "the store was written before the cleanup failure was reported")
@@ -3951,6 +3961,78 @@
           (.destroyForcibly process)
           (when (pos? (.length pid-file))
             (shell/sh "kill" (str/trim (slurp pid-file)))))))))
+
+;;;; Declined confirmations
+
+(deftest a-declined-overwrite-changes-nothing-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")]
+      (new-store! config "dev" "{:a 1}")
+      (doseq [answer ["n\n" "\n" "" "yes\n"]]
+        (testing (pr-str answer)
+          (testing "keygen keeps the existing key"
+            (let [before (file-bytes *key*)
+                  result (atom nil)
+                  out (with-out-str
+                        (with-in-str answer (reset! result (cli/keygen! config "dev"))))]
+              (is (= :aborted @result))
+              (is (str/includes? out "Aborted."))
+              (is (= before (file-bytes *key*)))))
+          (testing "new keeps the existing store and opens no editor"
+            (let [before (file-bytes ciphertext)
+                  opened? (atom false)
+                  result (atom nil)]
+              (with-redefs-fn {(cli-private 'run-editor!) (fn [_] (reset! opened? true))}
+                #(with-out-str (with-in-str answer (reset! result (cli/new! config "dev")))))
+              (is (= :aborted @result))
+              (is (not @opened?))
+              (is (= before (file-bytes ciphertext))))))))))
+
+;;;; A manifest whose digest alone is stale
+
+(deftest a-digest-only-mismatch-is-drift-with-an-identity-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          manifest (str *dir* "/secrets.edn.manifest")]
+      (store-through-stdin! config)
+      (spit manifest (str/replace (slurp manifest) #":ciphertext-sha \"[0-9a-f]{64}\""
+                                  (str ":ciphertext-sha \"" (apply str (repeat 64 "0")) "\"")))
+      (let [{:keys [result out err]} (capture-verify config "dev")]
+        (is (= {:results {:dev :drift} :exit 1} result))
+        (is (str/includes? err "ciphertext digest differs from the one the manifest records."))
+        (is (not (str/includes? err "STALE")) "the entries still agree")
+        (is (str/includes? out "bb secrets reencrypt 'dev'"))))))
+
+;;;; Exit codes on the JVM
+
+(deftest exit-codes-through-a-jvm-process-test
+  ;; `run-cli` spawns babashka. This runs the same contract through a JVM, on
+  ;; the classpath of this run, so it runs under the JVM suite only.
+  (when-not (or (System/getProperty "babashka.version") (age-env-set?))
+    (let [env (fn [n & {:as more}]
+                (merge {:secrets-file (str *dir* "/" n ".edn.age") :key-file *key*} more))
+          config (fn [envs] {:app "cli-test" :environments envs})
+          exits (fn [config args]
+                  (-> (ProcessBuilder. ^java.util.List (cli-command config args))
+                      (.redirectErrorStream true)
+                      (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)
+                      (.redirectInput
+                       (java.lang.ProcessBuilder$Redirect/from (io/file "/dev/null")))
+                      .start
+                      .waitFor))]
+      (doseq [n ["ok" "drift"]]
+        (with-out-str
+          (with-in-str "v"
+            (cli/set-secret! (cli/normalize-config (config {(keyword n) (env n)})) n ":k"))))
+      (spit (str *dir* "/drift.edn.manifest") "{:version 3}")
+      (is (= 0 (exits (config {:dev (env "ok")}) ["verify"])))
+      (is (= 1 (exits (config {:dev (env "drift")}) ["verify" "dev"])) "drift")
+      (is (= 2 (exits (config {:dev (env "absent")}) ["verify"])) "a missing secrets file")
+      (is (= 2 (exits (config {:dev (env "ok")}) ["doctor" "nowhere"])) "doctor could not run")
+      (is (= 1 (exits (config {:dev (env "absent")}) ["reencrypt" "dev"])) "any other command"))))
 
 ;;;; Residue
 

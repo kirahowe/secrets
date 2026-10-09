@@ -1052,11 +1052,21 @@
   [v n f]
   (with-redefs-fn {v n} f))
 
-(defn- temp-source-copies
-  "The ciphertext temp copies `source/acquire!` may have left behind, by name."
-  []
-  (set (filterv #(re-matches #"^secrets-.*\.age$" %)
-                (seq (.list (io/file (System/getProperty "java.io.tmpdir")))))))
+(defn- watching-source-copies
+  "Run `f`, and return the ciphertext temp copies `source/acquire!` made while
+  it ran. The temp directory is shared with every other process that uses the
+  library, so a test watches the files it creates itself."
+  [f]
+  (let [copies (atom [])
+        real-temp-file fs/owner-only-temp-file!]
+    (with-redefs [fs/owner-only-temp-file!
+                  (fn [& args]
+                    (let [file (apply real-temp-file args)]
+                      (when (= ["secrets-" ".age"] (vec args))
+                        (swap! copies conj file))
+                      file))]
+      (f))
+    @copies))
 
 (defn- acquire-source
   "Run `source/acquire!` with the source bound set to `limit`, running any
@@ -1094,28 +1104,31 @@
   (let [enc (encrypt-edn! {:k "v"})
         size (.length (io/file enc))
         jar-url (jar-source! enc "bounded.jar" "store.age")
-        before (temp-source-copies)]
-    (testing "a path used in place is checked without being copied"
-      (is (= [:ok size] (acquire-source enc size)) "exactly at the limit is accepted")
-      (is (= :source-too-large (acquire-source enc (dec size))) "one byte over is refused"))
-    (testing "a classpath jar entry is checked before it is copied"
-      (is (= [:ok size] (acquire-source jar-url size)))
-      (is (= :source-too-large (acquire-source jar-url (dec size)))))
-    (testing "load-secrets reports the bound it refused, and no source content"
-      (is (= {:k "v"} (with-bound #'source/max-source-bytes size
-                        #(secrets/load-secrets jar-url {:identity-file *key*}))))
-      (let [e (with-bound #'source/max-source-bytes (dec size)
-                #(try (secrets/load-secrets jar-url {:identity-file *key*})
-                      (catch clojure.lang.ExceptionInfo e e)))]
-        (is (= :source-too-large (:reason (ex-data e))))
-        (is (= (dec size) (:limit (ex-data e))))
-        (is (= size (:observed (ex-data e))))
-        (is (= #{:reason :limit :observed :source} (set (keys (ex-data e))))
-            "one shape: the reason, the bound, the observed size, and the source")
-        (is (str/includes? (ex-message e) "bounded.jar") "the message names the source")))
-    (testing "the bound is 16 MiB"
-      (is (= 16777216 source/max-source-bytes)))
-    (is (= before (temp-source-copies))
+        check
+        (fn []
+          (testing "a path used in place is checked without being copied"
+            (is (= [:ok size] (acquire-source enc size)) "exactly at the limit is accepted")
+            (is (= :source-too-large (acquire-source enc (dec size))) "one byte over is refused"))
+          (testing "a classpath jar entry is checked before it is copied"
+            (is (= [:ok size] (acquire-source jar-url size)))
+            (is (= :source-too-large (acquire-source jar-url (dec size)))))
+          (testing "load-secrets reports the bound it refused, and no source content"
+            (is (= {:k "v"} (with-bound #'source/max-source-bytes size
+                              #(secrets/load-secrets jar-url {:identity-file *key*}))))
+            (let [e (with-bound #'source/max-source-bytes (dec size)
+                      #(try (secrets/load-secrets jar-url {:identity-file *key*})
+                            (catch clojure.lang.ExceptionInfo e e)))]
+              (is (= :source-too-large (:reason (ex-data e))))
+              (is (= (dec size) (:limit (ex-data e))))
+              (is (= size (:observed (ex-data e))))
+              (is (= #{:reason :limit :observed :source} (set (keys (ex-data e))))
+                  "one shape: the reason, the bound, the observed size, and the source")
+              (is (str/includes? (ex-message e) "bounded.jar") "the message names the source")))
+          (testing "the bound is 16 MiB"
+            (is (= 16777216 source/max-source-bytes))))
+        copies (watching-source-copies check)]
+    (is (seq copies) "the jar entries were copied")
+    (is (not-any? #(.exists ^java.io.File %) copies)
         "no completed or partial ciphertext copy survives cleanup")))
 
 (deftest an-arbitrary-object-is-not-a-source-test
