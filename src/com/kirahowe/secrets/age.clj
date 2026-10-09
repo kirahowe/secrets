@@ -9,7 +9,7 @@
   caller's job (see `com.kirahowe.secrets` for runtime loading and `com.kirahowe.secrets.cli`
   for the management task).
 
-  `age` is a small, audited, modern file-encryption tool. A keypair is an
+  `age` is a file-encryption tool. A keypair is an
   identity file (the private key, `AGE-SECRET-KEY-1…`) plus a recipient (the
   public key, `age1…`). Encrypting to your own identity (`age -e -i key.txt`)
   gives a single-key workflow: the same file both encrypts and decrypts.

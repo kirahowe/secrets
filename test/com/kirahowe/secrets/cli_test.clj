@@ -991,6 +991,48 @@
           (is (= :drift (:dev results))
               "entries match but :ciphertext-sha does not"))))))
 
+(deftest verify-says-which-command-recreates-a-missing-manifest-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          manifest (str *dir* "/secrets.edn.manifest")]
+      (new-store! config "dev" "{:a 1}")
+      (.delete (io/file manifest))
+      (let [{:keys [result out]} (capture-verify config "dev")]
+        (is (= {:results {:dev :missing} :exit 2} result))
+        (is (str/includes? out (str "dev: no manifest at " manifest "\n")))
+        (is (str/includes? out "Write it with:  bb secrets reencrypt 'dev'"))
+        (is (not (str/includes? out "bb secrets edit"))
+            "an edit that changes nothing writes nothing"))
+      (testing "an unchanged edit leaves the manifest missing, and reencrypt writes it"
+        (edit-store! config "dev" identity)
+        (is (not (.exists (io/file manifest))))
+        (with-out-str (cli/reencrypt! config "dev"))
+        (is (= {:results {:dev :ok} :exit 0} (verify config "dev")))))))
+
+(deftest set-and-rm-write-namespaced-keys-without-map-shorthand-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          encrypted (str *dir* "/secrets.edn.age")
+          shown (atom nil)]
+      (new-store! config "dev" "{:db/host \"h\" :service {:api/key \"k\" :api/url \"u\"}}")
+      (doseq [[label change] [["set" #(with-in-str "5432" (cli/set-secret! config "dev" ":db/port" false))]
+                              ["rm" #(cli/remove-secret! config "dev" ":db/port")]]]
+        (testing label
+          ;; Whatever the caller's REPL has bound, the store is written in full.
+          (binding [*print-namespace-maps* true]
+            (with-out-str (change)))
+          (let [text (store-text encrypted *key*)]
+            (is (not (str/includes? text "#:")) text)
+            (is (str/includes? text ":db/host \"h\""))
+            (is (str/includes? text ":api/key \"k\"")))))
+      (testing "and that is what the next edit shows"
+        (edit-store! config "dev" (fn [text] (reset! shown text) text))
+        (is (not (str/includes? @shown "#:")))
+        (is (= {:db/host "h" :service {:api/key "k" :api/url "u"}}
+               (secrets/load-secrets encrypted *key*)))))))
+
 (deftest verify-keyless-freshness-test
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
@@ -1194,7 +1236,7 @@
                                   :recipients recorded}})
               (let [{:keys [result out err]} (capture-verify config "dev")]
                 (is (= {:results {:dev :drift} :exit 1} result))
-                (is (str/includes? (str out err) "value or type changed"))))))))))
+                (is (str/includes? (str out err) "changed its value or type"))))))))))
 
 (deftest verify-missing-is-exit-2-and-repl-safe-test
   (let [config (cli/normalize-config (test-config))
@@ -3306,14 +3348,14 @@
         (let [{:keys [result out err]} (capture-verify all nil)]
           (is (= {:good :ok :fine :ok :no-identity :error :wrong-key :error} (:results result)))
           (is (= 2 (:exit result)))
-          (is (str/includes? err (str "no-identity — The explicit identity path names an age"
+          (is (str/includes? err (str "no-identity: The explicit identity path names an age"
                                       " identity file that does not exist: " missing)))
-          (is (str/includes? err "wrong-key —"))
+          (is (str/includes? err "wrong-key:"))
           (is (= 2 (count (re-seq #"manifest matches" out))))))
       (testing "an environment named on the command line reports the same finding"
         (let [{:keys [result err]} (capture-verify all "no-identity")]
           (is (= {:results {:no-identity :error} :exit 2} result))
-          (is (str/includes? err (str "no-identity — The explicit identity path names an age"
+          (is (str/includes? err (str "no-identity: The explicit identity path names an age"
                                       " identity file that does not exist: " missing))))
         (is (= {:results {:wrong-key :error} :exit 2} (verify all "wrong-key"))))
       (testing "only an unknown environment throws"
@@ -3344,8 +3386,8 @@
       (try
         (let [{:keys [result out err]} (capture-verify config nil)]
           (is (= {:results {:good :ok :broken :error} :exit 2} result))
-          (is (str/includes? err (str "broken — Manifest " manifest-path " could not be read")))
-          (is (str/includes? out "good — manifest matches")))
+          (is (str/includes? err (str "broken: Manifest " manifest-path " could not be read")))
+          (is (str/includes? out "good: manifest matches")))
         (is (= {:results {:broken :error} :exit 2} (verify config "broken")))
         (testing "a failure that is not an ex-info is one content-free line too"
           (with-redefs-fn {(cli-private 'verify-one!)

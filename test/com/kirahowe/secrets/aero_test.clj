@@ -92,6 +92,21 @@
              (secrets-aero/read-config cfg {:secrets store})))
       (is (zero? @calls) "no identity is resolved and nothing is decrypted"))))
 
+(deftest a-required-secret-without-the-secrets-option-says-so-test
+  (let [cfg (spit-config! "{:url #secret/req :database/url}")
+        plain (spit-config! "plain.edn" "{:port 8080 :key #secret/opt :llm/api-key}")]
+    (doseq [[label opts] [["no :secrets key" {:profile :dev}]
+                          ["a nil :secrets" {:secrets nil}]]]
+      (testing label
+        (let [e (thrown-by #(secrets-aero/read-config cfg opts))
+              cause (last (take-while some? (iterate ex-cause e)))]
+          (is (= {:reason :invalid-config :key :database/url} (ex-data cause)))
+          (is (str/includes? (ex-message cause)
+                             "read-config was called without the :secrets option"))
+          (is (not (str/includes? (ex-message cause) "no secrets file found"))))))
+    (testing "an optional secret still reads nil, as it does for any absent store"
+      (is (= {:port 8080 :key nil} (secrets-aero/read-config plain {}))))))
+
 (deftest reads-are-independent-test
   (let [store (encrypt-edn! {:v :old})
         cfg (spit-config! "{:v #secret/req :v}")
@@ -128,7 +143,7 @@
         (is (= :no-file (reason {:secrets absent})))))
     (testing "no :secrets options at all"
       (is (= {:v nil} (secrets-aero/read-config cfg-opt {})))
-      (is (= :no-file (reason {}))))
+      (is (= :invalid-config (reason {}))))
     (testing "a designated identity that does not exist is an operator mistake"
       (let [keyless (assoc store :identity-file (str *dir* "/absent-key.txt"))]
         (is (= :no-identity (:reason (ex-data (thrown-by #(secrets-aero/read-config

@@ -327,7 +327,7 @@
       (fail! :invalid-config
              (str "Environment " label " :secrets-file (" secrets-file
                   ") does not end in .age, so the\n"
-                  "    derived :template/:manifest names would collide with — and overwrite — "
+                  "    derived :template/:manifest names would collide with, and overwrite, "
                   "the\n"
                   "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
                   "    explicitly.")
@@ -398,7 +398,7 @@
                (str "secrets config has no :app (a name string is required). It names the\n"
                     "    default key path ~/.config/<app>/key.txt and is recorded in the "
                     "manifest,\n"
-                    "    so there is deliberately no default — projects must not share a key "
+                    "    so there is deliberately no default: projects must not share a key "
                     "path\n"
                     "    by accident.")))
       (when (and (contains? config :default-environment)
@@ -552,7 +552,7 @@
 
 (def ^:private default-template
   (str ";; Encrypted secrets (age). Edit with `bb secrets edit`; never commit the\n"
-       ";; decrypted form. Values are plain EDN — strings, sets, nested maps, etc.\n"
+       ";; decrypted form. Values are plain EDN: strings, sets, nested maps, etc.\n"
        "{:example/api-key \"replace-me\"\n"
        " :example/allowed #{}}\n"))
 
@@ -833,11 +833,14 @@
   so the file stays readable to the next `bb secrets edit`, and printed with
   the length/level limits unbound: a REPL that has set `*print-length*` would
   otherwise write `...` into the store and silently truncate secrets.
+  Namespace-map shorthand is off, so a map whose keys share a namespace is
+  written `{:db/host …}` and never `#:db{:host …}`, which is what the next
+  `edit` shows.
 
   Note the whole file is regenerated, so comments a human wrote in an edited
   store do not survive a `set`. The values do."
   [value]
-  (binding [*print-length* nil *print-level* nil]
+  (binding [*print-length* nil *print-level* nil *print-namespace-maps* false]
     (with-out-str (pprint/pprint value))))
 
 (defn- strip-trailing-newline
@@ -1119,7 +1122,7 @@
                 (run-editor! tmp)
                 (let [after (read-edited! env tmp)]
                   (if (= before after)
-                    (warn "No changes — leaving" secrets-file "untouched.")
+                    (warn "No changes: leaving" secrets-file "untouched.")
                     (do
                       (info "Re-encrypting…")
                       (write-secrets! env target tmp after
@@ -1171,7 +1174,7 @@
                   ;; fails much later, far from the cause.
                   (fail! :blank-value
                          (str (if interactive? "Nothing entered" "Nothing on stdin")
-                              " — refusing to store a blank value for " (pr-str path) ".\n"
+                              ": refusing to store a blank value for " (pr-str path) ".\n"
                               (when-not interactive?
                                 "    Pipe the value in:  printf %s \"$VALUE\" | bb secrets set …\n")
                               "    To store an empty value deliberately, use --edn with \"\".")
@@ -1191,7 +1194,7 @@
               (let [store (if exists?
                             (do (info "Decrypting" secrets-file "…")
                                 (parse-secrets! secrets-file (decrypt-text! env) nil))
-                            (info "No secrets file at" secrets-file "— creating it."))
+                            (info "No secrets file at" (str secrets-file ":") "creating it."))
                     manifest-key (manifest-key-for (if exists? :update :create)
                                                    env store target)
                     current (or (manifest/user-data store) {})]
@@ -1391,10 +1394,9 @@
 
 (defn recipients!
   "List the recipients an environment encrypts to. Returns them as an eager seq
-  (nil in single-key mode). Read-only. A line that encryption would reject is
-  listed and marked as invalid instead of failing the listing. Throws for an
-  unknown environment and for a recipients file that is too large or cannot
-  be read."
+  (nil in single-key mode). Read-only. A line encryption would reject is
+  listed and marked. Throws for an unknown environment and for a recipients
+  file that is too large or cannot be read."
   [config env-arg]
   (let [{:keys [recipients-file] environment-name :name :as env}
         (resolve-env config env-arg)
@@ -1402,7 +1404,7 @@
     (if-not recipients-file
       (do
         (info environment-label
-              "is in single-key mode — it encrypts to its own key, not a recipients list.")
+              "is in single-key mode: it encrypts to its own key, not a recipients list.")
         nil)
       (let [recipients (read-recipients env)]
         (say! (recipients-lines environment-label recipients-file recipients))
@@ -1519,88 +1521,88 @@
   "One line per key path that moved between the manifest and the store."
   [{:keys [added removed changed]}]
   (concat
-   (for [path added] [:line "    +" (pr-str path) "— in secrets, missing from manifest"])
-   (for [path removed] [:line "    -" (pr-str path) "— in manifest, gone from secrets"])
-   (for [path changed] [:line "    ~" (pr-str path) "— value or type changed"])))
+   (for [path added] [:line "    +" (pr-str path) "is in the secrets and missing from the manifest"])
+   (for [path removed] [:line "    -" (pr-str path) "is in the manifest and gone from the secrets"])
+   (for [path changed] [:line "    ~" (pr-str path) "changed its value or type"])))
 
 (defn- finding-lines
   "The report for one environment's finding."
   [{:keys [app secrets-file manifest] environment-name :name}
    {:keys [reason] :as finding}]
-  (let [label (name environment-name)
-        regenerate [:line (str "    Regenerate it with:  bb secrets reencrypt "
-                               (shell-quote label))]
+  (let [quoted (shell-quote (name environment-name))
+        label (str (name environment-name) ":")
+        regenerate [:line (str "    Regenerate it with:  bb secrets reencrypt " quoted)]
         recipients-changed [:oops label
-                            "— recipients changed since the last encryption; run reencrypt."]]
+                            "recipients changed since the last encryption; run reencrypt."]]
     (case reason
       :manifest-disabled
-      [[:info label "— manifest disabled; skipping."]]
+      [[:info label "manifest disabled; skipping."]]
 
       :no-secrets-file
-      [[:warn label "— no secrets file at" secrets-file]]
+      [[:warn label "no secrets file at" secrets-file]]
 
       :no-manifest
-      [[:warn label "— no manifest at" manifest
-        (str "(run `bb secrets edit " (shell-quote label) "` to create it)")]]
+      [[:warn label "no manifest at" manifest]
+       [:line (str "    Write it with:  bb secrets reencrypt " quoted)]]
 
       :manifest-invalid-edn
-      [[:oops label "— manifest is not valid EDN:" (safe-edn/failure-message (:failure finding))]]
+      [[:oops label "manifest is not valid EDN:" (safe-edn/failure-message (:failure finding))]]
 
       :manifest-malformed
-      [[:oops label "— manifest is incomplete: expected a map with a :ciphertext-sha"
+      [[:oops label "manifest is incomplete: expected a map with a :ciphertext-sha"
         "and a :keys map whose every entry has a :type and a :vhash."]
        regenerate]
 
       :unsupported-version
-      [[:oops label "— manifest version" (pr-str (:version finding))
+      [[:oops label "manifest version" (pr-str (:version finding))
         "is unsupported by this version of the library."]
        regenerate
        [:line "    Or upgrade the library."]]
 
       :wrong-app
-      [[:oops label "— manifest describes app" (pr-str (:app finding))
+      [[:oops label "manifest describes app" (pr-str (:app finding))
         (str "but this project is " (pr-str app) ".")]
        [:line "    It belongs to a different store."]
        regenerate]
 
       :error
-      (into [[:oops label "—" (:message finding)]]
+      (into [[:oops label (:message finding)]]
             (when-let [hint (:hint finding)] [[:line "   " hint]]))
 
       :ciphertext-agrees
-      [[:ok label "— ciphertext agrees with the manifest"
+      [[:ok label "ciphertext agrees with the manifest"
         "(freshness only: no key, so values are not checked)."]]
 
       :ciphertext-changed
-      [[:oops label "— ciphertext changed since the manifest was written"
+      [[:oops label "ciphertext changed since the manifest was written"
         (str "(" manifest ").")]
        regenerate]
 
       :store-problem
-      [[:oops label "—" (:message finding)]]
+      [[:oops label (:message finding)]]
 
       :secrets-invalid-edn
-      [[:oops label "— encrypted secrets are not valid EDN:"
+      [[:oops label "encrypted secrets are not valid EDN:"
         (safe-edn/failure-message (:failure finding))]]
 
       :stale
       (-> []
           (into (when-let [diff (:diff finding)]
-                  (cons [:oops label "— manifest is STALE" (str "(" manifest "):")]
+                  (cons [:oops label "manifest is STALE" (str "(" manifest "):")]
                         (diff-lines diff))))
           (into (when (:ciphertext-changed? finding)
                   [[:oops label
-                    "— ciphertext digest differs from the one the manifest records."]]))
+                    "ciphertext digest differs from the one the manifest records."]]))
           (into (when (:recipients-changed? finding) [recipients-changed]))
           (conj regenerate))
 
       :recipients-changed
       [recipients-changed
        [:line (str "    The store is still encrypted to the earlier recipients:"
-                   "  bb secrets reencrypt " (shell-quote label))]]
+                   "  bb secrets reencrypt " quoted)]]
 
       :manifest-matches
-      [[:ok label "— manifest matches" (str "(" manifest ")")]])))
+      [[:ok label "manifest matches" (str "(" manifest ")")]])))
 
 (defn verify!
   "Check that each environment's committed manifest matches its encrypted

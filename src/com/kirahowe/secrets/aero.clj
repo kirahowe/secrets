@@ -31,18 +31,29 @@
 (defn read-config
   "Read the Aero config `source` as `aero.core/read-config` does, resolving
   `#secret/req` and `#secret/opt` against the store that `(:secrets opts)`
-  describes. See the namespace docstring."
+  describes. See the namespace docstring. Without a `:secrets` option there
+  is no store: `#secret/opt` reads nil and `#secret/req` throws
+  `:invalid-config`, naming the missing option."
   [source opts]
   (aero/read-config
    source
    (assoc opts ::readers (secrets/reader-literals (:secrets opts)))))
 
 (defn- read-secret [opts tag value]
-  (if-let [handler (get (::readers opts) tag)]
-    (handler value)
+  (cond
+    (not (contains? opts ::readers))
     (throw (ex-info (str "#" tag " needs com.kirahowe.secrets.aero/read-config;"
                          " aero.core/read-config alone cannot load secrets.")
-                    {:reason :no-secrets-reader :tag tag}))))
+                    {:reason :no-secrets-reader :tag tag}))
+
+    (and (= 'secret/req tag) (nil? (:secrets opts)))
+    (throw (ex-info (str "Required secret " (pr-str value) " cannot be read: read-config was"
+                         " called without the :secrets option, which says where the store"
+                         " is, for example {:secrets {:app \"myapp\" :resource"
+                         " \"secrets.edn.age\"}}.")
+                    {:reason :invalid-config :key value}))
+
+    :else ((get (::readers opts) tag) value)))
 
 (defmethod aero/reader 'secret/req [opts tag value] (read-secret opts tag value))
 (defmethod aero/reader 'secret/opt [opts tag value] (read-secret opts tag value))
