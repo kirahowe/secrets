@@ -371,9 +371,11 @@ Tradeoffs accepted:
 - The library writes its metadata as the first line of the store's map, which
   must be the first form in the plaintext after whitespace and comments, and
   takes only that line back out. The reserved key anywhere else was put there
-  by hand. Such a store still loads and verifies, but `edit`, `reencrypt`, and
-  `new` from such a template refuse the key as they refuse one typed in the
-  editor.
+  by hand. Such a store still loads and verifies. `edit`, and `new` from such
+  a template, refuse the key as they refuse one typed in the editor.
+  `reencrypt` drops it and renders the store again, without its comments,
+  before it writes fresh metadata, so it repairs every store that `verify` or
+  `edit` sends to it.
 - Solo mode records the fixed word `identity` as its recipient set, because the
   identity that decrypts a solo store is the one it is encrypted to. Moving a
   store between solo and team mode renews the key.

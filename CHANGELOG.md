@@ -87,6 +87,8 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
 - `set` refuses to read a terminal while stdout is redirected, because it
   could not hide what is typed. Pipe the value in.
 - `keygen` no longer prints a `flyctl` command.
+- `reencrypt` drops store metadata that was written by hand and writes its
+  own, so it repairs every store that `verify` and `edit` send to it.
 - A JVM program that calls the library exits when its own work is done. The
   library no longer starts threads that kept the JVM alive for a minute.
 - `set` and `rm` refuse a path that passes through a value that is not a map.

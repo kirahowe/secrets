@@ -667,7 +667,9 @@
   `:vhash` changes once and a removed recipient's copy of the old key says
   nothing about values published afterwards. The existing metadata is not
   read, which makes this the repair for a store whose metadata is missing,
-  malformed, or of another version."
+  malformed, or of another version. Metadata that is not on the library's own
+  line was written by hand: the store is then rendered again without it,
+  which drops the plaintext's comments."
   [config env-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
@@ -685,7 +687,11 @@
           (with-plaintext-temp
             (fn [tmp]
               (info "Decrypting" secrets-file "…")
-              (let [user-text (store/user-plaintext (store/decrypt-text! env))]
+              (let [text (store/user-plaintext (store/decrypt-text! env))
+                    value (:value (safe-edn/parse text))
+                    user-text (if (and (map? value) (contains? value manifest/store-key))
+                                (render-secrets (manifest/user-data value))
+                                text)]
                 (info "Re-encrypting to current recipients…")
                 (store/write-secrets! env target tmp user-text
                                       (manifest-key-for :reencrypt env nil target)))

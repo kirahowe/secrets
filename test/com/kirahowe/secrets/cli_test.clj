@@ -3669,6 +3669,38 @@
                   (is (str/includes? out "SECRETS_AGE_IDENTITY_FILE holds age key contents"))
                   (is (not (leaks? value (str (pr-str result) out err)))))))))))))
 
+;;;; Hand-written store metadata
+
+(deftest reencrypt-repairs-hand-written-store-metadata-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")]
+      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":seed")))
+      (doseq [[label written]
+              [["another version" "{:version 2 :manifest-key \"x\"}"]
+               ["nil" "nil"]
+               ["a string" "\"mine\""]
+               ["a nested map" "{:version 1 :manifest-key {:a {:b 1}} :recipients \"identity\"}"]]]
+        (testing label
+          (encrypt-text! (str "{:a 1 :com.kirahowe.secrets/store " written
+                              " :b {:c \"kept\"}}\n"))
+          (testing "verify and edit both say to run reencrypt"
+            (let [{:keys [result err]} (capture-verify config "dev")]
+              (is (= {:results {:dev :drift} :exit 1} result))
+              (is (str/includes? err "bb secrets reencrypt 'dev'")))
+            (let [e (test-env/thrown #(edit-store! config "dev" identity))]
+              (is (= :invalid-store (:reason (ex-data e))))
+              (is (str/includes? (ex-message e) "bb secrets reencrypt 'dev'"))))
+          (testing "and reencrypt does repair it"
+            (with-out-str (cli/reencrypt! config "dev"))
+            (is (= {:results {:dev :ok} :exit 0} (verify config "dev")))
+            (is (= {:a 1 :b {:c "kept"}} (secrets/load-secrets ciphertext *key*)))
+            (is (= 1 (count (re-seq #":com\.kirahowe\.secrets/store"
+                                    (store-text ciphertext *key*))))
+                "the only metadata left is the library's own line")
+            (is (manifest-key? (store-manifest-key ciphertext *key*)))))))))
+
 ;;;; set and the terminal
 
 (deftest set-refuses-a-terminal-it-cannot-hide-test
