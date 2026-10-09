@@ -275,17 +275,6 @@
                         descriptor (assoc :source descriptor)
                         nameable (assoc :identity nameable)))))))
 
-(defn- edn-failure-message
-  [{:keys [reason depth limit] :as failure}]
-  (case reason
-    :edn-empty "The decrypted secrets are empty; expected exactly one EDN value."
-    :edn-extra-values (str "The decrypted secrets contain more than one EDN value;"
-                           " expected exactly one.")
-    :edn-too-deep (str "The decrypted secrets nest " depth " collections deep, past the"
-                       " limit of " limit ".")
-    :edn-malformed (str "The decrypted secrets contain malformed EDN syntax"
-                        (safe-edn/failure-location failure) ".")))
-
 (def ^:private edn-failure-reasons
   #{:edn-empty :edn-extra-values :edn-too-deep :edn-malformed})
 
@@ -298,7 +287,8 @@
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
     (if ok?
       (manifest/user-data value)
-      (throw (ex-info (edn-failure-message parsed)
+      (throw (ex-info (str "The decrypted secrets are not valid EDN ("
+                           (safe-edn/failure-message parsed) ").")
                       (safe-edn/failure-data parsed))))))
 
 (defn- decrypt-and-read!

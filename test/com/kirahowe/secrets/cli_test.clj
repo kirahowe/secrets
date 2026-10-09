@@ -17,6 +17,7 @@
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.manifest :as manifest]
+            [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]
             [com.kirahowe.secrets.test-env :as test-env]))
 
@@ -619,14 +620,14 @@
           "invalid editor contents never create a manifest"))))
 
 (deftest safe-edn-failure-rendering-test
-  (let [render (cli-private 'edn-failure-message)]
+  (let [render safe-edn/failure-message]
     (is (= "malformed EDN syntax at line 7, column 11"
            (render {:reason :edn-malformed :line 7 :column 11})))
     (is (= "expected one EDN value, found empty input"
            (render {:reason :edn-empty})))
     (is (= "expected one EDN value, found another"
            (render {:reason :edn-extra-values})))
-    (is (= "EDN nesting depth 101 exceeds the limit of 100"
+    (is (= "EDN nesting depth 101 is past the limit of 100"
            (render {:reason :edn-too-deep :depth 101 :limit 100})))))
 
 (deftest cli-depth-bomb-is-rejected-before-recursive-parse-test

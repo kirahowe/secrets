@@ -737,25 +737,16 @@
             (manifest/generate-key))))
     (manifest/generate-key)))
 
-(defn- edn-failure-message
-  [{:keys [reason depth limit] :as failure}]
-  (case reason
-    :edn-empty "expected one EDN value, found empty input"
-    :edn-extra-values "expected one EDN value, found another"
-    :edn-too-deep (str "EDN nesting depth " depth " exceeds the limit of " limit)
-    :edn-malformed (str "malformed EDN syntax" (safe-edn/failure-location failure))))
-
-(defn- validate-plaintext!
-  "Parse all of `plaintext`, returning its EDN value. Fail before encryption
-  when it is empty, malformed, contains more than one value, or nests too
-  deeply."
-  [secrets-file plaintext]
-  (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
+(defn- parse-secrets!
+  "Parse all of `text`, the plaintext of the store at `secrets-file`, and
+  return its EDN value. Fail when it is empty, malformed, holds more than one
+  value, or nests too deeply, with `note` after the message."
+  [secrets-file text note]
+  (let [{:keys [ok? value] :as parsed} (safe-edn/parse text)]
     (if ok?
       value
       (fail! (:reason parsed)
-             (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").\n"
-                  "    Ciphertext and manifest were left unchanged.")
+             (str "Secrets are not valid EDN (" (safe-edn/failure-message parsed) ")." note)
              (merge {:secrets-file (str secrets-file)}
                     (safe-edn/failure-data parsed))))))
 
@@ -769,17 +760,6 @@
       (input-too-large! (str "The secrets file " secrets-file) source/max-source-bytes size
                         {:secrets-file (str secrets-file)})))
   (age/decrypt identity-file secrets-file))
-
-(defn- parsed-store!
-  "The value of decrypted store text `text`, or a failure naming why it is not
-  one EDN value."
-  [{:keys [secrets-file]} text]
-  (let [{:keys [ok? value] :as parsed} (safe-edn/parse text)]
-    (if ok?
-      value
-      (fail! (:reason parsed)
-             (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
-             (merge {:secrets-file secrets-file} (safe-edn/failure-data parsed))))))
 
 (def ^:private set-usage
   (str "`set` takes [env] <key>; the value is read from the prompt or stdin, "
@@ -809,7 +789,7 @@
                 "([:a :b]).")))
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse (str s))
         problem (cond
-                  (not ok?) (edn-failure-message parsed)
+                  (not ok?) (safe-edn/failure-message parsed)
                   (keyword? value) nil
                   (and (vector? value) (empty? value)) "got an empty vector"
                   (vector? value) (when-not (every? #(or (keyword? %) (string? %)) value)
@@ -936,15 +916,11 @@
       text)))
 
 (defn- read-edited!
-  "The text an editor left in private temp file `tmp`, bounded by
-  `max-plaintext-bytes`."
-  [secrets-file tmp]
-  (let [f (io/file (str tmp))]
-    (when (> (.length f) max-plaintext-bytes)
-      (input-too-large! (str "The plaintext for " secrets-file)
-                        max-plaintext-bytes (.length f)
-                        {:secrets-file (str secrets-file)}))
-    (slurp f :encoding "UTF-8")))
+  "The text an editor left in private temp file `tmp`, bounded as every
+  plaintext the CLI writes is."
+  [{:keys [secrets-file]} tmp]
+  (read-file-bounded! tmp max-plaintext-bytes "The edited plaintext"
+                      {:secrets-file (str secrets-file)}))
 
 (defn- store-plaintext!
   "Validate `user-text` and return `[value plaintext]`: the user's map, and
@@ -960,7 +936,7 @@
             (input-too-large! (str "The plaintext for " secrets-file)
                               max-plaintext-bytes size
                               {:secrets-file (str secrets-file)}))
-        value (validate-plaintext! secrets-file user-text)
+        value (parse-secrets! secrets-file user-text unchanged)
         _ (when-not (map? value)
             (fail! :secrets-not-a-map
                    (str "Secrets must be one EDN map, but the plaintext is a value of type "
@@ -1142,7 +1118,7 @@
               (info "Opening" (editor) "…")
               (run-editor! tmp)
               (info "Encrypting…")
-              (write-secrets! env target tmp (read-edited! secrets-file tmp)
+              (write-secrets! env target tmp (read-edited! env tmp)
                               (manifest-key-for :create env nil target))
               (report-written! env "Encrypted secrets written:" secrets-file)
               secrets-file)))))))
@@ -1171,13 +1147,13 @@
             (fn [tmp]
               (info "Decrypting" secrets-file "…")
               (let [text (decrypt-text! env)
-                    store (parsed-store! env text)
+                    store (parse-secrets! secrets-file text nil)
                     ;; A store without usable metadata fails before the editor opens.
                     _ (require-store-metadata! env store)
                     before (user-plaintext text)]
                 (spit tmp before :encoding "UTF-8")
                 (run-editor! tmp)
-                (let [after (read-edited! secrets-file tmp)]
+                (let [after (read-edited! env tmp)]
                   (if (= before after)
                     (warn "No changes — leaving" secrets-file "untouched.")
                     (do
@@ -1243,14 +1219,14 @@
                           value
                           (fail! (:reason parsed)
                                  (str "Value is not valid EDN ("
-                                      (edn-failure-message parsed) ").")
+                                      (safe-edn/failure-message parsed) ").")
                                  (merge {:key path} (safe-edn/failure-data parsed)))))
                       raw)]
           (with-plaintext-temp
             (fn [tmp]
               (let [store (if exists?
                             (do (info "Decrypting" secrets-file "…")
-                                (parsed-store! env (decrypt-text! env)))
+                                (parse-secrets! secrets-file (decrypt-text! env) nil))
                             (info "No secrets file at" secrets-file "— creating it."))
                     manifest-key (manifest-key-for (if exists? :update :create)
                                                    env store target)
@@ -1290,7 +1266,7 @@
                   :environment environment-name}))
         (let [target (encrypt-target! env)]
           (info "Decrypting" secrets-file "…")
-          (let [store (parsed-store! env (decrypt-text! env))
+          (let [store (parse-secrets! secrets-file (decrypt-text! env) nil)
                 manifest-key (manifest-key-for :update env store target)
                 current (manifest/user-data store)]
             (require-map-parents! current path)
@@ -1604,7 +1580,7 @@
         (str "(run `bb secrets edit " (shell-quote label) "` to create it)")]]
 
       :manifest-invalid-edn
-      [[:oops label "— manifest is not valid EDN:" (edn-failure-message (:failure finding))]]
+      [[:oops label "— manifest is not valid EDN:" (safe-edn/failure-message (:failure finding))]]
 
       :manifest-malformed
       [[:oops label "— manifest is incomplete: expected a map with a :ciphertext-sha"
@@ -1641,7 +1617,7 @@
 
       :secrets-invalid-edn
       [[:oops label "— encrypted secrets are not valid EDN:"
-        (edn-failure-message (:failure finding))]]
+        (safe-edn/failure-message (:failure finding))]]
 
       :stale
       (-> []

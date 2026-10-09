@@ -127,3 +127,13 @@
     line (str " at line " line)
     column (str " at column " column)
     :else ""))
+
+(defn failure-message
+  "Render a failed [[parse]] result as a clause saying what was wrong, such as
+  \"malformed EDN syntax at line 3, column 7\". It holds none of the text."
+  [{:keys [reason depth limit] :as failure}]
+  (case reason
+    :edn-empty "expected one EDN value, found empty input"
+    :edn-extra-values "expected one EDN value, found another"
+    :edn-too-deep (str "EDN nesting depth " depth " is past the limit of " limit)
+    :edn-malformed (str "malformed EDN syntax" (failure-location failure))))

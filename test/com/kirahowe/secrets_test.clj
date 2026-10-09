@@ -1134,8 +1134,11 @@
           "a plaintext past the bound cannot arrive in a ciphertext within it"))))
 
 (deftest edn-depth-scan-test
-  (let [depth #(#'safe-edn/nesting-depth %)
-        read-edn #(#'secrets/read-secrets-edn %)
+  (let [;; With the bound below zero every input is refused, and the refusal
+        ;; reports the depth the scan found.
+        depth (fn [s] (:depth (with-bound #'safe-edn/max-depth -1 #(safe-edn/parse s))))
+        refused? (fn [s] (= {:ok? false :reason :edn-too-deep :limit 100}
+                            (dissoc (safe-edn/parse s) :depth)))
         nested (fn [n] (str (apply str (repeat n \[)) (apply str (repeat n \]))))]
     (testing "only delimiters that are structure count as depth"
       (are [expected s] (= expected (depth s))
@@ -1155,17 +1158,18 @@
     (testing "nesting at the limit parses and one past it is refused"
       (is (= 100 (depth (nested 100))))
       (is (= 101 (depth (nested 101))))
-      (is (vector? (read-edn (nested 100))))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"past the limit of 100"
-                            (read-edn (nested 101)))))
+      (is (vector? (:value (safe-edn/parse (nested 100)))))
+      (is (refused? (nested 101)))
+      (is (= "EDN nesting depth 101 is past the limit of 100"
+             (safe-edn/failure-message (safe-edn/parse (nested 101))))))
     (testing "nesting deep enough to overflow a real parse is refused without parsing"
       (let [bomb (apply str (repeat 200000 \[))]
         (is (= 200000 (depth bomb)))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"past the limit of 100" (read-edn bomb))
+        (is (refused? bomb)
             "clojure.edn never sees it, so no StackOverflowError can happen")))
     (testing "balance is the parser's business, not the scanner's"
       (is (= 1 (depth "{:a 1")))
-      (is (thrown? Exception (read-edn "{:a 1"))))))
+      (is (= :edn-malformed (:reason (safe-edn/parse "{:a 1")))))))
 
 (deftest edn-failure-helpers-test
   (testing "failure-data keeps the allowlisted fields and nothing else"
