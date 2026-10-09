@@ -46,7 +46,7 @@
    (let [plain (str *dir* "/plain.edn")
          enc (str *dir* "/secrets.edn.age")]
      (spit plain (pr-str m))
-     (age/encrypt-file! identity-file plain enc)
+     (age/encrypt-file! {:identity-file identity-file} plain enc)
      (.delete (io/file plain))
      enc)))
 
@@ -183,7 +183,7 @@
       (with-cwd-entry "--armor"
         (fn [in]
           (spit in payload)
-          (age/encrypt-file! *key* (str in) out)
+          (age/encrypt-file! {:identity-file *key*} (str in) out)
           (is (= payload (age/decrypt *key* out))
               "age encrypts the file rather than armoring an encryption of stdin"))))))
 
@@ -192,7 +192,7 @@
         plain (str *dir* "/option-named.edn")
         enc (str *dir* "/option-named.age")]
     (spit plain payload)
-    (age/encrypt-file! *key* plain enc)
+    (age/encrypt-file! {:identity-file *key*} plain enc)
     (doseq [entry-name ["--version" "--help"]]
       (testing (str "a ciphertext named " entry-name " is decrypted as ciphertext")
         (with-cwd-entry entry-name
@@ -211,13 +211,13 @@
         (with-cwd-entry "-"
           (fn [in]
             (spit in payload)
-            (age/encrypt-file! *key* (str in) out)
+            (age/encrypt-file! {:identity-file *key*} (str in) out)
             (is (= payload (age/decrypt *key* out)))))))
     (testing "a ciphertext named - is decrypted instead of reading stdin"
       (let [plain (str *dir* "/dash-plain.edn")
             enc (str *dir* "/dash-plain.age")]
         (spit plain payload)
-        (age/encrypt-file! *key* plain enc)
+        (age/encrypt-file! {:identity-file *key*} plain enc)
         (with-cwd-entry "-"
           (fn [ct]
             (io/copy (io/file enc) ct)
@@ -226,22 +226,16 @@
 (deftest dash-leading-relative-paths-work-for-every-path-argument-test
   (let [payload "{:option/boundary \"relative\"}"
         plain "-secrets-boundary/plain.edn"
-        identity-file "-secrets-boundary/key.txt"
-        recipients-file "-secrets-boundary/recipients.txt"]
+        identity-file "-secrets-boundary/key.txt"]
     (with-cwd-entry "-secrets-boundary"
       (fn [_]
         (io/make-parents plain)
         (spit plain payload)
         (io/copy (io/file *key*) (io/file identity-file))
-        (spit recipients-file (str (age/public-key *key*) "\n"))
         (testing "input, output and identity file may all start with a dash"
           (let [out "-secrets-boundary/identity.age"]
             (age/encrypt-file! {:identity-file identity-file} plain out)
-            (is (= payload (age/decrypt identity-file out)))))
-        (testing "a dash-leading recipients file encrypts to that recipient"
-          (let [out "-secrets-boundary/recipients.age"]
-            (age/encrypt-file! {:recipients-file recipients-file} plain out)
-            (is (= payload (age/decrypt *key* out)))))))))
+            (is (= payload (age/decrypt identity-file out)))))))))
 
 (deftest a-file-named-dash-is-a-path-for-every-age-path-role-test
   (let [payload "{:option/boundary \"dash-roles\"}"
@@ -249,22 +243,15 @@
     (spit plain payload)
     (testing "an identity file named - is read from disk, never from stdin"
       (let [enc (str *dir* "/dash-roles-identity.age")]
-        (age/encrypt-file! *key* plain enc)
+        (age/encrypt-file! {:identity-file *key*} plain enc)
         (with-cwd-entry "-"
           (fn [id]
             (io/copy (io/file *key*) id)
             (is (= payload (age/decrypt "-" enc)))))))
-    (testing "a recipients file named - is read from disk, never from stdin"
-      (let [out (str *dir* "/dash-roles-recipients.age")]
-        (with-cwd-entry "-"
-          (fn [rf]
-            (spit rf (str (age/public-key *key*) "\n"))
-            (age/encrypt-file! {:recipients-file "-"} plain out)))
-        (is (= payload (age/decrypt *key* out)))))
     (testing "an output named - is a file, never stdout"
       (with-cwd-entry "-"
         (fn [out]
-          (age/encrypt-file! *key* plain "-")
+          (age/encrypt-file! {:identity-file *key*} plain "-")
           (is (.isFile out) "age wrote a file rather than streaming to stdout")
           (is (= payload (age/decrypt *key* "-"))))))))
 
@@ -292,7 +279,7 @@
                          (age/decrypt identity-file in))
                        (first @calls))]
     (testing "the encrypt terminator sits immediately before the input operand"
-      (let [argv (encrypt-argv "key.txt" "-in.edn" "out.age")]
+      (let [argv (encrypt-argv {:identity-file "key.txt"} "-in.edn" "out.age")]
         (is (= ["--" "./-in.edn"] (take-last 2 argv)) (pr-str argv))
         (is (= ["age" "-e" "-i" "key.txt" "-o" "out.age" "--" "./-in.edn"] argv))))
     (testing "the decrypt terminator sits immediately before the input operand"
@@ -302,21 +289,21 @@
     (testing "a recipient is a recipient string, not a path, so it passes verbatim"
       (is (= ["age" "-e" "-r" "-not-a-path" "-o" "out.age" "--" "plain.edn"]
              (encrypt-argv {:recipients ["-not-a-path"]} "plain.edn" "out.age"))))
-    (testing "-i, -R and -o render an exact - as ./-"
-      (is (= ["age" "-e" "-i" "./-" "-R" "./-" "-o" "./-" "--" "plain.edn"]
-             (encrypt-argv {:identity-file "-" :recipients-file "-"} "plain.edn" "-")))
+    (testing "-i and -o render an exact - as ./-"
+      (is (= ["age" "-e" "-i" "./-" "-o" "./-" "--" "plain.edn"]
+             (encrypt-argv {:identity-file "-"} "plain.edn" "-")))
       (is (= ["age" "-d" "-i" "./-" "--" "plain.age"] (decrypt-argv "-" "plain.age"))))))
 
 (deftest blank-and-nil-age-paths-fail-closed-test
   (let [plain (str *dir* "/blank-source.edn")
         enc (str *dir* "/blank-source.age")]
     (spit plain "{:option/boundary \"blank\"}")
-    (age/encrypt-file! *key* plain enc)
+    (age/encrypt-file! {:identity-file *key*} plain enc)
     (testing "a blank or nil encrypt input is refused, never taken as stdin"
       (doseq [[label in] [["empty" ""] ["spaces" "   "] ["nil" nil]]]
         (let [out (str *dir* "/blank-" label ".age")]
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                                (age/encrypt-file! *key* in out))
+                                (age/encrypt-file! {:identity-file *key*} in out))
               (str "input " (pr-str in) " names no file"))
           (is (not (.exists (io/file out)))
               (str "nothing is written for input " (pr-str in))))))
@@ -328,19 +315,16 @@
     (testing "a blank identity file is refused on both paths"
       (let [out (str *dir* "/blank-identity.age")]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/encrypt-file! "" plain out)))
+                              (age/encrypt-file! {:identity-file ""} plain out)))
         (is (not (.exists (io/file out))) "nothing is written for a blank identity")
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
                               (age/decrypt "" enc)))))
-    (testing "a blank output, a blank recipients file and a nil identity fail closed"
+    (testing "a blank output and a nil identity fail closed"
       (let [out (str *dir* "/blank-role.age")]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/encrypt-file! *key* plain "")))
+                              (age/encrypt-file! {:identity-file *key*} plain "")))
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/encrypt-file! {:recipients-file ""} plain out)))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/encrypt-file! nil plain out))
-            "a bare nil names a blank identity file, not \"no recipients at all\"")
+                              (age/encrypt-file! {:identity-file nil} plain out)))
         (is (not (.exists (io/file out))) "nothing is written for any blank role")))
     (testing "keygen! refuses a blank path instead of resolving to a directory"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (age/keygen! ""))))))
@@ -360,14 +344,10 @@
                                :recipients ["age1-valid-looking-recipient-value"]}
                               "plain"
                               "out")]
-         ["nil recipients-file map path"
-          #(age/encrypt-file! {:recipients-file nil} "plain" "out")]
-         ["whitespace recipients-file map path"
-          #(age/encrypt-file! {:recipients-file "   "} "plain" "out")]
-         ["nil encrypt output" #(age/encrypt-file! "key" "plain" nil)]
-         ["whitespace encrypt output" #(age/encrypt-file! "key" "plain" "   ")]
-         ["nil encrypt input" #(age/encrypt-file! "key" nil "out")]
-         ["whitespace encrypt input" #(age/encrypt-file! "key" "   " "out")]
+         ["nil encrypt output" #(age/encrypt-file! {:identity-file "key"} "plain" nil)]
+         ["whitespace encrypt output" #(age/encrypt-file! {:identity-file "key"} "plain" "   ")]
+         ["nil encrypt input" #(age/encrypt-file! {:identity-file "key"} nil "out")]
+         ["whitespace encrypt input" #(age/encrypt-file! {:identity-file "key"} "   " "out")]
          ["nil decrypt identity" #(age/decrypt nil "cipher")]
          ["whitespace decrypt identity" #(age/decrypt "   " "cipher")]
          ["nil decrypt input" #(age/decrypt "key" nil)]
@@ -387,7 +367,7 @@
           plain (str *dir* "/control.edn")
           out (str *dir* "/control.age")]
       (spit plain payload)
-      (age/encrypt-file! *key* plain out)
+      (age/encrypt-file! {:identity-file *key*} plain out)
       (is (= payload (age/decrypt *key* out)))
       (testing "and a :recipients list of literal age1… strings is untouched"
         (let [multi (str *dir* "/control-multi.age")]
@@ -957,31 +937,7 @@
       (testing "via an explicit :recipients list"
         (age/encrypt-file! {:recipients [pub1 pub2]} plain enc)
         (is (= {:x 1} (secrets/load-secrets enc *key*)))
-        (is (= {:x 1} (secrets/load-secrets enc key2))))
-      (testing "via a :recipients-file"
-        (let [rf (str *dir* "/recipients.txt")]
-          (spit rf (str "# team\n" pub1 "\n" pub2 "\n"))
-          (age/encrypt-file! {:recipients-file rf} plain enc)
-          (is (= {:x 1} (secrets/load-secrets enc *key*)))
-          (is (= {:x 1} (secrets/load-secrets enc key2))))))))
-
-(deftest single-key-still-works-test
-  (testing "passing a bare identity path encrypts to that identity (back-compat)"
-    (let [plain (str *dir* "/p.edn")
-          enc (str *dir* "/single.edn.age")]
-      (spit plain (pr-str {:y 2}))
-      (age/encrypt-file! *key* plain enc)
-      (is (= {:y 2} (secrets/load-secrets enc *key*))))))
-
-(deftest bare-public-key-guard-test
-  (testing "a bare age1… public key is rejected as an identity-file path"
-    (let [plain (str *dir* "/p.edn")]
-      (spit plain (pr-str {:z 3}))
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo #":recipients"
-           (age/encrypt-file! (age/public-key *key*)
-                              plain
-                              (str *dir* "/x.age")))))))
+        (is (= {:x 1} (secrets/load-secrets enc key2)))))))
 
 ;;;; Atomic moves
 
@@ -1126,7 +1082,7 @@
         plain (str *dir* "/" label ".edn")
         enc (str *dir* "/" label ".age")]
     (spit plain (str "{:pad \"" (apply str (repeat pad \a)) "\"}"))
-    (age/encrypt-file! *key* plain enc)
+    (age/encrypt-file! {:identity-file *key*} plain enc)
     (.delete (io/file plain))
     enc))
 
@@ -1260,7 +1216,7 @@
       (let [plain (str *dir* "/malformed-secret.edn")
             encrypted (str *dir* "/malformed-secret.edn.age")]
         (spit plain sentinel)
-        (age/encrypt-file! *key* plain encrypted)
+        (age/encrypt-file! {:identity-file *key*} plain encrypted)
         (.delete (io/file plain))
         (let [e (try
                   (secrets/load-secrets encrypted *key*)

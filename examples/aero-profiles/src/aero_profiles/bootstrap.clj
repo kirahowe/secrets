@@ -26,7 +26,7 @@
   (spit plain-file (pr-str {:openrouter/api-key "fake-default-key"
                             :openrouter/evals-api-key "fake-evals-key"}))
   (try
-    (age/encrypt-file! key-file plain-file encrypted-file)
+    (age/encrypt-file! {:identity-file key-file} plain-file encrypted-file)
     (finally (.delete (io/file plain-file))))
   (println "Bootstrap complete: disposable key and ciphertext are in tmp/ (gitignored).")
   (println "Run with: SECRETS_AGE_IDENTITY_FILE=tmp/key.txt bb run"))

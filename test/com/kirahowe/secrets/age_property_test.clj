@@ -39,33 +39,27 @@
 
 (defspec encrypt-names-every-path-after-its-flag-and-never-as-an-option 300
   (prop/for-all [identity-file any-path
-                 recipients-file any-path
+                 recipients (gen/vector g/age-recipient 0 3)
                  in any-path
                  out any-path
-                 flags (gen/elements [#{:identity-file} #{:recipients-file}
-                                      #{:identity-file :recipients-file}])]
-    (let [spec (cond-> {}
-                 (:identity-file flags) (assoc :identity-file identity-file)
-                 (:recipients-file flags) (assoc :recipients-file recipients-file))
-          paths (concat (when (:identity-file flags) [identity-file])
-                        (when (:recipients-file flags) [recipients-file])
-                        [in out])]
+                 identity? gen/boolean]
+    (let [target (cond-> {:recipients recipients}
+                   identity? (assoc :identity-file identity-file))
+          paths (concat (when identity? [identity-file]) [in out])]
       (if (some #(str/blank? (str %)) paths)
-        (let [e (thrown #(encrypt-argv spec in out))]
+        (let [e (thrown #(encrypt-argv target in out))]
           (and (instance? clojure.lang.ExceptionInfo e)
-               (contains? #{:identity :recipients-file :output :input}
-                          (:argument (ex-data e)))
+               (contains? #{:identity :output :input} (:argument (ex-data e)))
                (str/includes? (ex-message e) (name (:argument (ex-data e))))))
-        (let [argv (encrypt-argv spec in out)
+        (let [argv (encrypt-argv target in out)
               after-flag (fn [flag] (second (drop-while #(not= flag %) argv)))
               terminator (.indexOf ^java.util.List argv "--")]
           (and (= "age" (first argv))
                (= (- (count argv) 2) terminator)
                (not (str/starts-with? (peek argv) "-"))
                (not (str/starts-with? (after-flag "-o") "-"))
-               (or (not (:identity-file flags)) (not (str/starts-with? (after-flag "-i") "-")))
-               (or (not (:recipients-file flags))
-                   (not (str/starts-with? (after-flag "-R") "-")))))))))
+               (= recipients (map second (filter #(= "-r" (first %)) (partition 2 1 argv))))
+               (or (not identity?) (not (str/starts-with? (after-flag "-i") "-")))))))))
 
 ;;;; Recipients
 

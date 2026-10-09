@@ -39,7 +39,7 @@
    (let [plain (str *dir* "/secrets.edn")
          enc (str plain ".age")]
      (spit plain (pr-str m))
-     (age/encrypt-file! identity-file plain enc)
+     (age/encrypt-file! {:identity-file identity-file} plain enc)
      (.delete (io/file plain))
      {:file enc :identity-file *key*})))
 

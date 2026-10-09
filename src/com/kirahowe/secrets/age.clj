@@ -117,44 +117,16 @@
   "Encrypt plaintext file `in` to ciphertext file `out`. Returns `out`; throws
   on failure.
 
-  `recipients` selects who can decrypt. It is either:
-    • a bare String/File, always an identity-*file path*: encrypt to that
-      identity's own recipient (`age -e -i`), the single-key workflow. A bare
-      `age1…` public-key string throws. Pass those as `{:recipients [\"age1…\"]}`
-      (age would otherwise try to read the key as a file path); or
-    • a map with any of, whose recipients are unioned:
-        :identity-file    encrypt to this identity's own recipient (`-i`)
-        :recipients-file  path to a file of age public keys, one per line (`-R`)
-        :recipients       a seq of age recipient strings (`-r` each)
-
-  Multi-recipient encryption (`:recipients-file` / `:recipients`) lets each
-  person hold their *own* key: any one of the listed recipients can decrypt."
-  [recipients in out]
-  (when (and (string? recipients) (valid-recipient? recipients))
-    (throw (ex-info (str "encrypt-file! got a bare public key, but a bare "
-                         "recipients value means an identity-file path. Pass "
-                         "public keys as {:recipients [\"age1…\"]}.")
-                    {:reason :invalid-argument :recipients recipients})))
-  (let [recipient-spec (if (map? recipients)
-                         recipients
-                         {:identity-file recipients})
-        {:keys [identity-file recipients-file] rs :recipients} recipient-spec
-        identity-file? (contains? recipient-spec :identity-file)
-        recipients-file? (contains? recipient-spec :recipients-file)
-        argv (cond-> ["age" "-e"]
-               identity-file? (conj "-i" (path-arg :identity identity-file))
-               recipients-file? (conj "-R" (path-arg :recipients-file recipients-file)))
-        argv (reduce (fn [argv recipient]
-                       (-> argv
-                           (conj "-r")
-                           (conj (str recipient))))
-                     argv
-                     rs)
-        argv (-> argv
-                 (conj "-o")
-                 (conj (path-arg :output out))
-                 (conj "--")
-                 (conj (path-arg :input in)))]
+  `target` says who can decrypt. `{:identity-file path}` encrypts to that
+  identity's own recipient (`age -e -i`), the single-key workflow.
+  `{:recipients [\"age1…\" …]}` encrypts to each listed recipient (`-r`
+  each), so each person holds their own key and any one of them can decrypt."
+  [{:keys [identity-file recipients] :as target} in out]
+  (let [argv (-> ["age" "-e"]
+                 (into (when (contains? target :identity-file)
+                         ["-i" (path-arg :identity identity-file)]))
+                 (into (mapcat (fn [recipient] ["-r" (str recipient)])) recipients)
+                 (into ["-o" (path-arg :output out) "--" (path-arg :input in)]))]
     ;; Local argument validation first: probing the environment must not be
     ;; able to mask a path that never named a file.
     (ensure-installed!)

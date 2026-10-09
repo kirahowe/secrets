@@ -77,7 +77,7 @@
   (let [plain (str *dir* "/plain.edn")
         enc (str *dir* "/secrets.edn.age")]
     (spit plain text)
-    (age/encrypt-file! *key* plain enc)
+    (age/encrypt-file! {:identity-file *key*} plain enc)
     (.delete (io/file plain))
     enc))
 
@@ -680,7 +680,7 @@
       (testing "an existing decrypted store"
         (let [plain (str *dir* "/malformed.edn")]
           (spit plain malformed)
-          (age/encrypt-file! *key* plain encrypted)
+          (age/encrypt-file! {:identity-file *key*} plain encrypted)
           (.delete (io/file plain)))
         (let [captured
               (capture-failure

@@ -460,7 +460,7 @@
         encrypted (str dir "/" id ".age")]
     (try
       (spit plain text)
-      (age/encrypt-file! key plain encrypted)
+      (age/encrypt-file! {:identity-file key} plain encrypted)
       (f encrypted)
       (finally
         (.delete (io/file plain))
