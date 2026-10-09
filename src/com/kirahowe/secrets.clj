@@ -96,7 +96,7 @@
                 " base64-encoded age key file contents, or use"
                 " SECRETS_AGE_IDENTITY (raw contents) / SECRETS_AGE_IDENTITY_FILE"
                 " (a path) instead.")
-           {:env "SECRETS_AGE_IDENTITY_B64"}))
+           {:reason :invalid-identity :env "SECRETS_AGE_IDENTITY_B64"}))
 
 (defn- decode-b64-identity
   "Decode canonical base64 identity contents to raw identity text.
@@ -139,7 +139,7 @@
   (when (and v (str/blank? v))
     (throw (ex-info (str k " is set but empty. Unset it to fall back to the next"
                          " identity source, or set it to " (identity-env-help k) ".")
-                    {:env k})))
+                    {:reason :invalid-identity :env k})))
   v)
 
 (defn- getenv
@@ -360,8 +360,11 @@
   Missing or invalid inputs throw ex-info with a :reason:
     :no-identity        no identity resolves, the app default key file is
                         absent, or a designated identity file does not exist.
+    :invalid-identity   an identity variable is set but blank, or
+                        SECRETS_AGE_IDENTITY_B64 is not valid base64.
     :disallowed-identity  the identity path is URI-shaped or holds key
                         contents, so it is not a local path.
+    :decrypt-failed     age could not decrypt the source with the identity.
     :no-file            `source` is nil, an allowed local file is absent, or an
                         allowed local source cannot be read.
     :disallowed-source  `source` is outside the local-only provenance contract.

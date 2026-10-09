@@ -144,11 +144,11 @@
 (defn- question-marker [] (paint (tty?) :yellow "?"))
 
 (defn- fail!
-  "Throw an `ex-info` for a user-facing failure. `run!` catches these, prints
-  the message plus any :hint, :install, :error, or :docs in the data, and exits
-  1. Command fns never exit the process, or a REPL, themselves."
-  ([msg] (fail! msg {}))
-  ([msg data] (throw (ex-info msg data))))
+  "Throw an `ex-info` for a user-facing failure, with `reason` as its
+  `:reason`. `run!` prints the message plus any :hint, :install, :error, or
+  :docs in the data."
+  ([reason msg] (fail! reason msg nil))
+  ([reason msg data] (throw (ex-info msg (assoc data :reason reason)))))
 
 (defn- confirm!
   "Prompt y/N; true on \"y\", false otherwise. Never exits: callers decide
@@ -195,18 +195,18 @@
   `:manifest false` keep their meaning."
   [env kind path]
   (when (and (string? path) (str/blank? path))
-    (fail! (str "Environment " env " has a blank " kind " (a path string must not be empty).\n"
+    (fail! :invalid-config
+           (str "Environment " env " has a blank " kind " (a path string must not be empty).\n"
                 "    An empty path resolves to the working directory, not a file.")
            {:environment env :field kind :path path}))
   (when-let [problem (and (string? path) (source/path-problem path))]
-    (fail! (source/path-problem-message (str "Environment " env " " kind)
+    (fail! (if (#{:key-file :identity-file} kind)
+             :disallowed-identity
+             :disallowed-source)
+           (source/path-problem-message (str "Environment " env " " kind)
                                         "a local filesystem path"
                                         problem)
-           (cond-> {:environment env
-                    :field kind
-                    :reason (if (#{:key-file :identity-file} kind)
-                              :disallowed-identity
-                              :disallowed-source)}
+           (cond-> {:environment env :field kind}
              (:scheme problem) (assoc :scheme (:scheme problem)))))
   path)
 
@@ -248,7 +248,8 @@
   (try
     (canonical-path path)
     (catch java.io.IOException e
-      (fail! (str "Environment " environment-name " has an unresolvable " (name role)
+      (fail! :invalid-config
+             (str "Environment " environment-name " has an unresolvable " (name role)
                   " path — " path "\n    " (ex-message e))
              {:environment environment-name :role role :path path}))))
 
@@ -298,7 +299,7 @@
                              (not (compatible-role-sets (set (map :role entries))))))]
     (when-let [[canonical entries] (first (filter incompatible? groups))]
       (let [entries (vec (sort-by (juxt (comp name :environment) (comp name :role)) entries))]
-        (fail! (role-collision-message canonical entries)
+        (fail! :invalid-config (role-collision-message canonical entries)
                {:canonical-path canonical :path-collision entries})))))
 
 (def ^:private max-recipients-bytes
@@ -327,9 +328,10 @@
   `what` names the map in the message."
   [what known m]
   (when-let [unknown (seq (remove known (keys m)))]
-    (fail! (str what " has an unknown key: " (str/join ", " (map pr-str unknown)) ".\n"
+    (fail! :unknown-config-key
+           (str what " has an unknown key: " (str/join ", " (map pr-str unknown)) ".\n"
                 "    Known keys: " (str/join ", " (sort (map pr-str known))) ".")
-           {:reason :unknown-config-key :unknown-keys (vec unknown)})))
+           {:unknown-keys (vec unknown)})))
 
 (defn- normalize-environment
   [app environment-name
@@ -337,14 +339,16 @@
     :as env-config}]
   (reject-unknown-keys! (str "Environment " environment-name) environment-keys env-config)
   (when-not (string? secrets-file)
-    (fail! (str "Environment " environment-name
+    (fail! :invalid-config
+           (str "Environment " environment-name
                 " has no :secrets-file (a path string is required).")
            {:environment environment-name}))
   (require-path! environment-name :secrets-file secrets-file)
   (when (and (not (str/ends-with? secrets-file ".age"))
              (not (and (contains? env-config :template)
                        (contains? env-config :manifest))))
-    (fail! (str "Environment " environment-name " :secrets-file (" secrets-file
+    (fail! :invalid-config
+           (str "Environment " environment-name " :secrets-file (" secrets-file
                 ") does not end in .age, so the\n"
                 "    derived :template/:manifest names would collide with — and overwrite — "
                 "the\n"
@@ -399,9 +403,10 @@
   [{:keys [app environments] :as config}]
   (reject-unknown-keys! "secrets config" config-keys config)
   (when (empty? environments)
-    (fail! "secrets config has no :environments"))
+    (fail! :invalid-config "secrets config has no :environments"))
   (when-not (and (string? app) (not (str/blank? app)))
-    (fail! (str "secrets config has no :app (a name string is required). It names the\n"
+    (fail! :invalid-config
+           (str "secrets config has no :app (a name string is required). It names the\n"
                 "    default key path ~/.config/<app>/key.txt and is recorded in the "
                 "manifest,\n"
                 "    so there is deliberately no default — projects must not share a key "
@@ -422,11 +427,13 @@
   [{:keys [environments default-environment]} env-arg]
   (let [env-key (cond
                   (and (nil? env-arg) default-environment) default-environment
-                  (nil? env-arg) (fail! (str "Missing environment. One of: "
+                  (nil? env-arg) (fail! :usage
+                                        (str "Missing environment. One of: "
                                              (str/join ", " (map name (keys environments)))))
                   :else (keyword env-arg))]
     (or (environments env-key)
-        (fail! (str "Unknown environment: " (name env-key) ". One of: "
+        (fail! :usage
+               (str "Unknown environment: " (name env-key) ". One of: "
                     (str/join ", " (map name (keys environments))))
                {:environment env-key}))))
 
@@ -451,8 +458,9 @@
   "Fail because `what`, a short description that names the file where there is
   one, holds `observed` bytes against a bound of `limit`."
   [what limit observed context]
-  (fail! (str what " is larger than the " limit " byte limit.")
-         (merge context {:reason :input-too-large :limit limit :observed observed})))
+  (fail! :input-too-large
+         (str what " is larger than the " limit " byte limit.")
+         (merge context {:limit limit :observed observed})))
 
 (defn- utf8-length [^String s]
   (alength (.getBytes s java.nio.charset.StandardCharsets/UTF_8)))
@@ -537,7 +545,8 @@
                  (.inheritIO)
                  (.start))]
     (when-not (zero? (.waitFor proc))
-      (fail! (str "Editor exited with an error; leaving secrets unchanged."
+      (fail! :editor-failed
+             (str "Editor exited with an error; leaving secrets unchanged."
                   " Editor: " command)))))
 
 (defn- with-plaintext-temp
@@ -572,7 +581,8 @@
 
 (defn- require-age! []
   (when-not (age/installed?)
-    (fail! (str "The `age` tool is not installed.\n"
+    (fail! :age-not-installed
+           (str "The `age` tool is not installed.\n"
                 "    macOS:  brew install age\n"
                 "    Ubuntu: apt install age\n"
                 "    Docs:   https://age-encryption.org"))))
@@ -581,7 +591,8 @@
   "Require the resolved identity file, naming its path when it is missing."
   [{environment-name :name :keys [identity-file]}]
   (when-not (and identity-file (.exists (io/file identity-file)))
-    (fail! (str "No age identity for " (name environment-name)
+    (fail! :no-identity
+           (str "No age identity for " (name environment-name)
                 " at " identity-file "\n"
                 "    Create one with:  bb secrets keygen "
                 (shell-quote (name environment-name)) "\n"
@@ -634,7 +645,8 @@
   (let [label (clojure.core/name environment-name)]
     (doseq [[n line] entries]
       (when-not (age/valid-recipient? line)
-        (fail! (str "Not a valid age recipient on line " n " of " recipients-file
+        (fail! :invalid-recipient
+               (str "Not a valid age recipient on line " n " of " recipients-file
                     " (" label "): " (pr-str (line-prefix line)) "\n"
                     "    Every line must be an age1… public key, an ssh-ed25519/ssh-rsa\n"
                     "    key, or a # comment.")
@@ -658,7 +670,8 @@
   (let [label (clojure.core/name environment-name)
         entries (or (:entries (recipient-file-snapshot env)) [])]
     (when (empty? entries)
-      (fail! (str "No recipients yet for " label " in " recipients-file "\n"
+      (fail! :no-recipients
+             (str "No recipients yet for " label " in " recipients-file "\n"
                   "    Add one with:  bb secrets add-recipient "
                   (shell-quote label))
              {:recipients-file (str recipients-file)
@@ -692,7 +705,8 @@
     (let [label (shell-quote (name environment-name))
           reserved (pr-str manifest/store-key)
           reencrypt (str "\n    Write a current one with:  bb secrets reencrypt " label)]
-      (fail! (str "The store " secrets-file
+      (fail! :invalid-store
+             (str "The store " secrets-file
                   (case problem
                     :not-a-map
                     (str " holds a value of type " (name (manifest/value-type store))
@@ -710,8 +724,7 @@
                          ", which this version of the library does not support.\n"
                          "    Upgrade the library, or write a current one with:"
                          "  bb secrets reencrypt " label)))
-             {:reason :invalid-store
-              :problem problem
+             {:problem problem
               :secrets-file (str secrets-file)
               :environment environment-name}))
     (get store manifest/store-key)))
@@ -757,7 +770,8 @@
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
     (if ok?
       value
-      (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").\n"
+      (fail! (:reason parsed)
+             (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").\n"
                   "    Ciphertext and manifest were left unchanged.")
              (merge {:secrets-file (str secrets-file)}
                     (safe-edn/failure-data parsed))))))
@@ -780,7 +794,8 @@
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse text)]
     (if ok?
       value
-      (fail! (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
+      (fail! (:reason parsed)
+             (str "Secrets are not valid EDN (" (edn-failure-message parsed) ").")
              (merge {:secrets-file secrets-file} (safe-edn/failure-data parsed))))))
 
 (def ^:private set-usage
@@ -798,7 +813,8 @@
   mistyped command line may have put the secret."
   [s]
   (when (str/blank? (str s))
-    (fail! (str "Missing key. Accepted forms: a keyword (:some/key) or a vector path "
+    (fail! :usage
+           (str "Missing key. Accepted forms: a keyword (:some/key) or a vector path "
                 "([:a :b]).")))
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse (str s))
         problem (cond
@@ -809,15 +825,17 @@
                                     "got a vector containing a non-keyword, non-string element")
                   :else (str "got a value of type " (name (manifest/value-type value))))]
     (when problem
-      (fail! (str "Invalid key: " problem ".\n"
+      (fail! (if ok? :usage (:reason parsed))
+             (str "Invalid key: " problem ".\n"
                   "    Accepted forms: a keyword (:some/key) or a vector path "
                   "([:a :b]).")
              (when-not ok? (safe-edn/failure-data parsed))))
     (let [path (if (keyword? value) [value] value)]
       (when (= manifest/store-key (first path))
-        (fail! (str "The key " (pr-str (first path)) " is reserved for the library's own"
+        (fail! :reserved-key
+               (str "The key " (pr-str (first path)) " is reserved for the library's own"
                     " metadata. `set` and `rm` do not read, change, or remove it.")
-               {:reason :reserved-key :key path}))
+               {:key path}))
       path)))
 
 (defn- render-secrets
@@ -934,21 +952,22 @@
                               {:secrets-file (str secrets-file)}))
         value (validate-plaintext! secrets-file user-text)
         _ (when-not (map? value)
-            (fail! (str "Secrets must be one EDN map, but the plaintext is a value of type "
+            (fail! :secrets-not-a-map
+                   (str "Secrets must be one EDN map, but the plaintext is a value of type "
                         (name (manifest/value-type value)) "." unchanged)
-                   {:secrets-file (str secrets-file) :reason :secrets-not-a-map}))
+                   {:secrets-file (str secrets-file)}))
         _ (when (contains? value manifest/store-key)
-            (fail! (str "The plaintext holds " (pr-str manifest/store-key)
+            (fail! :reserved-key
+                   (str "The plaintext holds " (pr-str manifest/store-key)
                         ", which the library reserves for its own metadata.\n"
                         "    Remove it; the store keeps its own." unchanged)
-                   {:secrets-file (str secrets-file) :reason :reserved-key
-                    :key [manifest/store-key]}))
+                   {:secrets-file (str secrets-file) :key [manifest/store-key]}))
         plaintext (or (with-metadata user-text line)
-                      (fail! (str "The secrets map must be the first form in the plaintext."
+                      (fail! :secrets-map-not-first
+                             (str "The secrets map must be the first form in the plaintext."
                                   " Only whitespace and ; comments may come before its {."
                                   unchanged)
-                             {:secrets-file (str secrets-file)
-                              :reason :secrets-map-not-first}))]
+                             {:secrets-file (str secrets-file)}))]
     [value plaintext]))
 
 (defn- write-secrets!
@@ -1131,7 +1150,8 @@
       (let [{:keys [secrets-file] environment-name :name} env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
-          (fail! (str "No secrets file at " secrets-file "\n"
+          (fail! :no-file
+                 (str "No secrets file at " secrets-file "\n"
                       "    Create one with:  bb secrets new "
                       (shell-quote (clojure.core/name environment-name)))
                  {:secrets-file secrets-file
@@ -1185,7 +1205,7 @@
   [config env-arg key-arg edn?]
   ;; An unrecognised environment operand may be the value itself.
   (when (and env-arg (not (contains? (:environments config) (keyword env-arg))))
-    (fail! set-usage))
+    (fail! :usage set-usage))
   (with-environment-identity config (resolve-env config env-arg)
     (fn [env]
       (require-age!)
@@ -1204,7 +1224,8 @@
                   ;; variable expanded to nothing (`echo "$KEY" | bb secrets
                   ;; set …` in CI), and storing it produces a secret that
                   ;; fails much later, far from the cause.
-                  (fail! (str (if interactive? "Nothing entered" "Nothing on stdin")
+                  (fail! :blank-value
+                         (str (if interactive? "Nothing entered" "Nothing on stdin")
                               " — refusing to store a blank value for " (pr-str path) ".\n"
                               (when-not interactive?
                                 "    Pipe the value in:  printf %s \"$VALUE\" | bb secrets set …\n")
@@ -1215,7 +1236,8 @@
                             (safe-edn/parse raw)]
                         (if ok?
                           value
-                          (fail! (str "Value is not valid EDN ("
+                          (fail! (:reason parsed)
+                                 (str "Value is not valid EDN ("
                                       (edn-failure-message parsed) ").")
                                  (merge {:key path} (safe-edn/failure-data parsed)))))
                       raw)]
@@ -1248,7 +1270,8 @@
             {:keys [secrets-file] environment-name :name} env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
-          (fail! (str "No secrets file at " secrets-file "\n"
+          (fail! :no-file
+                 (str "No secrets file at " secrets-file "\n"
                       "    Create one with:  bb secrets new "
                       (shell-quote (clojure.core/name environment-name)) "\n"
                       "    or:               bb secrets set "
@@ -1265,7 +1288,8 @@
                 manifest-key (manifest-key-for :update env store target)
                 current (manifest/user-data store)]
             (when (= ::missing (get-in current path ::missing))
-              (fail! (str "No such key: " (pr-str path) " in " secrets-file)
+              (fail! :no-such-key
+                     (str "No such key: " (pr-str path) " in " secrets-file)
                      {:secrets-file secrets-file :key path}))
             (let [parent (butlast path)
                   k (last path)
@@ -1323,7 +1347,8 @@
       (let [{:keys [secrets-file] environment-name :name} env]
         (require-identity! env)
         (when-not (.exists (io/file secrets-file))
-          (fail! (str "No secrets file at " secrets-file "\n"
+          (fail! :no-file
+                 (str "No secrets file at " secrets-file "\n"
                       "    Create one with:  bb secrets new "
                       (shell-quote (clojure.core/name environment-name)))
                  {:secrets-file secrets-file
@@ -1364,20 +1389,22 @@
         (resolve-env config env-arg)
         environment-label (clojure.core/name environment-name)]
     (when-not recipients-file
-      (fail! (str environment-label
+      (fail! :no-recipients
+             (str environment-label
                   " has no :recipients-file configured (single-key mode).\n"
                   "    Add :recipients-file to its config to encrypt to multiple people.")
              {:environment environment-name}))
     (let [pub (or pubkey (age/public-key key-file))]
       (when-not pub
-        (fail! (str "No public key given and no key at " key-file "\n"
+        (fail! :no-identity
+               (str "No public key given and no key at " key-file "\n"
                     "    Generate one with:  bb secrets keygen "
                     (shell-quote environment-label))
                {:key-file key-file
                 :environment environment-name}))
       (let [pub (str/trim pub)]
         (when-not (age/valid-recipient? pub)
-          (fail! "Not a valid age public key." {:reason :invalid-recipient}))
+          (fail! :invalid-recipient "Not a valid age public key."))
         (let [snapshot (recipient-file-snapshot env)
               existing (or (:recipients snapshot) [])]
           (if (some #{pub} existing)
@@ -1830,14 +1857,11 @@
      :status status
      :exit (case status :healthy 0 :warning 1 :invalid 2)}))
 
-(defn- identity-failure?
-  "True when `e` came from resolving an identity: a blank or malformed
-  variable, a path that is not a local path, or a designated file that does
+(def ^:private identity-failure-reasons
+  "The reasons a failed identity resolution carries: a blank or undecodable
+  variable, a path that is not a local path, and a designated file that does
   not exist."
-  [e]
-  (let [data (ex-data e)]
-    (boolean (and (not (:remaining-file data))
-                  (or (:env data) (contains? data :identity-source))))))
+  #{:invalid-identity :disallowed-identity :no-identity})
 
 (defn- doctor-data
   [config env-arg]
@@ -1846,7 +1870,7 @@
     (try
       (with-environment-identity config env #(doctor-report % nil))
       (catch clojure.lang.ExceptionInfo e
-        (if (identity-failure? e)
+        (if (identity-failure-reasons (:reason (ex-data e)))
           (doctor-report (assoc env
                                 :identity-file (:identity-file (ex-data e))
                                 :identity-source (:identity-source (ex-data e)))
@@ -1931,7 +1955,7 @@
   (let [result (try
                  (doctor-data config env-arg)
                  (catch clojure.lang.ExceptionInfo e
-                   (when (:remaining-file (ex-data e))
+                   (when (= :private-file-remains (:reason (ex-data e)))
                      (throw e))
                    {:configuration {:valid? false :reason (ex-message e)}
                     :age nil
@@ -2019,7 +2043,8 @@
    :no-keyword-opts true
    :error-fn (fn [data]
                (let [data (restore-error-operand data operands)]
-                 (throw (ex-info (bbcli/format-command-error data) data))))})
+                 (throw (ex-info (bbcli/format-command-error data)
+                                 (assoc data :reason :usage)))))})
 
 (defn- root-epilog [{:keys [environments default-environment]}]
   (str "Environments: "

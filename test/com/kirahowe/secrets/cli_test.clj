@@ -3342,3 +3342,30 @@
           (is (= {:good :ok :fine :drift :no-identity :error :wrong-key :error}
                  (:results result)))
           (is (= 1 (:exit result))))))))
+
+(deftest command-failures-carry-a-reason-test
+  ;; Every failure a command throws has a :reason, so a caller never has to
+  ;; guess from the other keys in its data.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          reason-of (fn [f]
+                      (:reason (ex-data (try (with-out-str (f)) nil
+                                             (catch clojure.lang.ExceptionInfo e e)))))]
+      (is (= :invalid-config
+             (reason-of #(cli/normalize-config {:environments {:dev {:secrets-file "s.age"}}}))))
+      (is (= :usage (reason-of #(cli/edit! config "nowhere"))))
+      (is (= :no-file (reason-of #(cli/edit! config "dev"))))
+      (is (= :no-file (reason-of #(cli/reencrypt! config "dev"))))
+      (is (= :no-recipients (reason-of #(cli/add-recipient! config "dev" nil))))
+      (is (= :blank-value
+             (reason-of #(with-in-str "" (cli/set-secret! config "dev" ":a" false)))))
+      (is (= :usage (reason-of #(with-in-str "v" (cli/set-secret! config "dev" "42" false)))))
+      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":a" false)))
+      (is (= :no-such-key (reason-of #(cli/remove-secret! config "dev" ":absent"))))
+      (testing "a store the configured key cannot decrypt"
+        (let [other-key (str *dir* "/other-key.txt")]
+          (age/keygen! other-key)
+          (is (= :decrypt-failed
+                 (reason-of #(cli/edit! (cli/normalize-config (test-config {:key-file other-key}))
+                                        "dev")))))))))

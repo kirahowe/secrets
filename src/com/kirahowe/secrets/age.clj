@@ -42,7 +42,8 @@
   []
   (when-not (installed?)
     (throw (ex-info "The `age` encryption tool is not installed."
-                    {:tool "age"
+                    {:reason :age-not-installed
+                     :tool "age"
                      :install "macOS: brew install age  •  Debian/Ubuntu: apt install age"
                      :docs "https://age-encryption.org"}))))
 
@@ -79,7 +80,8 @@
   ^String [role p]
   (let [s (str p)]
     (when (str/blank? s)
-      (throw (ex-info (str "age " (name role) " path is blank") {:argument role :path s})))
+      (throw (ex-info (str "age " (name role) " path is blank")
+                      {:reason :blank-path :argument role :path s})))
     (if (str/starts-with? s "-")
       (str "./" s)
       s)))
@@ -102,7 +104,9 @@
                                    {:exit 127 :err "age-keygen not found on PATH"}))]
     (when-not (zero? exit)
       (throw (ex-info "age-keygen failed"
-                      {:path (str path) :error err
+                      {:reason :keygen-failed
+                       :path (str path)
+                       :error err
                        :install "macOS: brew install age"})))
     (.mkdirs parent)
     (let [tmp (fs/owner-only-temp-file! parent (str "." (.getName f) ".") ".tmp")]
@@ -134,7 +138,7 @@
     (throw (ex-info (str "encrypt-file! got a bare public key, but a bare "
                          "recipients value means an identity-file path. Pass "
                          "public keys as {:recipients [\"age1…\"]}.")
-                    {:recipients recipients})))
+                    {:reason :invalid-argument :recipients recipients})))
   (let [recipient-spec (if (map? recipients)
                          recipients
                          {:identity-file recipients})
@@ -160,7 +164,8 @@
     (ensure-installed!)
     (let [{:keys [exit err]} (apply shell/sh argv)]
       (when-not (zero? exit)
-        (throw (ex-info "age encryption failed" {:out (str out) :error err})))
+        (throw (ex-info "age encryption failed"
+                        {:reason :encrypt-failed :out (str out) :error err})))
       out)))
 
 (def max-plaintext-bytes
@@ -262,6 +267,7 @@
       (when-not (zero? exit)
         (throw (ex-info "age decryption failed"
                         (assoc context
+                               :reason :decrypt-failed
                                :error err
                                :hint (str "Wrong key, or you are not a recipient of "
                                           "this file.")))))

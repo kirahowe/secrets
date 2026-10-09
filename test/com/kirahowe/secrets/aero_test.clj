@@ -159,7 +159,8 @@
         e (thrown-by #(aero/read-config cfg {:secrets (encrypt-edn! {:v 1})
                                              :vault-token sentinel}))]
     (is (str/includes? (ex-message e) "com.kirahowe.secrets.aero/read-config"))
-    (is (= {:tag 'secret/opt} (ex-data e)) "the failure carries the tag only")
+    (is (= {:reason :no-secrets-reader :tag 'secret/opt} (ex-data e))
+        "the failure carries its reason and the tag only")
     (is (not (str/includes? (pr-str e) sentinel)))))
 
 ;;;; Composition with Aero's own tags

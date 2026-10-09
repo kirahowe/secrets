@@ -259,7 +259,7 @@
         (is (some? e))
         (is (str/includes? (ex-message e) (str template " already exists")))
         (is (str/includes? (ex-message e) "Created before stopping: bb.edn."))
-        (is (= {:path template :created ["bb.edn"]} (ex-data e)))
+        (is (= {:reason :file-exists :path template :created ["bb.edn"]} (ex-data e)))
         (is (= "mine" (slurp (file template)))))))
   (testing "a symbolic link is not written through"
     (.delete (file "bb.edn"))

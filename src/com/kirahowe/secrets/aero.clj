@@ -42,7 +42,7 @@
     (handler value)
     (throw (ex-info (str "#" tag " needs com.kirahowe.secrets.aero/read-config;"
                          " aero.core/read-config alone cannot load secrets.")
-                    {:tag tag}))))
+                    {:reason :no-secrets-reader :tag tag}))))
 
 (defmethod aero/reader 'secret/req [opts tag value] (read-secret opts tag value))
 (defmethod aero/reader 'secret/opt [opts tag value] (read-secret opts tag value))

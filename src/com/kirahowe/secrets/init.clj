@@ -33,7 +33,7 @@
   (or (io/resource coordinate-resource)
       (throw (ex-info (str "The initializer cannot find " coordinate-resource
                            " on the classpath; the library's source tree is incomplete.")
-                      {:resource coordinate-resource}))))
+                      {:reason :no-file :resource coordinate-resource}))))
 
 (def ^:private coordinates (edn/read-string (slurp (coordinate-url))))
 
@@ -61,7 +61,7 @@
                            "`git " (str/join " " args) "` failed in " dir ": " (str/trim err)
                            ". Run it from a git clone of the library, or add the dependency "
                            "by hand.")
-                      {:dir (str dir) :args (vec args) :exit exit})))
+                      {:reason :git-failed :dir (str dir) :args (vec args) :exit exit})))
     (str/trim out)))
 
 (defn library-dependency
@@ -120,7 +120,7 @@
   (when-not (and (string? value) (re-matches plain-name value))
     (throw (ex-info (str option " must be a plain name: letters, digits, dots, hyphens, or "
                          "underscores, starting with a letter")
-                    {:option option}))))
+                    {:reason :usage :option option}))))
 
 (defn parse-args
   "Parse initializer options, including standalone `-h` and `--help`. The names
@@ -129,7 +129,9 @@
   (let [parsed (bbcli/parse-opts args {:spec init-spec
                                        :restrict true
                                        :restrict-args true
-                                       :no-keyword-opts true})
+                                       :no-keyword-opts true
+                                       :error-fn (fn [{:keys [msg]}]
+                                                   (throw (ex-info msg {:reason :usage})))})
         opts (reduce-kv (fn [m option result]
                           (if (true? (get parsed option))
                             (assoc m result true)
@@ -138,7 +140,7 @@
                         boolean-option-names)]
     (when-not (:help? opts)
       (when-not (and (string? (:app opts)) (not (str/blank? (:app opts))))
-        (throw (ex-info "--app <name> is required" {}))))
+        (throw (ex-info "--app <name> is required" {:reason :usage}))))
     opts))
 
 ;;;; What a project needs
@@ -313,7 +315,7 @@
   (throw (ex-info (str path " already exists, so the initializer did not write it."
                        (when (seq created)
                          (str " Created before stopping: " (str/join ", " created) ".")))
-                  {:path (str path) :created created})))
+                  {:reason :file-exists :path (str path) :created created})))
 
 (defn apply-plan!
   "Create every `:create` file of `plan`, in order, and return `:created`, the

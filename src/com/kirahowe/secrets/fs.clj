@@ -49,11 +49,10 @@
 
   The file is deleted whether `f` returns or throws. When the delete fails and
   the file still exists, the operator has to remove it, so the path is
-  reported under `:remaining-file`. After a successful `f` that is an
-  `ex-info` with `:reason :private-file-remains`. After a failed `f` the
-  failure is rethrown as an `ex-info` whose message adds the path, whose data
-  is the failure's own data plus `:remaining-file` (and that `:reason` when
-  the failure had none), and whose cause is the failure."
+  reported under `:remaining-file` in an `ex-info` with `:reason
+  :private-file-remains`. After a failed `f` that `ex-info` carries the
+  failure's message with the path added, the failure's other data, and the
+  failure as its cause."
   [prefix suffix f]
   (let [file (owner-only-temp-file! prefix suffix)
         path (.getAbsolutePath ^java.io.File file)
@@ -64,9 +63,9 @@
                    (throw (if (try-delete! file)
                             t
                             (ex-info (str (ex-message t) "\n" remains)
-                                     (merge {:reason :private-file-remains}
-                                            (ex-data t)
-                                            {:remaining-file path})
+                                     (assoc (ex-data t)
+                                            :reason :private-file-remains
+                                            :remaining-file path)
                                      t)))))]
     (when-not (try-delete! file)
       (throw (ex-info remains {:reason :private-file-remains :remaining-file path})))

@@ -628,10 +628,10 @@
       (doseq [[label body expected-reason]
               [["after success" (fn [] :completed) :private-file-remains]
                ["after an ex-info" #(throw (ex-info "callback failed" {:reason :callback-failed}))
-                :callback-failed]
+                :private-file-remains]
                ["after another exception" #(throw (IllegalStateException. "callback failed"))
                 :private-file-remains]
-               ["after a failed write" nil :identity-not-materialized]]]
+               ["after a failed write" nil :private-file-remains]]]
         (testing label
           (with-redefs-fn
             (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
@@ -732,7 +732,7 @@
                      (catch clojure.lang.ExceptionInfo e e))]
           (is (some? e) label)
           (when e
-            (is (= {:env "SECRETS_AGE_IDENTITY_B64"} (ex-data e)) label)
+            (is (= {:reason :invalid-identity :env "SECRETS_AGE_IDENTITY_B64"} (ex-data e)) label)
             (is (re-find #"SECRETS_AGE_IDENTITY_B64.*base64-encoded"
                          (ex-message e))
                 label)
@@ -752,7 +752,7 @@
                      nil
                      (catch clojure.lang.ExceptionInfo e e))
               rendered (str (pr-str e) (pr-str (ex-data e)) (ex-message e))]
-          (is (= {:env "SECRETS_AGE_IDENTITY_B64"} (ex-data e)))
+          (is (= {:reason :invalid-identity :env "SECRETS_AGE_IDENTITY_B64"} (ex-data e)))
           (is (re-find #"base64-encoded age key file contents" (ex-message e)))
           (is (str/includes? (ex-message e) "SECRETS_AGE_IDENTITY"))
           (is (nil? (ex-cause e)))
@@ -1912,7 +1912,7 @@
           (doseq [identity-or-opts [nil {:app "myapp"} {:key-file *key*}]]
             (let [e (resolve-under environment identity-or-opts)]
               (is (re-find #"is set but empty" (str (ex-message e))))
-              (is (= {:env variable} (ex-data e))))))
+              (is (= {:reason :invalid-identity :env variable} (ex-data e))))))
         (testing "an explicit path is chosen before any variable is read"
           (doseq [identity-or-opts [*key* {:identity-file *key*}]]
             (is (= {:identity-file *key* :identity-source :identity-file}
@@ -1960,3 +1960,25 @@
           (do
             (is (= "age decryption failed" (ex-message failure)))
             (is (str/includes? (:hint data) "Wrong key"))))))))
+
+(deftest runtime-failures-carry-a-reason-test
+  ;; A caller tells failures apart by :reason, never by which other keys the
+  ;; data happens to hold.
+  (let [reason-of (fn [f] (:reason (ex-data (try (f) nil (catch clojure.lang.ExceptionInfo e e)))))
+        under (fn [environment f]
+                (with-redefs-fn (test-env/getenv-redefs environment) f))
+        enc (encrypt-edn! {:a 1})
+        other-key (str *dir* "/other-key.txt")]
+    (age/keygen! other-key)
+    (testing "a blank identity variable"
+      (is (= :invalid-identity
+             (reason-of #(under {"SECRETS_AGE_IDENTITY" " "}
+                                (fn [] (secrets/load-secrets enc)))))))
+    (testing "an identity variable that is not base64"
+      (is (= :invalid-identity
+             (reason-of #(under {"SECRETS_AGE_IDENTITY_B64" "not base64!"}
+                                (fn [] (secrets/load-secrets enc)))))))
+    (testing "a key that is not a recipient"
+      (is (= :decrypt-failed (reason-of #(secrets/load-secrets enc other-key)))))
+    (testing "a designated identity that does not exist"
+      (is (= :no-identity (reason-of #(secrets/load-secrets enc (str *dir* "/absent.txt"))))))))
