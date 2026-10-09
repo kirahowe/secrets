@@ -3567,3 +3567,48 @@
           (is (= :decrypt-failed
                  (reason-of #(cli/edit! (cli/normalize-config (test-config {:key-file other-key}))
                                         "dev")))))))))
+
+(deftest verify-reports-recipients-changed-since-the-last-encryption-test
+  ;; The commonest revocation mistake: a recipient is taken out of the file
+  ;; and the store is never re-encrypted, so the removed key still decrypts it.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [{:keys [alice bob-key alice-public recipients ciphertext]} (team-fixture)
+          both (slurp recipients)
+          third (str *dir* "/third-key.txt")]
+      (new-store! alice "dev" "{:a 1}")
+      (is (= {:results {:dev :ok} :exit 0} (verify alice "dev")))
+      (testing "a recipient removed from the file"
+        (spit recipients (str alice-public "\n"))
+        (let [{:keys [result out err]} (capture-verify alice "dev")]
+          (is (= {:results {:dev :drift} :exit 1} result))
+          (is (str/includes? err "recipients changed since the last encryption; run reencrypt"))
+          (is (str/includes? (str out err) "bb secrets reencrypt 'dev'")))
+        (is (some? (age/decrypt bob-key ciphertext)) "the removed key does still decrypt")
+        (is (= {:results {:dev :drift} :exit 1} (verify alice nil))))
+      (testing "reencrypt clears it"
+        (with-out-str (cli/reencrypt! alice "dev"))
+        (is (= {:results {:dev :ok} :exit 0} (verify alice "dev")))
+        (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))))
+      (testing "a recipient added to the file"
+        (spit recipients (str alice-public "\n" (age/keygen! third) "\n"))
+        (is (= {:results {:dev :drift} :exit 1} (verify alice "dev")))
+        (with-out-str (cli/reencrypt! alice "dev")))
+      (testing "the same set in another order, with a comment, is not a change"
+        (spit recipients (str "# the team\n" (age/public-key third) "\n\n" alice-public "\n"))
+        (is (= {:results {:dev :ok} :exit 0} (verify alice "dev"))))
+      (testing "a store moved from a recipients file to its own key"
+        (spit recipients both)
+        (with-out-str (cli/reencrypt! alice "dev"))
+        (let [solo (cli/normalize-config (test-config))]
+          (is (= {:results {:dev :drift} :exit 1} (verify solo "dev")))))
+      (testing "a stale manifest and changed recipients are reported together"
+        (spit recipients (str alice-public "\n"))
+        (encrypt-edn! {:a 2})
+        (let [{:keys [result err]} (capture-verify alice "dev")]
+          (is (= {:results {:dev :drift} :exit 1} result))
+          (is (str/includes? err "manifest is STALE"))
+          (is (str/includes? err "recipients changed since the last encryption"))))
+      (testing "a recipients file that cannot be used is a failure, not drift"
+        (spit recipients "not-a-recipient\n")
+        (is (= {:results {:dev :error} :exit 2} (verify alice "dev")))))))

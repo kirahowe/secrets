@@ -1549,16 +1549,25 @@
 (defn- keyed-finding
   "Full agreement: the committed entries against `fresh`, the entries of the
   decrypted store, plus the recorded `:ciphertext-sha` against `actual-sha`.
-  Either disagreement is drift; both are reported."
-  [committed fresh actual-sha]
+  Either disagreement is drift; both are reported. So is
+  `recipients-changed?`: the store records a recipient set other than the one
+  the environment encrypts to now."
+  [committed fresh actual-sha recipients-changed?]
   (let [diff (manifest/diff (:keys committed) fresh)
         stale-entries? (not (every? empty? (vals diff)))
         stale-sha? (not= (:ciphertext-sha committed) actual-sha)]
-    (if (or stale-entries? stale-sha?)
+    (cond
+      (or stale-entries? stale-sha?)
       {:status :drift
        :reason :stale
        :diff (when stale-entries? diff)
-       :ciphertext-changed? stale-sha?}
+       :ciphertext-changed? stale-sha?
+       :recipients-changed? recipients-changed?}
+
+      recipients-changed?
+      {:status :drift :reason :recipients-changed}
+
+      :else
       {:status :ok :reason :manifest-matches})))
 
 (defn- verify-one!
@@ -1596,10 +1605,13 @@
           :else
           (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
             (if ok?
-              (keyed-finding committed
-                             (manifest/entries
-                              value (:manifest-key (require-store-metadata! env value)))
-                             (sha256 secrets-file))
+              (let [{:keys [manifest-key recipients]} (require-store-metadata! env value)
+                    current (manifest/recipients-id
+                             (when (:recipients-file env) (recipient-snapshot env)))]
+                (keyed-finding committed
+                               (manifest/entries value manifest-key)
+                               (sha256 secrets-file)
+                               (not= recipients current)))
               {:status :drift
                :reason :secrets-invalid-edn
                :failure (safe-edn/failure-data parsed)}))))
@@ -1625,7 +1637,9 @@
    {:keys [reason] :as finding}]
   (let [label (name environment-name)
         regenerate [:line (str "    Regenerate it with:  bb secrets reencrypt "
-                               (shell-quote label))]]
+                               (shell-quote label))]
+        recipients-changed [:oops label
+                            "— recipients changed since the last encryption; run reencrypt."]]
     (case reason
       :manifest-disabled
       [[:info label "— manifest disabled; skipping."]]
@@ -1685,7 +1699,13 @@
           (into (when (:ciphertext-changed? finding)
                   [[:oops label
                     "— ciphertext digest differs from the one the manifest records."]]))
+          (into (when (:recipients-changed? finding) [recipients-changed]))
           (conj regenerate))
+
+      :recipients-changed
+      [recipients-changed
+       [:line (str "    The store is still encrypted to the earlier recipients:"
+                   "  bb secrets reencrypt " (shell-quote label))]]
 
       :manifest-matches
       [[:ok label "— manifest matches" (str "(" manifest ")")]])))
@@ -1715,7 +1735,9 @@
 
   A store whose metadata is missing, malformed, or of another version is
   drift: it cannot agree with any manifest, and the report says that
-  `reencrypt` writes a current one.
+  `reencrypt` writes a current one. So is a store that records a recipient
+  set other than the one its environment encrypts to now, which is what a
+  recipients file edited without a `reencrypt` looks like.
 
   A pass means the ciphertext and the manifest agree, which detects drift and
   a manifest from the wrong store. It does not establish authorship, even when

@@ -314,13 +314,21 @@ Lifecycle. Creating a store generates its key: `new`, or `set` when no store
 exists yet. `edit`, `set`, and `rm` keep the key. `reencrypt` always generates
 a new one, so every `:vhash` changes once. The metadata's `:recipients` is a
 digest of the recipient set the store was last encrypted to. `edit`, `set`,
-and `rm` encrypt to the
-recipients file as it reads when they run, so when that set differs from the
-recorded one they generate a new key as `reencrypt` does. Removing a recipient
-therefore renews the key on the next write of any kind, and a removed
-recipient's retained key says nothing about values published after it (A5).
-It still tests guesses against every manifest published before, as B2 says of
-old ciphertext. One function in `cli.clj` holds this rule.
+and `rm` encrypt to the recipients file as it reads when they run, so when
+that set differs from the recorded one they generate a new key as `reencrypt`
+does. A `verify` that has an identity compares the two as well, and reports a
+difference as drift that `reencrypt` clears.
+
+The record guards against a forgetful operator and a passive former recipient.
+When someone is removed from the recipients file and nobody re-encrypts,
+`verify` says so, and the next write of any kind renews the key, so the key
+that person kept says nothing about values published after it (A5). The
+record does not stop a current recipient who rewrites it before being removed,
+so that it matches the file afterwards: everyone who can decrypt a store can
+write its metadata. `reencrypt` is the revocation step. It renews the key
+every time and does not read the record. A retained key still tests guesses
+against every manifest published before the renewal, as B2 says of old
+ciphertext. One function in `cli.clj` holds the rule for the key's lifetime.
 
 Validity. A store's plaintext is one EDN map, because the metadata lives in
 it. Version 1 metadata is a map with exactly the three fields above: `:version
