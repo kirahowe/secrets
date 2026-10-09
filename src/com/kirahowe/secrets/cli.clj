@@ -723,7 +723,7 @@
         (store/resolve-env config env-arg)
         environment-label (clojure.core/name environment-name)]
     (when-not recipients-file
-      (fail! :no-recipients
+      (fail! :no-recipients-file
              (str environment-label
                   " has no :recipients-file configured (single-key mode).\n"
                   "    Add :recipients-file to its config to encrypt to multiple people.")
@@ -892,7 +892,8 @@
   The exit code is 0 when everything agrees and 1 when the only problem is
   drift. It is 2 when anything else stopped an environment from being
   verified: a missing secrets file or manifest, an identity that does not
-  resolve, a store the identity cannot decrypt, or a file that cannot be read.
+  resolve, a store the identity cannot decrypt, an invalid recipients file,
+  or a file that cannot be read.
   Such a failure is reported as that environment's :error and the other
   environments are still verified. The one failure that throws is an unknown
   or missing environment argument.
@@ -1191,7 +1192,8 @@
     [:line "Commands printed as suggestions are POSIX sh, single-quoted per argument."]
     [:line "verify exits 0 when every manifest agrees, 1 when the only problem is drift,"]
     [:line "  and 2 when anything else stopped it: a missing file, an identity or"]
-    [:line "  decryption failure, an unknown environment, or an invalid configuration."]
+    [:line "  decryption failure, an invalid recipients file, an unknown environment,"]
+    [:line "  or an invalid configuration."]
     [:line "doctor exits 0 when healthy, 1 on a warning, and 2 on an invalid configuration,"]
     [:line "  identity, or recipients file, or when it could not run."]
     [:line "Every other command exits 0, or 1 on any failure."]]))

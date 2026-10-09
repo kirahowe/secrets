@@ -73,8 +73,9 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
   may also be `false`), `:default-environment` has to name a configured
   environment, and no file may serve two purposes across the environments.
 - `verify` exits 1 only for drift. It exits 2 when anything else stopped it:
-  a missing file, an identity or decryption failure, an unknown environment,
-  or an invalid configuration. With no environment argument it reports an
+  a missing file, an identity or decryption failure, an invalid recipients
+  file, an unknown environment, or an invalid configuration. With no
+  environment argument it reports an
   environment it cannot check and continues with the others.
 - A dash-leading argument before `--` is an option for every command. An
   unknown command, option, or environment is refused without being repeated.
@@ -89,6 +90,11 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
 - `keygen` no longer prints a `flyctl` command.
 - `reencrypt` drops store metadata that was written by hand and writes its
   own, so it repairs every store that `verify` and `edit` send to it.
+- Failure reasons: a ciphertext past 16 MiB is `:source-too-large` in the CLI
+  as at runtime, a URI-shaped path in the CLI config is `:invalid-config`
+  (`:disallowed-identity` for `:key-file`), a file the CLI cannot read is
+  `:no-file`, and `add-recipient` for an environment with no
+  `:recipients-file` is `:no-recipients-file`.
 - A JVM program that calls the library exits when its own work is done. The
   library no longer starts threads that kept the JVM alive for a minute.
 - `set` and `rm` refuse a path that passes through a value that is not a map.

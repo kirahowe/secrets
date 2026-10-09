@@ -430,8 +430,8 @@ likeliest thing to be there (A3).
 
 Exit codes. For `verify` and `doctor`, 1 means drift or a warning and nothing
 else, and 2 means the command could not do its job: a missing file, an
-identity or decryption failure, an unknown environment, or an invalid
-configuration. A CI job can then tell a stale manifest from a missing key.
+identity or decryption failure, an invalid recipients file, an unknown
+environment, or an invalid configuration. A CI job can then tell a stale manifest from a missing key.
 Every other command exits 0 or 1.
 
 File permissions. The ciphertext, manifest, and recipients file are committed

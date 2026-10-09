@@ -2127,7 +2127,7 @@
             rendered (str (pr-str e) (ex-message e) (pr-str (ex-data e)))]
         (is (= {:environment :dev
                 :field :secrets-file
-                :reason :disallowed-source
+                :reason :invalid-config
                 :scheme "https"}
                (select-keys (ex-data e) [:environment :field :reason :scheme])))
         (is (not (str/includes? rendered sentinel)))
@@ -2137,7 +2137,7 @@
                 (cli/normalize-config (config {:secrets-file " https://127.0.0.1/store.age"}))
                 nil
                 (catch clojure.lang.ExceptionInfo e e))]
-        (is (= {:reason :disallowed-source :scheme "https"}
+        (is (= {:reason :invalid-config :scheme "https"}
                (select-keys (ex-data e) [:reason :scheme])))))
     (testing "the key file shares the runtime's reason and wording"
       (doseq [field [:key-file]]
@@ -2385,11 +2385,12 @@
           (let [argvs (recorded-sh-argvs #(bounded (dec size) command))
                 {:keys [failure]} (capture-failure #(bounded (dec size) command))]
             (is (not-any? #(= ["age" "-d"] (take 2 %)) argvs))
-            (is (= {:reason :input-too-large
+            (is (= {:reason :source-too-large
                     :limit (dec size)
                     :observed size
                     :secrets-file ciphertext}
-                   (:data failure)))
+                   (:data failure))
+                "the reason load-secrets gives for the same bound")
             (is (str/includes? (str (:message failure))
                                (str "The secrets file " ciphertext " is larger than the "
                                     (dec size) " byte limit.")))
@@ -3493,7 +3494,7 @@
       (is (= :usage (reason-of #(cli/edit! config "nowhere"))))
       (is (= :no-file (reason-of #(cli/edit! config "dev"))))
       (is (= :no-file (reason-of #(cli/reencrypt! config "dev"))))
-      (is (= :no-recipients (reason-of #(cli/add-recipient! config "dev" nil))))
+      (is (= :no-recipients-file (reason-of #(cli/add-recipient! config "dev" nil))))
       (is (= :blank-value
              (reason-of #(with-in-str "" (cli/set-secret! config "dev" ":a")))))
       (is (= :usage (reason-of #(with-in-str "v" (cli/set-secret! config "dev" "42")))))
@@ -3723,6 +3724,24 @@
       (is (str/includes? (help-text ["set" "--help"])
                          "The prompt needs stdin and stdout both to be terminals")))))
 
+;;;; A recipients file past its bound
+
+(deftest an-oversized-recipients-file-stops-verify-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [recipients (str *dir* "/recipients.txt")
+          config (cli/normalize-config (test-config {:recipients-file recipients}))]
+      (spit recipients (str (age/public-key *key*) "\n"))
+      (store-through-stdin! config)
+      (is (= {:results {:dev :ok} :exit 0} (verify config "dev")))
+      (let [{:keys [result err]} (with-bound (cli-private 'max-recipients-bytes) 8
+                                   #(capture-verify config "dev"))]
+        (is (= {:results {:dev :error} :exit 2} result)
+            "as an invalid line, an empty file, and a missing file are: not drift")
+        (is (str/includes? err
+                           (str "Recipients file " recipients " is larger than the 8 byte"))))
+      (is (str/includes? (help-text ["help"]) "an invalid recipients file")))))
+
 ;;;; SECRETS_AGE_IDENTITY_FILE naming another artifact
 
 (deftest an-identity-variable-that-names-an-artifact-is-called-by-its-name-test
@@ -3795,3 +3814,11 @@
     (let [captured (capture-failure #((cli-private 'dispatch!) (test-config) args))]
       (is (= :usage (get-in captured [:failure :data :reason])) (pr-str args))
       (is (str/includes? (str (get-in captured [:failure :message])) "Unknown command.")))))
+
+;;;; Reasons
+
+(deftest a-file-that-cannot-be-read-is-no-file-test
+  (let [config (cli/normalize-config (test-config {:recipients-file *dir*}))
+        e (test-env/thrown #(with-out-str (cli/recipients! config "dev")))]
+    (is (= :no-file (:reason (ex-data e))))
+    (is (str/includes? (ex-message e) (str "Recipients file " *dir* " could not be read")))))

@@ -167,6 +167,8 @@ The config is validated before a command runs:
 - Every environment setting is a string holding a local filesystem path, and
   `:manifest` may also be `false`. A leading `~` is expanded in every one of
   them.
+- A path that is URI-shaped, such as `https://…` or `file:/…`, is refused
+  with `:invalid-config` (`:disallowed-identity` for `:key-file`).
 - No file may serve two purposes. Environments may share a template, a key or
   identity file, or a recipients file. Two environments may name the same
   secrets file or manifest only when they name both the same, which makes
@@ -355,9 +357,9 @@ CI.
 
 `bb secrets verify` exits 0 when every manifest agrees with its ciphertext
 and 1 when the only problem is drift. It exits 2 when anything else stopped
-it: a missing file, an identity or decryption failure, an unknown environment,
-or an invalid configuration. A CI job can therefore tell a stale manifest from
-a missing key. It runs in one of two modes per environment.
+it: a missing file, an identity or decryption failure, an invalid recipients
+file, an unknown environment, or an invalid configuration. A CI job can
+therefore tell a stale manifest from a missing key. It runs in one of two modes per environment.
 
 Without an identity, it checks that the manifest is complete and that the
 SHA-256 it records is the digest of the ciphertext. This needs no key and no
@@ -444,8 +446,9 @@ encrypted to. That catches a forgotten `reencrypt`. It is not the removal
 step: `reencrypt` is, because it always renews the key.
 [The manifest](#the-manifest) explains why.
 
-Each command reads the recipients file once, before it decrypts or opens an
-editor, and refuses a line that is not an age or SSH public key.
+Each command that writes reads the recipients file once, before it decrypts
+or opens an editor, and refuses a line that is not an age or SSH public key.
+A `verify` that has an identity refuses it too, with exit 2.
 `bb secrets recipients` lists the file and marks such lines.
 
 Give deployments and CI their own recipient instead of a person's key.
@@ -624,7 +627,7 @@ Exit codes:
 
 | Command | 0 | 1 | 2 |
 | --- | --- | --- | --- |
-| `verify` | every manifest agrees | the only problem is drift | anything else stopped it: a missing file, an identity or decryption failure, an unknown environment, an invalid configuration |
+| `verify` | every manifest agrees | the only problem is drift | anything else stopped it: a missing file, an identity or decryption failure, an invalid recipients file, an unknown environment, an invalid configuration |
 | `doctor` | healthy | a warning: `age`, the secrets file, the manifest, the recipients file, or the key is not there | an invalid configuration, identity, or recipients file, or it could not run |
 | every other command | success | any failure | |
 
@@ -669,10 +672,10 @@ are the ones a caller can usefully branch on:
 | `:decrypt-failed`, `:age-not-installed` | `age` could not decrypt with this identity. The `age` binary is not on the `PATH`. |
 | `:edn-empty`, `:edn-extra-values`, `:edn-malformed`, `:edn-too-deep` | The plaintext is not exactly one well-formed EDN value. |
 | `:missing-key` | `#secret/req` named a key the store does not have. The tag also throws `:no-file` and `:no-identity`. |
-| `:invalid-config`, `:unknown-config-key` | The CLI config, or the options of the Aero `read-config`, cannot be used. |
+| `:invalid-config`, `:unknown-config-key` | The CLI config, or the options of the Aero `read-config`, cannot be used. A URI-shaped path in the config is `:invalid-config`. |
 | `:usage` | A command line the CLI cannot place: an unknown command, option, or environment, or a missing or surplus argument. |
 | `:invalid-store`, `:secrets-not-a-map`, `:reserved-key`, `:path-not-a-map`, `:no-such-key`, `:blank-value` | A write the CLI refused, and why. |
-| `:input-too-large`, `:invalid-recipient`, `:no-recipients`, `:unreadable-file` | A file the CLI was given is too large, holds an invalid recipient or none, or cannot be read. |
+| `:input-too-large`, `:invalid-recipient`, `:no-recipients`, `:no-recipients-file` | A recipients file, manifest, template, or plaintext the CLI was given is too large. The recipients file holds an invalid line, or nobody. `add-recipient` was run for an environment with no `:recipients-file`. |
 | `:manifest-stale` | The ciphertext was replaced and the manifest was not. Run `reencrypt`. |
 | `:private-file-remains` | A private temporary file could not be deleted. `:remaining-file` holds its path. |
 

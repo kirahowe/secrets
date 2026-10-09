@@ -124,8 +124,12 @@
 ;; | `:manifest` | no | manifest path, or `false` to keep none; default `<secrets-file>` with `.manifest` in place of `.age` |
 ;; | `:recipients-file` | no | committed list of age public keys; enables team mode |
 
-;; Every environment setting is a string holding a local filesystem path, and
-;; `:manifest` may also be `false`. No file may serve two purposes across the
+;; Every environment setting is a string holding a local filesystem path, with
+;; a leading `~` expanded, and `:manifest` may also be `false`. A URI-shaped
+;; path is refused with `:invalid-config` (`:disallowed-identity` for
+;; `:key-file`). A command's identity comes from the `SECRETS_AGE_IDENTITY*`
+;; variables and then `:key-file`: `:identity-file` is a runtime option, not a
+;; config key. No file may serve two purposes across the
 ;; environments. They may share a template, a key or identity file, or a
 ;; recipients file, and two of them may name the same secrets file or manifest
 ;; only when they name both the same.
@@ -189,10 +193,10 @@
 ;; | `:decrypt-failed`, `:age-not-installed` | `age` could not decrypt with this identity; the `age` binary is not on the `PATH` |
 ;; | `:edn-empty`, `:edn-extra-values`, `:edn-malformed`, `:edn-too-deep` | the plaintext is not exactly one well-formed EDN value |
 ;; | `:missing-key` | `#secret/req` named a key the store does not have |
-;; | `:invalid-config`, `:unknown-config-key` | the CLI config, or the options of the Aero `read-config`, cannot be used |
+;; | `:invalid-config`, `:unknown-config-key` | the CLI config, or the options of the Aero `read-config`, cannot be used; a URI-shaped path in the config is `:invalid-config` |
 ;; | `:usage` | a command line the CLI cannot place: an unknown command, option, or environment, or a missing or surplus argument |
 ;; | `:invalid-store`, `:secrets-not-a-map`, `:reserved-key`, `:path-not-a-map`, `:no-such-key`, `:blank-value` | a write the CLI refused, and why |
-;; | `:input-too-large`, `:invalid-recipient`, `:no-recipients`, `:unreadable-file` | a file the CLI was given is too large, holds an invalid recipient or none, or cannot be read |
+;; | `:input-too-large`, `:invalid-recipient`, `:no-recipients`, `:no-recipients-file` | a recipients file, manifest, template, or plaintext the CLI was given is too large; the recipients file holds an invalid line, or nobody; `add-recipient` was run for an environment with no `:recipients-file` |
 ;; | `:manifest-stale` | the ciphertext was replaced and the manifest was not; run `reencrypt` |
 ;; | `:private-file-remains` | a private temporary file could not be deleted; `:remaining-file` holds its path |
 

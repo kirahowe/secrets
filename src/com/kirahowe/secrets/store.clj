@@ -73,7 +73,7 @@
   CLI artifacts are local filesystem paths. The failure names the environment
   and field and never the value. `:key-file` fails with `:reason
   :disallowed-identity`, as the runtime's identity paths do, and every other
-  field with `:disallowed-source`. Non-string values such as `:manifest false`
+  field with `:invalid-config`. Non-string values such as `:manifest false`
   keep their meaning."
   [env kind path]
   (when (and (string? path) (str/blank? path))
@@ -83,7 +83,7 @@
                 "    An empty path resolves to the working directory, not a file.")
            {:environment env :field kind :path path}))
   (when-let [problem (and (string? path) (source/path-problem path))]
-    (fail! (if (= :key-file kind) :disallowed-identity :disallowed-source)
+    (fail! (if (= :key-file kind) :disallowed-identity :invalid-config)
            (source/path-problem-message (str "Environment " (name env) " " kind)
                                         "a local filesystem path"
                                         problem)
@@ -324,7 +324,7 @@
     (try
       (slurp f :encoding "UTF-8")
       (catch java.io.IOException e
-        (fail! :unreadable-file
+        (fail! :no-file
                (str kind " " path " could not be read (" (.getSimpleName (class e)) ").")
                context)))))
 
@@ -340,7 +340,7 @@
             (let [n (.read in buf)]
               (when (pos? n) (.update md buf 0 n) (recur))))))
       (catch java.io.IOException e
-        (fail! :unreadable-file
+        (fail! :no-file
                (str "File " path " could not be read (" (.getSimpleName (class e)) ")."))))
     (apply str (map #(format "%02x" %) (.digest md)))))
 
@@ -524,13 +524,16 @@
 
 (defn decrypt-text!
   "The environment's decrypted store as text, library metadata included. A
-  ciphertext past `source/max-source-bytes` is refused before it is decrypted,
-  which bounds the plaintext too: age does not compress."
+  ciphertext past `source/max-source-bytes` is refused with `:source-too-large`
+  before it is decrypted, as `load-secrets` refuses it, which bounds the
+  plaintext too: age does not compress."
   [{:keys [secrets-file identity-file]}]
-  (let [size (.length (io/file (str secrets-file)))]
-    (when (> size source/max-source-bytes)
-      (input-too-large! (str "The secrets file " secrets-file) source/max-source-bytes size
-                        {:secrets-file (str secrets-file)})))
+  (let [size (.length (io/file (str secrets-file)))
+        limit source/max-source-bytes]
+    (when (> size limit)
+      (fail! :source-too-large
+             (str "The secrets file " secrets-file " is larger than the " limit " byte limit.")
+             {:secrets-file (str secrets-file) :limit limit :observed size})))
   (age/decrypt identity-file secrets-file))
 
 ;;;; Plaintext and writing
@@ -779,7 +782,9 @@
                :failure (safe-edn/failure-data parsed)}))))
       (catch clojure.lang.ExceptionInfo e
         ;; A manifest or store past its size bound, and a store without
-        ;; usable metadata, cannot agree with any manifest.
-        (if (#{:input-too-large :invalid-store} (:reason (ex-data e)))
+        ;; usable metadata, cannot agree with any manifest. A recipients
+        ;; file past its bound is not drift, and propagates as an error.
+        (if (or (#{:source-too-large :invalid-store} (:reason (ex-data e)))
+                (and (= :input-too-large (:reason (ex-data e))) (:manifest (ex-data e))))
           {:status :drift :reason :store-problem :message (ex-message e)}
           (throw e))))))
