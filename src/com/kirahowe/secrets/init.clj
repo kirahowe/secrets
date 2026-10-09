@@ -426,19 +426,37 @@
    "Options:"
    (bbcli/format-opts {:spec init-spec})])
 
-(defn- print-init-error! [e]
+(defn- print-init-error!
+  "One line for failure `e`: an `ex-info`'s message, or any other exception's
+  class."
+  [e]
   (binding [*out* *err*]
-    (println (str "secrets init: " (ex-message e)))
+    (println (str "secrets init: "
+                  (if (instance? clojure.lang.ExceptionInfo e)
+                    (ex-message e)
+                    (str "Unexpected failure: " (.getName (class e))))))
     (println "Run with --help for usage and options.")))
 
+(defn- exit!
+  "Leave the process boundary with exit `code`, returning only when it is 0.
+  On the JVM the agent threads `clojure.java.shell` starts keep a finished
+  process alive for a minute, so they are shut down here."
+  [code]
+  (when-not (System/getProperty "babashka.version")
+    (shutdown-agents))
+  (when (pos? code)
+    (System/exit code)))
+
 (defn -main
-  "Run the secrets initializer from command-line arguments."
+  "Run the secrets initializer from command-line arguments, as the whole of a
+  process. A failure prints one line and exits 1."
   [& args]
-  (try
-    (let [opts (parse-args args)]
-      (if (:help? opts)
-        (run! println (help-lines))
-        (init! opts)))
-    (catch clojure.lang.ExceptionInfo e
-      (print-init-error! e)
-      (System/exit 1))))
+  (exit! (try
+           (let [opts (parse-args args)]
+             (if (:help? opts)
+               (run! println (help-lines))
+               (init! opts))
+             0)
+           (catch Exception e
+             (print-init-error! e)
+             1))))

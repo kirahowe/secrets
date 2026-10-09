@@ -2295,14 +2295,28 @@
   failure to run them at all is 2."
   #{"verify" "doctor"})
 
+(defn- exit!
+  "Leave the process boundary with exit `code`, returning only when it is 0.
+  On the JVM the agent threads that `future` and `clojure.java.shell` start
+  keep a finished process alive for a minute, so they are shut down here.
+  Babashka exits without that, and a task may go on to use them."
+  [code]
+  (when-not (System/getProperty "babashka.version")
+    (shutdown-agents))
+  (when (pos? code)
+    (System/exit code)))
+
 (defn run!
-  "Dispatch `args` against `config`, and exit the process when the outcome is
-  not success. This is the one place an exit code is decided.
+  "Dispatch `args` against `config` as the whole of a process: the entry point
+  for a `bb` task or a JVM `-main`, not a function to call at a REPL, where
+  the command functions are the API. This is the one place an exit code is
+  decided.
 
   A failure prints one line, and any hint the failure carries, on stderr, and
   never a stack trace. It exits 1, or 2 from `verify` and `doctor`, which
   keep 1 for drift and for a warning and otherwise exit with the `:exit` of
-  their result."
+  their result. On the JVM a successful run shuts down the agent thread
+  pools, so the process ends as soon as the command does."
   [config args]
   (let [status-command? (contains? status-commands (some-> (first args) str str/lower-case))
         exit (try
@@ -2311,5 +2325,4 @@
                (catch Exception e
                  (say! (error-lines e))
                  (if status-command? 2 1)))]
-    (when (pos? exit)
-      (System/exit exit))))
+    (exit! exit)))

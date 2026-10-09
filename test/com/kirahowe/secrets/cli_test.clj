@@ -38,9 +38,14 @@
   "Run `f` as if no terminal were attached. `set` prompts when it sees one, so
   a run from an interactive shell would otherwise wait on the keyboard instead
   of reading the piped input these tests give it. The tests that exercise the
-  prompt put a terminal back themselves."
+  prompt put a terminal back themselves.
+
+  `run!` is the whole of a process and ends by shutting the JVM's agent pools
+  down, which the rest of a test run still needs, so its exit is a no-op here.
+  The subprocess tests cover the real one."
   [f]
-  (with-redefs-fn {(ns-resolve 'com.kirahowe.secrets.cli 'tty?) (constantly false)}
+  (with-redefs-fn {(ns-resolve 'com.kirahowe.secrets.cli 'tty?) (constantly false)
+                   (ns-resolve 'com.kirahowe.secrets.cli 'exit!) (fn [_])}
     f))
 
 (use-fixtures :each with-no-terminal with-tmp-key)
@@ -3670,3 +3675,28 @@
       (is (= :healthy (:status result)))
       (is (= 0 (:exit result)))
       (is (str/includes? out "Template: missing")))))
+
+(deftest a-jvm-command-returns-promptly-test
+  ;; `future` and `clojure.java.shell` leave agent threads that kept a JVM
+  ;; alive for a minute after the command had finished. Babashka has no such
+  ;; wait, so this runs on the JVM only, against the classpath of this run.
+  (when-not (System/getProperty "babashka.version")
+    (let [config (test-config)
+          form (str "(require '[com.kirahowe.secrets.cli :as cli]) "
+                    "(cli/run! '" (pr-str config) " [\"show-key\"])")
+          started (System/currentTimeMillis)
+          process (-> (ProcessBuilder.
+                       ^java.util.List
+                       [(str (System/getProperty "java.home") "/bin/java")
+                        "-cp" (System/getProperty "java.class.path")
+                        "clojure.main" "-e" form])
+                      (.redirectErrorStream true)
+                      (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)
+                      .start)
+          finished? (.waitFor process 45 java.util.concurrent.TimeUnit/SECONDS)]
+      (when-not finished?
+        (.destroyForcibly process))
+      (is finished? "show-key shells out to age, and the process still ends without the wait")
+      (when finished?
+        (is (zero? (.exitValue process)))
+        (is (< (- (System/currentTimeMillis) started) 45000))))))

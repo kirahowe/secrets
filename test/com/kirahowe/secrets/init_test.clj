@@ -86,7 +86,8 @@
     (doseq [flag ["-h" "--help"]]
       (is (= {:env "dev" :help? true} (init/parse-args [flag]))
           "help must not demand an app name")
-      (let [out (with-out-str (init/-main flag))]
+      (let [out (with-redefs-fn {#'init/exit! (fn [_])}
+                  #(with-out-str (init/-main flag)))]
         (is (str/includes? out "Usage: -m com.kirahowe.secrets.init --app NAME [options]"))
         (is (str/includes? out "--apply"))
         (is (str/includes? out "never modifies a file that already exists"))))))
