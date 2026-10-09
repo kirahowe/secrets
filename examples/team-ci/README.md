@@ -22,9 +22,12 @@ The ciphertext contains only fake values. The manifest records key paths,
 types, a keyed hash of each value, and the ciphertext's SHA-256. It never
 records a value.
 
-The check runs without a key because the job names no identity and the
-runner has no key file. An identity that is named, by `:identity-file` or an
-identity variable, has to exist.
+The `fixture` environment configures a `:key-file`,
+`.local/fixture-identity.txt`, which does not exist in a checkout. A key file
+says where the key normally lives, so when no file is there `verify` checks
+without a key and passes as "freshness only". An identity that is named, by
+`:identity-file` or an identity variable, has to exist, and a missing one
+makes `verify` exit 2.
 
 ## Disposable Alice and Bob workflow
 
@@ -80,8 +83,9 @@ Adding the public key changes only `recipients.txt`. Re-encryption writes the
 new ciphertext and manifest, and the teammate can read from then on.
 
 To remove someone, delete their public-key line from the committed recipients
-file and re-encrypt. Their identity cannot decrypt ciphertext written after
-that. It still decrypts every earlier version in git history, and nothing
+file and re-encrypt. Until the store is re-encrypted the edit changes nothing,
+and a `verify` that has an identity reports it as drift. Afterwards their
+identity cannot decrypt ciphertext written from then on. It still decrypts every earlier version in git history, and nothing
 takes back a value they already read, so rotate the affected credentials at
 their providers.
 
@@ -89,7 +93,8 @@ their providers.
 manifest changes in that commit. The removed person held the old key, and
 with it they could have tested guesses against later manifests. `edit`, `set`,
 and `rm` renew the key the same way when they find that the recipients file
-has changed since the store was last encrypted.
+has changed since the store was last encrypted, which covers a forgotten
+`reencrypt`. `reencrypt` is still the removal step.
 
 Use a dedicated deployment recipient instead of a developer's identity. Commit
 its public recipient and give the job its private identity through one of
