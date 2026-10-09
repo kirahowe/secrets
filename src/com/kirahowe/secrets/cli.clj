@@ -206,14 +206,15 @@
   [env kind path]
   (when (and (string? path) (str/blank? path))
     (fail! :invalid-config
-           (str "Environment " env " has a blank " kind " (a path string must not be empty).\n"
+           (str "Environment " (name env) " has a blank " kind
+                " (a path string must not be empty).\n"
                 "    An empty path resolves to the working directory, not a file.")
            {:environment env :field kind :path path}))
   (when-let [problem (and (string? path) (source/path-problem path))]
     (fail! (if (#{:key-file :identity-file} kind)
              :disallowed-identity
              :disallowed-source)
-           (source/path-problem-message (str "Environment " env " " kind)
+           (source/path-problem-message (str "Environment " (name env) " " kind)
                                         "a local filesystem path"
                                         problem)
            (cond-> {:environment env :field kind}
@@ -259,7 +260,7 @@
     (canonical-path path)
     (catch java.io.IOException e
       (fail! :invalid-config
-             (str "Environment " environment-name " has an unresolvable " (name role)
+             (str "Environment " (name environment-name) " has an unresolvable " (name role)
                   " path — " path "\n    " (ex-message e))
              {:environment environment-name :role role :path path}))))
 
@@ -286,7 +287,7 @@
   (str "Configuration assigns one path to incompatible artifact roles:\n"
        "    " canonical "\n"
        (str/join "\n" (map (fn [{:keys [environment role path]}]
-                             (str "      " environment " " (name role) " — " path))
+                             (str "      " (name environment) " " (name role) " — " path))
                            entries))
        "\n    A path may be shared only as one identity/key artifact, one shared"
        "\n    recipients list, or one shared template."))
@@ -327,10 +328,8 @@
   #{:app :default-environment :environments})
 
 (def ^:private environment-keys
-  "Every key an environment's config may hold. `:name` and `:app` are the two
-  normalization stamps on it, so a normalized config normalizes again."
-  #{:secrets-file :key-file :identity-file :template :manifest :recipients-file
-    :name :app})
+  "Every key an environment's config may hold. Each names a path."
+  #{:secrets-file :key-file :identity-file :template :manifest :recipients-file})
 
 (defn- reject-unknown-keys!
   "Fail when map `m` holds a key outside `known`, naming the key and the known
@@ -347,33 +346,36 @@
   [app environment-name
    {:keys [secrets-file key-file identity-file template manifest recipients-file]
     :as env-config}]
-  (reject-unknown-keys! (str "Environment " environment-name) environment-keys env-config)
-  (when-not (string? secrets-file)
-    (fail! :invalid-config
-           (str "Environment " environment-name
-                " has no :secrets-file (a path string is required).")
-           {:environment environment-name}))
-  (require-path! environment-name :secrets-file secrets-file)
-  (when (and (not (str/ends-with? secrets-file ".age"))
-             (not (and (contains? env-config :template)
-                       (contains? env-config :manifest))))
-    (fail! :invalid-config
-           (str "Environment " environment-name " :secrets-file (" secrets-file
-                ") does not end in .age, so the\n"
-                "    derived :template/:manifest names would collide with — and overwrite — "
-                "the\n"
-                "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
-                "    explicitly.")
-           {:environment environment-name
-            :secrets-file secrets-file}))
-  (let [configured-key-file? (boolean key-file)
-        configured-identity-file? (and (contains? env-config :identity-file)
-                                       (some? identity-file))
-        key-file (if configured-key-file?
+  (let [label (name environment-name)]
+    (reject-unknown-keys! (str "Environment " label) environment-keys env-config)
+    (doseq [[k v] env-config]
+      (when-not (or (string? v) (and (= :manifest k) (false? v)))
+        (fail! :invalid-config
+               (str "Environment " label " " k " must be a path string"
+                    (when (= :manifest k) ", or false to keep no manifest")
+                    ", not a value of type " (name (manifest/value-type v)) ".")
+               {:environment environment-name :field k})))
+    (when-not secrets-file
+      (fail! :invalid-config
+             (str "Environment " label " has no :secrets-file (a path string is required).")
+             {:environment environment-name}))
+    (require-path! environment-name :secrets-file secrets-file)
+    (when (and (not (str/ends-with? secrets-file ".age"))
+               (not (and (contains? env-config :template)
+                         (contains? env-config :manifest))))
+      (fail! :invalid-config
+             (str "Environment " label " :secrets-file (" secrets-file
+                  ") does not end in .age, so the\n"
+                  "    derived :template/:manifest names would collide with — and overwrite — "
+                  "the\n"
+                  "    ciphertext itself. Use a .age extension, or set :template and :manifest\n"
+                  "    explicitly.")
+             {:environment environment-name
+              :secrets-file secrets-file})))
+  (let [key-file (if key-file
                    (secrets/expand-home key-file)
                    (secrets/default-key-file app))
-        explicit-identity (when configured-identity-file?
-                            (secrets/expand-home identity-file))
+        explicit-identity (some-> identity-file secrets/expand-home)
         template (if (contains? env-config :template)
                    template
                    (str/replace secrets-file #"\.age$" ".example"))
@@ -393,53 +395,64 @@
            :secrets-file secrets-file
            :key-file key-file
            :identity-file explicit-identity
-           ;; Explicit values (including :manifest false) are always kept;
-           ;; absent values are derived from the secrets file.
+           ;; An explicit :manifest false is kept. Absent values are derived
+           ;; from the secrets file.
            :template template
            :manifest manifest
            :recipients-file recipients-file)))
 
 (defn normalize-config
-  "Apply per-environment defaults (:key-file, :template, :manifest), preserve
-  explicit :identity-file options, validate, and stamp each env with its :name
-  and :app. Requires a non-blank :app,
-  at least one environment, and a non-blank :secrets-file string per
-  environment. A secrets path not ending in `.age` requires explicit :template
-  and :manifest values. Every resolved artifact path is checked for role
-  collisions across all environments. A key the config or an environment does
-  not define is rejected by name, so a misspelled key cannot be silently
+  "Validate a secrets config as it is written in `bb.edn` and return it with
+  per-environment defaults (:key-file, :template, :manifest) applied. The
+  command functions take the result. A config this function returned comes
+  back unchanged.
+
+  Requires a non-blank :app and at least one environment, each a map with a
+  :secrets-file. Every environment setting is a path string, and :manifest
+  may also be false. A secrets path not ending in `.age` requires explicit
+  :template and :manifest values. Every resolved artifact path is checked for
+  role collisions across all environments. A key the config or an environment
+  does not define is rejected by name, so a misspelled key cannot be silently
   ignored. Does not select an environment identity or create private files.
   Throws ex-info on invalid input."
   [{:keys [app environments] :as config}]
-  (when-not (map? config)
-    (fail! :invalid-config "secrets config must be a map with :app and :environments"))
-  (reject-unknown-keys! "secrets config" config-keys config)
-  (when-not (and (map? environments) (seq environments))
-    (fail! :invalid-config
-           (str "secrets config needs :environments, a map from each environment's name to"
-                " a map of its settings, with at least one environment")))
-  (doseq [[environment-name env-config] environments]
-    (when-not (and (keyword? environment-name) (map? env-config))
-      (fail! :invalid-config
-             (str "secrets config :environments must map each environment's name, a"
-                  " keyword, to a map of its settings such as"
-                  " {:secrets-file \"secrets.edn.age\"}"))))
-  (when-not (and (string? app) (not (str/blank? app)))
-    (fail! :invalid-config
-           (str "secrets config has no :app (a name string is required). It names the\n"
-                "    default key path ~/.config/<app>/key.txt and is recorded in the "
-                "manifest,\n"
-                "    so there is deliberately no default — projects must not share a key "
-                "path\n"
-                "    by accident.")))
-  (let [normalized (reduce-kv (fn [normalized environment-name env-config]
-                                (assoc normalized
-                                       environment-name
-                                       (normalize-environment app environment-name env-config)))
-                              {}
-                              environments)]
-    (validate-artifact-roles! normalized)
-    (assoc config :environments normalized)))
+  (if (::normalized (meta config))
+    config
+    (do
+      (when-not (map? config)
+        (fail! :invalid-config "secrets config must be a map with :app and :environments"))
+      (reject-unknown-keys! "secrets config" config-keys config)
+      (when-not (and (map? environments) (seq environments))
+        (fail! :invalid-config
+               (str "secrets config needs :environments, a map from each environment's name to"
+                    " a map of its settings, with at least one environment")))
+      (doseq [[environment-name env-config] environments]
+        (when-not (and (keyword? environment-name) (map? env-config))
+          (fail! :invalid-config
+                 (str "secrets config :environments must map each environment's name, a"
+                      " keyword, to a map of its settings such as"
+                      " {:secrets-file \"secrets.edn.age\"}"))))
+      (when-not (and (string? app) (not (str/blank? app)))
+        (fail! :invalid-config
+               (str "secrets config has no :app (a name string is required). It names the\n"
+                    "    default key path ~/.config/<app>/key.txt and is recorded in the "
+                    "manifest,\n"
+                    "    so there is deliberately no default — projects must not share a key "
+                    "path\n"
+                    "    by accident.")))
+      (when (and (contains? config :default-environment)
+                 (not (contains? environments (:default-environment config))))
+        (fail! :invalid-config
+               (str "secrets config :default-environment must name one of its environments: "
+                    (str/join ", " (map name (keys environments))))))
+      (let [normalized (reduce-kv (fn [normalized environment-name env-config]
+                                    (assoc normalized
+                                           environment-name
+                                           (normalize-environment app environment-name env-config)))
+                                  {}
+                                  environments)]
+        (validate-artifact-roles! normalized)
+        (vary-meta (assoc config :environments normalized) assoc ::normalized true)))))
 
 (defn- resolve-env
   "Resolve an environment argument string to its (defaulted) config map.

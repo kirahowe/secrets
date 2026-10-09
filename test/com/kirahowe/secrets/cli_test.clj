@@ -426,7 +426,7 @@
               "does not end in .age"]
              ["a URI-shaped path"
               {:app "x" :environments {:dev {:secrets-file "https://example.com/s.age"}}}
-              "Environment :dev :secrets-file must be a local filesystem path"]
+              "Environment dev :secrets-file must be a local filesystem path"]
              ["a role collision"
               {:app "x" :environments {:dev {:secrets-file "s.age" :template "s.age"
                                              :manifest "s.manifest"}}}
@@ -993,7 +993,10 @@
           keyless-verify (fn []
                            (under-default-key-file
                             missing
-                            #(verify (cli/normalize-config (test-config {:key-file nil})) "dev")))]
+                            #(verify (cli/normalize-config
+                                      (update-in (test-config) [:environments :dev]
+                                                 dissoc :key-file))
+                                     "dev")))]
       (encrypt-edn! {:a 1})
       (with-out-str (cli/reencrypt! config "dev"))
       (testing "fresh manifest → freshness verified without any key"
@@ -1045,7 +1048,9 @@
   "A config with no designated identity, for use under `under-default-key-file`
   with an absent default, so `verify` takes the keyless path."
   [absent]
-  (under-default-key-file absent #(cli/normalize-config (test-config {:key-file nil}))))
+  (under-default-key-file
+   absent
+   #(cli/normalize-config (update-in (test-config) [:environments :dev] dissoc :key-file))))
 
 (defn- capture-keyed-and-keyless
   "Run `verify` on dev with the fixture identity and again with none. Returns
@@ -2174,7 +2179,7 @@
                      (catch clojure.lang.ExceptionInfo e e))]
           (is (= {:environment :dev :field field :reason :disallowed-identity :scheme "key"}
                  (select-keys (ex-data e) [:environment :field :reason :scheme])))
-          (is (= (str "Environment :dev " field " must be a local filesystem path, but its"
+          (is (= (str "Environment dev " field " must be a local filesystem path, but its"
                       " value starts with the URI scheme \"key\". For a relative file whose"
                       " name contains a colon, write ./ before the name.")
                  (ex-message e))))))
@@ -2328,7 +2333,9 @@
                             (with-out-str (cli/recipients! config "dev"))
                             (catch clojure.lang.ExceptionInfo e e)))
               rendered (pr-str (ex-data e))
-              doctor (bounded #(:result (doctor-under config "dev" {})))
+              doctor (bounded #(:result (doctor-under
+                                         (test-config {:recipients-file recipients-file})
+                                         "dev" {})))
               state (get-in doctor [:encryption :recipients])]
           (is (= {:reason :input-too-large
                   :limit (count exact-content)
@@ -2453,7 +2460,7 @@
       (let [e (failure (test-config {:secrets-fle "elsewhere.age" :manfest false}))]
         (is (= :unknown-config-key (:reason (ex-data e))))
         (is (= #{:secrets-fle :manfest} (set (:unknown-keys (ex-data e)))))
-        (is (str/includes? (ex-message e) "Environment :dev has an unknown key"))
+        (is (str/includes? (ex-message e) "Environment dev has an unknown key"))
         (is (str/includes? (ex-message e) ":secrets-fle"))
         (doseq [known [:secrets-file :key-file :identity-file :template :manifest
                        :recipients-file]]
@@ -2520,31 +2527,31 @@
   (doseq [[label environments tokens]
           [["the resolved identity equals the manifest in one environment"
             {:dev {:secrets-file "s.age" :manifest "id.txt" :identity-file "id.txt"}}
-            [":dev manifest" ":dev identity-file"]]
+            ["dev manifest" "dev identity-file"]]
            ["the resolved identity equals the ciphertext"
             {:dev {:secrets-file "s.age" :identity-file "s.age"}}
-            [":dev secrets-file" ":dev identity-file"]]
+            ["dev secrets-file" "dev identity-file"]]
            ["the resolved identity equals the template"
             {:dev {:secrets-file "s.age" :identity-file "s.example"}}
-            [":dev template" ":dev identity-file"]]
+            ["dev template" "dev identity-file"]]
            ["dev ciphertext equals the prod key file"
             {:dev {:secrets-file "shared.age" :key-file "dev-key.txt"}
              :prod {:secrets-file "prod.age" :key-file "shared.age"}}
-            [":dev secrets-file" ":prod key-file"]]
+            ["dev secrets-file" "prod key-file"]]
            ["two environments write one manifest"
             {:dev {:secrets-file "d.age" :manifest "m.edn" :key-file "k.txt"}
              :prod {:secrets-file "p.age" :manifest "m.edn" :key-file "k.txt"}}
-            [":dev manifest" ":prod manifest"]]
+            ["dev manifest" "prod manifest"]]
            ["two environments write one ciphertext"
             {:dev {:secrets-file "s.age" :template "d.example" :manifest "d.manifest"}
              :prod {:secrets-file "s.age" :template "p.example" :manifest "p.manifest"}}
-            [":dev secrets-file" ":prod secrets-file"]]
+            ["dev secrets-file" "prod secrets-file"]]
            ["the template equals the ciphertext"
             {:dev {:secrets-file "s.age" :template "s.age"}}
-            [":dev secrets-file" ":dev template"]]
+            ["dev secrets-file" "dev template"]]
            ["the recipients file equals the key file"
             {:dev {:secrets-file "s.age" :key-file "k.txt" :recipients-file "k.txt"}}
-            [":dev key-file" ":dev recipients-file"]]]]
+            ["dev key-file" "dev recipients-file"]]]]
     (testing label
       (let [message (str (ex-message (role-collision {:app "x" :environments environments})))]
         (doseq [token tokens]
@@ -2760,7 +2767,7 @@
       (doseq [field [:key-file :identity-file :template :manifest :recipients-file]]
         (let [{:keys [failure] :as captured}
               (capture-failure #(cli/normalize-config (config field)))]
-          (is (= (str "Environment :dev " field " holds age key contents where a local"
+          (is (= (str "Environment dev " field " holds age key contents where a local"
                       " filesystem path was expected. Key contents belong in"
                       " SECRETS_AGE_IDENTITY.")
                  (:message failure)))
@@ -2829,7 +2836,7 @@
   (let [run (fn [variable value]
               (with-identity-environment
                 {variable value}
-                #(capture-doctor (cli/normalize-config (test-config)) "dev")))]
+                #(capture-doctor (test-config) "dev")))]
     (testing "a blank variable"
       (let [{:keys [result out]} (run "SECRETS_AGE_IDENTITY" "")]
         (is (= 2 (:exit result)))
@@ -3612,3 +3619,43 @@
       (testing "a recipients file that cannot be used is a failure, not drift"
         (spit recipients "not-a-recipient\n")
         (is (= {:results {:dev :error} :exit 2} (verify alice "dev")))))))
+
+(deftest environment-settings-are-path-strings-test
+  ;; `:manifest true` once switched the manifest off without a word, and a
+  ;; number passed as a key file.
+  (let [failure (fn [overrides]
+                  (try (cli/normalize-config (test-config overrides))
+                       nil
+                       (catch Exception e e)))]
+    (doseq [[k v type-name] [[:manifest true "boolean"]
+                             [:manifest nil "nil"]
+                             [:manifest :none "keyword"]
+                             [:key-file 42 "integer"]
+                             [:key-file nil "nil"]
+                             [:identity-file :env "keyword"]
+                             [:template false "boolean"]
+                             [:recipients-file ["team.txt"] "vector"]
+                             [:secrets-file 'secrets.edn.age "symbol"]]]
+      (testing (pr-str [k v])
+        (let [e (failure {k v})]
+          (is (= {:reason :invalid-config :environment :dev :field k} (ex-data e)))
+          (is (str/includes? (str (ex-message e))
+                             (str "Environment dev " k " must be a path string")))
+          (is (str/includes? (str (ex-message e)) (str "not a value of type " type-name))))))
+    (testing ":manifest false is the one setting that is not a path"
+      (is (false? (get-in (cli/normalize-config (test-config {:manifest false}))
+                          [:environments :dev :manifest])))
+      (is (str/includes? (ex-message (failure {:manifest true}))
+                         "or false to keep no manifest")))
+    (testing "the stamps normalization adds are not settings a config may hold"
+      (doseq [k [:name :app]]
+        (let [e (failure {k "other"})]
+          (is (= :unknown-config-key (:reason (ex-data e))))
+          (is (= "Known keys: :identity-file, :key-file, :manifest, :recipients-file, :secrets-file, :template."
+                 (str/trim (last (str/split-lines (ex-message e)))))))))
+    (testing "a default environment that is not configured"
+      (doseq [default [:prod "dev" 5]]
+        (let [e (try (cli/normalize-config (assoc (test-config) :default-environment default))
+                     (catch Exception e e))]
+          (is (= :invalid-config (:reason (ex-data e))))
+          (is (str/includes? (str (ex-message e)) "must name one of its environments: dev")))))))
