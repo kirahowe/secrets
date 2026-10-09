@@ -794,8 +794,10 @@
   "One line per key path that moved between the manifest and the store."
   [{:keys [added removed changed]}]
   (concat
-   (for [path added] [:line "    +" (pr-str path) "is in the secrets and missing from the manifest"])
-   (for [path removed] [:line "    -" (pr-str path) "is in the manifest and gone from the secrets"])
+   (for [path added]
+     [:line "    +" (pr-str path) "is in the secrets and missing from the manifest"])
+   (for [path removed]
+     [:line "    -" (pr-str path) "is in the manifest and gone from the secrets"])
    (for [path changed] [:line "    ~" (pr-str path) "changed its value or type"])))
 
 (defn- finding-lines

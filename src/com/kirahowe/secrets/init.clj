@@ -429,7 +429,8 @@
    "Options:"
    (str/join "\n" (for [[flags _ value-name text] options]
                     (format "  %-13s %s"
-                            (str (str/join ", " (sort-by count flags)) (when value-name (str " " value-name)))
+                            (str (str/join ", " (sort-by count flags))
+                                 (when value-name (str " " value-name)))
                             text)))])
 
 (defn- print-init-error!

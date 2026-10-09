@@ -1021,8 +1021,9 @@
           encrypted (str *dir* "/secrets.edn.age")
           shown (atom nil)]
       (new-store! config "dev" "{:db/host \"h\" :service {:api/key \"k\" :api/url \"u\"}}")
-      (doseq [[label change] [["set" #(with-in-str "5432" (cli/set-secret! config "dev" ":db/port" false))]
-                              ["rm" #(cli/remove-secret! config "dev" ":db/port")]]]
+      (doseq [[label change]
+              [["set" #(with-in-str "5432" (cli/set-secret! config "dev" ":db/port" false))]
+               ["rm" #(cli/remove-secret! config "dev" ":db/port")]]]
         (testing label
           ;; Whatever the caller's REPL has bound, the store is written in full.
           (binding [*print-namespace-maps* true]
