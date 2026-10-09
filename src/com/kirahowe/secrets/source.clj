@@ -3,20 +3,13 @@
 
   Local-only, bounded acquisition of encrypted secrets sources.
 
-  Source values may themselves contain credentials, so diagnostics cross this
-  boundary only as allowlisted descriptors. Acquisition accepts filesystem
-  sources and strict local `file:` or `jar:file:` locators, never caller-provided
-  URL handlers or arbitrary `clojure.java.io` dispatch, and enforces the byte
-  bound while data moves."
+  A source is a filesystem path or a classpath resource URL whose scheme is
+  `file:` or `jar:file:`. Source values may themselves contain credentials, so
+  diagnostics cross this boundary only as allowlisted descriptors, and a URL
+  is read through its fields and never opened through its handler."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.fs :as fs]))
-
-(def ^:private max-locator-schemes
-  "How many nested locator schemes a descriptor unwraps (`jar:file:` is two)
-  before it keeps only the schemes it has seen. A source string can spell
-  `a:b:c:…` to any depth, and describing one is bounded work."
-  4)
 
 (def ^:private uri-scheme
   "A leading URI scheme, per RFC 3986. A source string carrying one is a
@@ -27,16 +20,11 @@
   "A Windows drive path, which is a path rather than a one-letter URI scheme."
   #"(?i)^[a-z]:[\\/]")
 
-(def ^:private max-source-bytes
+(def max-source-bytes
   "The most ciphertext bytes one source may hold (16 MiB). It catches an
   accidental huge input, such as the wrong file, before it is copied or
   decrypted."
   16777216)
-
-(def ^:private source-chunk-bytes
-  "Sources are copied in fixed 64 KiB chunks so the running total is checked
-  before every further read rather than after the source is exhausted."
-  65536)
 
 (def ^:private no-store-hint
   "One-line remediation appended to no-secrets-file errors."
@@ -86,159 +74,84 @@
          (when bare?
            " For a relative file whose name contains a colon, write ./ before the name."))))
 
-(defn- parse-uri
-  "Return `s` as a `java.net.URI`, or nil when it does not parse.
+(defn- decode
+  "Decode the percent-escapes of URL path `raw` without reading `+` as a
+  space. Nil when `raw` is empty or malformed."
+  [raw]
+  (when (seq raw)
+    (try
+      (java.net.URLDecoder/decode (str/replace raw "+" "%2B") "UTF-8")
+      (catch IllegalArgumentException _ nil))))
 
-  The `URISyntaxException` is dropped rather than reported because its message
-  quotes the whole string it rejected."
-  [s]
-  (try
-    (java.net.URI. s)
-    (catch Exception _ nil)))
-
-(defn- url->uri
-  "Rebuild `url` from field getters without invoking its URLStreamHandler."
+(defn- url-source
+  "The local source that classpath resource `url` names, or nil when it is not
+  one `clojure.java.io/resource` returns for a local classpath: a `file:` URL,
+  or a `jar:file:` URL of an entry in a local archive, with no authority,
+  query, or fragment. Only the URL's fields are read. It is never opened."
   [^java.net.URL url]
-  (let [scheme (.getProtocol url)
-        user-info (.getUserInfo url)
-        host (not-empty (.getHost url))
-        port (.getPort url)
-        authority? (or user-info host (pos? port))]
-    (parse-uri
-     (str scheme ":"
-          (when authority?
-            (str "//" (when user-info (str user-info "@")) host
-                 (when (pos? port) (str ":" port))))
-          (.getPath url)
-          (when-let [query (.getQuery url)] (str "?" query))
-          (when-let [fragment (.getRef url)] (str "#" fragment))))))
-
-(defn- locator-parts
-  "Return the scheme chain and innermost parsed URI for locator string `s`.
-
-  An opaque URI wraps another locator (`jar:file:/app.jar!/store.age`), and each
-  wrapper contributes only its scheme. Unwrapping stops at a part that is not
-  opaque, does not parse, or carries no scheme, and at `max-locator-schemes`
-  either way."
-  [s]
-  (loop [s s schemes []]
-    (let [scheme (second (re-find uri-scheme s))
-          uri (when scheme (parse-uri s))
-          schemes (cond-> schemes scheme (conj scheme))]
-      (if (and uri (.isOpaque uri) (< (count schemes) max-locator-schemes))
-        (recur (.getSchemeSpecificPart uri) schemes)
-        [schemes uri]))))
-
-(defn- locator-descriptor
-  "Build allowlisted metadata for locator string `s`.
-
-  Scheme chain, host, port, and path may be retained. Userinfo, query, and
-  fragment are always dropped because they commonly hold credentials. A path
-  can hold a token too, but retaining it is necessary to identify a failing
-  resource; that residual diagnostic risk is explicit."
-  [s]
-  (let [[schemes uri] (locator-parts (str/trim s))
-        host (some-> uri .getHost not-empty)
-        path (some-> uri .getPath not-empty)
-        port (or (some-> uri .getPort) -1)]
-    (cond-> {:kind :url :scheme (str/join ":" schemes)}
-      host (assoc :host host)
-      (pos? port) (assoc :port port)
-      path (assoc :path path))))
+  (when (and (empty? (.getAuthority url)) (nil? (.getQuery url)) (nil? (.getRef url)))
+    (case (.getProtocol url)
+      "file" (when-let [path (decode (.getPath url))]
+               {:file (io/file path)})
+      "jar" (let [[_ archive entry] (re-matches #"file:(/(?!/).*?)!/(.+)" (.getPath url))]
+              (when (and (decode archive) (decode entry))
+                {:archive (io/file (decode archive)) :entry (decode entry)}))
+      nil)))
 
 (defn descriptor
   "Return allowlisted metadata naming `source` without rendering secret data.
 
-  URL, URI, and scheme-carrying string descriptors retain only scheme, host,
-  port, and path; userinfo, query, and fragment are dropped. File, Path, and
-  plain path strings retain their path. Any other value retains only its class
-  name, never its `toString`; `nil` has no descriptor. The result is safe for
-  exception data and diagnostics under this namespace's explicit allowlist."
+  A File, a Path, and a path string keep their path. A classpath resource URL
+  this namespace accepts keeps its scheme and path. A URL it refuses, and a
+  string that is URI-shaped, keep only the scheme. Any other value, a string
+  holding key contents included, keeps only its class name, never its
+  `toString`. `nil` has no descriptor."
   [source]
   (cond
     (nil? source) nil
-    (instance? java.io.File source) {:kind :file :path (str source)}
-    (instance? java.nio.file.Path source) {:kind :file :path (str source)}
-    (string? source) (if (locator-scheme source)
-                       (locator-descriptor source)
-                       {:kind :file :path source})
+    (or (instance? java.io.File source) (instance? java.nio.file.Path source))
+    {:kind :file :path (str source)}
+
+    (and (string? source) (nil? (path-problem source)))
+    {:kind :file :path source}
+
+    (and (string? source) (:scheme (path-problem source)))
+    {:kind :url :scheme (:scheme (path-problem source))}
+
     (instance? java.net.URL source)
-    (if-let [uri (url->uri source)]
-      (locator-descriptor (str uri))
-      {:kind :url :scheme (.getProtocol ^java.net.URL source)})
-    (instance? java.net.URI source) (locator-descriptor (str source))
+    (cond-> {:kind :url :scheme (.getProtocol ^java.net.URL source)}
+      (url-source source) (assoc :path (.getPath ^java.net.URL source)))
+
     :else {:kind :object :class (.getName (class source))}))
 
 (defn- source-description
-  "Render one diagnostic line from `source-descriptor` and nothing else."
-  [{:keys [kind path scheme host port] class-name :class}]
-  (if (= :url kind)
-    (str scheme ":" (when host (str "//" host)) (when port (str ":" port)) path)
-    (or path (str "an instance of " class-name))))
-
-(defn- disallowed-source!
-  "Reject `source-descriptor` before opening or resolving its source."
-  [source-descriptor]
-  (throw
-   (ex-info
-    (str "Secrets sources are local-only. Expected a filesystem path, File, Path,"
-         " local file: locator, or jar:file: classpath resource; "
-         (source-description source-descriptor) " is not permitted.")
-    {:source source-descriptor :reason :disallowed-source})))
-
-(defn- local-file-uri?
-  "True when `uri` is an absolute local `file:` URI with no authority or suffix."
-  [^java.net.URI uri]
-  (and (= "file" (some-> (.getScheme uri) str/lower-case))
-       (not (.isOpaque uri))
-       (nil? (.getRawAuthority uri))
-       (nil? (.getRawQuery uri))
-       (nil? (.getRawFragment uri))
-       (seq (.getRawPath uri))))
-
-(defn- decode-jar-entry
-  "Decode a jar entry's raw URI path without treating `+` as form-encoded space."
-  [raw-entry]
-  (when (seq raw-entry)
-    (try
-      (java.net.URLDecoder/decode (str/replace raw-entry "+" "%2B") "UTF-8")
-      (catch IllegalArgumentException _ nil))))
-
-(defn- jar-file-source
-  "Return the local archive and entry named by a strict `jar:file:` `uri`."
-  [^java.net.URI uri]
-  (when (and (= "jar" (some-> (.getScheme uri) str/lower-case))
-             (.isOpaque uri)
-             (nil? (.getRawFragment uri)))
-    (let [raw (.getRawSchemeSpecificPart uri)
-          separator (.indexOf ^String raw "!/")]
-      (when (pos? separator)
-        (let [archive-uri (parse-uri (subs raw 0 separator))
-              entry (decode-jar-entry (subs raw (+ separator 2)))]
-          (when (and archive-uri (local-file-uri? archive-uri) entry)
-            {:archive (io/file archive-uri) :entry entry}))))))
-
-(defn- locator-source
-  "Turn an allowed local locator `uri` into a source spec, or nil."
-  [^java.net.URI uri]
-  (case (some-> (.getScheme uri) str/lower-case)
-    "file" (when (local-file-uri? uri) {:file (io/file uri)})
-    "jar" (jar-file-source uri)
-    nil))
+  "Render one diagnostic phrase from `source-descriptor` and nothing else."
+  [{:keys [kind path scheme] class-name :class}]
+  (cond
+    (= :object kind) (str "an instance of " class-name)
+    (= :file kind) path
+    path (str scheme ":" path)
+    :else (str "a " scheme ": URL")))
 
 (defn- local-source
-  "Classify `source` without opening it, rejecting anything outside local policy."
+  "Classify `source` without opening it: `{:file f}`, or `{:archive f :entry
+  name}` for a jar entry. Anything else is refused with `:disallowed-source`."
   [source source-descriptor]
-  (or
-   (cond
-     (instance? java.io.File source) {:file source}
-     (instance? java.nio.file.Path source) {:file (.toFile ^java.nio.file.Path source)}
-     (string? source) (if (locator-scheme source)
-                        (some-> source str/trim parse-uri locator-source)
-                        {:file (io/file source)})
-     (instance? java.net.URI source) (locator-source source)
-     (instance? java.net.URL source) (some-> source url->uri locator-source))
-   (disallowed-source! source-descriptor)))
+  (let [problem (when (string? source) (path-problem source))]
+    (or
+     (cond
+       (instance? java.io.File source) {:file source}
+       (instance? java.nio.file.Path source) {:file (.toFile ^java.nio.file.Path source)}
+       (instance? java.net.URL source) (url-source source)
+       (and (string? source) (nil? problem)) {:file (io/file source)})
+     (throw
+      (ex-info
+       (if problem
+         (path-problem-message "The secrets source" "a local filesystem path" problem)
+         (str "Secrets sources are local-only. Expected a filesystem path (a String, File,"
+              " or Path) or a file: or jar:file: classpath resource URL; "
+              (source-description source-descriptor) " is not permitted."))
+       {:source source-descriptor :reason :disallowed-source})))))
 
 (defn- source-too-large!
   "Throw a content-free source-size failure."
@@ -250,55 +163,26 @@
                    :limit max-source-bytes
                    :reason :source-too-large})))
 
-(defn- copy-source!
-  "Copy `in` to `out` in fixed chunks without writing beyond
-  `max-source-bytes`."
-  [source-descriptor ^java.io.InputStream in ^java.io.OutputStream out]
-  (let [chunk (byte-array source-chunk-bytes)]
-    (loop [total 0]
-      (let [n (.read in chunk 0 source-chunk-bytes)]
-        (when-not (neg? n)
-          (let [total (+ total n)]
-            (when (> total max-source-bytes)
-              (source-too-large! source-descriptor total))
-            (.write out chunk 0 n)
-            (recur total)))))))
-
-(defn- copy-jar-source!
-  "Copy one local jar `source` entry to `out`."
-  [source-descriptor {:keys [archive entry]} ^java.io.OutputStream out]
-  (with-open [jar (java.util.jar.JarFile. ^java.io.File archive)]
-    (if-let [jar-entry (.getJarEntry jar entry)]
-      (with-open [in (.getInputStream jar jar-entry)]
-        (copy-source! source-descriptor in out))
-      (throw (java.io.FileNotFoundException. "Classpath jar resource not found.")))))
-
-(defn- copy-local-source!
-  "Copy a local source spec to an owner-only temp file. Any failure, an
-  `Error` included, deletes the temp file before it propagates."
-  [source-descriptor {:keys [file] :as source}]
+(defn- copy-jar-entry!
+  "Copy entry `entry` of local jar `archive` to an owner-only temp file and
+  return `[file cleanup!]`. An entry past `max-source-bytes` is refused before
+  it is copied. Any failure, an `Error` included, deletes the temp file before
+  it propagates."
+  [source-descriptor {:keys [archive entry]}]
   (let [tmp (fs/owner-only-temp-file! "secrets-" ".age")]
     (try
-      (with-open [out (io/output-stream tmp)]
-        (if file
-          (with-open [in (io/input-stream file)]
-            (copy-source! source-descriptor in out))
-          (copy-jar-source! source-descriptor source out)))
+      (with-open [jar (java.util.jar.JarFile. ^java.io.File archive)]
+        (let [jar-entry (or (.getJarEntry jar entry)
+                            (throw (java.io.FileNotFoundException.
+                                    "Classpath jar resource not found.")))]
+          (when (> (.getSize jar-entry) max-source-bytes)
+            (source-too-large! source-descriptor (.getSize jar-entry)))
+          (with-open [in (.getInputStream jar jar-entry)]
+            (io/copy in tmp))))
       [tmp #(.delete tmp)]
       (catch Throwable t
         (.delete tmp)
         (throw t)))))
-
-(defn- source->file
-  "Resolve `source` under local-only policy to a `[file cleanup!]` pair."
-  [source source-descriptor]
-  (let [{:keys [file] :as local} (local-source source source-descriptor)]
-    (if (and file (.exists ^java.io.File file))
-      (do
-        (when (> (.length ^java.io.File file) max-source-bytes)
-          (source-too-large! source-descriptor (.length ^java.io.File file)))
-        [file (fn [])])
-      (copy-local-source! source-descriptor local))))
 
 (defn- unreadable-source!
   "Throw a source-safe `:no-file` failure for unreadable allowed local input."
@@ -313,29 +197,34 @@
                 e)
        (ex-info (str "Could not read secrets source "
                      (source-description source-descriptor)
-                     " (" (.getName (class e)) "). The failure's own message is withheld:"
-                     " it is built from the source itself, userinfo and query included.")
+                     " (" (.getName (class e)) ").")
                 {:source source-descriptor :reason :no-file})))))
 
 (defn acquire!
   "Acquire local `source` as `[file cleanup!]`.
 
-  `source-descriptor` must be the value returned by [[descriptor]] for `source`;
-  it is the only source representation admitted to failures. Existing files are
-  checked in place. Strict local `jar:file:` entries are streamed to an
+  `source` is a filesystem path (a String, `java.io.File`, or
+  `java.nio.file.Path`) or a classpath resource URL as
+  `clojure.java.io/resource` returns it, whose scheme is `file:` or
+  `jar:file:`. `source-descriptor` must be the value returned by
+  [[descriptor]] for `source`; it is the only source representation admitted
+  to failures. A file is checked in place. A jar entry is copied to an
   owner-only temporary file, and the returned cleanup function removes that
   copy. A source past `max-source-bytes` throws `:source-too-large` with the
-  numeric `:limit` and `:observed`. Nil, remote, malformed, and arbitrary
-  object sources fail without invoking caller-provided URL handlers or rendering
-  source data."
+  numeric `:limit` and `:observed`. Anything else throws `:disallowed-source`
+  before it is opened, and is never rendered."
   [source source-descriptor]
   (when (nil? source)
     (throw (ex-info (str "No secrets source given: source is nil. This almost always means"
-                         " (io/resource \"secrets.edn.age\") found nothing on the classpath"
-                         " — check the encrypted file is present as a classpath resource. "
+                         " (io/resource \"secrets.edn.age\") found nothing on the classpath."
+                         " Check the encrypted file is present as a classpath resource. "
                          no-store-hint)
                     {:reason :no-file})))
-  (try
-    (source->file source source-descriptor)
-    (catch java.io.IOException e (unreadable-source! source-descriptor e))
-    (catch IllegalArgumentException e (unreadable-source! source-descriptor e))))
+  (let [{:keys [^java.io.File file] :as local} (local-source source source-descriptor)]
+    (try
+      (cond
+        (nil? file) (copy-jar-entry! source-descriptor local)
+        (not (.exists file)) (throw (java.io.FileNotFoundException. "No such file."))
+        (> (.length file) max-source-bytes) (source-too-large! source-descriptor (.length file))
+        :else [file (fn [])])
+      (catch java.io.IOException e (unreadable-source! source-descriptor e)))))

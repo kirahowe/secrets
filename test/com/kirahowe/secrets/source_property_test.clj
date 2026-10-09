@@ -1,9 +1,9 @@
 (ns com.kirahowe.secrets.source-property-test
-  "Properties of source classification. A descriptor keeps a locator's scheme,
-  host, port, and path and nothing a credential could sit in. A string with a
-  scheme is a locator even after leading whitespace, and `./` makes any
-  relative name a path. Only local `file:` and `jar:file:` locators are
-  accepted, and a refusal names the source without repeating its credential."
+  "Properties of source classification. A source is a filesystem path or a
+  local classpath resource URL. A string with a scheme is refused as a path
+  even after leading whitespace, and `./` makes any relative name a path. A
+  descriptor of anything refused keeps a scheme or a class and nothing a
+  credential could sit in."
   (:require [clojure.string :as str]
             [clojure.test.check.clojure-test :refer [defspec]]
             [clojure.test.check.generators :as gen]
@@ -32,9 +32,9 @@
   (gen/elements ["" " " "\t" "\n" "  \r\n"]))
 
 (defn- credentialed
-  "Generator of `[string expected credential]`: a locator with `scheme`, host,
-  port, and path, wrapped in userinfo, query, and fragment that carry a
-  planted credential, and the descriptor that keeps none of it."
+  "Generator of `[string scheme credential]`: a locator with one of `schemes`,
+  a host, port, and path, wrapped in userinfo, query, and fragment that carry
+  a planted credential."
   [schemes]
   (gen/let [scheme (gen/elements schemes)
             cred g/marker
@@ -52,55 +52,10 @@
       [(str scheme "://" (when userinfo (str userinfo "@")) host (when port (str ":" port)) path
             (when (:query where) (str "?token=" cred "&x=1"))
             (when (:fragment where) (str "#" cred)))
-       (cond-> {:kind :url :scheme scheme :host host}
-         port (assoc :port port)
-         (seq path) (assoc :path path))
+       (str/lower-case scheme)
        cred])))
 
 (def ^:private remote-schemes ["http" "https" "ftp" "s3" "gopher" "HTTP" "Https"])
-
-(def ^:private jar-locator
-  "Generator of `[string expected credential]` for a `jar:file:` locator whose
-  inner authority and entry query may carry a planted credential."
-  (gen/let [cred g/marker
-            authority? gen/boolean
-            host host
-            archive (gen/fmap #(str "/" (str/join "/" %) ".jar") (gen/vector word 1 3))
-            entry word
-            query? gen/boolean
-            fragment? gen/boolean]
-    [(str "jar:file:" (when authority? (str "//user:" cred "@" host)) archive "!/" entry
-          (when query? (str "?token=" cred))
-          (when fragment? (str "#" cred)))
-     (cond-> {:kind :url :scheme "jar:file" :path (str archive "!/" entry)}
-       authority? (assoc :host host))
-     cred]))
-
-(defn- as-form
-  "`s` as a `form` of source, keeping the expected descriptor in step: a URL
-  reports its protocol in lower case, and a string may lead with whitespace."
-  [form space [s expected cred]]
-  (case form
-    :string [(str space s) expected cred]
-    :uri [(java.net.URI. s) expected cred]
-    :url [(java.net.URL. s) (update expected :scheme str/lower-case) cred]))
-
-(def ^:private credentialed-source
-  "Generator of `[source expected-descriptor credential]` over strings, URIs,
-  and (for schemes Java has a handler for) URLs."
-  (gen/one-of
-   [(gen/let [form (gen/elements [:string :uri])
-              space leading-space
-              locator (credentialed remote-schemes)]
-      (as-form form space locator))
-    (gen/let [form (gen/elements [:string :uri :url])
-              space leading-space
-              locator (credentialed ["http" "https"])]
-      (as-form form space locator))
-    (gen/let [form (gen/elements [:string :uri])
-              space leading-space
-              locator jar-locator]
-      (as-form form space locator))]))
 
 (defn- acquire-failure
   "The exception `source/acquire!` throws for `input`, or nil when it returns.
@@ -113,11 +68,14 @@
 
 ;;;; Descriptors
 
-(defspec descriptors-keep-the-locator-and-drop-its-credential 300
-  (prop/for-all [[input expected cred] credentialed-source]
-    (let [d (source/descriptor input)]
-      (and (= expected d)
-           (not (str/includes? (pr-str d) cred))))))
+(defspec a-locator-is-described-by-its-scheme-alone 300
+  (prop/for-all [[s scheme cred] (credentialed remote-schemes)
+                 space leading-space
+                 [url-text url-scheme url-cred] (credentialed ["http" "https"])]
+    (and (= {:kind :url :scheme scheme} (source/descriptor (str space s)))
+         (= {:kind :url :scheme url-scheme} (source/descriptor (java.net.URL. url-text)))
+         (not (str/includes? (pr-str (source/descriptor (str space s))) cred))
+         (not (str/includes? (pr-str (source/descriptor (java.net.URL. url-text))) url-cred)))))
 
 (defspec a-source-object-is-described-by-its-class-alone 100
   (prop/for-all [cred g/marker]
@@ -157,7 +115,7 @@
                  space (gen/elements ["" " " "\t"])]
     (let [padded (str space s)
           e (acquire-failure padded)]
-      (and (nil? (#'source/locator-scheme padded))
+      (and (nil? (source/path-problem padded))
            (= {:kind :file :path padded} (source/descriptor padded))
            (not= :disallowed-source (:reason (ex-data e)))))))
 
@@ -169,21 +127,22 @@
     (every? (fn [[name expected-scheme]]
               (let [refused (acquire-failure (str space name))
                     kept (acquire-failure (str "./" name))]
-                (and (= expected-scheme (#'source/locator-scheme (str space name)))
+                (and (= expected-scheme (:scheme (source/path-problem (str space name))))
                      (= :disallowed-source (:reason (ex-data refused)))
-                     (nil? (#'source/locator-scheme (str "./" name)))
+                     (str/includes? (ex-message refused) "write ./ before the name")
+                     (nil? (source/path-problem (str "./" name)))
                      (= :no-file (:reason (ex-data kept))))))
             [[(str scheme ":" rest-of-name) scheme]
              [(str drive ":" rest-of-name) (str/lower-case (str drive))]])))
 
-(defspec local-file-locators-are-accepted-in-every-form 60
-  (prop/for-all [form (gen/elements [:string :uri :url])]
+(defspec a-local-file-is-accepted-as-a-path-or-a-resource-url 40
+  (prop/for-all [form (gen/elements [:string :file :path :url])]
     (let [file (fs/owner-only-temp-file! "kira-source-" ".age")
-          locator (str "file:" (.getAbsolutePath file))
           input (case form
-                  :string locator
-                  :uri (java.net.URI. locator)
-                  :url (java.net.URL. locator))]
+                  :string (.getAbsolutePath file)
+                  :file file
+                  :path (.toPath file)
+                  :url (.toURL (.toURI file)))]
       (try
         (let [[found cleanup!] (source/acquire! input (source/descriptor input))]
           (cleanup!)
@@ -195,25 +154,29 @@
 ;;;; Refusals
 
 (def ^:private refused-source
-  "Generator of `[source credential]` that local-only policy must refuse."
+  "Generator of `[source credential]` that local-only policy must refuse:
+  URI-shaped strings, URI objects, URLs that are not a local resource, and
+  arbitrary objects."
   (gen/one-of
-   [(gen/let [[s _ cred] (credentialed remote-schemes)
+   [(gen/let [[s _ cred] (credentialed (into remote-schemes ["file" "jar:file"]))
               space leading-space]
       [(str space s) cred])
     (gen/fmap (fn [[s _ cred]] [(java.net.URI. s) cred]) (credentialed remote-schemes))
     (gen/fmap (fn [[s _ cred]] [(java.net.URL. s) cred]) (credentialed ["http" "https"]))
     (gen/let [cred g/marker
               host host
-              space leading-space
-              shape (gen/elements [:authority :query :fragment :remote-jar :nested-jar])]
-      [(str space
-            (case shape
-              :authority (str "file://user:" cred "@" host "/store.age")
-              :query (str "file:/store.age?token=" cred)
-              :fragment (str "file:/store.age#" cred)
-              :remote-jar (str "jar:http://user:" cred "@" host "/app.jar!/store.age")
-              :nested-jar (str "jar:jar:file:/a.jar!/b.jar!/store.age?token=" cred)))
+              shape (gen/elements [:authority :query :fragment :remote-jar
+                                   :jar-authority :jar-query])]
+      [(java.net.URL.
+        (case shape
+          :authority (str "file://user:" cred "@" host "/store.age")
+          :query (str "file:/store.age?token=" cred)
+          :fragment (str "file:/store.age#" cred)
+          :remote-jar (str "jar:http://user:" cred "@" host "/app.jar!/store.age")
+          :jar-authority (str "jar:file://user:" cred "@" host "/app.jar!/store.age")
+          :jar-query (str "jar:file:/app.jar!/store.age?token=" cred)))
        cred])
+    (gen/fmap (fn [cred] [(str "file:/srv/" cred "/store.age") cred]) g/marker)
     (gen/fmap (fn [cred] [(reify Object (toString [_] cred)) cred]) g/marker)]))
 
 (defspec a-non-local-source-is-refused-without-its-credential 300

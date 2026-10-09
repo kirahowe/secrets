@@ -338,13 +338,11 @@
   top-level key `:com.kirahowe.secrets/store`, under which the CLI keeps a
   store's metadata, is library data and is never returned.
 
-  `source` is local-only: a filesystem path string, File, Path, local `file:`
-  URL/URI/string, or a `jar:file:` classpath resource URL/URI/string.
-  HTTP(S), every other scheme, remote or nested jar sources, malformed local
-  locators, and arbitrary values accepted by `clojure.java.io/input-stream` are
-  rejected with `:disallowed-source` before DNS, connection, redirect, or
-  response reads. This API performs no remote operation, so it has no network
-  timeout contract. `identity-or-opts` is an identity path or an options map:
+  `source` is local-only: a filesystem path as a String, `java.io.File`, or
+  `java.nio.file.Path`, or a classpath resource as the `java.net.URL` that
+  `clojure.java.io/resource` returns, whose scheme is `file:` or `jar:file:`.
+  Anything else is rejected with `:disallowed-source` before it is opened.
+  `identity-or-opts` is an identity path or an options map:
     :identity-file  explicit identity path (wins over :app and the env vars)
     :app            app name for the default ~/.config/<app>/key.txt
   Without an explicit identity or app, only the SECRETS_AGE_IDENTITY*
@@ -369,9 +367,10 @@
   `clojure.edn`, not `eval`.
 
   Every failure about a source carries `:source`, allowlisted metadata naming
-  which source failed (a locator's scheme, host, port, and path, a file's path,
-  or a rejected object's class) and never the source value, whose userinfo,
-  query, or `toString` can be a credential. Injected identities are kept in a
+  which source failed (a file's path, a resource URL's scheme and path, a
+  refused URL's or string's scheme alone, or a rejected object's class) and
+  never the source value, whose userinfo, query, or `toString` can be a
+  credential. Injected identities are kept in a
   private temporary file only for the duration of this operation."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]

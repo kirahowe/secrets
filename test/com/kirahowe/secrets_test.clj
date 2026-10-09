@@ -848,14 +848,15 @@
       (is (= {:k "v"} (secrets/load-secrets enc *key*))))))
 
 (defn- jar-source!
-  "Write `encrypted` as `entry` in a local jar and return its `jar:file:` URI."
+  "Write `encrypted` as `entry` in a local jar and return the `jar:file:` URL
+  `clojure.java.io/resource` gives for that entry on a classpath."
   [encrypted jar-name entry]
   (let [jar (io/file *dir* jar-name)]
     (with-open [zos (java.util.zip.ZipOutputStream. (io/output-stream jar))]
       (.putNextEntry zos (java.util.zip.ZipEntry. entry))
       (io/copy (io/file encrypted) zos)
       (.closeEntry zos))
-    (java.net.URI. (str "jar:" (.toURI jar) "!/" entry))))
+    (java.net.URL. (str "jar:" (.toURI jar) "!/" entry))))
 
 (def ^:private ^:dynamic *guarded-url-spec* nil)
 (def ^:private ^:dynamic *guarded-url-invocations* nil)
@@ -881,32 +882,71 @@
             (swap! *guarded-url-invocations* inc)
             (proxy-super toExternalForm url))))"))))
 
-(deftest local-source-loading-test
+(deftest accepted-and-refused-source-forms-test
   (let [enc (encrypt-edn! {:from :local})
         file (io/file enc)
         file-uri (.toURI file)
-        jar-uri (jar-source! enc "app.jar" "secrets.edn.age")]
-    (testing "filesystem paths and local file locators remain accepted"
-      (doseq [source [enc file (.toPath file) (str file-uri) file-uri (.toURL file-uri)]]
+        jar-url (jar-source! enc "app.jar" "secrets.edn.age")
+        spaced-jar-url (jar-source! enc "my app+v1.jar" "conf/secrets.edn.age")]
+    (testing "a filesystem path as a String, File, or Path"
+      (doseq [source [enc file (.toPath file)]]
         (is (= {:from :local} (secrets/load-secrets source *key*)))))
-    (testing "local classpath jar resources remain accepted"
-      (doseq [source [(str jar-uri) jar-uri (.toURL jar-uri)]]
-        (is (= {:from :local} (secrets/load-secrets source *key*)))))
+    (testing "a classpath resource URL: a file, or an entry of a local jar"
+      (doseq [source [(.toURL file-uri) jar-url spaced-jar-url]]
+        (is (= {:from :local} (secrets/load-secrets source *key*)) (str source))))
+    (testing "a resource a class loader finds in a jar"
+      ;; Babashka cannot construct a URLClassLoader. Its classpath resources
+      ;; have the same `jar:file:` shape as the URLs above.
+      (when-not (System/getProperty "babashka.version")
+        (let [url (io/resource "secrets.edn.age"
+                               (clojure.lang.DynamicClassLoader.
+                                (java.net.URLClassLoader.
+                                 (into-array java.net.URL
+                                             [(.toURL (.toURI (io/file *dir* "app.jar")))])
+                                 nil)))]
+          (is (= "jar" (.getProtocol url)))
+          (is (= {:from :local} (secrets/load-secrets url *key*))))))
+    (testing "a string locator and a URI object are refused, naming only the scheme"
+      (doseq [[source scheme] [[(str file-uri) "file"]
+                               [(str " " file-uri) "file"]
+                               [(str jar-url) "jar"]
+                               ["https://user:pw-SENTINEL@example.com/s.age" "https"]]]
+        (let [e (is (thrown? clojure.lang.ExceptionInfo (secrets/load-secrets source *key*)))]
+          (is (= {:reason :disallowed-source :source {:kind :url :scheme scheme}} (ex-data e)))
+          (is (= (str "The secrets source must be a local filesystem path, but its value"
+                      " starts with the URI scheme \"" scheme "\".")
+                 (ex-message e)))))
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (secrets/load-secrets file-uri *key*)))]
+        (is (= {:reason :disallowed-source :source {:kind :object :class "java.net.URI"}}
+               (ex-data e)))))
+    (testing "a relative name with a colon gets the ./ hint"
+      (let [e (is (thrown? clojure.lang.ExceptionInfo (secrets/load-secrets "store:age" *key*)))]
+        (is (= :disallowed-source (:reason (ex-data e))))
+        (is (str/ends-with? (ex-message e) "write ./ before the name."))))
+    (testing "a URL of another scheme, or with an authority, query, or fragment"
+      (doseq [spec ["http://127.0.0.1:8080/store.age"
+                    "https://user:pw-SENTINEL@example.com/store.age"
+                    "file://example.com/share/store.age"
+                    (str file-uri "?token=pw-SENTINEL")
+                    (str file-uri "#pw-SENTINEL")
+                    "jar:http://example.com/app.jar!/store.age"
+                    (str jar-url "?token=pw-SENTINEL")]]
+        (let [e (is (thrown? clojure.lang.ExceptionInfo
+                             (secrets/load-secrets (java.net.URL. spec) *key*))
+                    spec)
+              scheme (.getProtocol (java.net.URL. spec))]
+          (is (= {:reason :disallowed-source :source {:kind :url :scheme scheme}} (ex-data e)))
+          (is (str/includes? (ex-message e) (str "a " scheme ": URL is not permitted")))
+          (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e))) "SENTINEL"))))))
     (testing "an allowed-looking caller URL cannot substitute its own I/O handler"
       (if (System/getProperty "babashka.version")
         (is true "JVM-only hostile URLStreamHandler coverage")
-        (doseq [spec [(str file-uri) (str jar-uri)]]
+        (doseq [spec [(str file-uri) (str jar-url)]]
           (let [invoked (atom 0)]
             (is (= {:from :local}
                    (secrets/load-secrets (guarded-url spec invoked) *key*)))
             (is (zero? @invoked)
                 "classification avoids handler rendering and I/O dispatch")))))))
-
-(deftest a-locator-with-surrounding-whitespace-is-read-as-that-locator-test
-  (let [enc (encrypt-edn! {:k "v"})
-        locator (str (.toURI (io/file enc)))]
-    (doseq [source [(str " " locator) (str locator "\n") (str "\t" locator " ")]]
-      (is (= {:k "v"} (secrets/load-secrets source *key*)) (pr-str source)))))
 
 ;;;; Multi-recipient encryption
 
@@ -1098,29 +1138,6 @@
     (is (some? e) "the source must be rejected")
     e))
 
-(defn- tracked-http-source!
-  "Start a loopback endpoint, returning its URL, request signal, and cleanup."
-  [response]
-  (let [server (java.net.ServerSocket. 0)
-        requested (promise)
-        worker (future
-                 (try
-                   (with-open [socket (.accept server)]
-                     (deliver requested true)
-                     (if response
-                       (let [out (.getOutputStream socket)]
-                         (.write out (.getBytes ^String response "UTF-8"))
-                         (.flush out))
-                       (Thread/sleep 5000)))
-                   (catch java.net.SocketException _)
-                   (finally
-                     (.close server))))]
-    {:url (str "http://127.0.0.1:" (.getLocalPort server) "/store.age")
-     :requested requested
-     :cleanup! (fn []
-                 (.close server)
-                 (future-cancel worker))}))
-
 (defn- encrypt-sized!
   "Encrypt a store whose EDN plaintext is exactly `n` bytes and return the
   ciphertext path."
@@ -1136,19 +1153,19 @@
 (deftest source-size-boundary-test
   (let [enc (encrypt-edn! {:k "v"})
         size (.length (io/file enc))
-        jar-uri (jar-source! enc "bounded.jar" "store.age")
+        jar-url (jar-source! enc "bounded.jar" "store.age")
         before (temp-source-copies)]
     (testing "a path used in place is checked without being copied"
       (is (= [:ok size] (acquire-source enc size)) "exactly at the limit is accepted")
       (is (= :source-too-large (acquire-source enc (dec size))) "one byte over is refused"))
-    (testing "a classpath jar entry is counted while it is copied"
-      (is (= [:ok size] (acquire-source jar-uri size)))
-      (is (= :source-too-large (acquire-source jar-uri (dec size)))))
+    (testing "a classpath jar entry is checked before it is copied"
+      (is (= [:ok size] (acquire-source jar-url size)))
+      (is (= :source-too-large (acquire-source jar-url (dec size)))))
     (testing "load-secrets reports the bound it refused, and no source content"
       (is (= {:k "v"} (with-bound #'source/max-source-bytes size
-                        #(secrets/load-secrets jar-uri {:identity-file *key*}))))
+                        #(secrets/load-secrets jar-url {:identity-file *key*}))))
       (let [e (with-bound #'source/max-source-bytes (dec size)
-                #(try (secrets/load-secrets jar-uri {:identity-file *key*})
+                #(try (secrets/load-secrets jar-url {:identity-file *key*})
                       (catch clojure.lang.ExceptionInfo e e)))]
         (is (= :source-too-large (:reason (ex-data e))))
         (is (= (dec size) (:limit (ex-data e))))
@@ -1157,47 +1174,15 @@
             "one shape: the reason, the bound, the observed size, and the source")
         (is (str/includes? (ex-message e) "bounded.jar") "the message names the source")))
     (testing "the bound is 16 MiB"
-      (is (= 16777216 @#'source/max-source-bytes)))
+      (is (= 16777216 source/max-source-bytes)))
     (is (= before (temp-source-copies))
         "no completed or partial ciphertext copy survives cleanup")))
 
-(deftest remote-source-policy-test
-  (testing "nonlocal and malformed nested locators are rejected by shape"
-    (doseq [source ["ftp://example.com/store.age"
-                    "gopher://example.com/store.age"
-                    "jar:http://example.com/app.jar!/store.age"
-                    "jar:jar:file:/tmp/app.jar!/nested.jar!/store.age"
-                    "file://127.0.0.1/share/store.age"
-                    (java.io.ByteArrayInputStream. (byte-array 0))]]
-      (let [e (source-policy-failure source)]
-        (is (= :disallowed-source (:reason (ex-data e)))))))
-  (testing "loopback, private, redirects, and pre-byte stalls are rejected by URL shape"
-    (doseq [[label spec]
-            [["loopback target" "http://127.0.0.1:8080/store.age"]
-             ["private target" "https://10.0.0.1/store.age"]
-             ["redirect hop" "http://127.0.0.1:8080/redirect-to-private"]
-             ["connection stall" "http://192.0.2.1:81/connect-stall"]
-             ["read stall before the first byte" "http://127.0.0.1:8080/read-stall"]]]
-      (testing label
-        (let [e (source-policy-failure (java.net.URL. spec))]
-          (is (= :disallowed-source (:reason (ex-data e))))))))
-  (testing "controlled direct, redirect, and read-stall endpoints receive no request"
-    (doseq [[label response]
-            [["direct response" "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"]
-             ["redirect hop" "HTTP/1.1 302 Found\r\nLocation: http://10.0.0.1/\r\n\r\n"]
-             ["read stall before first byte" nil]]]
-      (testing label
-        (let [{:keys [url requested cleanup!]} (tracked-http-source! response)
-              attempt (future (source-policy-failure url))]
-          (try
-            (let [result (deref attempt 1000 ::timed-out)]
-              (is (not= ::timed-out result) "local-only rejection does not wait on transport")
-              (when (instance? clojure.lang.ExceptionInfo result)
-                (is (= :disallowed-source (:reason (ex-data result)))))
-              (is (not (realized? requested)) "the endpoint accepted no connection"))
-            (finally
-              (cleanup!)
-              (future-cancel attempt))))))))
+(deftest an-arbitrary-object-is-not-a-source-test
+  (let [e (source-policy-failure (java.io.ByteArrayInputStream. (byte-array 0)))]
+    (is (= {:reason :disallowed-source
+            :source {:kind :object :class "java.io.ByteArrayInputStream"}}
+           (ex-data e)))))
 
 (deftest plaintext-size-boundary-test
   (let [limit 4096
@@ -1433,25 +1418,22 @@
   (let [describe source/descriptor
         signed (str "https://user:" (:userinfo source-sentinels)
                     "@example.com:8443/store.age")]
-    (testing "a locator keeps scheme, host, port, and path, and nothing else"
+    (testing "a URI-shaped string and a refused URL keep only the scheme"
       (are [source expected] (= expected (describe source))
-        signed
-        {:kind :url :scheme "https" :host "example.com" :port 8443 :path "/store.age"}
-
-        (java.net.URL. signed)
-        {:kind :url :scheme "https" :host "example.com" :port 8443 :path "/store.age"}
-
+        signed {:kind :url :scheme "https"}
+        (java.net.URL. signed) {:kind :url :scheme "https"}
         (str "https://example.com/store.age?X-Amz-Signature=" (:query source-sentinels))
-        {:kind :url :scheme "https" :host "example.com" :path "/store.age"}
-
-        (str "https://example.com/store.age#" (:fragment source-sentinels))
-        {:kind :url :scheme "https" :host "example.com" :path "/store.age"}
-
-        "file:///srv/secrets/store.age"
+        {:kind :url :scheme "https"}
+        "file:///srv/secrets/store.age" {:kind :url :scheme "file"}
+        "jar:file:/srv/app.jar!/secrets.edn.age" {:kind :url :scheme "jar"}
+        (java.net.URL. (str "file:/srv/store.age#" (:fragment source-sentinels)))
+        {:kind :url :scheme "file"}))
+    (testing "an accepted resource URL keeps its scheme and path"
+      (are [source expected] (= expected (describe source))
+        (java.net.URL. "file:/srv/secrets/store.age")
         {:kind :url :scheme "file" :path "/srv/secrets/store.age"}
-
-        "jar:file:/srv/app.jar!/secrets.edn.age"
-        {:kind :url :scheme "jar:file" :path "/srv/app.jar!/secrets.edn.age"}))
+        (java.net.URL. "jar:file:/srv/app.jar!/secrets.edn.age")
+        {:kind :url :scheme "jar" :path "file:/srv/app.jar!/secrets.edn.age"}))
     (testing "a path is kept; anything else contributes only its class"
       (are [source expected] (= expected (describe source))
         "/srv/secrets/store.age" {:kind :file :path "/srv/secrets/store.age"}
@@ -1460,6 +1442,7 @@
         {:kind :object :class "java.io.ByteArrayInputStream"}
         (StringBuilder. (:to-string source-sentinels))
         {:kind :object :class "java.lang.StringBuilder"}
+        "AGE-SECRET-KEY-1SENTINEL" {:kind :object :class "java.lang.String"}
         nil nil))
     (testing "no descriptor carries a sentinel, whichever field held it"
       (doseq [source [signed
@@ -1485,20 +1468,18 @@
   (let [wrong-key (str *dir* "/wrong-key.txt")
         _ (age/keygen! wrong-key)
         enc (encrypt-edn! {:nested {:deep {:deeper "v"}}})
-        jar-uri (jar-source! enc "diagnostics.jar" "store.age")
-        descriptor (source/descriptor jar-uri)
+        jar-url (jar-source! enc "diagnostics.jar" "store.age")
+        descriptor (source/descriptor jar-url)
         failure (fn [source opts]
                   (load-failure source (merge {:identity-file *key*} opts)))]
     (testing "a disallowed locator explains the local-only policy"
       (let [e (failure (sentinel-url 8443) nil)
             data (ex-data e)]
         (is (= :disallowed-source (:reason data)))
-        (is (= {:kind :url :scheme "http" :host "127.0.0.1"
-                :port 8443 :path "/store.age"}
-               (:source data)))
-        (is (str/includes? (ex-message e) "local-only"))))
+        (is (= {:kind :url :scheme "http"} (:source data)))
+        (is (str/includes? (ex-message e) "must be a local filesystem path"))))
     (testing "an oversized local resource names the bound and safe descriptor"
-      (let [e (with-bound #'source/max-source-bytes 1 #(failure jar-uri nil))
+      (let [e (with-bound #'source/max-source-bytes 1 #(failure jar-url nil))
             data (ex-data e)]
         (is (= :source-too-large (:reason data)))
         (is (= 1 (:limit data)))
@@ -1506,14 +1487,14 @@
         (is (= descriptor (:source data)))
         (is (str/includes? (ex-message e) "larger than the 1 byte limit"))))
     (testing "a wrong key still says so and names the local resource"
-      (let [e (failure jar-uri {:identity-file wrong-key})
+      (let [e (failure jar-url {:identity-file wrong-key})
             data (ex-data e)]
         (is (= "age decryption failed" (ex-message e)))
         (is (str/includes? (:hint data) "Wrong key"))
         (is (seq (:error data)) "the captured stderr is still there")
         (is (= descriptor (:source data)))))
     (testing "an EDN plaintext past its depth bound keeps its reason and source"
-      (let [e (with-bound #'safe-edn/max-depth 1 #(failure jar-uri nil))
+      (let [e (with-bound #'safe-edn/max-depth 1 #(failure jar-url nil))
             data (ex-data e)]
         (is (= :edn-too-deep (:reason data)))
         (is (= 1 (:limit data)))
@@ -1528,29 +1509,32 @@
         (is (= {:kind :object :class "java.lang.StringBuilder"} (:source data)))
         (is (str/includes? (ex-message e) "an instance of java.lang.StringBuilder"))))))
 
-(deftest source-copy-is-deleted-on-any-failure-test
+(deftest a-jar-entry-copy-is-deleted-on-failure-test
   (let [enc (encrypt-edn! {:k "v"})
-        jar-uri (jar-source! enc "copy-failure.jar" "store.age")
+        jar-url (jar-source! enc "copy-failure.jar" "store.age")
+        missing-entry (java.net.URL. (str jar-url ".absent"))
+        wrong-key (str *dir* "/copy-failure-key.txt")
+        _ (age/keygen! wrong-key)
         real-temp fs/owner-only-temp-file!]
-    (doseq [failure [(java.io.IOException. "forced copy failure")
-                     (Error. "forced copy failure")]]
-      (testing (.getName (class failure))
-        (let [created (atom nil)]
-          (with-redefs-fn
-            {#'fs/owner-only-temp-file! (fn [& args]
-                                          (reset! created (apply real-temp args)))
-             #'source/copy-source! (fn [_ _ ^java.io.OutputStream out]
-                                     (.write out (.getBytes "partial ciphertext"))
-                                     (throw failure))}
-            (fn []
-              (is (some? (try (secrets/load-secrets jar-uri *key*)
-                              nil
-                              (catch Throwable t t))))))
+    (doseq [[label source identity bound reason]
+            [["an entry the jar does not hold" missing-entry *key* nil :no-file]
+             ["an entry past the size bound" jar-url *key* 1 :source-too-large]
+             ["a copy the identity cannot decrypt" jar-url wrong-key nil :decrypt-failed]]]
+      (testing label
+        (let [created (atom nil)
+              load #(try (secrets/load-secrets source identity)
+                         nil
+                         (catch clojure.lang.ExceptionInfo e e))
+              e (with-redefs-fn
+                  {#'fs/owner-only-temp-file! (fn [& args]
+                                                (reset! created (apply real-temp args)))}
+                  (if bound #(with-bound #'source/max-source-bytes bound load) load))]
+          (is (= reason (:reason (ex-data e))))
           (is (some? @created) "the copy was started")
           (is (not (.exists ^java.io.File @created))))))))
 
 (deftest locator-scheme-test
-  (are [s scheme] (= scheme (#'source/locator-scheme s))
+  (are [s scheme] (= scheme (:scheme (source/path-problem s)))
     "https://user:pw@host/key" "https"
     "HTTPS://host/key" "https"
     "jar:file:/app.jar!/store.age" "jar"
@@ -1632,8 +1616,7 @@
             (when-let [e (failure #(secrets/reader-literals {option locator
                                                              :identity-file *key*}))]
               (is (= {:reason :disallowed-source
-                      :source {:kind :url :scheme "https" :host "host.example"
-                               :path "/key.txt"}}
+                      :source {:kind :url :scheme "https"}}
                      (ex-data e))
                   "the same descriptor shape a load failure carries")
               (is (= (str "The secrets " option " option must be a " expected
