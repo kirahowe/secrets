@@ -50,8 +50,7 @@
 ;; a developer's machine with the wrong key. If you want fallback behaviour,
 ;; leave the variable unset.
 
-;; On Fly, that means one command. `bb secrets keygen` prints it with your key
-;; path filled in:
+;; On Fly, for example, that is one command:
 
 ;; ```sh
 ;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- ~/.config/myapp/key.txt)"

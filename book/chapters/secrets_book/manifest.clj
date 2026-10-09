@@ -107,7 +107,7 @@
   "Calls `cli/set-secret!` with `value` on stdin and no terminal attached."
   [config env k value edn?]
   (with-redefs-fn {#'cli/tty? (constantly false)}
-    #(with-in-str value (cli/set-secret! config env k edn?))))
+    #(with-in-str value (cli/set-secret! config env k {:edn? edn?}))))
 
 ;; `set-from-pipe!` is a helper for this chapter that calls `cli/set-secret!`
 ;; with a string on stdin, as a shell pipe into `bb secrets set` would.

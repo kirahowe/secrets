@@ -342,12 +342,9 @@ past 8 MiB, and to read a recipients file past 256 KiB or a manifest past
 
 A deployment needs the `age` binary, the ciphertext, and one identity. The
 ciphertext ships with the code, on disk or inside the jar. Give the process
-the identity through one of the three variables above. `bb secrets keygen`
-prints the command for Fly:
-
-```sh
-flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- '/Users/you/.config/myapp/key.txt')"
-```
+the identity through one of the three variables above. `SECRETS_AGE_IDENTITY`
+takes the contents of the key file, which is how most platforms store a
+secret.
 
 A runtime that cannot start a subprocess cannot decrypt. There, use the
 platform's own secret store in production and this library in development and
@@ -578,21 +575,22 @@ describes.
 Every command takes the environment first and uses the default when it is
 omitted. Before a `--`, an argument that starts with a dash is an option, and
 one the command does not define is an error. Everything after `--` is an
-argument, so a key may begin with a dash. A usage error prints the command's
-usage and never the argument that caused it, which may be a value typed in the
-wrong place. That includes an unknown command and an unknown environment.
+argument, even one that looks like an option. Command names are case
+sensitive. A usage error prints the command's usage and never the argument
+that caused it, which may be a value typed in the wrong place. That includes
+an unknown command and an unknown environment.
 
 | Command | What it does |
 | --- | --- |
 | `keygen [env]` | Generate an identity at the environment's `:key-file` and print its public key. Asks before replacing one. |
 | `new [env]` | Create the store from its template in `$VISUAL`, `$EDITOR`, or `vim`. |
 | `edit [env]` | Decrypt, open the editor, and re-encrypt if the text changed. Comments are kept. |
-| `set [env] <key> [--edn]` | Set one value from a hidden prompt, or from stdin when it is not a terminal. Creates the store if there is none. |
+| `set [env] <key> [--edn]` | Set one value from a hidden prompt, or from stdin when it is not a terminal. The prompt needs stdin and stdout both to be terminals: with stdout redirected, pipe the value in. Creates the store if there is none. |
 | `rm [env] <key>` | Remove one key. Fails if the key or the store is absent. |
 | `verify [env]` | Check manifests against ciphertexts. With no `env`, checks every environment. |
 | `doctor [env]` | Report on the setup: `age`, the files, the identity, and the recipients. |
 | `show-key [env]` | Print the public key of the configured `:key-file`. |
-| `add-recipient [env] [public-key]` | Append a public key to the recipients file. With no key, the environment's own. |
+| `add-recipient [env] [public-key]` | Append a public key to the recipients file. With no key, the environment's own. A single argument that is a public key goes to the default environment, and any other single argument is the environment. |
 | `recipients [env]` | List the recipients file. |
 | `reencrypt [env]` | Re-encrypt to the current recipients with a new manifest key. |
 | `help [command]` | Show help. `<command> --help` does the same for one command. |
@@ -645,8 +643,9 @@ Exit codes:
 `com.kirahowe.secrets.cli` has `(run! config args)`, `(normalize-config
 config)`, and one function per command: `keygen!`, `new!`, `edit!`,
 `set-secret!`, `remove-secret!`, `verify!`, `doctor!`, `show-key!`,
-`add-recipient!`, `recipients!`, and `reencrypt!`. The command functions
-return data, throw `ex-info`, and never exit. `verify!` and `doctor!` report
+`add-recipient!`, `recipients!`, and `reencrypt!`. `set-secret!` takes its
+options as a map, `(set-secret! config env key {:edn? true})`. The command
+functions return data, throw `ex-info`, and never exit. `verify!` and `doctor!` report
 most failures in their result, with the exit code under `:exit`. `run!` is the
 entry point of a process, on Babashka or the JVM, and the one place that
 exits.

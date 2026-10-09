@@ -155,7 +155,7 @@
 ;; | `verify` | `[env]` | check the committed manifest against the secrets |
 ;; | `doctor` | `[env]` | report on the setup: age, the files, the identity, and the recipients |
 ;; | `show-key` | `[env]` | print public keys for sharing |
-;; | `add-recipient` | `[env] [public-key]` | add a public key to the recipients file |
+;; | `add-recipient` | `[env] [public-key]` | add a public key to the recipients file; a single argument that is a public key goes to the default environment, and any other single argument is the environment |
 ;; | `recipients` | `[env]` | list the configured recipient public keys |
 ;; | `reencrypt` | `[env]` | re-encrypt to the current recipients, with a new manifest key |
 ;; | `help` | `[command]` | show global or command-specific help |
@@ -174,8 +174,8 @@
 
 ;; Before a `--`, an argument that starts with a dash is an option, for every
 ;; command, and an option the command doesn't define is an error. Everything
-;; after `--` is an argument, even when it looks like an option, so a key name
-;; may start with a dash.
+;; after `--` is an argument, even one that looks like an option. Command
+;; names are case sensitive.
 
 ;; A usage error prints the command's usage and never repeats the argument
 ;; that caused it. That covers an unknown command and an unknown environment
@@ -278,7 +278,7 @@
   "Calls `cli/set-secret!` with `value` on stdin and no terminal attached."
   [config env k value edn?]
   (with-redefs-fn {#'cli/tty? (constantly false)}
-    #(with-in-str value (cli/set-secret! config env k edn?))))
+    #(with-in-str value (cli/set-secret! config env k {:edn? edn?}))))
 
 ;; `set-from-pipe!` is a helper for this chapter. It calls `cli/set-secret!`
 ;; with a string on stdin, the way `printf %s t-123 | bb secrets set dev

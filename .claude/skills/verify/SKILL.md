@@ -166,7 +166,10 @@ must match what you see.
     the first `set`, and `recipients`. `doctor` must show the recipients
     file and "Recipients: 1" and be healthy.
   - `add-recipient <other-key>` must recommend `reencrypt`, and `verify`
-    must now exit 1 with "recipients changed since the last encryption".
+    must now exit 1 with "recipients changed since the last encryption". A
+    single argument that is a public key goes to the default environment,
+    and any other single argument is the environment, so
+    `add-recipient <env>` adds that environment's own key.
   - A `set` at that point must say the recipients changed and that it is
     generating a new manifest key. The other key must then pass `verify`
     through `SECRETS_AGE_IDENTITY_FILE`, and a `set` by that key must change

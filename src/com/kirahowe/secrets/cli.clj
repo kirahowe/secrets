@@ -85,7 +85,16 @@
 
 (def ^:private stderr-levels #{:oops :stderr})
 
-(defn- tty? [] (some? (System/console)))
+(defn- tty?
+  "True when there is a console, which needs stdin and stdout both to be
+  terminals. Called with `:stdin`, true when standard input alone is a
+  terminal: `test -t 0` answers that with this process's stdin, because
+  `System/console` is nil whenever stdout is redirected."
+  ([] (some? (System/console)))
+  ([_stdin]
+   (-> (ProcessBuilder. ^java.util.List ["sh" "-c" "test -t 0"])
+       (.redirectInput java.lang.ProcessBuilder$Redirect/INHERIT)
+       .start .waitFor zero?)))
 
 (defn- paint
   "`s` wrapped in the ANSI codes for `style` when `color?`, else `s` itself."
@@ -390,15 +399,8 @@
            [:line [:bold "  Public key:"] pub]
            [:line]
            [:warn "Back this key up (e.g. a password manager). It is NOT in git and"]
-           [:line (str "    cannot be recovered. To deploy, set it as the "
-                       "SECRETS_AGE_IDENTITY secret:")]
-           ;; `cat --` because a key file named `-n` or `--help` has to reach
-           ;; cat as a pathname.
-           ;; The surrounding "$(…)" is the shell's own construct, not
-           ;; interpolated data, and is what makes the file contents one
-           ;; argument to flyctl.
-           [:line [:dim (str "      flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat -- "
-                             (shell-quote key-file) ")\"")]]]
+           [:line (str "    cannot be recovered. A deployment takes its contents in"
+                       " SECRETS_AGE_IDENTITY.")]]
     recipients-file
     (into [[:line]
            [:info "This project encrypts to a shared recipients file. Add your public"]
@@ -518,14 +520,17 @@
        (read-reader-bounded! *in* limit "Standard input" context)))))
 
 (defn set-secret!
-  "Set a value typed at a hidden terminal prompt, or read from stdin when
-  stdin is not a terminal. `key-arg` is a keyword or a non-empty vector of
+  "Set a value typed at a hidden terminal prompt when stdin and stdout are
+  both terminals, and read from stdin when stdin is not a terminal. With
+  stdin a terminal and stdout redirected it refuses, because it could not
+  hide what is typed. `key-arg` is a keyword or a non-empty vector of
   keyword/string path elements. Piped input loses one trailing newline. The
-  value is stored verbatim as a string unless `edn?` is true, in which case
-  the input must be one EDN value. Blank input is rejected. Creates a missing
-  secrets file from an empty map, then re-encrypts and updates the manifest.
-  Returns the secrets-file path. Re-rendering removes plaintext comments."
-  [config env-arg key-arg edn?]
+  value is stored verbatim as a string unless `opts` holds `:edn? true`, in
+  which case the input must be one EDN value. Blank input is rejected.
+  Creates a missing secrets file from an empty map, then re-encrypts and
+  updates the manifest. Returns the secrets-file path. Re-rendering removes
+  plaintext comments."
+  [config env-arg key-arg & [{:keys [edn?]}]]
   (store/with-environment-identity config (with-set-usage #(store/resolve-env config env-arg))
     (fn [env]
       (require-age!)
@@ -535,6 +540,10 @@
         (when exists? (store/require-identity! env))
         (let [target (store/encrypt-target! env)
               interactive? (tty?)
+              _ (when (and (not interactive?) (tty? :stdin))
+                  (fail! :usage
+                         (str "stdout is redirected; run `set` without redirecting it,"
+                              " or pipe the value in.")))
               raw (read-set-value! env path interactive?)
               _ (when (str/blank? raw)
                   ;; The same rule the library applies to a set-but-empty
@@ -1099,10 +1108,11 @@
    {:name "set" :args "[env] <key>"
     :flags {"--edn" "Parse the value as EDN instead of storing it verbatim as a string."}
     :doc (str "Set a key from a hidden prompt, or from stdin when it is not a terminal.\n"
-              "The value is never read from the command line.")
+              "The prompt needs stdin and stdout both to be terminals: with stdout\n"
+              "redirected, pipe the value in. It is never read from the command line.")
     :run (fn [config args flags]
            (let [[env k] (env-and-key args)]
-             (set-secret! config env k (contains? flags "--edn"))))}
+             (set-secret! config env k {:edn? (contains? flags "--edn")})))}
    {:name "rm" :args "[env] <key>"
     :doc "Remove a key."
     :run (fn [config args _flags]
@@ -1119,8 +1129,13 @@
     :run (env-command #'show-key!)}
    {:name "add-recipient" :args "[env] [public-key]"
     :doc (str "Add a public key to an environment's recipients file.\n"
-              "Without a key it adds the environment's own.")
-    :run (fn [config [env public-key] _flags] (add-recipient! config env public-key))}
+              "Without a key it adds the environment's own. A single argument that is\n"
+              "a public key goes to the default environment; any other single\n"
+              "argument is the environment.")
+    :run (fn [config [env public-key :as args] _flags]
+           (if (and (= 1 (count args)) (age/valid-recipient? env))
+             (add-recipient! config nil env)
+             (add-recipient! config env public-key)))}
    {:name "recipients" :args "[env]"
     :doc "List configured recipient public keys."
     :run (env-command #'recipients!)}
@@ -1177,10 +1192,10 @@
     [:line "Every other command exits 0, or 1 on any failure."]]))
 
 (defn- find-command
-  "The table entry named `command-name`, in any letter case. An unknown name
-  fails without being repeated: it may be a value typed in the wrong place."
+  "The table entry named `command-name`. An unknown name fails without being
+  repeated: it may be a value typed in the wrong place."
   [command-name]
-  (or (some #(when (= (str/lower-case command-name) (:name %)) %) commands)
+  (or (some #(when (= command-name (:name %)) %) commands)
       (fail! :usage "Unknown command. Run `bb secrets help` for the list.")))
 
 (defn- dispatch!
@@ -1236,7 +1251,7 @@
   keep 1 for drift and for a warning and otherwise exit with the `:exit` of
   their result."
   [config args]
-  (let [status-command? (contains? status-commands (some-> (first args) str str/lower-case))
+  (let [status-command? (contains? status-commands (first args))
         exit (try
                (let [result (dispatch! config args)]
                  (if status-command? (:exit result 0) 0))

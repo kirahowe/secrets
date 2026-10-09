@@ -73,7 +73,7 @@
   "Calls `cli/set-secret!` with `value` on stdin and no terminal attached."
   [config env k value]
   (with-redefs-fn {#'cli/tty? (constantly false)}
-    #(with-in-str value (cli/set-secret! config env k false))))
+    #(with-in-str value (cli/set-secret! config env k))))
 
 ^:kindly/hide-code
 (defn manifest-entries

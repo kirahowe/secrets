@@ -642,7 +642,7 @@
           e (try
               (with-out-str
                 (with-in-str bomb
-                  (cli/set-secret! config "dev" ":bomb" true)))
+                  (cli/set-secret! config "dev" ":bomb" {:edn? true})))
               (catch clojure.lang.ExceptionInfo e e))]
       (is (= :edn-too-deep (:reason (ex-data e))))
       (is (= 100 (:limit (ex-data e))))
@@ -670,7 +670,7 @@
               (capture-failure
                (fn []
                  (with-in-str malformed
-                   (cli/set-secret! config "dev" ":secret/value" true))))]
+                   (cli/set-secret! config "dev" ":secret/value" {:edn? true}))))]
           (is (= :edn-malformed (get-in captured [:failure :data :reason])))
           (is (nil? (get-in captured [:failure :cause])))
           (assert-redacted! sentinel captured)))
@@ -679,7 +679,7 @@
               (capture-failure
                (fn []
                  (with-in-str "unused"
-                   (cli/set-secret! config "dev" malformed false))))]
+                   (cli/set-secret! config "dev" malformed))))]
           (is (= :edn-malformed (get-in captured [:failure :data :reason])))
           (assert-redacted! sentinel captured)))
       (testing "an existing decrypted store"
@@ -691,7 +691,7 @@
               (capture-failure
                (fn []
                  (with-in-str "replacement"
-                   (cli/set-secret! config "dev" ":secret/value" false))))]
+                   (cli/set-secret! config "dev" ":secret/value"))))]
           (is (= :edn-malformed (get-in captured [:failure :data :reason])))
           (is (nil? (get-in captured [:failure :cause])))
           (assert-redacted! sentinel captured)))
@@ -802,7 +802,7 @@
       (is (contains? default-mode "OTHERS_READ")
           "the test needs a umask that lets others read an ordinary file")
       (with-out-str (cli/add-recipient! config "dev" nil))
-      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k" false)))
+      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k")))
       (testing "a new store, manifest, and recipients file have default permissions"
         (doseq [path [encrypted manifest-path recipients]]
           (is (= default-mode (mode path)) path)))
@@ -832,7 +832,7 @@
         (doseq [[label invoke]
                 [["set"
                   #(with-in-str "after-set"
-                     (cli/set-secret! config "dev" ":value" false))]
+                     (cli/set-secret! config "dev" ":value"))]
                  ["edit"
                   #(with-redefs-fn {(cli-private 'run-editor!)
                                     (fn [path] (spit path "{:value \"after-edit\"}"))}
@@ -900,7 +900,7 @@
                 (fn []
                   (with-out-str
                     (with-in-str "written-before-cleanup-failure"
-                      (cli/set-secret! config "dev" ":cleanup/test" false))))))))
+                      (cli/set-secret! config "dev" ":cleanup/test"))))))))
         success-error (:failure success)
         remaining (first (:paths success))
         rendered (str/join " " (mapcat rest ((cli-private 'error-lines) success-error)))
@@ -946,7 +946,7 @@
       (testing "a failed delete after success is an error naming the plaintext file"
         (let [e (with-redefs-fn (failing-delete-of "secrets-")
                   #(try
-                     (with-out-str (with-in-str "v2" (cli/set-secret! config "dev" ":k" false)))
+                     (with-out-str (with-in-str "v2" (cli/set-secret! config "dev" ":k")))
                      nil
                      (catch clojure.lang.ExceptionInfo e e)))
               remaining (:remaining-file (ex-data e))]
@@ -1022,7 +1022,7 @@
           shown (atom nil)]
       (new-store! config "dev" "{:db/host \"h\" :service {:api/key \"k\" :api/url \"u\"}}")
       (doseq [[label change]
-              [["set" #(with-in-str "5432" (cli/set-secret! config "dev" ":db/port" false))]
+              [["set" #(with-in-str "5432" (cli/set-secret! config "dev" ":db/port"))]
                ["rm" #(cli/remove-secret! config "dev" ":db/port")]]]
         (testing label
           ;; Whatever the caller's REPL has bound, the store is written in full.
@@ -1424,7 +1424,7 @@
                                        " ")))
         (let [text (help-text [command "--help"])]
           (is (= text
-                 (help-text ["help" (str/upper-case command)])
+                 (help-text ["help" command])
                  (help-text [command "anything" "surplus" "-h"])))
           (is (str/starts-with? text (str "Usage: " usage "\n")))
           (is (str/includes? text "  -h, --help   Show this help.\n"))))))
@@ -1465,21 +1465,26 @@
     (doseq [[args expected note]
             [[["keygen"] [nil] "an omitted [env] is nil"]
              [["keygen" "dev"] ["dev"] "an explicit [env] is positional"]
-             [["KEYGEN" "prod"] ["prod"] "command names are case insensitive"]
              [["doctor" "prod"] ["prod"] "doctor takes [env] too"]
              [["rm" ":k"] [nil ":k"] "one argument is the key"]
              [["rm" "dev" ":k"] ["dev" ":k"] "two are the environment and the key"]
-             [["set" ":k"] [nil ":k" false] "set without --edn"]
-             [["set" "--edn" "dev" ":k"] ["dev" ":k" true] "--edn before the arguments"]
-             [["set" "dev" "--edn" ":k"] ["dev" ":k" true] "--edn between them"]
-             [["set" "dev" ":k" "--edn"] ["dev" ":k" true] "--edn after them"]
-             [["add-recipient" "dev"] ["dev" nil] "the first argument is the environment"]
+             [["set" ":k"] [nil ":k" {:edn? false}] "set without --edn"]
+             [["set" "--edn" "dev" ":k"] ["dev" ":k" {:edn? true}] "--edn before the arguments"]
+             [["set" "dev" "--edn" ":k"] ["dev" ":k" {:edn? true}] "--edn between them"]
+             [["set" "dev" ":k" "--edn"] ["dev" ":k" {:edn? true}] "--edn after them"]
+             [["add-recipient" "dev"] ["dev" nil] "one argument that is no key is the environment"]
+             [["add-recipient" (str "age1" (apply str (repeat 58 "q")))]
+              [nil (str "age1" (apply str (repeat 58 "q")))]
+              "one argument that is a public key goes to the default environment"]
+             [["add-recipient" "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9 me@host"]
+              [nil "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGb9 me@host"]
+              "an SSH public key too"]
              [["add-recipient" "dev" "age1x"] ["dev" "age1x"] "the second is the key"]
              ;; Everything after the terminator is positional.
              [["keygen" "--" "--help"] ["--help"] "a help flag after --"]
              [["keygen" "--" "dev"] ["dev"] "an ordinary argument after --"]
-             [["set" "--" "--edn"] [nil "--edn" false] "set's own flag after --"]
-             [["set" "--edn" "--" "-k"] [nil "-k" true] "a flag before -- still counts"]
+             [["set" "--" "--edn"] [nil "--edn" {:edn? false}] "set's own flag after --"]
+             [["set" "--edn" "--" "-k"] [nil "-k" {:edn? true}] "a flag before -- still counts"]
              [["rm" "dev" "--" "-k"] ["dev" "-k"] "a dash-leading key after --"]]]
       (testing (str (str/join " " args) ": " note)
         (is (= expected (dispatched config args)))))))
@@ -1532,11 +1537,6 @@
 ;;; issue 020 fixes is what an operator's shell would do with an interpolated
 ;;; configuration value. These tests hand the emitted text to a real /bin/sh
 ;;; and look at the argv it produces.
-
-(def ^:private stub-cat-output
-  "What the `cat` stub prints, so a recorded flyctl argument is checkable
-  without any real key material reaching an assertion."
-  "STUB-CAT-OUTPUT")
 
 (defn- posix-sh? []
   (.canExecute (io/file "/bin/sh")))
@@ -1598,12 +1598,12 @@
   [guidance]
   (into []
         (comp (map str/trim)
-              (filter #(re-find #"^(flyctl|bb secrets|printf) " %)))
+              (filter #(re-find #"^(bb secrets|printf) " %)))
         (str/split-lines guidance)))
 
 (defn- run-snippet
   "Run one emitted snippet in `dir` with `stub-dir` first on PATH, so no real
-  bb or flyctl can be reached."
+  bb can be reached."
   [snippet {:keys [dir stub-dir log]}]
   (shell/sh "/bin/sh" "-c" snippet
             :dir dir
@@ -1671,8 +1671,7 @@
                       {:secrets-file (.getPath (io/file case-dir "secrets.edn.age"))
                        :key-file key-file
                        :recipients-file (.getPath (io/file case-dir "recipients.txt"))}}})]
-        (doseq [stub ["bb" "flyctl"]] (write-stub! stub-dir stub ""))
-        (write-stub! stub-dir "cat" stub-cat-output)
+        (write-stub! stub-dir "bb" "")
         (let [guidance (str (with-out-str (cli/keygen! config nil))
                             (with-out-str (cli/add-recipient! config nil nil)))
               snippets (emitted-snippets guidance)
@@ -1680,13 +1679,10 @@
                                           :stub-dir (.getPath stub-dir)
                                           :log log})
                          snippets)]
-          (is (= 4 (count snippets)) (str label ": every snippet was emitted"))
-          (is (= [0 0 0 0] (mapv :exit runs))
+          (is (= 3 (count snippets)) (str label ": every snippet was emitted"))
+          (is (= [0 0 0] (mapv :exit runs))
               (str label ": each snippet parsed and ran"))
-          (is (= [["cat" "--" key-file]
-                  ["flyctl" "secrets" "set"
-                   (str "SECRETS_AGE_IDENTITY=" stub-cat-output)]
-                  ["bb" "secrets" "add-recipient" environment-label]
+          (is (= [["bb" "secrets" "add-recipient" environment-label]
                   ["bb" "secrets" "set" environment-label ":secret/key"]
                   ["bb" "secrets" "new" environment-label]]
                  (stub-invocations log))
@@ -1694,39 +1690,6 @@
           (is (empty? (filter #(str/starts-with? % "pwned")
                               (concat (.list run-dir) (.list case-dir))))
               (str label ": no sentinel file was created")))))))
-
-(deftest key-file-named-like-an-option-is-read-as-a-path-test
-  (if-not (posix-sh?)
-    (is true "skipped: no executable /bin/sh")
-    (doseq [[i entry-name] (map-indexed vector ["-n" "--help"])]
-      (with-cwd-entry entry-name
-        (fn [_]
-          (let [case-dir (doto (io/file *dir* (str "option-" i)) .mkdirs)
-                stub-dir (doto (io/file case-dir "stubs") .mkdirs)
-                log (.getPath (io/file case-dir "argv.log"))
-                marker "KEY-FILE-CONTENTS"
-                config (cli/normalize-config
-                        {:app "cli-test"
-                         :default-environment :dev
-                         :environments
-                         {:dev {:secrets-file (.getPath
-                                               (io/file case-dir "secrets.edn.age"))
-                                :key-file entry-name}}})
-                snippet (first (emitted-snippets
-                                (with-out-str (cli/keygen! config nil))))]
-            ;; Real cat, stub flyctl: the generated key is replaced by a marker
-            ;; because the question is only whether cat resolved a dash-leading
-            ;; name as a pathname, and no key material belongs in an assertion.
-            (spit entry-name marker)
-            (write-stub! stub-dir "flyctl" "")
-            (let [{:keys [exit]} (run-snippet snippet {:dir "."
-                                                       :stub-dir (.getPath stub-dir)
-                                                       :log log})]
-              (is (zero? exit) (str entry-name ": the snippet ran"))
-              (is (= [["flyctl" "secrets" "set"
-                       (str "SECRETS_AGE_IDENTITY=" marker)]]
-                     (stub-invocations log))
-                  (str entry-name ": cat read the file, not an option")))))))))
 
 (deftest ordinary-guidance-is-unchanged-in-substance-test
   (let [key-file (.getPath (io/file *dir* "ordinary-key.txt"))
@@ -1740,8 +1703,9 @@
                                           (io/file *dir* "ordinary-recipients.txt"))}}})
         guidance (str (with-out-str (cli/keygen! config nil))
                       (with-out-str (cli/add-recipient! config nil nil)))]
-    (is (= [(str "flyctl secrets set SECRETS_AGE_IDENTITY=\"$(cat -- '" key-file "')\"")
-            "bb secrets add-recipient 'dev'"
+    (is (not (str/includes? guidance "flyctl")) "no vendor's command is suggested")
+    (is (str/includes? guidance "A deployment takes its contents in SECRETS_AGE_IDENTITY."))
+    (is (= ["bb secrets add-recipient 'dev'"
             "printf %s \"$VALUE\" | bb secrets set 'dev' :secret/key"
             "bb secrets new 'dev'"]
            (emitted-snippets guidance))
@@ -1756,7 +1720,7 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (is (not (.exists (io/file encrypted))) "no store yet")
       (with-out-str
-        (with-in-str "s3cr3t" (cli/set-secret! config "dev" ":openrouter/api-key" false)))
+        (with-in-str "s3cr3t" (cli/set-secret! config "dev" ":openrouter/api-key")))
       (is (.exists (io/file encrypted)) "set creates the file")
       (is (= {:openrouter/api-key "s3cr3t"}
              (secrets/load-secrets encrypted *key*))))))
@@ -1768,7 +1732,7 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (encrypt-edn! {:a "old" :b "keep"})
       (with-out-str (cli/reencrypt! config "dev"))
-      (with-out-str (with-in-str "new" (cli/set-secret! config "dev" ":a" false)))
+      (with-out-str (with-in-str "new" (cli/set-secret! config "dev" ":a")))
       (is (= {:a "new" :b "keep"} (secrets/load-secrets encrypted *key*))))))
 
 (deftest set-nested-vector-path-test
@@ -1777,11 +1741,11 @@
     (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str
-        (with-in-str "acct-123" (cli/set-secret! config "dev" "[:r2 :account-id]" false)))
+        (with-in-str "acct-123" (cli/set-secret! config "dev" "[:r2 :account-id]")))
       (is (= {:r2 {:account-id "acct-123"}} (secrets/load-secrets encrypted *key*)))
       (testing "a sibling key added under the same parent leaves the first untouched"
         (with-out-str
-          (with-in-str "us-east" (cli/set-secret! config "dev" "[:r2 :region]" false)))
+          (with-in-str "us-east" (cli/set-secret! config "dev" "[:r2 :region]")))
         (is (= {:r2 {:account-id "acct-123" :region "us-east"}}
                (secrets/load-secrets encrypted *key*)))))))
 
@@ -1792,7 +1756,7 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str
         (with-in-str "#{\"a@b.com\" \"c@d.com\"}"
-          (cli/set-secret! config "dev" ":auth/admins" true)))
+          (cli/set-secret! config "dev" ":auth/admins" {:edn? true})))
       (is (= {:auth/admins #{"a@b.com" "c@d.com"}}
              (secrets/load-secrets encrypted *key*)))
       (let [m (edn/read-string (slurp (str *dir* "/secrets.edn.manifest")))]
@@ -1804,7 +1768,7 @@
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
-      (with-out-str (with-in-str "42" (cli/set-secret! config "dev" ":n" false)))
+      (with-out-str (with-in-str "42" (cli/set-secret! config "dev" ":n")))
       (is (= {:n "42"} (secrets/load-secrets encrypted *key*))
           "default (no --edn) always stores a string, regardless of stdin's shape"))))
 
@@ -1814,16 +1778,16 @@
     (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
       (testing "a single trailing \\n is stripped"
-        (with-out-str (with-in-str "secret\n" (cli/set-secret! config "dev" ":a" false)))
+        (with-out-str (with-in-str "secret\n" (cli/set-secret! config "dev" ":a")))
         (is (= "secret" (:a (secrets/load-secrets encrypted *key*)))))
       (testing "a single trailing \\r\\n is stripped"
-        (with-out-str (with-in-str "secret\r\n" (cli/set-secret! config "dev" ":b" false)))
+        (with-out-str (with-in-str "secret\r\n" (cli/set-secret! config "dev" ":b")))
         (is (= "secret" (:b (secrets/load-secrets encrypted *key*)))))
       (testing "only exactly one trailing newline is stripped — the rest is verbatim"
-        (with-out-str (with-in-str "line1\n\n" (cli/set-secret! config "dev" ":c" false)))
+        (with-out-str (with-in-str "line1\n\n" (cli/set-secret! config "dev" ":c")))
         (is (= "line1\n" (:c (secrets/load-secrets encrypted *key*)))))
       (testing "no trailing newline at all is untouched"
-        (with-out-str (with-in-str "bare" (cli/set-secret! config "dev" ":d" false)))
+        (with-out-str (with-in-str "bare" (cli/set-secret! config "dev" ":d")))
         (is (= "bare" (:d (secrets/load-secrets encrypted *key*))))))))
 
 (deftest set-refuses-a-blank-value-test
@@ -1835,14 +1799,14 @@
                     " — an unset CI variable expands to nothing")
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"(?i)nothing on stdin"
-             (with-out-str (with-in-str "" (cli/set-secret! config "dev" ":a" false)))))
+             (with-out-str (with-in-str "" (cli/set-secret! config "dev" ":a")))))
         (is (not (.exists (io/file encrypted))) "and nothing was written"))
       (testing "whitespace-only stdin fails the same way"
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"(?i)nothing on stdin"
-             (with-out-str (with-in-str "\n" (cli/set-secret! config "dev" ":a" false))))))
+             (with-out-str (with-in-str "\n" (cli/set-secret! config "dev" ":a"))))))
       (testing "--edn is the escape hatch for a deliberately empty value"
-        (with-out-str (with-in-str "\"\"" (cli/set-secret! config "dev" ":a" true)))
+        (with-out-str (with-in-str "\"\"" (cli/set-secret! config "dev" ":a" {:edn? true})))
         (is (= {:a ""} (secrets/load-secrets encrypted *key*)))))))
 
 (deftest set-prompts-on-a-terminal-test
@@ -1862,24 +1826,24 @@
         (reset! typed "typed-secret")
         (with-out-str
           (with-in-str "piped-and-ignored"
-            (at-terminal #(cli/set-secret! config "dev" ":api/key" false))))
+            (at-terminal #(cli/set-secret! config "dev" ":api/key"))))
         (is (= {:api/key "typed-secret"} (stored)))
         (is (= 1 (count @prompts)))
         (is (str/includes? (first @prompts) ":api/key") "the prompt names the key"))
       (testing "--edn parses the typed line"
         (reset! typed "#{\"a@b.com\"}")
-        (with-out-str (at-terminal #(cli/set-secret! config "dev" ":auth/admins" true)))
+        (with-out-str (at-terminal #(cli/set-secret! config "dev" ":auth/admins" {:edn? true})))
         (is (= #{"a@b.com"} (:auth/admins (stored)))))
       (testing "a blank line is refused like blank stdin"
         (reset! typed "")
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"(?i)nothing entered"
-             (with-out-str (at-terminal #(cli/set-secret! config "dev" ":blank" false))))))
+             (with-out-str (at-terminal #(cli/set-secret! config "dev" ":blank"))))))
       (testing "end of input at the prompt is refused the same way"
         (reset! typed nil)
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"(?i)nothing entered"
-             (with-out-str (at-terminal #(cli/set-secret! config "dev" ":eof" false))))))
+             (with-out-str (at-terminal #(cli/set-secret! config "dev" ":eof"))))))
       (is (= {:api/key "typed-secret" :auth/admins #{"a@b.com"}} (stored))
           "refused values left the store untouched"))))
 
@@ -1888,8 +1852,8 @@
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))
           encrypted (str *dir* "/secrets.edn.age")]
-      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:a :b]" false)))
-      (with-out-str (with-in-str "w" (cli/set-secret! config "dev" ":c" false)))
+      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:a :b]")))
+      (with-out-str (with-in-str "w" (cli/set-secret! config "dev" ":c")))
       (let [plaintext ((cli-private 'user-plaintext) (age/decrypt *key* encrypted))]
         (is (= {:a {:b "v"} :c "w"} (edn/read-string plaintext)))
         (is (= "{:a {:b \"v\"}, :c \"w\"}\n" plaintext)
@@ -1898,13 +1862,13 @@
             "the regenerated store is pretty-printed, so the next `edit` is readable"))
       (testing "print limits set in a REPL cannot truncate the store"
         (binding [*print-length* 1 *print-level* 1]
-          (with-out-str (with-in-str "x" (cli/set-secret! config "dev" ":d" false))))
+          (with-out-str (with-in-str "x" (cli/set-secret! config "dev" ":d"))))
         (is (= {:a {:b "v"} :c "w" :d "x"}
                (secrets/load-secrets encrypted *key*)))))))
 
 (deftest set-refreshes-the-manifest-so-verify-passes-test
   (let [config (cli/normalize-config (test-config))]
-    (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k" false)))
+    (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":k")))
     (let [{:keys [results exit]} (verify config "dev")]
       (is (= 0 exit))
       (is (= :ok (:dev results))))))
@@ -1955,20 +1919,20 @@
     (testing "neither a keyword nor a vector"
       (doseq [bad ["not-a-keyword" "42" "{}" "\"a string\"" "nil"]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
-                              (with-out-str (cli/set-secret! config "dev" bad false)))
+                              (with-out-str (cli/set-secret! config "dev" bad)))
             bad)))
     (testing "an empty vector"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
-                            (with-out-str (cli/set-secret! config "dev" "[]" false)))))
+                            (with-out-str (cli/set-secret! config "dev" "[]")))))
     (testing "a vector of non-keyword/string elements"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
-                            (with-out-str (cli/set-secret! config "dev" "[1 2]" false)))))
+                            (with-out-str (cli/set-secret! config "dev" "[1 2]")))))
     (testing "malformed EDN"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
-                            (with-out-str (cli/set-secret! config "dev" "[:unfinished" false)))))
+                            (with-out-str (cli/set-secret! config "dev" "[:unfinished")))))
     (testing "a missing key argument"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing key"
-                            (with-out-str (cli/set-secret! config "dev" nil false)))))
+                            (with-out-str (cli/set-secret! config "dev" nil)))))
     (testing "the same validation applies to rm"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid key"
                             (with-out-str (cli/remove-secret! config "dev" "42")))))))
@@ -2046,7 +2010,7 @@
         (is (not (str/includes? initial-out "reencrypt"))))
       (let [set-out (with-out-str
                       (with-in-str secret-value
-                        (cli/set-secret! config "dev" ":service/token" false)))
+                        (cli/set-secret! config "dev" ":service/token")))
             bob-public (age/keygen! bob-key)
             teammate-added (atom nil)
             teammate-out (with-out-str
@@ -2227,7 +2191,7 @@
   "Run `set` (the shortest command that encrypts) with its chatter captured."
   [config]
   (with-out-str
-    (with-in-str "snapshot-value" (cli/set-secret! config "dev" ":a" false))))
+    (with-in-str "snapshot-value" (cli/set-secret! config "dev" ":a"))))
 
 (deftest recipients-are-snapshotted-before-the-editor-test
   (if (age-env-set?)
@@ -2397,12 +2361,12 @@
               "the fixture is at the bound in bytes, not characters")
           (with-out-str
             (with-in-str exact-stdin
-              (bounded stdin-limit #(cli/set-secret! config "dev" ":n" true))))
+              (bounded stdin-limit #(cli/set-secret! config "dev" ":n" {:edn? true}))))
           (is (= "é" (:n (secrets/load-secrets ciphertext *key*))))
           (let [e (try
                     (with-out-str
                       (with-in-str (str exact-stdin " ")
-                        (bounded stdin-limit #(cli/set-secret! config "dev" ":n" true))))
+                        (bounded stdin-limit #(cli/set-secret! config "dev" ":n" {:edn? true}))))
                     (catch clojure.lang.ExceptionInfo e e))]
             (is (= {:reason :input-too-large :limit stdin-limit :observed (inc stdin-limit)}
                    (select-keys (ex-data e) [:reason :limit :observed])))))))))
@@ -2417,7 +2381,7 @@
           before (file-bytes ciphertext)
           bounded (fn [n f] (with-bound #'source/max-source-bytes n f))
           commands [["edit" #(edit-store! config "dev" identity)]
-                    ["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b" false))]
+                    ["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b"))]
                     ["rm" #(cli/remove-secret! config "dev" ":a")]
                     ["reencrypt" #(cli/reencrypt! config "dev")]]]
       (testing "the bound is the one load-secrets applies: 16 MiB"
@@ -2478,7 +2442,7 @@
                     :prod {:secrets-file (str *dir* "/prod.edn.age") :key-file *key*}}})
           big-manifest (str *dir* "/dev.edn.manifest")]
       (doseq [env ["dev" "prod"]]
-        (with-out-str (with-in-str "v" (cli/set-secret! config env ":k" false))))
+        (with-out-str (with-in-str "v" (cli/set-secret! config env ":k"))))
       (spit big-manifest (str (slurp big-manifest) (apply str (repeat 4096 " "))))
       (let [{:keys [result err]}
             (with-bound (cli-private 'max-manifest-bytes) 4096
@@ -2699,7 +2663,7 @@
                                      :key-file key-file}}}]
     (doseq [[label command]
             [["keygen" #(cli/keygen! (normalize-without-env-identity config) "dev")]
-             ["set" #(cli/set-secret! (normalize-without-env-identity config) "dev" ":a" false)]]]
+             ["set" #(cli/set-secret! (normalize-without-env-identity config) "dev" ":a")]]]
       (testing label
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"name the same file"
                               (with-out-str (with-in-str "value\n" (command)))))
@@ -2719,7 +2683,7 @@
     (with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" other}
       #(is (thrown-with-msg? clojure.lang.ExceptionInfo #"name the same file"
                              (with-in-str "value"
-                               (cli/set-secret! config "dev" ":test" false)))))
+                               (cli/set-secret! config "dev" ":test")))))
     (is (= identity (slurp other)))
     (is (not (.exists (io/file (str *dir* "/secrets.edn.age")))))))
 
@@ -2911,7 +2875,7 @@
      :bob (cli/normalize-config (test-config {:recipients-file recipients :key-file bob-key}))}))
 
 (defn- set-value! [config k v]
-  (with-out-str (with-in-str v (cli/set-secret! config "dev" k false))))
+  (with-out-str (with-in-str v (cli/set-secret! config "dev" k))))
 
 (defn- vhash-of
   "The `:vhash` `manifest-key` gives `value`."
@@ -3128,7 +3092,7 @@
           (doseq [reserved [:com.kirahowe.secrets/store]
                   path [(pr-str reserved) (pr-str [reserved]) (pr-str [reserved :x])]
                   [label command] [["set" #(with-in-str "chosen-by-the-user"
-                                             (cli/set-secret! config "dev" path false))]
+                                             (cli/set-secret! config "dev" path))]
                                    ["rm" #(cli/remove-secret! config "dev" path)]]]
             (testing (str label " " path)
               (let [e (failure command)]
@@ -3215,7 +3179,7 @@
           (let [bytes-before (file-bytes ciphertext)
                 manifest-before (slurp manifest-path)]
             (doseq [[command run]
-                    [["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b" false))]
+                    [["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b"))]
                      ["rm" #(cli/remove-secret! config "dev" ":a")]
                      ["edit" #(with-redefs-fn {(cli-private 'run-editor!)
                                                (fn [path] (spit path "{:a 2}"))}
@@ -3266,7 +3230,7 @@
       (with-out-str (cli/reencrypt! config "dev"))
       (encrypt-text! "[\"planted-value\" 2]")
       (doseq [[command run]
-              [["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b" false))]
+              [["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b"))]
                ["rm" #(cli/remove-secret! config "dev" ":a")]
                ["edit" #(with-redefs-fn {(cli-private 'run-editor!) (fn [_])}
                           (fn [] (cli/edit! config "dev")))]]]
@@ -3316,7 +3280,7 @@
                  ["edit" #(with-redefs-fn {(cli-private 'run-editor!)
                                            (fn [path] (spit path "{:e 1}"))}
                             (fn [] (cli/edit! config "dev")))]
-                 ["set" #(with-in-str "v" (cli/set-secret! config "dev" ":s" false))]
+                 ["set" #(with-in-str "v" (cli/set-secret! config "dev" ":s"))]
                  ["rm" #(cli/remove-secret! config "dev" ":a")]
                  ["reencrypt" #(cli/reencrypt! config "dev")]]]
           (testing label
@@ -3348,7 +3312,7 @@
       (age/keygen! other-key)
       (doseq [n ["good" "fine" "wrong-key"]]
         (with-out-str
-          (with-in-str "v" (cli/set-secret! (config {(keyword n) (env n *key*)}) n ":k" false))))
+          (with-in-str "v" (cli/set-secret! (config {(keyword n) (env n *key*)}) n ":k"))))
       (testing "each failing environment is reported and the others are verified"
         (let [{:keys [result out err]} (capture-verify all nil)]
           (is (= {:good :ok :fine :ok :no-identity :error :wrong-key :error} (:results result)))
@@ -3385,7 +3349,7 @@
                   {:app "cli-test" :environments {:good (env "good") :broken (env "broken")}})
           manifest-path (str *dir* "/broken.edn.manifest")]
       (doseq [n ["good" "broken"]]
-        (with-out-str (with-in-str "v" (cli/set-secret! config n ":k" false))))
+        (with-out-str (with-in-str "v" (cli/set-secret! config n ":k"))))
       (.delete (io/file manifest-path))
       (.mkdir (io/file manifest-path))
       (try
@@ -3422,7 +3386,7 @@
                  ["[:nothing :x]" "[:nothing]" "nil"]
                  ["[:deep :leaf :x :y]" "[:deep :leaf]" "integer"]]
                 [command run]
-                [["set" #(with-in-str "v" (cli/set-secret! config "dev" path false))]
+                [["set" #(with-in-str "v" (cli/set-secret! config "dev" path))]
                  ["rm" #(cli/remove-secret! config "dev" path)]]]
           (testing (str command " " path)
             (let [e (failure run)]
@@ -3433,8 +3397,8 @@
                                       "PLANTED-value")))
               (is (= bytes-before (file-bytes ciphertext))))))
         (testing "a path through maps, or into nothing yet, still works"
-          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:deep :more :y]" false)))
-          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:new :a :b]" false)))
+          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:deep :more :y]")))
+          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:new :a :b]")))
           (with-out-str (cli/remove-secret! config "dev" "[:deep :more :x]"))
           (is (= {:leaf 1 :more {:y "v"}} (:deep (secrets/load-secrets ciphertext *key*))))
           (is (= {:a {:b "v"}} (:new (secrets/load-secrets ciphertext *key*)))))))))
@@ -3505,7 +3469,7 @@
       (doseq [n ["ok" "drift" "wrong-key" "no-manifest" "unreadable" "designated"]]
         (with-out-str
           (with-in-str "v"
-            (cli/set-secret! (cli/normalize-config (config {(keyword n) (env n)})) n ":k" false))))
+            (cli/set-secret! (cli/normalize-config (config {(keyword n) (env n)})) n ":k"))))
       (spit (str *dir* "/drift.edn.manifest") "{:version 3}")
       (.delete (io/file (str *dir* "/no-manifest.edn.manifest")))
       (testing "verify, with the environment named and with no argument"
@@ -3557,9 +3521,9 @@
       (is (= :no-file (reason-of #(cli/reencrypt! config "dev"))))
       (is (= :no-recipients (reason-of #(cli/add-recipient! config "dev" nil))))
       (is (= :blank-value
-             (reason-of #(with-in-str "" (cli/set-secret! config "dev" ":a" false)))))
-      (is (= :usage (reason-of #(with-in-str "v" (cli/set-secret! config "dev" "42" false)))))
-      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":a" false)))
+             (reason-of #(with-in-str "" (cli/set-secret! config "dev" ":a")))))
+      (is (= :usage (reason-of #(with-in-str "v" (cli/set-secret! config "dev" "42")))))
+      (with-out-str (with-in-str "v" (cli/set-secret! config "dev" ":a")))
       (is (= :no-such-key (reason-of #(cli/remove-secret! config "dev" ":absent"))))
       (testing "a store the configured key cannot decrypt"
         (let [other-key (str *dir* "/other-key.txt")]
@@ -3678,3 +3642,54 @@
       (when finished?
         (is (zero? (.exitValue process)))
         (is (< (- (System/currentTimeMillis) started) 45000))))))
+
+;;;; set and the terminal
+
+(deftest set-refuses-a-terminal-it-cannot-hide-test
+  (let [config (cli/normalize-config (test-config))
+        prompted? (atom false)
+        captured (with-redefs-fn {(cli-private 'tty?) (fn ([] false) ([_stdin] true))
+                                  (cli-private 'prompt-hidden!) (fn [_]
+                                                                  (reset! prompted? true)
+                                                                  "x")}
+                   #(capture-failure
+                     (fn [] (with-in-str "typed-at-the-terminal"
+                              (cli/set-secret! config "dev" ":k")))))]
+    (testing "stdin is a terminal and stdout is not: the typed value would echo"
+      (is (= :usage (get-in captured [:failure :data :reason])))
+      (is (= "stdout is redirected; run `set` without redirecting it, or pipe the value in."
+             (get-in captured [:failure :message])))
+      (is (not @prompted?) "no prompt was shown")
+      (is (not (.exists (io/file *dir* "secrets.edn.age"))) "and nothing was read or stored"))
+    (testing "the help says when the prompt is used"
+      (is (str/includes? (help-text ["set" "--help"])
+                         "The prompt needs stdin and stdout both to be terminals")))))
+
+;;;; add-recipient with one argument
+
+(deftest add-recipient-with-one-argument-test
+  (let [recipients (str *dir* "/recipients.txt")
+        config (test-config {:recipients-file recipients})
+        other (age/keygen! (str *dir* "/other-key.txt"))]
+    (testing "a public key goes to the default environment"
+      (with-out-str (cli/run! config ["add-recipient" other]))
+      (is (= (str other "\n") (slurp recipients))))
+    (testing "anything else is the environment, whose own key is added"
+      (with-out-str (cli/run! config ["add-recipient" "dev"]))
+      (is (= (str other "\n" (age/public-key *key*) "\n") (slurp recipients))))
+    (testing "an argument that is neither is an unknown environment"
+      (let [captured (capture-failure
+                      #((cli-private 'dispatch!) config ["add-recipient" "age1nope"]))]
+        (is (= :usage (get-in captured [:failure :data :reason])))
+        (is (str/includes? (get-in captured [:failure :message]) "Unknown environment."))))
+    (testing "the help states the rule"
+      (is (str/includes? (help-text ["add-recipient" "--help"])
+                         "a public key goes to the default environment")))))
+
+;;;; Command names
+
+(deftest command-names-are-case-sensitive-test
+  (doseq [args [["KEYGEN" "dev"] ["Verify"] ["help" "SET"]]]
+    (let [captured (capture-failure #((cli-private 'dispatch!) (test-config) args))]
+      (is (= :usage (get-in captured [:failure :data :reason])) (pr-str args))
+      (is (str/includes? (str (get-in captured [:failure :message])) "Unknown command.")))))
