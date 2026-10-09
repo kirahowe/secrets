@@ -360,8 +360,8 @@
                         allowed local source cannot be read.
     :disallowed-source  `source` is outside the local-only provenance contract.
   Fixed bounds catch an accidental huge or deeply nested input: a source past
-  16 MiB throws `:source-too-large`, plaintext past 8 MiB throws
-  `:plaintext-too-large`, and EDN nested past 100 collections throws
+  16 MiB throws `:source-too-large`, which bounds the plaintext too because
+  age does not compress, and EDN nested past 100 collections throws
   `:edn-too-deep`. Each carries the numeric `:limit`. The identity is resolved
   first, then source policy and opening. The plaintext is read with
   `clojure.edn`, not `eval`.

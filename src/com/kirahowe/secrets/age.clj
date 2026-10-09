@@ -164,113 +164,35 @@
                         {:reason :encrypt-failed :out (str out) :error err})))
       out)))
 
-(def max-plaintext-bytes
-  "The most plaintext bytes one decryption may produce (8 MiB). It catches an
-  accidental huge input, such as the wrong file, while `age` is still writing.
-  The CLI refuses to write a store past the same bound, so every store it
-  writes can be read back."
-  8388608)
-
-(def ^:private capture-chunk-bytes
-  "Plaintext is drained in fixed 64 KiB chunks so the running total is checked
-  before every further read."
-  65536)
-
-(defn- destroy-process!
-  "Terminate `process`, escalating to a forcible kill when it does not exit
-  within a short bounded wait. A process still writing plaintext nobody will
-  read has to stop, not linger."
-  [^java.lang.Process process]
-  (.destroy process)
-  (when-not (.waitFor process 2 java.util.concurrent.TimeUnit/SECONDS)
-    (.destroyForcibly process)
-    (.waitFor process 2 java.util.concurrent.TimeUnit/SECONDS))
-  nil)
-
-(defn- stream-bounded-stdout!
-  "Run `argv`, copying its stdout to `out`, and return `{:exit n :err s}`.
-
-  At most `max-plaintext-bytes` are written. Each read asks for no more than
-  one byte past the bound, and the read that crosses it throws `ex-info` with
-  `:reason :plaintext-too-large`, `context`, the numeric `:limit` and
-  `:observed`, and never a captured byte. The process is destroyed on the way out if it is
-  still running. stderr is drained on its own thread, because a process that
-  fills an unread stderr pipe blocks forever."
-  [argv ^java.io.OutputStream out context]
-  (let [process (.start (java.lang.ProcessBuilder. ^java.util.List (vec argv)))
-        stderr (future (slurp (.getErrorStream process)))
-        chunk (byte-array capture-chunk-bytes)]
-    (try
-      ;; Nothing here writes to the child, so it gets EOF on stdin at once and
-      ;; cannot block on a pipe no one will fill.
-      (.close (.getOutputStream process))
-      (with-open [stdout (.getInputStream process)]
-        (loop [total 0]
-          (let [max-bytes max-plaintext-bytes
-                remaining (- max-bytes total)
-                requested (int (if (< remaining capture-chunk-bytes)
-                                 (inc remaining)
-                                 capture-chunk-bytes))
-                n (.read stdout chunk 0 requested)]
-            (when-not (neg? n)
-              (let [observed (+ total n)]
-                (when (> observed max-bytes)
-                  (throw (ex-info (str "The decrypted plaintext of "
-                                       (:encrypted-file context) " is larger than the "
-                                       max-bytes " byte limit.")
-                                  (assoc context
-                                         :observed observed
-                                         :limit max-bytes
-                                         :reason :plaintext-too-large))))
-                (.write out chunk 0 n)
-                (recur observed))))))
-      {:exit (.waitFor process) :err @stderr}
-      (finally
-        (when (.isAlive process)
-          (destroy-process! process))))))
-
-(defn- decrypt-argv
-  "Build the `age -d` argv decrypting `encrypted-file` with `identity-file`.
-  Both paths go through `path-arg` and `--` sits immediately before the
-  positional input, so no path can be read as an option or as stdin."
-  [identity-file encrypted-file]
-  ["age" "-d" "-i" (path-arg :identity identity-file)
-   "--" (path-arg :input encrypted-file)])
-
-(defn- decrypt-bytes
+(defn decrypt
   "Decrypt `encrypted-file` with `identity-file` and return the plaintext as a
-  byte array. The plaintext is binary safe and is held in memory only.
+  UTF-8 string, held in memory only.
 
   Success establishes that the ciphertext is intact and that `identity-file`
   matches one of its recipients. It does not identify who encrypted it: age
   does not sign, so this is payload integrity, never sender authenticity.
 
-  Plaintext is copied in fixed-size chunks. The chunk that would cross
-  [[max-plaintext-bytes]] kills `age` and throws with
-  `:reason :plaintext-too-large`.
+  age does not compress, so the plaintext is smaller than the ciphertext. The
+  caller bounds the ciphertext's size before calling, and that bounds what is
+  read here.
 
-  A failure names `:encrypted-file` and `:identity-file`, which are filesystem
-  paths and never key contents. A non-zero exit also carries the captured
-  stderr and a wrong-key `:hint`. A failed decryption returns no partial
-  plaintext."
-  ^bytes [identity-file encrypted-file]
-  (let [argv (decrypt-argv identity-file encrypted-file)
-        context {:encrypted-file (str encrypted-file)
-                 :identity-file (str identity-file)}
-        out (java.io.ByteArrayOutputStream.)]
+  Both paths go through `path-arg` and `--` sits immediately before the input,
+  so no path can be read as an option or as stdin. A failure names
+  `:encrypted-file` and `:identity-file`, which are filesystem paths and never
+  key contents, and carries the captured stderr and a wrong-key `:hint`. A
+  failed decryption returns no partial plaintext."
+  [identity-file encrypted-file]
+  (let [argv ["age" "-d" "-i" (path-arg :identity identity-file)
+              "--" (path-arg :input encrypted-file)]]
+    ;; Local argument validation first: probing the environment must not be
+    ;; able to mask a path that never named a file.
     (ensure-installed!)
-    (let [{:keys [exit err]} (stream-bounded-stdout! argv out context)]
+    (let [{:keys [exit out err]} (apply shell/sh argv)]
       (when-not (zero? exit)
         (throw (ex-info "age decryption failed"
-                        (assoc context
-                               :reason :decrypt-failed
-                               :error err
-                               :hint (str "Wrong key, or you are not a recipient of "
-                                          "this file.")))))
-      (.toByteArray out))))
-
-(defn decrypt
-  "Decrypt `encrypted-file` with `identity-file`; return the plaintext as a
-  UTF-8 string. The plaintext bound and failures are those of `decrypt-bytes`."
-  [identity-file encrypted-file]
-  (String. (decrypt-bytes identity-file encrypted-file) "UTF-8"))
+                        {:reason :decrypt-failed
+                         :encrypted-file (str encrypted-file)
+                         :identity-file (str identity-file)
+                         :error err
+                         :hint "Wrong key, or you are not a recipient of this file."})))
+      out)))

@@ -17,6 +17,7 @@
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.manifest :as manifest]
+            [com.kirahowe.secrets.source :as source]
             [com.kirahowe.secrets.test-env :as test-env]))
 
 (def ^:private ^:dynamic *dir* nil)
@@ -2361,7 +2362,7 @@
           limit (+ (count exact-plaintext)
                    (count ((cli-private 'metadata-line)
                            manifest-key (manifest/recipients-id nil))))
-          bounded (fn [n f] (with-bound #'age/max-plaintext-bytes n f))
+          bounded (fn [n f] (with-bound (cli-private 'max-plaintext-bytes) n f))
           config (cli/normalize-config (test-config {:manifest false}))
           env (get-in config [:environments :dev])
           write-secrets! (fn [text]
@@ -2400,6 +2401,42 @@
                     (catch clojure.lang.ExceptionInfo e e))]
             (is (= {:reason :input-too-large :limit stdin-limit :observed (inc stdin-limit)}
                    (select-keys (ex-data e) [:reason :limit :observed])))))))))
+
+(deftest a-ciphertext-past-the-bound-is-refused-before-age-reads-it-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (get-in config [:environments :dev :secrets-file])
+          _ (new-store! config "dev" "{:a 1}")
+          size (.length (io/file ciphertext))
+          before (file-bytes ciphertext)
+          bounded (fn [n f] (with-bound #'source/max-source-bytes n f))
+          commands [["edit" #(edit-store! config "dev" identity)]
+                    ["set" #(with-in-str "v" (cli/set-secret! config "dev" ":b" false))]
+                    ["rm" #(cli/remove-secret! config "dev" ":a")]
+                    ["reencrypt" #(cli/reencrypt! config "dev")]]]
+      (testing "the bound is the one load-secrets applies: 16 MiB"
+        (is (= 16777216 source/max-source-bytes)))
+      (testing "a ciphertext exactly at the bound is read"
+        (is (= {:results {:dev :ok} :exit 0} (bounded size #(verify config "dev")))))
+      (doseq [[label command] commands]
+        (testing (str label " refuses one byte over, and no age process decrypts")
+          (let [argvs (recorded-sh-argvs #(bounded (dec size) command))
+                {:keys [failure]} (capture-failure #(bounded (dec size) command))]
+            (is (not-any? #(= ["age" "-d"] (take 2 %)) argvs))
+            (is (= {:reason :input-too-large
+                    :limit (dec size)
+                    :observed size
+                    :secrets-file ciphertext}
+                   (:data failure)))
+            (is (str/includes? (str (:message failure))
+                               (str "The secrets file " ciphertext " is larger than the "
+                                    (dec size) " byte limit.")))
+            (is (= before (file-bytes ciphertext))))))
+      (testing "verify reports it as that environment's drift"
+        (let [{:keys [result err]} (bounded (dec size) #(capture-verify config "dev"))]
+          (is (= {:results {:dev :drift} :exit 1} result))
+          (is (str/includes? err "is larger than the")))))))
 
 (deftest manifest-byte-bound-test
   (let [manifest-file (str *dir* "/bounded.manifest")

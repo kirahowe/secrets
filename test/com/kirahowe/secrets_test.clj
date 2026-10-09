@@ -198,7 +198,7 @@
         (with-cwd-entry entry-name
           (fn [ct]
             (io/copy (io/file enc) ct)
-            (let [plaintext (String. (#'age/decrypt-bytes *key* (str ct)) "UTF-8")]
+            (let [plaintext (age/decrypt *key* (str ct))]
               (is (= payload plaintext) "the authenticated plaintext is returned")
               (is (seq plaintext) "age's empty option output is never plaintext")
               (is (not (re-find #"^v?\d+\.\d+\.\d+" plaintext))
@@ -288,16 +288,8 @@
                        (first @calls))
         decrypt-argv (fn [identity-file in]
                        (reset! calls [])
-                       ;; `sh` cannot bound the plaintext it captures, so
-                       ;; decryption runs at the bounded-stream seam and the
-                       ;; argv is recorded there. `sh` answers only the
-                       ;; `age --version` probe.
-                       (with-redefs [shell/sh (recording {:exit 0 :out (byte-array 0) :err ""})
-                                     age/stream-bounded-stdout!
-                                     (fn [argv & _]
-                                       (swap! calls conj (vec argv))
-                                       {:exit 0 :err ""})]
-                         (#'age/decrypt-bytes identity-file in))
+                       (with-redefs [shell/sh (recording {:exit 0 :out "" :err ""})]
+                         (age/decrypt identity-file in))
                        (first @calls))]
     (testing "the encrypt terminator sits immediately before the input operand"
       (let [argv (encrypt-argv "key.txt" "-in.edn" "out.age")]
@@ -331,7 +323,7 @@
     (testing "a blank or nil decrypt input is refused, never taken as stdin"
       (doseq [in ["" "   " nil]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (#'age/decrypt-bytes *key* in))
+                              (age/decrypt *key* in))
             (str "input " (pr-str in) " names no file"))))
     (testing "a blank identity file is refused on both paths"
       (let [out (str *dir* "/blank-identity.age")]
@@ -339,7 +331,7 @@
                               (age/encrypt-file! "" plain out)))
         (is (not (.exists (io/file out))) "nothing is written for a blank identity")
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (#'age/decrypt-bytes "" enc)))))
+                              (age/decrypt "" enc)))))
     (testing "a blank output, a blank recipients file and a nil identity fail closed"
       (let [out (str *dir* "/blank-role.age")]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
@@ -376,16 +368,13 @@
          ["whitespace encrypt output" #(age/encrypt-file! "key" "plain" "   ")]
          ["nil encrypt input" #(age/encrypt-file! "key" nil "out")]
          ["whitespace encrypt input" #(age/encrypt-file! "key" "   " "out")]
-         ["nil decrypt identity" #(#'age/decrypt-bytes nil "cipher")]
-         ["whitespace decrypt identity" #(#'age/decrypt-bytes "   " "cipher")]
-         ["nil decrypt input" #(#'age/decrypt-bytes "key" nil)]
-         ["whitespace decrypt input" #(#'age/decrypt-bytes "key" "   ")]]]
+         ["nil decrypt identity" #(age/decrypt nil "cipher")]
+         ["whitespace decrypt identity" #(age/decrypt "   " "cipher")]
+         ["nil decrypt input" #(age/decrypt "key" nil)]
+         ["whitespace decrypt input" #(age/decrypt "key" "   ")]]]
     (with-redefs [shell/sh (fn [& _]
                              (swap! shell-calls inc)
-                             (throw (ex-info "subprocess ran" {})))
-                  age/stream-bounded-stdout! (fn [& _]
-                                               (swap! shell-calls inc)
-                                               (throw (ex-info "subprocess ran" {})))]
+                             (throw (ex-info "subprocess ran" {})))]
       (doseq [[label invoke] invalid-calls]
         (reset! shell-calls 0)
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank" (invoke)) label)
@@ -994,15 +983,6 @@
                               plain
                               (str *dir* "/x.age")))))))
 
-(deftest binary-roundtrip-test
-  (testing "decrypt-bytes preserves binary plaintext exactly"
-    (let [payload (byte-array (mapv unchecked-byte [0 1 2 255 254 10 13]))
-          plain (io/file *dir* "bin.dat")
-          enc (str *dir* "/bin.dat.age")]
-      (io/copy payload plain)
-      (age/encrypt-file! *key* plain enc)
-      (is (java.util.Arrays/equals payload (#'age/decrypt-bytes *key* enc))))))
-
 ;;;; Atomic moves
 
 (deftest atomic-move-replaces-the-target-entry-test
@@ -1184,66 +1164,18 @@
             :source {:kind :object :class "java.io.ByteArrayInputStream"}}
            (ex-data e)))))
 
-(deftest plaintext-size-boundary-test
-  (let [limit 4096
-        bounded (fn [f] (with-bound #'age/max-plaintext-bytes limit f))
-        exact (encrypt-sized! limit "plaintext-exact")
-        over (encrypt-sized! (inc limit) "plaintext-over")]
-    (testing "the bound is 8 MiB"
-      (is (= 8388608 age/max-plaintext-bytes)))
-    (testing "a plaintext exactly at the bound decrypts and loads"
-      (is (= limit (alength (bounded #(#'age/decrypt-bytes *key* exact)))))
-      (is (string? (:pad (bounded #(secrets/load-secrets exact {:identity-file *key*}))))))
-    (testing "one byte over is refused without disclosing any plaintext"
-      (let [e (bounded #(try (#'age/decrypt-bytes *key* over)
-                             (catch clojure.lang.ExceptionInfo e e)))
-            data (ex-data e)]
-        (is (= {:reason :plaintext-too-large
-                :limit limit
-                :observed (inc limit)
-                :encrypted-file over
-                :identity-file *key*}
-               data)
-            "one shape: the reason, the bound, the bytes read, and the paths")
-        (is (str/includes? (ex-message e) over) "the message names the file")
-        (is (not (re-find #"aaa" (ex-message e))) "the message carries no plaintext")
-        (is (not (re-find #"aaa" (pr-str data))) "and neither does the ex-data")))
-    (testing "load-secrets refuses it for the same reason"
-      (is (= :plaintext-too-large
-             (:reason (ex-data (bounded #(try (secrets/load-secrets over {:identity-file *key*})
-                                              (catch clojure.lang.ExceptionInfo e e))))))))))
-
-(deftest oversized-plaintext-terminates-the-subprocess-test
-  ;; A controlled process standing in for age: it emits forever and ignores
-  ;; SIGPIPE, so closing its stdout does not end it and only an explicit
-  ;; destroy can. It publishes its own pid, and `kill -0` answers for it
-  ;; afterwards. The call runs under a timeout so a bound that stops working
-  ;; fails the test and does not hang it.
-  (let [pid-file (str *dir* "/emitter.pid")
-        script (str "trap '' PIPE; echo $$ > " pid-file
-                    "; while :; do printf 'AAAAAAAAAAAAAAAA' 2>/dev/null; done")
-        limit 4096
-        out (java.io.ByteArrayOutputStream.)
-        call (future
-               (with-bound #'age/max-plaintext-bytes limit
-                 #(try (#'age/stream-bounded-stdout! ["/bin/sh" "-c" script] out {})
-                       (catch clojure.lang.ExceptionInfo e e))))
-        e (deref call 15000 :timed-out)
-        pid (str/trim (slurp pid-file))
-        alive? (fn [] (zero? (:exit (shell/sh "kill" "-0" pid))))]
-    (try
-      (is (not= :timed-out e) "the capture returns promptly and does not read forever")
-      (is (= :plaintext-too-large (:reason (ex-data e))))
-      (is (= (inc limit) (:observed (ex-data e)))
-          "nothing beyond one byte past the bound was ever read")
-      (is (<= (.size out) limit) "and nothing past the bound was written")
-      (is (not (re-find #"AAA" (str (ex-message e) (pr-str (ex-data e)))))
-          "no captured output reaches the failure")
-      (is (not (alive?))
-          "the emitter is gone: it was destroyed, not left writing to a closed pipe")
-      (finally
-        (future-cancel call)
-        (when (alive?) (shell/sh "kill" "-9" pid))))))
+(deftest a-source-bound-bounds-the-plaintext-test
+  ;; age does not compress, so a ciphertext is always larger than its
+  ;; plaintext and the source bound is the plaintext bound too.
+  (doseq [n [1 4096 70000]]
+    (let [enc (encrypt-sized! n (str "sized-" n))
+          size (.length (io/file enc))]
+      (is (< n size) (str n " plaintext bytes encrypt to more bytes"))
+      (is (= :source-too-large
+             (:reason (ex-data (with-bound #'source/max-source-bytes n
+                                 #(try (secrets/load-secrets enc {:identity-file *key*})
+                                       (catch clojure.lang.ExceptionInfo e e))))))
+          "a plaintext past the bound cannot arrive in a ciphertext within it"))))
 
 (deftest edn-depth-scan-test
   (let [depth #(#'safe-edn/nesting-depth %)
@@ -1347,8 +1279,7 @@
     (testing "a :limits option changes nothing: the bounds are fixed"
       (is (= {:k "v"}
              (secrets/load-secrets enc {:identity-file *key*
-                                        :limits {:max-plaintext-bytes 1
-                                                 :max-source-bytes 1
+                                        :limits {:max-source-bytes 1
                                                  :max-edn-depth 0}})))
       (is (= "v"
              (edn/read-string
@@ -1360,7 +1291,6 @@
       (doseq [[ns-sym var-sym] [['com.kirahowe.secrets 'default-limits]
                                 ['com.kirahowe.secrets 'resolve-limits]
                                 ['com.kirahowe.secrets.age 'resolve-limits]
-                                ['com.kirahowe.secrets.age 'default-max-plaintext-bytes]
                                 ['com.kirahowe.secrets.safe-edn 'default-max-depth]]]
         (is (nil? (ns-resolve ns-sym var-sym)) (str ns-sym "/" var-sym))))))
 
@@ -1920,14 +1850,13 @@
   (let [wrong-key (str *dir* "/wrong-key.txt")
         enc (encrypt-edn! {:pad (apply str (repeat 2048 \a))})]
     (age/keygen! wrong-key)
-    (doseq [[key bound reason] [[wrong-key age/max-plaintext-bytes nil]
-                                [*key* 16 :plaintext-too-large]]]
+    (doseq [[key bound reason] [[wrong-key source/max-source-bytes nil]]]
       (let [contents (slurp key)
             secret-line (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
                                        (str/split-lines contents)))
             failure (with-redefs-fn
                       (assoc (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-                             #'age/max-plaintext-bytes bound)
+                             #'source/max-source-bytes bound)
                       (fn [] (load-failure enc nil)))
             data (ex-data failure)
             path (:identity-file data)]

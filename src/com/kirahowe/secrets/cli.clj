@@ -272,6 +272,13 @@
   accidental huge input, such as a path that names the wrong file."
   262144)
 
+(def ^:private max-plaintext-bytes
+  "The most plaintext bytes a store the CLI writes may hold (8 MiB). It catches
+  an accidental huge input, such as a path that names the wrong file. A store
+  this size encrypts to well under the 16 MiB of ciphertext a read accepts, so
+  every store the CLI writes can be read back."
+  8388608)
+
 (def ^:private max-manifest-bytes
   "The most bytes a manifest may hold (1 MiB). It catches an accidental huge
   input, such as a path that names the wrong file."
@@ -552,7 +559,7 @@
 (defn- template-content [{:keys [template]}]
   (let [f (io/file (str template))]
     (if (.exists f)
-      (read-file-bounded! f age/max-plaintext-bytes "Template" {:template (str template)})
+      (read-file-bounded! f max-plaintext-bytes "Template" {:template (str template)})
       default-template)))
 
 (defn- require-age! []
@@ -752,15 +759,15 @@
              (merge {:secrets-file (str secrets-file)}
                     (safe-edn/failure-data parsed))))))
 
-(defn- decrypt-and-parse
-  "Decrypt the environment's store and parse it, returning `safe-edn/parse`'s
-  result map."
-  [{:keys [secrets-file identity-file]}]
-  (safe-edn/parse (age/decrypt identity-file secrets-file)))
-
 (defn- decrypt-text!
-  "The environment's decrypted store as text, library metadata included."
+  "The environment's decrypted store as text, library metadata included. A
+  ciphertext past `source/max-source-bytes` is refused before it is decrypted,
+  which bounds the plaintext too: age does not compress."
   [{:keys [secrets-file identity-file]}]
+  (let [size (.length (io/file (str secrets-file)))]
+    (when (> size source/max-source-bytes)
+      (input-too-large! (str "The secrets file " secrets-file) source/max-source-bytes size
+                        {:secrets-file (str secrets-file)})))
   (age/decrypt identity-file secrets-file))
 
 (defn- parsed-store!
@@ -930,12 +937,12 @@
 
 (defn- read-edited!
   "The text an editor left in private temp file `tmp`, bounded by
-  `age/max-plaintext-bytes`."
+  `max-plaintext-bytes`."
   [secrets-file tmp]
   (let [f (io/file (str tmp))]
-    (when (> (.length f) age/max-plaintext-bytes)
+    (when (> (.length f) max-plaintext-bytes)
       (input-too-large! (str "The plaintext for " secrets-file)
-                        age/max-plaintext-bytes (.length f)
+                        max-plaintext-bytes (.length f)
                         {:secrets-file (str secrets-file)}))
     (slurp f :encoding "UTF-8")))
 
@@ -943,15 +950,15 @@
   "Validate `user-text` and return `[value plaintext]`: the user's map, and
   the text to encrypt, which is `user-text` with the store's metadata written
   in. Fails, before anything is encrypted, on a plaintext past
-  `age/max-plaintext-bytes`, which is checked before it is parsed, and on text
+  `max-plaintext-bytes`, which is checked before it is parsed, and on text
   that is not one EDN map or that holds the reserved key."
   [secrets-file target user-text manifest-key]
   (let [unchanged "\n    Ciphertext and manifest were left unchanged."
         line (metadata-line manifest-key (manifest/recipients-id (:recipients target)))
         size (+ (utf8-length user-text) (utf8-length line))
-        _ (when (> size age/max-plaintext-bytes)
+        _ (when (> size max-plaintext-bytes)
             (input-too-large! (str "The plaintext for " secrets-file)
-                              age/max-plaintext-bytes size
+                              max-plaintext-bytes size
                               {:secrets-file (str secrets-file)}))
         value (validate-plaintext! secrets-file user-text)
         _ (when-not (map? value)
@@ -1183,9 +1190,9 @@
 (defn- read-set-value!
   "The value for `set`: one line typed at a hidden terminal prompt when
   `interactive?`, otherwise everything on stdin minus one trailing newline.
-  Both are bounded by `age/max-plaintext-bytes`."
+  Both are bounded by `max-plaintext-bytes`."
   [env path interactive?]
-  (let [limit age/max-plaintext-bytes
+  (let [limit max-plaintext-bytes
         context {:environment (:name env) :key path}]
     (if interactive?
       (let [value (or (prompt-hidden! (str (question-marker) " Value for " (pr-str path)
@@ -1549,7 +1556,7 @@
           (keyless-finding committed (sha256 secrets-file))
 
           :else
-          (let [{:keys [ok? value] :as parsed} (decrypt-and-parse env)]
+          (let [{:keys [ok? value] :as parsed} (safe-edn/parse (decrypt-text! env))]
             (if ok?
               (let [{:keys [manifest-key recipients]} (require-store-metadata! env value)
                     current (manifest/recipients-id
@@ -1564,8 +1571,7 @@
       (catch clojure.lang.ExceptionInfo e
         ;; A manifest or store past its size bound, and a store without
         ;; usable metadata, cannot agree with any manifest.
-        (if (#{:input-too-large :plaintext-too-large :invalid-store}
-             (:reason (ex-data e)))
+        (if (#{:input-too-large :invalid-store} (:reason (ex-data e)))
           {:status :drift :reason :store-problem :message (ex-message e)}
           (throw e))))))
 
