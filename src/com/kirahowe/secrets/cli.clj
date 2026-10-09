@@ -150,6 +150,16 @@
   ([reason msg] (fail! reason msg nil))
   ([reason msg data] (throw (ex-info msg (assoc data :reason reason)))))
 
+(defn- failure-message
+  "One line saying what failure `e` was, holding no file contents. An
+  `ex-info` gives its own message. Any other exception gives its class, plus
+  its message when it is an `IOException`, whose message names a path."
+  [e]
+  (cond
+    (instance? clojure.lang.ExceptionInfo e) (ex-message e)
+    (instance? java.io.IOException e) (str (.getName (class e)) ": " (ex-message e))
+    :else (str "Unexpected failure: " (.getName (class e)))))
+
 (defn- confirm!
   "Prompt y/N; true on \"y\", false otherwise. Never exits: callers decide
   what a declined prompt means."
@@ -401,9 +411,19 @@
   ignored. Does not select an environment identity or create private files.
   Throws ex-info on invalid input."
   [{:keys [app environments] :as config}]
+  (when-not (map? config)
+    (fail! :invalid-config "secrets config must be a map with :app and :environments"))
   (reject-unknown-keys! "secrets config" config-keys config)
-  (when (empty? environments)
-    (fail! :invalid-config "secrets config has no :environments"))
+  (when-not (and (map? environments) (seq environments))
+    (fail! :invalid-config
+           (str "secrets config needs :environments, a map from each environment's name to"
+                " a map of its settings, with at least one environment")))
+  (doseq [[environment-name env-config] environments]
+    (when-not (and (keyword? environment-name) (map? env-config))
+      (fail! :invalid-config
+             (str "secrets config :environments must map each environment's name, a"
+                  " keyword, to a map of its settings such as"
+                  " {:secrets-file \"secrets.edn.age\"}"))))
   (when-not (and (string? app) (not (str/blank? app)))
     (fail! :invalid-config
            (str "secrets config has no :app (a name string is required). It names the\n"
@@ -467,7 +487,12 @@
   (let [f (io/file (str path))]
     (when (> (.length f) limit)
       (input-too-large! (str kind " " path) limit (.length f) context))
-    (slurp f :encoding "UTF-8")))
+    (try
+      (slurp f :encoding "UTF-8")
+      (catch java.io.IOException e
+        (fail! :unreadable-file
+               (str kind " " path " could not be read (" (.getSimpleName (class e)) ").")
+               context)))))
 
 (defn- read-reader-bounded!
   "Read all of character `reader`, failing when its UTF-8 form passes `limit`
@@ -553,13 +578,20 @@
 (defn- distinct-by [f coll]
   (->> coll (group-by f) vals (map first)))
 
-(defn- sha256 [path]
+(defn- sha256
+  "The SHA-256 hex of the file at `path`. A file that cannot be read fails
+  naming the path."
+  [path]
   (let [md (java.security.MessageDigest/getInstance "SHA-256")]
-    (with-open [in (io/input-stream (io/file (str path)))]
-      (let [buf (byte-array 8192)]
-        (loop []
-          (let [n (.read in buf)]
-            (when (pos? n) (.update md buf 0 n) (recur))))))
+    (try
+      (with-open [in (io/input-stream (io/file (str path)))]
+        (let [buf (byte-array 8192)]
+          (loop []
+            (let [n (.read in buf)]
+              (when (pos? n) (.update md buf 0 n) (recur))))))
+      (catch java.io.IOException e
+        (fail! :unreadable-file
+               (str "File " path " could not be read (" (.getSimpleName (class e)) ")."))))
     (apply str (map #(format "%02x" %) (.digest md)))))
 
 (def ^:private default-template
@@ -832,6 +864,25 @@
                     " metadata. `set` and `rm` do not read, change, or remove it.")
                {:key path}))
       path)))
+
+(defn- require-map-parents!
+  "Fail when `path` passes through a value of `secrets` that is not a map,
+  where `assoc-in` and `update-in` cannot go. The failure names the path up to
+  that value and its type, never the value."
+  [secrets path]
+  (loop [value secrets
+         walked []
+         [k & more] path]
+    (when (and (seq more) (contains? value k))
+      (let [child (get value k)
+            walked (conj walked k)]
+        (when-not (map? child)
+          (fail! :path-not-a-map
+                 (str "Cannot reach " (pr-str path) ": " (pr-str walked) " holds a value of type "
+                      (name (manifest/value-type child)) ", not a map, so there is nothing"
+                      " under it to set or remove.")
+                 {:key path}))
+        (recur child walked more)))))
 
 (defn- render-secrets
   "Render a secrets map as the plaintext `set`/`rm` re-encrypt. Pretty-printed
@@ -1245,6 +1296,7 @@
                     manifest-key (manifest-key-for (if exists? :update :create)
                                                    env store target)
                     current (or (manifest/user-data store) {})]
+                (require-map-parents! current path)
                 (info (if exists? "Re-encrypting…" "Encrypting…"))
                 (write-secrets! env target tmp
                                 (render-secrets (assoc-in current path value))
@@ -1282,6 +1334,7 @@
           (let [store (parsed-store! env (decrypt-text! env))
                 manifest-key (manifest-key-for :update env store target)
                 current (manifest/user-data store)]
+            (require-map-parents! current path)
             (when (= ::missing (get-in current path ::missing))
               (fail! :no-such-key
                      (str "No such key: " (pr-str path) " in " secrets-file)
@@ -1511,11 +1564,11 @@
 (defn- verify-one!
   "Verify one environment's committed manifest against its encrypted secrets,
   returning its finding. When the environment's identity file does not exist,
-  which can only be the absent app default, it compares the manifest's
-  recorded :ciphertext-sha against the actual ciphertext (freshness only).
-  With an identity it decrypts the store and compares its entries, hashed
-  under the store's manifest key. A store without a well-formed key is drift,
-  reported with the message `require-manifest-key!` gives.
+  which can only be an absent key file, it compares the manifest's recorded
+  :ciphertext-sha against the actual ciphertext (freshness only). With an
+  identity it decrypts the store and compares its entries, hashed under the
+  store's manifest key. A store without usable metadata is drift, reported
+  with the message `require-store-metadata!` gives.
 
   This establishes *agreement* between the two committed artifacts, which is drift
   detection, and never who authored either of them; see [[verify!]]."
@@ -1551,8 +1604,8 @@
                :reason :secrets-invalid-edn
                :failure (safe-edn/failure-data parsed)}))))
       (catch clojure.lang.ExceptionInfo e
-        ;; A manifest or store past its size bound, and a store without a
-        ;; well-formed manifest key, cannot agree with any manifest.
+        ;; A manifest or store past its size bound, and a store without
+        ;; usable metadata, cannot agree with any manifest.
         (if (#{:input-too-large :plaintext-too-large :invalid-store}
              (:reason (ex-data e)))
           {:status :drift :reason :store-problem :message (ex-message e)}
@@ -1639,29 +1692,30 @@
 
 (defn verify!
   "Check that each environment's committed manifest matches its encrypted
-  secrets. With no env, verifies all of them. Never exits: returns
+  secrets. With no env, verifies all of them. Returns
   {:results {env-name status} :exit code}, where each status is :ok,
-  :ok-keyless, :drift, :missing, or :error. The exit code is 1 on drift and 0
-  when everything agrees. It is 2 when a secrets file or manifest is missing,
-  or when an environment could not be verified at all.
+  :ok-keyless, :drift, :missing, or :error.
+
+  The exit code is 0 when everything agrees and 1 when the only problem is
+  drift. It is 2 when anything else stopped an environment from being
+  verified: a missing secrets file or manifest, an identity that does not
+  resolve, a store the identity cannot decrypt, or a file that cannot be read.
+  Such a failure is reported as that environment's :error and the other
+  environments are still verified. The one failure that throws is an unknown
+  or missing environment argument.
 
   Every manifest has to be complete before anything is compared: the supported
   `:version`, this project's `:app`, a `:ciphertext-sha`, and a `:keys` map
   whose every entry has a `:type` and a `:vhash`. Anything else is drift, with
   or without an identity. Keyless verification then compares the ciphertext
-  hash and does not require age. It applies only when no identity was
-  designated and the app's default key file is absent. Full verification
-  decrypts and also compares the store's entries, hashed under the store's
-  manifest key, so a changed value fails it in solo and team stores alike.
+  hash and does not require age. It applies when no identity was designated
+  and the environment's key file is absent. Full verification decrypts and
+  also compares the store's entries, hashed under the store's manifest key, so
+  a changed value fails it in solo and team stores alike.
 
-  A store whose manifest key is missing or malformed is drift: it cannot agree
-  with any manifest, and the report says that `reencrypt` generates a new key.
-
-  Some failures throw: an identity designated by :identity-file, a configured
-  :key-file, or SECRETS_AGE_IDENTITY_FILE that does not exist (`:no-identity`),
-  and a store this identity cannot decrypt. With an environment named, the
-  failure propagates. With no env, it is reported as that environment's
-  problem with status :error and the other environments are still verified.
+  A store whose metadata is missing, malformed, or of another version is
+  drift: it cannot agree with any manifest, and the report says that
+  `reencrypt` writes a current one.
 
   A pass means the ciphertext and the manifest agree, which detects drift and
   a manifest from the wrong store. It does not establish authorship, even when
@@ -1677,11 +1731,10 @@
                      (try
                        (with-environment-identity config env
                          (fn [env] [env (verify-one! env)]))
-                       (catch clojure.lang.ExceptionInfo e
-                         (when env-arg (throw e))
+                       (catch Exception e
                          [env {:status :error
                                :reason :error
-                               :message (ex-message e)
+                               :message (failure-message e)
                                :hint (:hint (ex-data e))}])))
         results (into {}
                       (map (fn [env]
@@ -1691,8 +1744,8 @@
                       envs)
         statuses (set (vals results))]
     {:results results
-     :exit (cond (statuses :drift) 1
-                 (some statuses [:missing :error]) 2
+     :exit (cond (some statuses [:missing :error]) 2
+                 (statuses :drift) 1
                  :else 0)}))
 
 ;;;; Doctor
@@ -2005,7 +2058,7 @@
   "Render the error and its remediation on stderr."
   [e]
   (let [data (ex-data e)]
-    (into [[:oops (ex-message e)]]
+    (into [[:oops (failure-message e)]]
           (for [k [:hint :install :error :docs]
                 :let [v (get data k)]
                 :when (and (some? v) (not (str/blank? (str v))))
@@ -2041,10 +2094,14 @@
                  (throw (ex-info (bbcli/format-command-error data)
                                  (assoc data :reason :usage)))))})
 
-(defn- root-epilog [{:keys [environments default-environment]}]
+(defn- root-epilog
+  "The text under the command list. It is built before the config is
+  validated, so it lists environments only when they have the valid shape."
+  [{:keys [environments default-environment]}]
   (str "Environments: "
-       (str/join ", " (map name (keys environments)))
-       (when default-environment
+       (when (and (map? environments) (every? keyword? (keys environments)))
+         (str/join ", " (map name (keys environments))))
+       (when (keyword? default-environment)
          (str " (default: " (name default-environment) ")"))
        \newline
        \newline
@@ -2053,12 +2110,12 @@
         ["An omitted [env] uses the default environment."
          "-- ends the options: everything after it is an operand, even -h, --help, or --edn."
          "Commands printed as suggestions are POSIX sh, single-quoted per argument."
-         "verify exits 0 (ok), 1 (drift), or 2 (missing or unverifiable)."
-         "doctor exits 0 (healthy), 1 (warning/action needed), or 2 (invalid configuration)."])))
-
-(defn- exit-on-status! [{:keys [exit]}]
-  (when (pos? exit)
-    (System/exit exit)))
+         "verify exits 0 when every manifest agrees, 1 when the only problem is drift,"
+         "  and 2 when anything else stopped it: a missing file, an identity or"
+         "  decryption failure, an unknown environment, or an invalid configuration."
+         "doctor exits 0 when healthy, 1 on a warning, and 2 on an invalid configuration,"
+         "  identity, or recipients file, or when it could not run."
+         "Every other command exits 0, or 1 on any failure."])))
 
 (defn- command-table [config operands]
   [{:cmds []
@@ -2130,7 +2187,7 @@
                   :coerce :string
                   :desc "Environment (defaults to configured environment)"}]]
     :exec-fn (fn [{:keys [env]}]
-               (exit-on-status! (verify! (normalize-config config) (operand operands env))))}
+               (verify! (normalize-config config) (operand operands env)))}
    {:cmds ["doctor"]
     :doc "Safely diagnose configuration and verification capability."
     :args->opts [:env]
@@ -2139,7 +2196,7 @@
                   :coerce :string
                   :desc "Environment (defaults to configured environment)"}]]
     :exec-fn (fn [{:keys [env]}]
-               (exit-on-status! (doctor! config (operand operands env))))}
+               (doctor! config (operand operands env)))}
    {:cmds ["show-key"]
     :doc "Print public keys for sharing."
     :args->opts [:env]
@@ -2198,11 +2255,26 @@
   (let [{:keys [argv operands]} (normalize-argv args)]
     (bbcli/dispatch (command-table config operands) argv (dispatch-options operands))))
 
+(def ^:private status-commands
+  "The commands whose exit code is a status: 1 is drift or a warning, so a
+  failure to run them at all is 2."
+  #{"verify" "doctor"})
+
 (defn run!
-  "Dispatch `args` against `config`, exiting only at the CLI process boundary."
+  "Dispatch `args` against `config`, and exit the process when the outcome is
+  not success. This is the one place an exit code is decided.
+
+  A failure prints one line, and any hint the failure carries, on stderr, and
+  never a stack trace. It exits 1, or 2 from `verify` and `doctor`, which
+  keep 1 for drift and for a warning and otherwise exit with the `:exit` of
+  their result."
   [config args]
-  (try
-    (dispatch! config args)
-    (catch clojure.lang.ExceptionInfo e
-      (say! (error-lines e))
-      (System/exit 1))))
+  (let [status-command? (contains? status-commands (some-> (first args) str str/lower-case))
+        exit (try
+               (let [result (dispatch! config args)]
+                 (if status-command? (:exit result 0) 0))
+               (catch Exception e
+                 (say! (error-lines e))
+                 (if status-command? 2 1)))]
+    (when (pos? exit)
+      (System/exit exit))))

@@ -1001,16 +1001,14 @@
           (is (= 0 exit))
           (is (= :ok-keyless (:dev results)))))
       (testing "a designated identity that does not exist is an error, never keyless"
-        (doseq [[label run]
+        (doseq [[label run-verify]
                 [["an :identity-file"
                   #(verify (cli/normalize-config (test-config {:identity-file missing})) "dev")]
                  ["SECRETS_AGE_IDENTITY_FILE"
                   #(with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" missing}
                      (fn [] (verify config "dev")))]]]
           (testing label
-            (let [e (try (run) (catch clojure.lang.ExceptionInfo e e))]
-              (is (= :no-identity (:reason (ex-data e))))
-              (is (str/includes? (str (ex-message e)) missing))))))
+            (is (= {:results {:dev :error} :exit 2} (run-verify))))))
       (testing "a configured :key-file that does not exist is keyless, like the app default"
         (let [{:keys [result out]}
               (capture-verify (cli/normalize-config (test-config {:key-file missing})) "dev")]
@@ -2787,13 +2785,17 @@
       (with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" "key:txt"}
         (fn []
           (testing "a command fails with the runtime's reason and wording"
-            (doseq [args [["reencrypt" "dev"] ["verify" "dev"] ["rm" "dev" ":a"]]]
+            (doseq [args [["reencrypt" "dev"] ["rm" "dev" ":a"]]]
               (let [{:keys [failure]} (capture-failure #((cli-private 'dispatch!) config args))]
                 (is (= expected (:message failure)) (pr-str args))
                 (is (= {:reason :disallowed-identity
                         :scheme "key"
                         :identity-source :secrets-age-identity-file}
                        (:data failure))))))
+          (testing "verify reports it as that environment's failure"
+            (let [{:keys [result err]} (capture-verify (cli/normalize-config config) "dev")]
+              (is (= {:results {:dev :error} :exit 2} result))
+              (is (str/includes? err expected))))
           (testing "doctor reports it as an identity problem with the same reason"
             (let [{:keys [result out]} (capture-doctor config "dev")]
               (is (= 2 (:exit result)))
@@ -3355,16 +3357,189 @@
                                       " identity file that does not exist: " missing)))
           (is (str/includes? err "wrong-key —"))
           (is (= 2 (count (re-seq #"manifest matches" out))))))
-      (testing "an environment named on the command line still throws"
-        (is (= :no-identity
-               (:reason (ex-data (try (verify all "no-identity")
-                                      (catch clojure.lang.ExceptionInfo e e)))))))
-      (testing "drift in another environment still decides the exit code"
+      (testing "an environment named on the command line reports the same finding"
+        (let [{:keys [result err]} (capture-verify all "no-identity")]
+          (is (= {:results {:no-identity :error} :exit 2} result))
+          (is (str/includes? err (str "no-identity — The explicit identity path names an age"
+                                      " identity file that does not exist: " missing))))
+        (is (= {:results {:wrong-key :error} :exit 2} (verify all "wrong-key"))))
+      (testing "only an unknown environment throws"
+        (is (= :usage (:reason (ex-data (try (verify all "nowhere")
+                                             (catch clojure.lang.ExceptionInfo e e)))))))
+      (testing "exit 1 means drift and nothing else"
         (spit (str *dir* "/fine.edn.manifest") "{:version 3}")
         (let [{:keys [result]} (capture-verify all nil)]
           (is (= {:good :ok :fine :drift :no-identity :error :wrong-key :error}
                  (:results result)))
-          (is (= 1 (:exit result))))))))
+          (is (= 2 (:exit result)) "a failure beside the drift is still a failure"))
+        (is (= {:results {:fine :drift} :exit 1} (verify all "fine")))
+        (is (= 1 (:exit (verify (config good) nil))))))))
+
+(deftest an-unreadable-artifact-is-that-environments-failure-test
+  ;; A manifest path that is a directory once escaped as a bare
+  ;; FileNotFoundException and ended the whole run.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [env (fn [n] {:secrets-file (str *dir* "/" n ".edn.age") :key-file *key*})
+          config (cli/normalize-config
+                  {:app "cli-test" :environments {:good (env "good") :broken (env "broken")}})
+          manifest-path (str *dir* "/broken.edn.manifest")]
+      (doseq [n ["good" "broken"]]
+        (with-out-str (with-in-str "v" (cli/set-secret! config n ":k" false))))
+      (.delete (io/file manifest-path))
+      (.mkdir (io/file manifest-path))
+      (try
+        (let [{:keys [result out err]} (capture-verify config nil)]
+          (is (= {:results {:good :ok :broken :error} :exit 2} result))
+          (is (str/includes? err (str "broken — Manifest " manifest-path " could not be read")))
+          (is (str/includes? out "good — manifest matches")))
+        (is (= {:results {:broken :error} :exit 2} (verify config "broken")))
+        (testing "a failure that is not an ex-info is one content-free line too"
+          (with-redefs-fn {(cli-private 'verify-one!)
+                           (fn [_] (throw (IllegalStateException. "PLANTED-detail")))}
+            #(let [{:keys [result err]} (capture-verify config nil)]
+               (is (= {:results {:good :error :broken :error} :exit 2} result))
+               (is (str/includes? err "Unexpected failure: java.lang.IllegalStateException"))
+               (is (not (str/includes? err "PLANTED-detail"))))))
+        (finally
+          (.delete (io/file manifest-path)))))))
+
+(deftest set-and-rm-refuse-a-path-through-a-value-that-is-not-a-map-test
+  ;; These once reached assoc-in and update-in and ended in a ClassCastException.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")
+          failure (fn [f] (try (with-out-str (f)) nil (catch Exception e e)))]
+      (new-store! config "dev"
+                  (str "{:text \"PLANTED-value\" :list [:k] :set #{:k} :nothing nil"
+                       " :deep {:leaf 1 :more {:x 1}}}"))
+      (let [bytes-before (file-bytes ciphertext)]
+        (doseq [[path holder type-name]
+                [["[:text :x]" "[:text]" "string"]
+                 ["[:list :k]" "[:list]" "vector"]
+                 ["[:set :k]" "[:set]" "set"]
+                 ["[:nothing :x]" "[:nothing]" "nil"]
+                 ["[:deep :leaf :x :y]" "[:deep :leaf]" "integer"]]
+                [command run]
+                [["set" #(with-in-str "v" (cli/set-secret! config "dev" path false))]
+                 ["rm" #(cli/remove-secret! config "dev" path)]]]
+          (testing (str command " " path)
+            (let [e (failure run)]
+              (is (= :path-not-a-map (:reason (ex-data e))))
+              (is (str/includes? (str (ex-message e))
+                                 (str holder " holds a value of type " type-name ", not a map")))
+              (is (not (str/includes? (str (ex-message e) (pr-str (ex-data e)))
+                                      "PLANTED-value")))
+              (is (= bytes-before (file-bytes ciphertext))))))
+        (testing "a path through maps, or into nothing yet, still works"
+          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:deep :more :y]" false)))
+          (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:new :a :b]" false)))
+          (with-out-str (cli/remove-secret! config "dev" "[:deep :more :x]"))
+          (is (= {:leaf 1 :more {:y "v"}} (:deep (secrets/load-secrets ciphertext *key*))))
+          (is (= {:a {:b "v"}} (:new (secrets/load-secrets ciphertext *key*)))))))))
+
+(deftest environments-must-be-a-map-of-maps-test
+  (doseq [environments [{:prod "secrets.edn.age"}
+                        [:dev]
+                        "dev"
+                        {"dev" {:secrets-file "s.edn.age"}}
+                        {:dev [:secrets-file "s.edn.age"]}]]
+    (testing (pr-str environments)
+      (let [e (try (cli/normalize-config {:app "x" :environments environments})
+                   (catch Exception e e))]
+        (is (= :invalid-config (:reason (ex-data e))))
+        (is (str/includes? (str (ex-message e)) ":environments")))))
+  (is (= :invalid-config
+         (:reason (ex-data (try (cli/normalize-config [:app "x"]) (catch Exception e e)))))))
+
+(defn- run-cli
+  "Run `bb secrets`-style `args` against `config` in a subprocess, which is
+  where exit codes and what reaches the terminal can be seen. `opts` may give
+  `:in` for stdin and `:env`, extra environment variables."
+  [config args & [{:keys [in env]}]]
+  (shell/sh "bb" "-cp" "src" "-e"
+            (str "(require '[com.kirahowe.secrets.cli :as cli]) "
+                 "(cli/run! '" (pr-str config) " " (pr-str args) ")")
+            :in (or in "")
+            :env (merge (into {} (System/getenv)) env)))
+
+(deftest ordinary-failures-print-one-line-and-no-stack-trace-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (test-config)]
+      (new-store! (cli/normalize-config config) "dev" "{:text \"s\" :set #{:k}}")
+      (doseq [[label run-config args in fragment]
+              [["set through a string" config ["set" "[:text :x]"] "v" "[:text] holds a value"]
+               ["rm through a set" config ["rm" "[:set :k]"] nil "[:set] holds a value"]
+               ["an environment that is not a map"
+                {:app "x" :environments {:prod "s.age"}} ["recipients" "prod"] nil
+                ":environments must map"]
+               ["environments that are a vector"
+                {:app "x" :environments [:dev]} ["show-key"] nil ":environments"]]]
+        (testing label
+          (let [{:keys [exit out err]} (run-cli run-config args {:in in})]
+            (is (= 1 exit))
+            (is (str/includes? err fragment))
+            (is (not (re-find #"-----|Exception|\.clj:\d+" (str out err)))
+                "no error dump or stack trace")))))))
+
+(deftest verify-and-doctor-exit-codes-test
+  ;; For these two commands 1 means drift or a warning and nothing else.
+  ;; Everything that stopped the command from doing its job is 2.
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [other-key (str *dir* "/other-key.txt")
+          missing (str *dir* "/no-such-key.txt")
+          directory (str *dir* "/a-directory")
+          env (fn [n & {:as overrides}]
+                (merge {:secrets-file (str *dir* "/" n ".edn.age") :key-file *key*} overrides))
+          config (fn [envs] {:app "cli-test" :environments envs})
+          exits (fn [run-config args & [opts]]
+                  (let [{:keys [exit out err]} (run-cli run-config args opts)]
+                    (is (not (re-find #"-----|\.clj:\d+" (str out err)))
+                        (str "no error dump for " (pr-str args)))
+                    exit))]
+      (age/keygen! other-key)
+      (.mkdir (io/file directory))
+      (doseq [n ["ok" "drift" "wrong-key" "no-manifest" "unreadable" "designated"]]
+        (with-out-str
+          (with-in-str "v"
+            (cli/set-secret! (cli/normalize-config (config {(keyword n) (env n)})) n ":k" false))))
+      (spit (str *dir* "/drift.edn.manifest") "{:version 3}")
+      (.delete (io/file (str *dir* "/no-manifest.edn.manifest")))
+      (testing "verify, with the environment named and with no argument"
+        (doseq [[label expected environment opts]
+                [["everything agrees" 0 (env "ok")]
+                 ["drift" 1 (env "drift")]
+                 ["a missing manifest" 2 (env "no-manifest")]
+                 ["a missing secrets file" 2 (env "absent")]
+                 ["a store the key cannot decrypt" 2 (env "wrong-key" :key-file other-key)]
+                 ["a manifest that cannot be read" 2 (env "unreadable" :manifest directory)]
+                 ["a designated identity that does not exist" 2
+                  (env "designated" :identity-file missing)]
+                 ["a blank identity variable" 2 (env "ok") {:env {"SECRETS_AGE_IDENTITY" ""}}]
+                 ["an identity variable that is not base64" 2 (env "ok")
+                  {:env {"SECRETS_AGE_IDENTITY_B64" "not base64!"}}]]
+                args [["verify" "dev"] ["verify"]]]
+          (testing (str label " " (pr-str args))
+            (is (= expected (exits (config {:dev environment}) args opts))))))
+      (testing "an unknown environment and an invalid configuration"
+        (doseq [command ["verify" "doctor"]]
+          (is (= 2 (exits (config {:dev (env "ok")}) [command "nowhere"])) command)
+          (is (= 2 (exits {:app "x" :environments {:dev "s.age"}} [command "dev"])) command)
+          (is (= 2 (exits {:environments {:dev (env "ok")}} [command])) command)))
+      (testing "one failing environment beside one that drifted is still 2"
+        (is (= 2 (exits (config {:drift (env "drift") :absent (env "absent")}) ["verify"]))))
+      (testing "other commands keep exit 1"
+        (is (= 1 (exits (config {:dev (env "ok")}) ["recipients" "nowhere"])))
+        (is (= 1 (exits (config {:dev (env "absent")}) ["reencrypt" "dev"])))
+        (is (= 0 (exits (config {:dev (env "ok")}) ["recipients" "dev"]))))
+      (testing "the help text states the codes"
+        (let [{:keys [out]} (run-cli (config {:dev (env "ok")}) ["help"])]
+          (is (str/includes? out "verify exits 0 when every manifest agrees, 1 when the only"))
+          (is (str/includes? out "doctor exits 0 when healthy, 1 on a warning, and 2"))
+          (is (str/includes? out "Every other command exits 0, or 1 on any failure.")))))))
 
 (deftest command-failures-carry-a-reason-test
   ;; Every failure a command throws has a :reason, so a caller never has to
