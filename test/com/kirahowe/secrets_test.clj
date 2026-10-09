@@ -1852,6 +1852,48 @@
     (testing "a designated identity that does not exist"
       (is (= :no-identity (reason-of #(secrets/load-secrets enc (str *dir* "/absent.txt"))))))))
 
+;;;; Key contents where an identity path belongs
+
+(deftest encoded-key-contents-as-an-identity-path-are-refused-unechoed-test
+  (let [enc (encrypt-edn! {:k "v"})
+        contents (slurp *key*)
+        packed (.encodeToString (java.util.Base64/getEncoder)
+                                (.getBytes ^String contents "UTF-8"))
+        body (subs (first (filter #(str/starts-with? % "AGE-SECRET-KEY-1")
+                                  (str/split-lines contents)))
+                   (count "AGE-SECRET-KEY-1"))
+        leaks? (fn [value text]
+                 (some #(str/includes? text %) (remove str/blank? (str/split-lines value))))
+        under (fn [environment f] (with-redefs-fn (test-env/getenv-redefs environment) f))
+        load (fn [identity] #(under {} (fn [] (secrets/load-secrets enc identity))))]
+    (doseq [[label value]
+            [["base64" packed]
+             ["wrapped base64" (str/join "\n" (map str/join (partition-all 76 packed)))]
+             ["base64 with a trailing newline" (str packed "\n")]
+             ["a key body without its prefix" body]]
+            [source run]
+            [["an explicit path" (load value)]
+             [":identity-file" (load {:identity-file value})]
+             [":key-file" (load {:key-file value})]
+             ["SECRETS_AGE_IDENTITY_FILE"
+              #(under {"SECRETS_AGE_IDENTITY_FILE" value} (fn [] (secrets/load-secrets enc)))]
+             ["with-identity" #(under {} (fn [] (secrets/with-identity value identity)))]
+             ["a reader's :identity-file"
+              #(under {} (fn []
+                           ((get (secrets/reader-literals {:file enc :identity-file value})
+                                 'secret/opt)
+                            :k)))]]]
+      (testing (str label " as " source)
+        (let [e (test-env/thrown run)]
+          (is (= :disallowed-identity (:reason (ex-data e))))
+          (is (str/includes? (str (ex-message e)) "holds age key contents"))
+          (is (not (contains? (ex-data e) :identity-file)))
+          (is (not (leaks? value (test-env/rendered e)))
+              "the message, the data, and the cause chain all omit the value"))))
+    (testing "a path that only looks unusual is still a path"
+      (doseq [path ["keys/dev" "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L" "AAAA" "key.txt" "/etc/keys/age"]]
+        (is (nil? (source/path-problem path)) path)))))
+
 ;;;; A JVM program that loads secrets and returns
 
 (deftest a-jvm-program-that-loads-secrets-exits-promptly-test

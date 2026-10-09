@@ -3643,6 +3643,60 @@
         (is (zero? (.exitValue process)))
         (is (< (- (System/currentTimeMillis) started) 45000))))))
 
+;;;; Key contents in a path setting
+
+(defn- encoded-key-values
+  "The fixture key in each form a path setting may wrongly hold: base64 on
+  one line, base64 wrapped as `base64` prints it, and the key body with its
+  `AGE-SECRET-KEY-` prefix cut off."
+  []
+  (let [contents (slurp *key*)
+        packed (.encodeToString (java.util.Base64/getEncoder)
+                                (.getBytes ^String contents "UTF-8"))
+        body (subs (first (filter #(str/starts-with? % "AGE-SECRET-KEY-1")
+                                  (str/split-lines contents)))
+                   (count "AGE-SECRET-KEY-1"))]
+    [["base64" packed]
+     ["wrapped base64" (str/join "\n" (map str/join (partition-all 76 packed)))]
+     ["a key body without its prefix" body]
+     ["a key body after the 1" (str "1" body)]]))
+
+(defn- leaks?
+  "True when `text` holds any line of `value`."
+  [value text]
+  (boolean (some #(str/includes? text %) (remove str/blank? (str/split-lines value)))))
+
+(deftest encoded-key-contents-in-a-path-setting-are-never-echoed-test
+  (doseq [[label value] (encoded-key-values)]
+    (testing label
+      (testing "as :key-file in the config"
+        (let [captured (capture-failure #(cli/normalize-config (test-config {:key-file value})))]
+          (is (= :disallowed-identity (get-in captured [:failure :data :reason])))
+          (is (= (str "Environment dev :key-file holds age key contents where a local"
+                      " filesystem path was expected. Key contents belong in"
+                      " SECRETS_AGE_IDENTITY.")
+                 (get-in captured [:failure :message])))
+          (is (not (leaks? value (pr-str captured))))))
+      (testing "as SECRETS_AGE_IDENTITY_FILE"
+        (let [config (cli/normalize-config (test-config))]
+          (with-identity-environment {"SECRETS_AGE_IDENTITY_FILE" value}
+            (fn []
+              (testing "in verify"
+                (let [{:keys [result out err]} (capture-verify config "dev")]
+                  (is (= {:results {:dev :error} :exit 2} result))
+                  (is (str/includes? err "SECRETS_AGE_IDENTITY_FILE holds age key contents"))
+                  (is (not (leaks? value (str out err))))))
+              (testing "in edit"
+                (let [captured (capture-failure #(cli/edit! config "dev"))]
+                  (is (= :disallowed-identity (get-in captured [:failure :data :reason])))
+                  (is (not (contains? (get-in captured [:failure :data]) :identity-file)))
+                  (is (not (leaks? value (pr-str captured))))))
+              (testing "in doctor"
+                (let [{:keys [result out err]} (capture-doctor (test-config) "dev")]
+                  (is (= 2 (:exit result)))
+                  (is (str/includes? out "SECRETS_AGE_IDENTITY_FILE holds age key contents"))
+                  (is (not (leaks? value (str (pr-str result) out err)))))))))))))
+
 ;;;; set and the terminal
 
 (deftest set-refuses-a-terminal-it-cannot-hide-test

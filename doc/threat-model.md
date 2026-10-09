@@ -269,7 +269,8 @@ When no file is there, no identity is available: keyless verification still
 runs and `#secret/opt` reads nil, while a command that needs the key says
 where it looked. Every identity path has a leading `~` expanded. A URI-shaped
 path, and key contents in a path setting, are refused without being echoed
-(A2, A3).
+(A2, A3). Key contents are recognized raw, base64-encoded, and as a key body
+whose `AGE-SECRET-KEY-` prefix was cut off.
 
 Raw and base64 identities are materialized for each operation in an exclusive
 0600 temporary file. The operation deletes it with an ordinary delete and

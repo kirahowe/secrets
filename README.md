@@ -320,8 +320,8 @@ that. Unset the variable to fall back.
 Identity paths are local paths with a leading `~` expanded. A value that
 starts with a URI scheme is refused with `:disallowed-identity`. A bare
 relative name with a colon in it, such as `key:txt`, reads as a scheme, so
-write `./key:txt`. Key contents placed in a path setting are refused the same
-way and are not echoed.
+write `./key:txt`. Key contents placed in a path setting, raw or
+base64-encoded, are refused the same way and are not echoed.
 
 `age` reads identities from files, so the contents from 3 and 4 are written to
 an owner-only temporary file for the one operation and deleted when it ends.

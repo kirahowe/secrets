@@ -41,7 +41,7 @@
   URI-shaped value, which includes a bare relative name with a colon such as
   `key:txt`, fails with `:disallowed-identity` and the error names its source
   and scheme; write `./key:txt` for such a file. Key contents in a path
-  setting fail the same way and are never echoed.
+  setting, raw or base64-encoded, fail the same way and are never echoed.
 
   A path you designate has to exist. An explicit path, `:identity-file`, or
   $SECRETS_AGE_IDENTITY_FILE that names a missing file fails with

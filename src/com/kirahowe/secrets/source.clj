@@ -42,16 +42,32 @@
     (when-not (re-find windows-absolute-path s)
       (some-> (second (re-find uri-scheme s)) str/lower-case))))
 
+(defn- key-contents?
+  "True when `s` holds an age secret key and so must never be echoed: the key
+  itself, its base64 encoding (ASCII whitespace ignored), or the 58 upper-case
+  bech32 characters of a key whose `AGE-SECRET-KEY-` prefix was cut off."
+  [s]
+  (let [marker "AGE-SECRET-KEY-"
+        packed (str/replace s #"[ \t\r\n]" "")]
+    (boolean
+     (or (str/includes? s marker)
+         (re-matches #"1?[QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L]{58}" s)
+         (try (str/includes? (String. (.decode (java.util.Base64/getDecoder) packed)
+                                      "ISO-8859-1")
+                             marker)
+              (catch IllegalArgumentException _ false))))))
+
 (defn path-problem
   "Return nil when string `s` can name a local file, or a map saying why it
-  cannot. `{:problem :key-contents}` means it holds an age secret key.
+  cannot. `{:problem :key-contents}` means it holds an age secret key, raw or
+  base64-encoded.
   `{:problem :locator :scheme scheme :bare? boolean}` means it is URI-shaped;
   `:bare?` is true when nothing after the scheme contains a `/`, which is what
   a relative file name with a colon in it looks like. The map never holds any
   part of `s` except its scheme."
   [s]
   (let [s (str/trim (str s))]
-    (if (str/includes? s "AGE-SECRET-KEY-")
+    (if (key-contents? s)
       {:problem :key-contents}
       (when-let [scheme (locator-scheme s)]
         {:problem :locator
