@@ -13,8 +13,10 @@ works when the resource is inside the uberjar.
 `resources/common/secrets.edn.example` is a tracked, plaintext-safe shape
 template with placeholders. It is documentation only and is never loaded by
 the service. This example repository ignores the disposable ciphertext made
-by the bootstrap script so local runs do not dirty the checkout. The script
-encrypts with `age` directly, so the demo store has no manifest. A real app
+by the bootstrap script so local runs do not dirty the checkout. The
+bootstrap encrypts with `age` directly, so the demo store has no manifest and
+no store metadata. `bb secrets edit`, `set`, and `rm` refuse such a store
+until `bb secrets reencrypt` has run once. A real app
 should create its store with `bb secrets`, commit the ciphertext and the
 manifest written beside it, and never commit an age identity or decrypted
 plaintext.

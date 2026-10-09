@@ -280,14 +280,15 @@ Raw and base64 identities are materialized for each operation in an exclusive
 checks the deletion on both success and failure. It does not try to overwrite
 the file first: that protects nothing on a copy-on-write or flash filesystem.
 Caller-owned paths are never deleted. A cleanup failure carries structured
-error data with the temporary path so an operator can remove the remaining file.
-Paths are permitted diagnostic metadata; identity contents are never included. A
-shutdown hook deletes the private temporary files that are live when SIGINT,
-SIGTERM, or SIGHUP ends the process, so Ctrl-C or a closed terminal during
-`edit` leaves no plaintext. A crash or SIGKILL can still leave a temporary
-file behind, and deletion is not secure erasure on every filesystem. The extra temporary-file write per operation is the accepted
-cost of removing shared identity state. The plaintext temporary file that
-`new`, `edit`, `set`, `rm`, and `reencrypt` use follows the same rule.
+error data with the temporary path so an operator can remove the remaining
+file. Paths are permitted diagnostic metadata; identity contents are never
+included. A shutdown hook deletes the private temporary files that are live
+when SIGINT, SIGTERM, or SIGHUP ends the process, so Ctrl-C or a closed
+terminal during `edit` leaves no plaintext. A crash or SIGKILL can still leave
+a temporary file behind, and deletion is not secure erasure on every
+filesystem. The extra temporary-file write per operation is the accepted cost
+of removing shared identity state. The plaintext temporary file that `new`,
+`edit`, `set`, `rm`, and `reencrypt` use follows the same rule.
 
 `load-secrets` owns this scope automatically. CLI normalization validates and
 canonicalizes configured paths without selecting an environment identity or
@@ -433,8 +434,8 @@ likeliest thing to be there (A3).
 Exit codes. For `verify` and `doctor`, 1 means drift or a warning and nothing
 else, and 2 means the command could not do its job: a missing file, an
 identity or decryption failure, an invalid recipients file, an unknown
-environment, or an invalid configuration. A CI job can then tell a stale manifest from a missing key.
-Every other command exits 0 or 1.
+environment, or an invalid configuration. A CI job can then tell a stale
+manifest from a missing key. Every other command exits 0 or 1.
 
 File permissions. The ciphertext, manifest, and recipients file are committed
 and shipped, so they get the permissions any new file gets. Only identities
@@ -443,11 +444,11 @@ and temporary plaintext are private (A4).
 Configuration. A key the config or an environment does not define is an error
 that names the key and not its value, so a misspelled key cannot silently
 configure nothing. Every environment setting is a path string with a leading
-`~` expanded, and `:manifest` may also be `false`. Across all environments a file is a secrets file, a
-manifest, a template, an identity, or a recipients file, and only one of them.
-Environments may share a template, an identity, or a recipients file. Two
-environments share a secrets file or a manifest only when they share both,
-which makes them one store under two names (A2).
+`~` expanded, and `:manifest` may also be `false`. Across all environments a
+file is a secrets file, a manifest, a template, an identity, or a recipients
+file, and only one of them. Environments may share a template, an identity, or
+a recipients file. Two environments share a secrets file or a manifest only
+when they share both, which makes them one store under two names (A2).
 
 ## How to decide what to change
 

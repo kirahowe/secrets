@@ -39,9 +39,11 @@ disposable key instead of a real one under `~/.config`.
 
 `bb bootstrap` is safe to rerun: it removes and recreates only those exact
 disposable files. `bb clean` removes them explicitly. The bootstrap encrypts
-with the `age` wrapper directly, so this store has no manifest. In a real
-application, create the store with `bb secrets` and commit the ciphertext and
-the manifest it writes. This starter keeps its ciphertext under ignored `tmp/`.
+with `age` directly, so the demo store has no manifest and no store metadata.
+`bb secrets edit`, `set`, and `rm` refuse such a store until `bb secrets
+reencrypt` has run once. In a real application, create the store with `bb
+secrets` and commit the ciphertext and the manifest it writes. This starter
+keeps its ciphertext under ignored `tmp/`.
 
 For a REPL started with the same variable exported, load the namespace and call
 `(aero-profiles.core/run! {:file "tmp/secrets.edn.age" :app "aero-profiles"} "evals")`.

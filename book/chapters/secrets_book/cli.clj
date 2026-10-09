@@ -33,10 +33,11 @@
 ;; | The project has | The initializer |
 ;; |-----------------|-----------------|
 ;; | neither file | creates a `bb.edn` with the library and the `secrets` task |
-;; | a `bb.edn` | prints the dependency and the task for you to add |
+;; | a `bb.edn` and no `deps.edn` | prints the dependency and the task for you to add |
 ;; | a `deps.edn` and no `bb.edn` | creates a `bb.edn` with the task and a `:local/root "."` dependency on the project, and prints the library entry to add to `deps.edn` |
+;; | both files | prints the library entry to add to `deps.edn`, and the task and the `:local/root "."` dependency to add to `bb.edn`. A `bb.edn` that already declares the library keeps it, and only the task is printed |
 
-;; In the last case the library is declared once, in `deps.edn`, and Babashka
+;; With a `deps.edn` the library is declared once, in `deps.edn`, and Babashka
 ;; reaches it through the project, so the JVM application and the task load
 ;; the same version. In every case it also creates the template,
 ;; `secrets/secrets.edn.example`, unless one is already there.

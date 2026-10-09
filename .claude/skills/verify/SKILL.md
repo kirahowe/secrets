@@ -1,6 +1,6 @@
 ---
 name: verify
-description: Exercise the library end to end from a user's perspective before a release — scaffold a fresh consumer project, run the full CLI surface, runtime loading, and identity injection, and compare each step against the README's promises.
+description: Exercise the library end to end from a user's perspective before a release: scaffold a fresh consumer project, run the full CLI surface, runtime loading, and identity injection, and compare each step against the README's promises.
 ---
 
 # Pre-release user-journey verification

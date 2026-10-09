@@ -123,9 +123,9 @@
 
 ;; The library recognizes a resource inside a local jar, streams it to an
 ;; owner-only temporary copy, passes that file to `age`, and then deletes it.
-;; The copy stops at the fixed 16 MiB bound on ciphertext. The library refuses
-;; remote and nested jar URLs, so loading secrets at runtime never makes a
-;; network request.
+;; The copy stops at the fixed 16 MiB bound on ciphertext. A remote URL is
+;; refused, and a nested jar URL is not found (`:no-file`), so loading secrets
+;; at runtime never makes a network request.
 
 ;; ## Startup wiring
 

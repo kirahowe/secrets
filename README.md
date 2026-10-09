@@ -199,8 +199,8 @@ Anything else, such as an HTTP URL or a `file:` string, is refused with
 `:reason :disallowed-source` before it is opened.
 
 The second argument chooses the identity. It is a path, or a map with
-`:identity-file`, `:key-file`, or `:app`. [Identity resolution](#identity-resolution) gives
-the full order.
+`:identity-file`, `:key-file`, or `:app`.
+[Identity resolution](#identity-resolution) gives the full order.
 
 A vector path walks maps by key and vectors by integer index. It does not
 index into a string, set, or list, so a path that continues past such a value
@@ -328,11 +328,11 @@ base64-encoded, are refused the same way and are not echoed.
 
 `age` reads identities from files, so the contents from 3 and 4 are written to
 an owner-only temporary file for the one operation and deleted when it ends.
-If the delete fails, the error names the file that remains. A process ended
-by Ctrl-C, a closed terminal, or `SIGTERM` deletes the file on its way out.
-One that crashes or is killed with `SIGKILL` can leave it behind, and deleting
-a file does not erase it from the disk. Use `SECRETS_AGE_IDENTITY_FILE` with a mounted secret
-when the platform offers one.
+If the delete fails, the error names the file that remains. A process ended by
+Ctrl-C, a closed terminal, or `SIGTERM` deletes the file on its way out. One
+that crashes or is killed with `SIGKILL` can leave it behind, and deleting a
+file does not erase it from the disk. Use `SECRETS_AGE_IDENTITY_FILE` with a
+mounted secret when the platform offers one.
 
 ### Size bounds
 
@@ -356,11 +356,12 @@ CI.
 
 ### Verifying in CI
 
-`bb secrets verify` exits 0 when every manifest agrees with its ciphertext
-and 1 when the only problem is drift. It exits 2 when anything else stopped
-it: a missing file, an identity or decryption failure, an invalid recipients
-file, an unknown environment, or an invalid configuration. A CI job can
-therefore tell a stale manifest from a missing key. It runs in one of two modes per environment.
+`bb secrets verify` exits 0 when every manifest agrees with its ciphertext and
+1 when the only problem is drift. It exits 2 when anything else stopped it: a
+missing file, an identity or decryption failure, an invalid recipients file,
+an unknown environment, or an invalid configuration. A CI job can therefore
+tell a stale manifest from a missing key. It runs in one of two modes per
+environment.
 
 Without an identity, it checks that the manifest is complete and that the
 SHA-256 it records is the digest of the ciphertext. This needs no key and no
@@ -527,9 +528,10 @@ the manifest cannot be replaced after the ciphertext was, the command says the
 manifest is stale, `verify` reports the drift, and `bb secrets reencrypt`
 regenerates it.
 
-Each file is staged beside its target under a name of the form
-`.<target>.<uuid>.tmp`. That holds for the ciphertext, the manifest, the
-recipients file, and a generated key. A command deletes its staging file when
+The ciphertext, the manifest, and the recipients file are each staged beside
+their target under a name of the form `.<target>.<uuid>.tmp`. A generated key
+is staged beside its target as `.<target>.<random>.tmp`, readable only by its
+owner. A command deletes its staging file when
 it ends, but one that is killed can leave it behind. Such a file is safe to
 delete, and a `.*.tmp` line in `.gitignore` keeps it from being committed.
 
@@ -649,10 +651,10 @@ config)`, and one function per command: `keygen!`, `new!`, `edit!`,
 `set-secret!`, `remove-secret!`, `verify!`, `doctor!`, `show-key!`,
 `add-recipient!`, `recipients!`, and `reencrypt!`. `set-secret!` takes its
 options as a map, `(set-secret! config env key {:edn? true})`. The command
-functions return data, throw `ex-info`, and never exit. `verify!` and `doctor!` report
-most failures in their result, with the exit code under `:exit`. `run!` is the
-entry point of a process, on Babashka or the JVM, and the one place that
-exits.
+functions return data, throw `ex-info`, and never exit. `verify!` and
+`doctor!` report most failures in their result, with the exit code under
+`:exit`. `run!` is the entry point of a process, on Babashka or the JVM, and
+the one place that exits.
 
 `com.kirahowe.secrets.init` has `-main` and `(init! opts)`.
 
