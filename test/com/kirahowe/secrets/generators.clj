@@ -49,6 +49,14 @@
 
 ;;;; EDN values
 
+(defn- bounded
+  "`generator` with its size capped at 30. A property's cost under babashka
+  grows faster than the size test.check hands it, and what these shapes cover
+  (nesting, key kinds, awkward strings) is all present well below the default
+  of 200."
+  [generator]
+  (gen/scale #(min % 30) generator))
+
 (defn scalar-of
   "Generator of scalar EDN values that print and read back to themselves, with
   strings drawn from `string-gen`."
@@ -71,12 +79,13 @@
 (def value
   "Any EDN value: scalars nested in vectors, lists, sets, and maps, including
   collections used as map keys."
-  (gen/recursive-gen (fn [inner]
-                       (gen/one-of [(gen/vector inner)
-                                    (gen/list inner)
-                                    (gen/set inner)
-                                    (gen/map inner inner)]))
-                     scalar))
+  (bounded
+   (gen/recursive-gen (fn [inner]
+                        (gen/one-of [(gen/vector inner)
+                                     (gen/list inner)
+                                     (gen/set inner)
+                                     (gen/map inner inner)]))
+                      scalar)))
 
 (def secret-key
   "A map key as a secrets file would use one."
@@ -85,12 +94,13 @@
 (defn secrets-of
   "Generator of a secrets value whose leaves are built from `scalar-gen`."
   [scalar-gen]
-  (gen/recursive-gen (fn [inner]
-                       (gen/map secret-key inner {:max-elements 5}))
-                     (gen/one-of [scalar-gen
-                                  (gen/vector scalar-gen)
-                                  (gen/set scalar-gen)
-                                  (gen/list scalar-gen)])))
+  (bounded
+   (gen/recursive-gen (fn [inner]
+                        (gen/map secret-key inner {:max-elements 5}))
+                      (gen/one-of [scalar-gen
+                                   (gen/vector scalar-gen)
+                                   (gen/set scalar-gen)
+                                   (gen/list scalar-gen)]))))
 
 (def secrets
   "A secrets value: maps under `secret-key` keys whose leaves are scalars or
@@ -100,12 +110,12 @@
 
 (def secrets-map
   "A secrets file's top-level map."
-  (gen/map secret-key secrets {:max-elements 5}))
+  (bounded (gen/map secret-key secrets {:max-elements 5})))
 
 (def encodable-secrets-map
   "A secrets file's top-level map whose strings survive a UTF-8 file, for
   properties that write the printed map to disk."
-  (gen/map secret-key (secrets-of (scalar-of encodable-text)) {:max-elements 5}))
+  (bounded (gen/map secret-key (secrets-of (scalar-of encodable-text)) {:max-elements 5})))
 
 ;;;; age keys and identity files
 
