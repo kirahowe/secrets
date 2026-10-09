@@ -3724,6 +3724,23 @@
       (is (str/includes? (help-text ["set" "--help"])
                          "The prompt needs stdin and stdout both to be terminals")))))
 
+;;;; Where a typo is
+
+(deftest a-typo-in-the-editor-says-where-it-is-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))]
+      (new-store! config "dev" "{:a 1}")
+      (let [captured (capture-failure
+                      #(edit-store! config "dev"
+                                    (constantly "{:a 1\n :b \"SENTINEL-VALUE\" :c}\n")))]
+        (is (= :edn-malformed (get-in captured [:failure :data :reason])))
+        (is (= {:line 2 :column 25}
+               (select-keys (get-in captured [:failure :data]) [:line :column])))
+        (is (str/includes? (get-in captured [:failure :message])
+                           "malformed EDN syntax at line 2, column 25"))
+        (assert-redacted! "SENTINEL-VALUE" captured)))))
+
 ;;;; A recipients file past its bound
 
 (deftest an-oversized-recipients-file-stops-verify-test
@@ -3741,6 +3758,63 @@
         (is (str/includes? err
                            (str "Recipients file " recipients " is larger than the 8 byte"))))
       (is (str/includes? (help-text ["help"]) "an invalid recipients file")))))
+
+;;;; A key file without its comment lines
+
+(deftest a-key-file-without-its-comment-lines-has-a-public-key-test
+  (let [bare (str *dir* "/bare-key.txt")
+        public (age/public-key *key*)
+        recipients (str *dir* "/recipients.txt")
+        config (cli/normalize-config (test-config {:key-file bare :recipients-file recipients}))]
+    (spit bare (str (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
+                                   (str/split-lines (slurp *key*))))
+                    "\n"))
+    (testing "show-key prints it and does not call the key absent"
+      (let [result (atom nil)
+            out (with-out-str (reset! result (cli/show-key! config "dev")))]
+        (is (= {:dev public} @result))
+        (is (str/includes? out public))
+        (is (not (str/includes? out "no key at")))))
+    (testing "add-recipient adds it and does not suggest keygen"
+      (is (= public (let [result (atom nil)]
+                      (with-out-str (reset! result (cli/add-recipient! config "dev" nil)))
+                      @result)))
+      (is (= (str public "\n") (slurp recipients))))
+    (testing "a key file with its comment is read without running a program"
+      (is (= [] (recorded-sh-argvs #(age/public-key *key*)))))
+    (testing "a file that holds no key has none"
+      (spit bare "not a key\n")
+      (is (nil? (age/public-key bare))))))
+
+;;;; Print limits
+
+(deftest print-limits-reach-neither-the-store-nor-its-manifest-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [config (cli/normalize-config (test-config))
+          ciphertext (str *dir* "/secrets.edn.age")
+          value {:deep {:a {:b {:c [1 2 3]}}} :list [1 2 3 4] :db/host "h" :db/port 1}
+          input (pr-str value)]
+      (binding [*print-length* 1 *print-level* 1 *print-namespace-maps* true]
+        (with-out-str (with-in-str input (cli/set-secret! config "dev" ":v" {:edn? true})))
+        (with-out-str (with-in-str "x" (cli/set-secret! config "dev" ":w")))
+        (is (= {:results {:dev :ok} :exit 0} (verify config "dev"))))
+      (let [manifest-text (slurp (str *dir* "/secrets.edn.manifest"))]
+        (is (not (str/includes? manifest-text "...")))
+        (is (= #{[:v :deep :a :b :c] [:v :list] [:v :db/host] [:v :db/port] [:w]}
+               (set (keys (:keys (edn/read-string manifest-text)))))))
+      (is (= {:v value :w "x"} (secrets/load-secrets ciphertext *key*))))))
+
+;;;; doctor and an identity that does not resolve
+
+(deftest doctor-says-an-identity-did-not-resolve-test
+  (doseq [environment [{"SECRETS_AGE_IDENTITY" ""}
+                       {"SECRETS_AGE_IDENTITY_B64" "NOT-BASE64!!"}]]
+    (let [{:keys [result out]} (doctor-under (complete-doctor-config) nil
+                                             {:environment environment})]
+      (is (= 2 (:exit result)))
+      (is (str/includes? out "Identity: not resolved\n"))
+      (is (not (re-find #"Identity:\s+\((missing|present)\)" out))))))
 
 ;;;; SECRETS_AGE_IDENTITY_FILE naming another artifact
 

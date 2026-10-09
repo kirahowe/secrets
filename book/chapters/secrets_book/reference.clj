@@ -189,7 +189,7 @@
 ;; | Reasons | Meaning |
 ;; |---------|---------|
 ;; | `:no-identity`, `:invalid-identity`, `:disallowed-identity` | no identity is available, or a named identity file is missing; an identity variable is blank or not base64; an identity path is URI-shaped or holds key contents |
-;; | `:no-file`, `:disallowed-source`, `:source-too-large` | the source is nil, absent, or unreadable; it is not a local path or a classpath resource; it is past 16 MiB |
+;; | `:no-file`, `:disallowed-source`, `:source-too-large` | the source is nil, blank, absent, a directory, or unreadable, or a file the CLI needs cannot be read; it is not a local path or a classpath resource; the ciphertext is past 16 MiB, at runtime or in the CLI |
 ;; | `:decrypt-failed`, `:age-not-installed` | `age` could not decrypt with this identity; the `age` binary is not on the `PATH` |
 ;; | `:edn-empty`, `:edn-extra-values`, `:edn-malformed`, `:edn-too-deep` | the plaintext is not exactly one well-formed EDN value |
 ;; | `:missing-key` | `#secret/req` named a key the store does not have |

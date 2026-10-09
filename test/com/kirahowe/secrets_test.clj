@@ -1182,12 +1182,14 @@
     (is (= {:reason :edn-malformed :line 2 :column 1}
            (safe-edn/failure-data {:ok? false :reason :edn-malformed :line 2 :column 1
                                    :value "SECRET" :message "SECRET"}))))
-  (testing "failure-location renders whatever position is known"
-    (are [failure fragment] (= fragment (safe-edn/failure-location failure))
-      {:line 3 :column 7} " at line 3, column 7"
-      {:line 3} " at line 3"
-      {:column 7} " at column 7"
-      {} "")))
+  (testing "a malformed input reports where the reader stopped, and none of the text"
+    (are [s line column] (= {:ok? false :reason :edn-malformed :line line :column column}
+                            (safe-edn/parse s))
+      "{:a 1\n :b #SENTINEL}\n" 2 15
+      "{:a 1\n :b \"SENTINEL\n" 3 1
+      "\n\n{:a 1 :b}" 3 10)
+    (is (= "malformed EDN syntax at line 2, column 15"
+           (safe-edn/failure-message (safe-edn/parse "{:a 1\n :b #SENTINEL}\n"))))))
 
 (deftest edn-parse-failures-are-content-free-test
   (let [sentinel "123SENTINELSECRET"
@@ -1206,7 +1208,7 @@
         :edn-extra-values "{:one 1} {:two 2}"
         :edn-malformed sentinel
         :edn-malformed "{:unfinished"))
-    (testing "only numeric parser location metadata is retained"
+    (testing "nothing of a parser exception is retained, only the reader's own position"
       (with-redefs [edn/read (fn [& _]
                                (throw
                                 (ex-info (str "Invalid number: " sentinel)
@@ -1216,8 +1218,8 @@
                                           :source-fragment sentinel})))]
         (is (= {:ok? false
                 :reason :edn-malformed
-                :line 7
-                :column 11}
+                :line 1
+                :column 1}
                (safe-edn/parse sentinel)))))
     (testing "the runtime exception chain drops parser messages, data, and causes"
       (let [plain (str *dir* "/malformed-secret.edn")
@@ -1235,7 +1237,8 @@
           (is (nil? (ex-cause e)) "no parser-derived exception is retained")
           (is (not (str/includes? diagnostic sentinel)))
           (is (not (str/includes? diagnostic "Invalid number")))
-          (is (str/includes? (ex-message e) "malformed EDN syntax")))))))
+          (is (re-find #"malformed EDN syntax at line \d+, column \d+" (ex-message e)))
+          (is (every? pos-int? (map (ex-data e) [:line :column]))))))))
 
 (deftest limits-are-not-an-option-test
   (let [enc (encrypt-edn! {:k "v"})]
@@ -1896,6 +1899,23 @@
     (testing "a path that only looks unusual is still a path"
       (doseq [path ["keys/dev" "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7L" "AAAA" "key.txt" "/etc/keys/age"]]
         (is (nil? (source/path-problem path)) path)))))
+
+;;;; A source that is not a file
+
+(deftest a-blank-or-directory-source-is-no-file-test
+  (doseq [[label source] [["a blank string" ""]
+                          ["whitespace" "  "]
+                          ["a directory path" *dir*]
+                          ["a directory File" (io/file *dir*)]
+                          ["a directory Path" (.toPath (io/file *dir*))]]]
+    (testing label
+      (let [e (test-env/thrown #(secrets/load-secrets source *key*))]
+        (is (= :no-file (:reason (ex-data e))))
+        (is (not (str/includes? (str (ex-message e)) "Wrong key"))))))
+  (testing "a reader whose :file is a directory finds no secrets file"
+    (let [readers (secrets/reader-literals {:file *dir* :identity-file *key*})]
+      (is (nil? ((get readers 'secret/opt) :k)))
+      (is (= :no-file (:reason (ex-data (test-env/thrown #((get readers 'secret/req) :k)))))))))
 
 ;;;; A JVM program that loads secrets and returns
 

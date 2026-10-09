@@ -62,7 +62,7 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
   a string, a `File`, or a `Path`, or the classpath resource `URL` that
   `io/resource` returns, including one inside a jar. Every other URL, a
   URI-shaped string, and an input stream are refused with
-  `:disallowed-source`.
+  `:disallowed-source`. A blank path and a directory are `:no-file`.
 - `get-secret` with a vector path walks maps and vectors only. A path that
   continues into a string, set, or list is not found.
 - Aero configs with secret tags have to be read with
@@ -90,6 +90,7 @@ Changes since `v0.1.0`. A project on `v0.1.0` has to act on the "Changed" and
 - `keygen` no longer prints a `flyctl` command.
 - `reencrypt` drops store metadata that was written by hand and writes its
   own, so it repairs every store that `verify` and `edit` send to it.
+- An EDN syntax error is reported with its line and column.
 - Failure reasons: a ciphertext past 16 MiB is `:source-too-large` in the CLI
   as at runtime, a URI-shaped path in the CLI config is `:invalid-config`
   (`:disallowed-identity` for `:key-file`), a file the CLI cannot read is

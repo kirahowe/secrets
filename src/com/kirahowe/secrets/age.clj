@@ -48,16 +48,6 @@
                      :install "macOS: brew install age  •  Debian/Ubuntu: apt install age"
                      :docs "https://age-encryption.org"}))))
 
-(defn public-key
-  "Extract the public key (recipient) from an age identity file's
-  `# public key:` header line. Returns nil if the file is missing or has no
-  such line."
-  [identity-file]
-  (let [f (io/file (str identity-file))]
-    (when (.exists f)
-      (some #(second (re-find #"(?i)public key:\s*(\S+)" %))
-            (str/split-lines (slurp f))))))
-
 (defn valid-recipient?
   "Return true when `s` looks like an age recipient (an `age1…` public key, or
   an `ssh-ed25519`/`ssh-rsa` line). This is not a full validation: `age` itself
@@ -80,6 +70,21 @@
     (if (str/starts-with? s "-")
       (str "./" s)
       s)))
+
+(defn public-key
+  "Return the public key (recipient) of the age identity file, or nil when the
+  file is missing or holds no key. The key is read from the file's
+  `# public key:` comment. A file without that comment, such as a key restored
+  as its one `AGE-SECRET-KEY-1…` line, is handed to `age-keygen -y`, which
+  needs `age` installed."
+  [identity-file]
+  (let [f (io/file (str identity-file))]
+    (when (.exists f)
+      (or (some #(second (re-find #"(?i)public key:\s*(\S+)" %))
+                (str/split-lines (slurp f)))
+          (do (ensure-installed!)
+              (let [{:keys [exit out]} (fs/sh ["age-keygen" "-y" (path-arg :key f)])]
+                (when (zero? exit) (not-empty (str/trim out)))))))))
 
 (defn keygen!
   "Generate a fresh age identity at `path`, creating parent directories, and

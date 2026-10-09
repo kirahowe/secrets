@@ -10,6 +10,7 @@
             [clojure.string :as str]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.store :as store])
   (:import [java.nio.charset StandardCharsets]
@@ -184,12 +185,9 @@
   print limits off. The pretty printer's commas are dropped, which is safe
   because no string the initializer generates contains one."
   [x]
-  (binding [*print-namespace-maps* false
-            *print-length* nil
-            *print-level* nil]
-    (-> (with-out-str (pprint/pprint x))
-        str/trim-newline
-        (str/replace "," ""))))
+  (-> (manifest/print-whole #(with-out-str (pprint/pprint x)))
+      str/trim-newline
+      (str/replace "," "")))
 
 (defn- entry-text
   "A map entry as it is typed into a file, with a long value on its own lines."

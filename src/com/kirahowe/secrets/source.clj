@@ -206,7 +206,7 @@
   (let [path (when (= :file (:kind source-descriptor)) (:path source-descriptor))]
     (throw
      (if path
-       (ex-info (if (.exists (io/file path))
+       (ex-info (if (.isFile (io/file path))
                   (str "Could not read secrets source " path ": " (.getMessage e))
                   (str "Secrets file not found: " path ". " no-store-hint))
                 {:source source-descriptor :reason :no-file}
@@ -222,7 +222,8 @@
   `source` is a filesystem path (a String, `java.io.File`, or
   `java.nio.file.Path`) or a classpath resource URL as
   `clojure.java.io/resource` returns it, whose scheme is `file:` or
-  `jar:file:`. `source-descriptor` must be the value returned by
+  `jar:file:`. A nil or blank source, and a path that is not a file, throw
+  `:no-file`. `source-descriptor` must be the value returned by
   [[descriptor]] for `source`; it is the only source representation admitted
   to failures. A file is checked in place. A jar entry is copied to an
   owner-only temporary file, and the returned cleanup function removes that
@@ -236,11 +237,14 @@
                          " Check the encrypted file is present as a classpath resource. "
                          no-store-hint)
                     {:reason :no-file})))
+  (when (and (string? source) (str/blank? source))
+    (throw (ex-info "No secrets source given: the source path is blank."
+                    {:reason :no-file})))
   (let [{:keys [^java.io.File file] :as local} (local-source source source-descriptor)]
     (try
       (cond
         (nil? file) (copy-jar-entry! source-descriptor local)
-        (not (.exists file)) (throw (java.io.FileNotFoundException. "No such file."))
+        (not (.isFile file)) (throw (java.io.FileNotFoundException. "No such file."))
         (> (.length file) max-source-bytes) (source-too-large! source-descriptor (.length file))
         :else [file (fn [])])
       (catch java.io.IOException e (unreadable-source! source-descriptor e)))))

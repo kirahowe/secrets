@@ -326,7 +326,7 @@
     :disallowed-identity  the identity path is URI-shaped or holds key
                         contents, so it is not a local path.
     :decrypt-failed     age could not decrypt the source with the identity.
-    :no-file            `source` is nil, an allowed local file is absent, or an
+    :no-file            `source` is nil or blank, or names no file, or an
                         allowed local source cannot be read.
     :disallowed-source  `source` is outside the local-only provenance contract.
   Fixed bounds catch an accidental huge or deeply nested input: a source past
@@ -373,7 +373,7 @@
   describe why it is unavailable."
   [{:keys [resource file] :as opts}]
   (let [source (cond
-                 file (when (.exists (io/file (str file)))
+                 file (when (.isFile (io/file (str file)))
                         (io/file (str file)))
                  resource (io/resource resource))]
     (cond

@@ -668,7 +668,7 @@ are the ones a caller can usefully branch on:
 | Reasons | Meaning |
 | --- | --- |
 | `:no-identity`, `:invalid-identity`, `:disallowed-identity` | No identity is available, or a named identity file is missing. An identity variable is blank or not base64. An identity path is URI-shaped or holds key contents. |
-| `:no-file`, `:disallowed-source`, `:source-too-large` | The source is nil, absent, or unreadable. It is not a local path or a classpath resource. It is past 16 MiB. |
+| `:no-file`, `:disallowed-source`, `:source-too-large` | The source is nil, blank, absent, a directory, or unreadable, or a file the CLI needs cannot be read. It is not a local path or a classpath resource. The ciphertext is past 16 MiB, at runtime or in the CLI. |
 | `:decrypt-failed`, `:age-not-installed` | `age` could not decrypt with this identity. The `age` binary is not on the `PATH`. |
 | `:edn-empty`, `:edn-extra-values`, `:edn-malformed`, `:edn-too-deep` | The plaintext is not exactly one well-formed EDN value. |
 | `:missing-key` | `#secret/req` named a key the store does not have. The tag also throws `:no-file` and `:no-identity`. |

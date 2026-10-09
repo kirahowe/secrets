@@ -347,8 +347,7 @@
   Note the whole file is regenerated, so comments a human wrote in an edited
   store do not survive a `set`. The values do."
   [value]
-  (binding [*print-length* nil *print-level* nil *print-namespace-maps* false]
-    (with-out-str (pprint/pprint value))))
+  (manifest/print-whole #(with-out-str (pprint/pprint value))))
 
 (defn- strip-trailing-newline
   "Strip exactly one trailing newline (\\n or \\r\\n) from `s`, so
@@ -641,11 +640,12 @@
 
 (defn show-key!
   "Print the public key(s). Share these so teammates can encrypt to you.
-  Reads the configured :key-file (not the env-var identity). Returns a map of
-  env name → public key (nil when the key is missing); environments sharing a
-  :key-file are reported once, under whichever env is seen first."
+  Reads the configured :key-file (not the env-var identity), and runs
+  `age-keygen` only for a key file that lacks its `# public key:` comment.
+  Returns a map of env name → public key (nil when the key is missing);
+  environments sharing a :key-file are reported once, under whichever env is
+  seen first."
   [config env-arg]
-  (require-age!)
   (let [envs (if env-arg
                [(store/resolve-env config env-arg)]
                (vals (:environments config)))]
@@ -1024,9 +1024,11 @@
                [:line "Recipients:" (:count recipients-file)])
          true
          (conj [:line "Identity:"
-                (str (identity-source-display-label (:source identity))
-                     (when (:path identity) (str " " (:path identity)))
-                     (if (:exists? identity) " (present)" " (missing)"))])))
+                (if-let [source (identity-source-display-label (:source identity))]
+                  (str source
+                       (when (:path identity) (str " " (:path identity)))
+                       (if (:exists? identity) " (present)" " (missing)"))
+                  "not resolved")])))
      (for [warning warnings] [:line "Warning:" warning])
      (for [problem problems] [:line "Problem:" problem])
      [[:line "Status:" (case (int exit) 0 "healthy" 1 "warning" 2 "invalid")]]
