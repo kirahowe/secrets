@@ -1008,38 +1008,11 @@
 
 ;;;; Commands
 
-(defn- sharing-environments
-  "Every environment name (sorted) whose :key-file canonically resolves to the
-  same file as `key-file`. :key-file defaults to one app-wide path rather than
-  one per environment, so more than one environment routinely shares a single
-  key; keygen! reports this set after writing so that naming one environment
-  on the command line does not read as having made a key just for it."
-  [environments key-file]
-  (let [target (canonical-path key-file)]
-    (->> (vals environments)
-         (filter #(= target (canonical-path (:key-file %))))
-         (map :name)
-         (sort-by name))))
-
-(defn- sole-shared-environment
-  "When every configured environment's :key-file resolves to the same file, an
-  environment argument cannot change keygen!'s outcome, so return that
-  (arbitrary) environment rather than making the caller pick one. Returns nil
-  when environments differ, leaving resolve-env's ambiguity error in place."
-  [{:keys [environments]}]
-  (let [envs (vals environments)]
-    (when (apply = (map (comp canonical-path :key-file) envs))
-      (first envs))))
-
 (defn- keygen-lines
-  "The report after a key is written: who shares it, the public key, and how to
-  back it up and deploy it. `sharing` is every environment name resolving to
-  `key-file`; `app-default?` says that is the app-wide default path."
-  [environment-name key-file recipients-file sharing app-default? pub]
+  "The report after a key is written: where, the public key, and how to back
+  it up and deploy it."
+  [environment-name key-file recipients-file pub]
   (cond-> [[:ok "Key written:" key-file]
-           [:line (str "    Used by: " (str/join ", " (map name sharing))
-                       (when app-default?
-                         " — every environment without its own :key-file"))]
            [:line]
            [:line [:bold "  Public key:"] pub]
            [:line]
@@ -1061,19 +1034,14 @@
                              (shell-quote (name environment-name)))]]])))
 
 (defn keygen!
-  "Generate an age identity at an environment's key-file. Returns the key-file
-  path, or :aborted when an existing key is kept.
-
-  The default key path is app-wide, so the function reports every environment
-  that shares it. With no environment or default, generation proceeds only
-  when all configured environments resolve to the same key path; otherwise it
-  throws. Existing keys require confirmation before replacement."
+  "Generate an age identity at an environment's key-file and print where it
+  is and its public key. Returns the key-file path, or :aborted when an
+  existing key is kept. An existing key requires confirmation before it is
+  replaced."
   [config env-arg]
   (require-age!)
   (let [{:keys [key-file recipients-file] environment-name :name}
-        (or (when (and (nil? env-arg) (nil? (:default-environment config)))
-              (sole-shared-environment config))
-            (resolve-env config env-arg))
+        (resolve-env config env-arg)
         proceed? (or (not (.exists (io/file key-file)))
                      (do
                        (warn "Key already exists:" key-file)
@@ -1083,13 +1051,9 @@
       (do (info "Aborted.") :aborted)
       (do
         (info "Generating age key for" (name environment-name) "…")
-        (let [pub (age/keygen! key-file)
-              sharing (sharing-environments (:environments config) key-file)
-              app-default? (= (canonical-path key-file)
-                              (canonical-path (secrets/default-key-file (:app config))))]
-          (say! (keygen-lines environment-name key-file recipients-file
-                              sharing app-default? pub))
-          key-file)))))
+        (say! (keygen-lines environment-name key-file recipients-file
+                            (age/keygen! key-file)))
+        key-file))))
 
 (defn new!
   "Create an encrypted secrets file from its template using $VISUAL, $EDITOR,
