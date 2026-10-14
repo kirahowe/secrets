@@ -2,19 +2,20 @@
 
 ## Supported versions
 
-This project is in alpha. One version is tagged, `v0.1.0`, and it is available
-only as a git dependency. Nothing is published to Clojars.
+This project is in alpha. The first release is `0.1.0`, tagged `v0.1.0`, and
+it is available only as a git dependency. Nothing is published to Clojars at
+the time of writing.
 
 | Version or branch | Status |
 | --- | --- |
-| `v0.1.0` | The newest tag. Reports are accepted. A fix ships in the next alpha, not as a patch to this tag. |
+| `0.1.0` | The current alpha. Supported, and reports are accepted. A fix ships in the next alpha, not as a patch to this tag. |
 | `main` | Development branch, where fixes land first. Not a release. |
 | Anything else | Not supported. |
 
-A fix is released as a new alpha tagged from `main`. Alphas can break
-compatibility, so taking a fix can mean following the upgrade notes in
-[CHANGELOG.md](CHANGELOG.md). When a new alpha is tagged it becomes the only
-supported release, and this table is updated with it.
+A fix is released as the next alpha, tagged from `main`. Alphas can break
+compatibility, so [CHANGELOG.md](CHANGELOG.md) says what a new alpha changes.
+When a new alpha is tagged it becomes the only supported release, and this
+table is updated with it.
 
 ## Scope
 

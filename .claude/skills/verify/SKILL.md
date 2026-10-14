@@ -74,27 +74,7 @@ written, and that `deps.edn` is unchanged. Add the entry by hand, then run
 `bb secrets --help`, which proves Babashka resolves the library through
 `deps.edn`.
 
-## Phase 2: migration from v0.1.0
-
-Export the `v0.1.0` sources (`git archive v0.1.0 src`, unpacked in scratch)
-and create a store with them on the classpath:
-
-```sh
-printf %s old-value | bb -cp <v0.1.0>/src -e \
-  "(require '[com.kirahowe.secrets.cli :as cli]) (cli/run! <config> [\"set\" \":example/api-key\"])"
-```
-
-The store then carries a `:version 1` manifest and no store metadata. Back on
-the current code:
-
-- `verify` must exit 1 and report version 1 as unsupported, naming
-  `bb secrets reencrypt <env>`.
-- `set` must exit 1 and say the store has no store metadata
-  (`:com.kirahowe.secrets/store`), naming the same command.
-- `reencrypt` must succeed and write a `:version 3` manifest.
-- `verify` and `doctor` must then exit 0.
-
-## Phase 3: CLI surface
+## Phase 2: CLI surface
 
 Run every command and check output and exit codes. `verify` and `doctor` exit
 1 only for drift or a warning and 2 for anything that stopped them. Every
@@ -187,7 +167,7 @@ must match what you see.
   result and return within a few seconds, and with an unknown environment
   must exit 2.
 
-## Phase 4: runtime consumption
+## Phase 3: runtime consumption
 
 With the library `src` directly on Babashka's classpath
 (`bb -cp <checkout>/src script.clj`):
@@ -225,7 +205,7 @@ options must throw `:invalid-config` for a `#secret/req`, naming the
 `:secrets` option, and read nil for a `#secret/opt`. The namespace's only
 public var must be `read-config`.
 
-## Phase 5: identity injection
+## Phase 4: identity injection
 
 Each of these must decrypt with no app name given:
 
@@ -267,7 +247,7 @@ not a recipient of the store under test:
   `inside callback` must be 1, which shows the counter can see the file, and
   `after load` must be 0 in both runs.
 
-## Phase 6: the library's own gates
+## Phase 5: the library's own gates
 
 In the checkout: `bb test`, `clojure -M:test`, `bb lint`, `bb format:check`,
 and `bb book:build`. Wrap the long ones in `caffeinate -is timeout …`, because
@@ -280,7 +260,7 @@ The policy tests scan `book/chapters`, the README, and the real workflows for
 action references pinned to full 40-hex commit SHAs. A truncated SHA in a doc
 chapter fails several tests at once.
 
-## Phase 7: shipped examples
+## Phase 6: shipped examples
 
 Each example must run with its own README's commands and leave nothing
 tracked behind (`git status` stays clean):

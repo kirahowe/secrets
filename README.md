@@ -32,7 +32,7 @@ task, [Babashka](https://babashka.org). Babashka resolves `:deps` entries
 through Java, so a JDK has to be on the `PATH` too. The library's only
 runtime dependency is Clojure.
 
-Nothing is published to Clojars yet. Depend on the library through git:
+Nothing is published to Clojars yet. Depend on version 0.1.0 through git:
 
 ```clojure
 ;; a release tag and the commit it names
@@ -43,11 +43,8 @@ io.github.kirahowe/secrets {:git/tag "v0.1.0" :git/sha "<commit the tag names>"}
 com.kirahowe/secrets {:mvn/version "0.1.0"}
 ```
 
-The `v0.1.0` tag is older than this README and lacks several things described
-here (the [changelog](CHANGELOG.md) lists them). To use the library as
-documented before the next tag, pin a commit of `main` instead: write
-`{:git/sha "<commit>"}` as the coordinate, or let the initializer below write
-it for you.
+Replace the placeholder with the full commit that `v0.1.0` names, or let the
+initializer below write the coordinate for you.
 
 ## Quick start
 
@@ -495,8 +492,8 @@ A store whose metadata is missing, malformed, or of another version fails
 `edit`, `set`, and `rm` and is drift for a `verify` that has an identity. The
 message says which it is and names `bb secrets reencrypt`, which writes
 current metadata without reading the old. That is the state of a store
-written by another tool or by an earlier version of this library. A store
-that is not a map at all is told to start over with `bb secrets new`.
+written by another tool, such as `age` itself. A store that is not a map at
+all is told to start over with `bb secrets new`.
 
 ### What the manifest discloses
 

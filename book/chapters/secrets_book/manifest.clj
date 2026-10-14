@@ -243,9 +243,8 @@
 ;; ## A store without metadata
 
 ;; A store whose metadata is missing, malformed, or of another version can't
-;; have a manifest. This happens to a store written by another tool, or by an
-;; earlier version of this library. Here is one, encrypted with `age`
-;; directly:
+;; have a manifest. This happens to a store written by another tool. Here is
+;; one, encrypted with `age` directly:
 
 (let [plain (str dir "/p3.edn")]
   (spit plain (pr-str {:database/url "jdbc:postgresql://db/app"}))
