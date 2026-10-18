@@ -38,3 +38,4 @@ book/rendered/
 /-secrets-cli-boundary/
 /-secrets-cli-boundary-delete
 /-secrets-cli-boundary-editor/
+.volley/

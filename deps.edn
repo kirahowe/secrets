@@ -10,10 +10,10 @@
  ;;; ever shipping in the jar.
  {:test {:extra-paths ["test" "build"]
          :extra-deps {aero/aero {:mvn/version "1.1.6"}
-                      lambdaisland/kaocha {:mvn/version "1.91.1392"}
+                      com.kirahowe/volley {:mvn/version "0.1.0-alpha.1"}
                       org.clojure/data.json {:mvn/version "2.5.1"}
                       org.clojure/test.check {:mvn/version "1.1.3"}}
-         :main-opts ["-m" "kaocha.runner"]}
+         :main-opts ["-m" "volley.main"]}
 
   ;;; Clay's newest release still selects older Ring/Jackson components. Keep
   ;;; the overrides here, inside :book, so the renderer gets reviewed fixed
