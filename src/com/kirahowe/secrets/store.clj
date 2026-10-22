@@ -1,11 +1,10 @@
 (ns com.kirahowe.secrets.store
   "Implementation namespace; not part of the public API and may change without notice.
 
-  The store beneath the `bb secrets` commands: config normalization and
-  validation, recipients, the store's metadata and manifest key, encrypting and
-  decrypting the store, writing it with its manifest, and verifying the two
-  against each other. Nothing here prompts, opens an editor, or prints.
-  `com.kirahowe.secrets.cli` does that and calls into this namespace."
+  The store beneath the `bb secrets` commands: config validation, recipients,
+  store metadata, writing the store with its manifest, and verifying the two.
+  Nothing here prompts, opens an editor, or prints; `com.kirahowe.secrets.cli`
+  does that."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets :as secrets]
@@ -20,16 +19,14 @@
 ;;;; Failures and shell words
 
 (defn shell-quote
-  "Render `s` as a single POSIX `sh` word: wrapped in `'`, with each embedded
-  `'` written as `'\\''`. The empty string renders as `''`. Inside single
-  quotes every other character is literal, so no escaping rule is needed."
+  "Render `s` as a single POSIX `sh` word, wrapped in `'` with each embedded
+  `'` written as `'\\''`."
   [s]
   (str "'" (str/replace (str s) "'" "'\\''") "'"))
 
 (defn fail!
-  "Throw an `ex-info` for a user-facing failure, with `reason` as its
-  `:reason`. `run!` prints the message plus any :hint, :install, :error, or
-  :docs in the data."
+  "Throw an `ex-info` with `reason` as its `:reason`. `run!` prints the message
+  plus any :hint, :install, :error, or :docs in the data."
   ([reason msg] (fail! reason msg nil))
   ([reason msg data] (throw (ex-info msg (assoc data :reason reason)))))
 
@@ -44,8 +41,8 @@
     :else (str "Unexpected failure: " (.getName (class e)))))
 
 (defn exit!
-  "End the process with exit `code`, returning only when it is 0. The CLI and
-  the initializer leave through here, and it is the seam their tests replace."
+  "End the process with exit `code`, returning only when it is 0. The seam the
+  CLI and initializer tests replace."
   [code]
   (when (pos? code)
     (System/exit code)))
@@ -53,20 +50,15 @@
 ;;;; Config
 
 (defn- canonical-path
-  "Canonicalize `path`, so aliases like `./key.txt` and `key.txt` compare
-  equal."
+  "Canonicalize `path`, so `./key.txt` and `key.txt` compare equal."
   [path]
   (.getCanonicalPath (io/file (str path))))
 
 (defn- require-path!
-  "Reject a blank path, a URI-shaped path, and key contents in a path field,
-  returning `path` otherwise.
-
-  CLI artifacts are local filesystem paths. The failure names the environment
-  and field and never the value. `:key-file` fails with `:reason
-  :disallowed-identity`, as the runtime's identity paths do, and every other
-  field with `:invalid-config`. Non-string values such as `:manifest false`
-  keep their meaning."
+  "Return `path` unless it is blank, URI-shaped, or key contents. The failure
+  names the environment and field, never the value. `:key-file` fails with
+  `:disallowed-identity`, as the runtime's identity paths do; other fields with
+  `:invalid-config`. Non-string values such as `:manifest false` pass."
   [env kind path]
   (when (and (string? path) (str/blank? path))
     (fail! :invalid-config
@@ -84,9 +76,9 @@
   path)
 
 (def ^:private path-purposes
-  "What each path setting of an environment is for. `:identity-file` is not
-  a setting: it is the path SECRETS_AGE_IDENTITY_FILE gave a running command.
-  It and `:key-file` both name an identity, so one file may be both."
+  "What each path setting is for. `:identity-file` is not a config setting but
+  the path SECRETS_AGE_IDENTITY_FILE gave a running command. It and `:key-file`
+  both name an identity, so one file may be both."
   {:secrets-file :secrets-file
    :manifest :manifest
    :template :template
@@ -96,18 +88,14 @@
 
 (defn- reject-shared-paths!
   "Fail when two settings name one file that cannot serve both, comparing
-  canonical paths across every environment, so `./key.txt` and `key.txt` are
-  one file and one environment's ciphertext cannot be another's key.
+  canonical paths across every environment. The failure names the two settings.
 
-  A file has one purpose: it is a secrets file, a manifest, a template, an
-  identity, or a recipients file. Environments may share a template, an
-  identity, or a recipients file, which commands only read. Two environments
-  may name the same secrets file only when they name the same manifest too,
-  and the reverse: then they are one store under two names. The failure names
-  the two settings.
+  A file has one purpose: secrets file, manifest, template, identity, or
+  recipients file. Environments may share a template, identity, or recipients
+  file, which commands only read. They may share a secrets file only with the
+  same manifest, and the reverse: then they are one store under two names.
 
-  This reads the configuration as it is now. It is a check against a
-  configuration mistake, not against the filesystem changing afterwards."
+  This checks the configuration as it is now, not the filesystem afterwards."
   [environments]
   (let [uses (for [env (sort-by (comp name :name) (vals environments))
                    [setting purpose] path-purposes
@@ -143,15 +131,13 @@
   262144)
 
 (def max-plaintext-bytes
-  "The most plaintext bytes a store the CLI writes may hold (8 MiB). It catches
-  an accidental huge input, such as a path that names the wrong file. A store
-  this size encrypts to well under the 16 MiB of ciphertext a read accepts, so
+  "The most plaintext bytes a store the CLI writes may hold (8 MiB). Such a
+  store encrypts to well under the 16 MiB of ciphertext a read accepts, so
   every store the CLI writes can be read back."
   8388608)
 
 (def ^:private max-manifest-bytes
-  "The most bytes a manifest may hold (1 MiB). It catches an accidental huge
-  input, such as a path that names the wrong file."
+  "The most bytes a manifest may hold (1 MiB)."
   1048576)
 
 (def ^:private config-keys
@@ -230,21 +216,19 @@
       env)))
 
 (defn normalize-config
-  "Validate a secrets config as it is written in `bb.edn` and return it with
-  per-environment defaults (:template, :manifest) applied. The
-  command functions take the result. A config this function returned comes
-  back unchanged.
+  "Validate a secrets config as written in `bb.edn` and return it with
+  per-environment defaults (:template, :manifest) applied. The command
+  functions take the result, and a config this function returned comes back
+  unchanged. Throws ex-info on invalid input.
 
   Requires a non-blank :app and at least one environment, each a map with a
-  :secrets-file. Every environment setting except :key-command is a path
-  string with a leading `~` expanded, and :manifest may also be false.
-  :key-command is a vector of strings, and an environment names at most one
-  of :key-file and :key-command. A secrets path not ending in
-  `.age` requires explicit :template and :manifest values. No file may serve two purposes across the
-  environments (see `reject-shared-paths!`). A key the config or an environment
-  does not define is rejected by name, so a misspelled key cannot be silently
-  ignored. Does not select an environment identity or create private files.
-  Throws ex-info on invalid input."
+  :secrets-file. Environment settings other than :key-command are path strings
+  with a leading `~` expanded, and :manifest may also be false. :key-command is
+  a vector of strings, and an environment names at most one of :key-file and
+  :key-command. A secrets path not ending in `.age` requires explicit
+  :template and :manifest. No file may serve two purposes across environments
+  (see `reject-shared-paths!`). Unknown keys are rejected by name. Does not
+  select an identity or create private files."
   [{:keys [app environments] :as config}]
   (if (::normalized (meta config))
     config
@@ -294,10 +278,9 @@
 
 (defn with-environment-identity
   "Resolve the environment's identity once and call `f` with the environment
-  and that identity merged, so one key serves the command's decryption and
-  hashing. An identity path that came from SECRETS_AGE_IDENTITY_FILE was not
-  in the config when its paths were checked, so it is checked against them
-  here."
+  and identity merged, so one key serves decryption and hashing. A path from
+  SECRETS_AGE_IDENTITY_FILE was not in the config when its paths were checked,
+  so it is checked here."
   [config env f]
   (let [identity (secrets/resolve-identity env)
         resolved (merge env identity)]
@@ -427,8 +410,8 @@
 
 (defn- validate-recipient-entries!
   "Reject any entry `age/valid-recipient?` refuses, naming the 1-based line
-  number and quoting only a truncated prefix. A hand-edited line may hold
-  anything, and a diagnostic is not the place to echo it."
+  number and quoting only a truncated prefix, since a hand-edited line may hold
+  anything."
   [{:keys [recipients-file] environment-name :name} entries]
   (let [label (clojure.core/name environment-name)]
     (doseq [[n line] entries]
@@ -442,18 +425,13 @@
                 :environment environment-name})))))
 
 (defn- recipient-snapshot
-  "Read the environment's recipients file exactly once and return the immutable
-  vector of validated recipients to encrypt to, deduplicated in first-seen
-  order.
+  "Read the environment's recipients file once and return the validated
+  recipients to encrypt to, deduplicated in first-seen order. Fails on a file
+  past `max-recipients-bytes`, an entry `age/valid-recipient?` rejects, or an
+  empty result.
 
-  The file is read once so one operation uses one consistent set. A pathname
-  handed to age would be read again inside age, after an editor session that can
-  run for minutes and during which the file may have been edited. Everything the
-  file says is decided here, before the sensitive work starts, and the resulting
-  values are what gets encrypted to.
-
-  Fails on a file larger than `max-recipients-bytes`, an entry
-  `age/valid-recipient?` rejects, or an empty result."
+  Read once so one operation uses one consistent set: a pathname handed to age
+  would be re-read after an editor session that can run for minutes."
   [{:keys [recipients-file] environment-name :name :as env}]
   (let [label (clojure.core/name environment-name)
         entries (or (:entries (recipient-file-snapshot env)) [])]
@@ -468,14 +446,14 @@
     (vec (distinct (map second entries)))))
 
 (defn encrypt-target!
-  "The immutable age recipient spec to encrypt with, resolved once before any
-  sensitive work begins (before an editor opens, before stdin is read, before
-  anything is decrypted) and threaded down to `age/encrypt-file!` from there.
+  "The age recipient spec to encrypt with, resolved once before any sensitive
+  work (an editor opening, stdin read, decryption) and passed down to
+  `age/encrypt-file!`.
 
   Multi-recipient mode returns the validated `{:recipients [\"age1…\" …]}`
-  snapshot, so age receives repeated `-r` values and no pathname to re-read.
-  Single-key mode returns the environment's resolved identity (so
-  SECRETS_AGE_IDENTITY* works in CI too)."
+  snapshot, so age gets repeated `-r` values and no pathname to re-read.
+  Single-key mode returns the resolved identity (so SECRETS_AGE_IDENTITY*
+  works in CI too)."
   [{:keys [recipients-file] :as env}]
   (if recipients-file
     {:recipients (recipient-snapshot env)}
@@ -554,10 +532,10 @@
                     (safe-edn/failure-data parsed))))))
 
 (defn decrypt-text!
-  "The environment's decrypted store as text, library metadata included. A
-  ciphertext past `source/max-source-bytes` is refused with `:source-too-large`
-  before it is decrypted, as `load-secrets` refuses it, which bounds the
-  plaintext too: age does not compress."
+  "The environment's decrypted store as text, metadata included. Refuses a
+  ciphertext past `source/max-source-bytes` with `:source-too-large` before
+  decrypting, as `load-secrets` does. age does not compress, so this bounds the
+  plaintext too."
   [{:keys [secrets-file] :as env}]
   (let [size (.length (io/file (str secrets-file)))
         limit source/max-source-bytes]
@@ -651,11 +629,11 @@
       text)))
 
 (defn- store-plaintext!
-  "Validate `user-text` and return `[value plaintext]`: the user's map, and
-  the text to encrypt, which is `user-text` with the store's metadata written
-  in. Fails, before anything is encrypted, on a plaintext past
-  `max-plaintext-bytes`, which is checked before it is parsed, and on text
-  that is not one EDN map or that holds the reserved key."
+  "Validate `user-text` and return `[value plaintext]`: the user's map and the
+  text to encrypt, which is `user-text` with the metadata written in. Fails
+  before anything is encrypted on a plaintext past `max-plaintext-bytes`
+  (checked before parsing), on text that is not one EDN map, or on text that
+  holds the reserved key."
   [secrets-file target user-text manifest-key]
   (let [unchanged "\n    Ciphertext and manifest were left unchanged."
         line (metadata-line manifest-key (manifest/recipients-id (:recipients target)))
@@ -685,18 +663,16 @@
     [value plaintext]))
 
 (defn write-secrets!
-  "Validate `user-text`, the store's plaintext without library metadata, write
-  it with `manifest-key` into private temp file `tmp`, encrypt that to the
-  already-resolved `target` recipient spec, and replace the ciphertext and
-  then the manifest, each atomically.
+  "Validate `user-text` (the plaintext without library metadata), write it with
+  `manifest-key` into private temp file `tmp`, encrypt to the resolved
+  `target`, then replace the ciphertext and the manifest, each atomically.
 
-  `tmp` is the caller's own private temp file, so the keyed plaintext is on
-  disk only inside the scope that deletes it. Validation, encryption, and
-  manifest rendering all finish before anything is replaced, so a failure
-  there leaves both files as they were. The pair is not one transaction: the
-  ciphertext is authoritative and the manifest is derived from it. If the
-  manifest cannot be replaced after the ciphertext was, the failure has
-  `:reason :manifest-stale` and says how to regenerate it."
+  `tmp` is the caller's, so the keyed plaintext is on disk only inside the
+  scope that deletes it. Everything that can fail finishes before anything is
+  replaced. The pair is not one transaction: the ciphertext is authoritative
+  and the manifest derived from it, so if the manifest cannot be replaced after
+  the ciphertext, the failure has `:reason :manifest-stale` and says how to
+  regenerate it."
   [{:keys [manifest app secrets-file] environment-name :name} target tmp user-text manifest-key]
   (let [[value plaintext] (store-plaintext! secrets-file target user-text manifest-key)
         staging (fs/staging-file secrets-file)]
@@ -784,16 +760,15 @@
       {:status :ok :reason :manifest-matches})))
 
 (defn verify-one!
-  "Verify one environment's committed manifest against its encrypted secrets,
-  returning its finding. When the environment has no identity, which can
-  only be an absent key file or Keychain item, it compares the manifest's recorded
-  :ciphertext-sha against the actual ciphertext (freshness only). With an
-  identity it decrypts the store and compares its entries, hashed under the
-  store's manifest key. A store without usable metadata is drift, reported
-  with the message `require-store-metadata!` gives.
+  "Verify one environment's committed manifest against its encrypted secrets
+  and return the finding. Without an identity (an absent key file or Keychain
+  item) it compares only the manifest's :ciphertext-sha with the ciphertext.
+  With one it decrypts the store and compares its entries, hashed under the
+  store's manifest key. A store without usable metadata is drift, reported with
+  the `require-store-metadata!` message.
 
-  This establishes *agreement* between the two committed artifacts, which is drift
-  detection, and never who authored either of them; see [[verify!]]."
+  This establishes agreement between the two committed artifacts, never who
+  authored either; see `doc/threat-model.md`."
   [{:keys [app secrets-file manifest] :as env}]
   (cond
     (not (string? manifest))

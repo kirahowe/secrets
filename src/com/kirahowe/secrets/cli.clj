@@ -6,17 +6,18 @@
       {:tasks {secrets {:requires ([com.kirahowe.secrets.cli :as cli])
                         :task (cli/run! my-config *command-line-args*)}}}
 
-  `run!` is the entry point of a process. It alone prints a failure and exits:
-  1 on failure, and for `verify` and `doctor` 1 on drift or a warning and 2 on
-  any failure. `normalize-config` validates a config map. The README describes
-  the config keys and how a command resolves its identity.
+  `run!` is the process entry point and the only place that prints a failure
+  and exits: 1 on failure, except `verify` and `doctor`, which use 1 for drift
+  or a warning and 2 for any failure. `normalize-config` validates a config
+  map. The README describes the config keys and how a command resolves its
+  identity.
 
-  The command functions are the API for a REPL or a program: `keygen!`,
-  `new!`, `edit!`, `set-secret!`, `remove-secret!`, `verify!`, `doctor!`,
-  `show-key!`, `add-recipient!`, `recipients!`, and `reencrypt!`. They return
-  data (a path, a results map, or :aborted), throw `ex-info` with a `:reason`
-  on failure, and never exit. `verify!` and `doctor!` report most failures in
-  their result, with the exit code under `:exit`."
+  The command functions (`keygen!`, `new!`, `edit!`, `set-secret!`,
+  `remove-secret!`, `verify!`, `doctor!`, `show-key!`, `add-recipient!`,
+  `recipients!`, `reencrypt!`) are the API for a REPL or a program. They
+  return data (a path, a results map, or :aborted), throw `ex-info` with a
+  `:reason` on failure, and never exit. `verify!` and `doctor!` report most
+  failures in their result, with the exit code under `:exit`."
   (:refer-clojure :exclude [run!])
   (:require [clojure.java.io :as io]
             [clojure.pprint :as pprint]
@@ -31,12 +32,10 @@
 
 ;;;; Output
 
-;;; Everything a command reports is a *line*: a vector whose first element is
-;;; its level and whose remaining elements are segments, joined with one space
-;;; the way `println` joins its arguments. A segment is a string or a
-;;; `[style string]` pair to paint. Commands build lines as plain data (the
-;;; `*-lines` functions are pure) and `say!` is the one place a line is
-;;; painted and written out.
+;;; A report is a vector of *lines*: `[level & segments]`, segments joined with
+;;; a space as `println` does. A segment is a string or a `[style string]` pair.
+;;; The `*-lines` functions are pure; `say!` is the one place lines are painted
+;;; and written.
 ;;;
 ;;;   :line    stdout, no marker          :stderr  stderr, no marker
 ;;;   :info •  :ok ✓  :warn ⚠  stdout     :oops ✗  stderr
@@ -51,10 +50,9 @@
 (def ^:private stderr-levels #{:oops :stderr})
 
 (defn- tty?
-  "True when there is a console, which needs stdin and stdout both to be
-  terminals. Called with `:stdin`, true when standard input alone is a
-  terminal: `test -t 0` answers that with this process's stdin, because
-  `System/console` is nil whenever stdout is redirected."
+  "True when stdin and stdout are both terminals. With `:stdin`, true when
+  stdin alone is one; `System/console` is nil whenever stdout is redirected,
+  so `test -t 0` answers that."
   ([] (some? (System/console)))
   ([_stdin]
    (-> (ProcessBuilder. ^java.util.List ["sh" "-c" "test -t 0"])
@@ -80,8 +78,8 @@
       text)))
 
 (defn- say!
-  "Write `lines`, each to the stream its level names. Color is decided once per
-  call, and this is the only place a report reaches `*out*` or `*err*`."
+  "Write `lines`, each to the stream its level names, with color decided once
+  per call."
   [lines]
   (let [color? (tty?)]
     (doseq [[level :as line] lines]
@@ -116,19 +114,18 @@
 ;;;; Config
 
 (defn normalize-config
-  "Validate a secrets config as it is written in `bb.edn` and return it with
+  "Validate a secrets config as written in `bb.edn` and return it with
   per-environment defaults (:key-file, :template, :manifest) applied. The
-  command functions take the result. A config this function returned comes
-  back unchanged.
+  command functions take the result, and normalizing a result again returns
+  it unchanged.
 
   Requires a non-blank :app and at least one environment, each a map with a
-  :secrets-file. Every environment setting is a path string with a leading
-  `~` expanded, and :manifest may also be false. A secrets path not ending in
-  `.age` requires explicit :template and :manifest values. No file may serve
-  two purposes across the environments. A key the config or an environment
-  does not define is rejected by name, so a misspelled key cannot be silently
-  ignored. Does not select an environment identity or create private files.
-  Throws ex-info on invalid input."
+  :secrets-file. Environment settings are path strings with a leading `~`
+  expanded; :manifest may also be false. A secrets path not ending in `.age`
+  requires explicit :template and :manifest. No file may serve two purposes
+  across the environments. An unknown key is rejected by name, so a misspelling
+  cannot be silently ignored. Selects no identity and creates no files. Throws
+  ex-info on invalid input."
   [config]
   (store/normalize-config config))
 
@@ -144,9 +141,8 @@
 ;;;; Utilities
 
 (defn- read-reader-bounded!
-  "Read all of character `reader`, failing when its UTF-8 form passes `limit`
-  bytes. A character is at least one byte, so reading stops one chunk past the
-  bound and never accumulates an unbounded value."
+  "Read all of `reader`, failing when its UTF-8 form passes `limit` bytes. A
+  character is at least one byte, so reading can stop one chunk past the bound."
   [^java.io.Reader reader limit what context]
   (let [captured (StringBuilder.)
         chunk (char-array 8192)]
@@ -163,10 +159,8 @@
       text)))
 
 (defn- editor-value
-  "The editor command to run: the `VISUAL` value `visual`, else the `EDITOR`
-  value `editor`, else `vim`. A blank value counts as unset, so an empty
-  `VISUAL` cannot hide a working `EDITOR`. A value is returned whole, with
-  any arguments it carries."
+  "The editor command: `visual`, else `editor`, else `vim`. A blank value
+  counts as unset, so an empty `VISUAL` cannot hide a working `EDITOR`."
   [visual editor]
   (or (first (remove str/blank? [visual editor])) "vim"))
 
@@ -176,22 +170,19 @@
   (editor-value (System/getenv "VISUAL") (System/getenv "EDITOR")))
 
 (defn- editor-argv
-  "The argv that runs editor command `command` on `path` through the shell.
-  `path` is passed positionally rather than interpolated, so the shell treats it
-  as data and it can never become part of the command."
+  "The argv that runs editor `command` on `path` through the shell. `path` is
+  a positional argument, never interpolated, so it stays data."
   [command path]
   ["sh" "-c" (str command " \"$1\"") "editor" path])
 
 (defn- run-editor!
-  "Open `$VISUAL`/`$EDITOR` on `path`, inheriting the terminal. The editor value
-  goes through the shell because it may carry arguments (\"code --wait\",
-  \"emacsclient -t\"); the path is passed as a positional argument, not
-  interpolated. An arbitrary editor would read a dash-leading path as its own
-  option and `--` is not portable across editors, so `path` is made absolute
-  before it reaches the editor. Throws if the editor exits non-zero, naming the
-  editor command, because a misconfigured one is otherwise indistinguishable from an
-  editor that genuinely failed. The command is configuration, not a secret; the
-  plaintext path stays out of the message."
+  "Open `$VISUAL`/`$EDITOR` on `path`, inheriting the terminal. The value goes
+  through the shell because it may carry arguments (\"code --wait\"). `path` is
+  made absolute because an editor would read a dash-leading path as an option
+  and `--` is not portable across editors. Throws `:editor-failed` on a
+  non-zero exit, naming the editor command (configuration, not a secret) so a
+  misconfigured editor is recognizable. The plaintext path stays out of the
+  message."
   [path]
   (let [command (editor)
         path (.getAbsolutePath (io/file (str path)))
@@ -204,8 +195,8 @@
                   " Editor: " command)))))
 
 (defn- with-plaintext-temp
-  "Call `f` with a private temporary file for plaintext secrets, deleted when
-  `f` returns or throws. A failed delete is reported with the remaining path."
+  "Call `f` with a private temp file for plaintext, deleted when `f` returns
+  or throws."
   [f]
   (fs/with-private-temp-file "secrets-" ".edn" f))
 
@@ -231,7 +222,7 @@
        "never from the command line."))
 
 (defn- with-set-usage
-  "Call `f`, adding `set-usage` as the hint of a failure. An argument `set`
+  "Call `f`, adding `set-usage` as the hint of a failure: an argument `set`
   cannot place may be the value itself, typed on the command line."
   [f]
   (try (f)
@@ -239,14 +230,12 @@
          (throw (ex-info (ex-message e) (assoc (ex-data e) :hint set-usage) e)))))
 
 (defn- parse-key-path
-  "Parse a `set`/`rm` CLI key argument as EDN into the vector `assoc-in` /
-  `get-in` / `update-in` expect: a bare keyword becomes a one-element path,
-  a vector of keywords/strings is a nested path. Rejects anything else,
-  including a missing argument, with a `fail!` naming both accepted forms, so
-  a typo'd path is caught before any file is touched. A path at or under the
-  store's reserved metadata key is rejected too. The failure names the
-  rejected value's type and never the value: `set` receives the key where a
-  mistyped command line may have put the secret."
+  "Parse a `set`/`rm` key argument as EDN into a path vector: a keyword
+  becomes a one-element path, a vector of keywords/strings is a nested path.
+  Anything else, including a missing argument, fails before any file is
+  touched, as does a path at or under the reserved metadata key. A failure
+  names the rejected value's type, never the value: a mistyped command line
+  may have put the secret in the key position."
   [s]
   (when (str/blank? (str s))
     (fail! :usage
@@ -275,9 +264,8 @@
       path)))
 
 (defn- require-map-parents!
-  "Fail when `path` passes through a value of `secrets` that is not a map,
-  where `assoc-in` and `update-in` cannot go. The failure names the path up to
-  that value and its type, never the value."
+  "Fail with `:path-not-a-map` when `path` passes through a non-map value of
+  `secrets`. The failure names the path up to it and its type, never the value."
   [secrets path]
   (loop [value secrets
          walked []
@@ -294,24 +282,17 @@
         (recur child walked more)))))
 
 (defn- render-secrets
-  "Render a secrets map as the plaintext `set`/`rm` re-encrypt. Pretty-printed
-  so the file stays readable to the next `bb secrets edit`, and printed with
-  the length/level limits unbound: a REPL that has set `*print-length*` would
-  otherwise write `...` into the store and silently truncate secrets.
-  Namespace-map shorthand is off, so a map whose keys share a namespace is
-  written `{:db/host …}` and never `#:db{:host …}`, which is what the next
-  `edit` shows.
-
-  Note the whole file is regenerated, so comments a human wrote in an edited
-  store do not survive a `set`. The values do."
+  "Render a secrets map as the plaintext `set`/`rm` re-encrypt. The print
+  limits are unbound, because a REPL with `*print-length*` set would otherwise
+  write `...` into the store and truncate secrets. Namespace-map shorthand is
+  off, so keys print as `{:db/host …}`, as the next `edit` shows. The whole
+  file is regenerated, so plaintext comments do not survive."
   [value]
   (manifest/print-whole #(with-out-str (pprint/pprint value))))
 
 (defn- strip-trailing-newline
   "Strip exactly one trailing newline (\\n or \\r\\n) from `s`, so
-  `echo secret | bb secrets set …` stores the obvious value; anything else,
-  including a value that itself ends with a blank line, passes through
-  verbatim."
+  `echo secret | bb secrets set …` stores the obvious value."
   [s]
   (cond
     (str/ends-with? s "\r\n") (subs s 0 (- (count s) 2))
@@ -319,15 +300,13 @@
     :else s))
 
 (defn- read-edited!
-  "The text an editor left in private temp file `tmp`, bounded as every
-  plaintext the CLI writes is."
+  "The text an editor left in temp file `tmp`, size-bounded."
   [{:keys [secrets-file]} tmp]
   (store/read-file-bounded! tmp store/max-plaintext-bytes "The edited plaintext"
                             {:secrets-file (str secrets-file)}))
 
 (defn- report-written!
-  "Report `outcome` for the ciphertext and, when the environment keeps a
-  manifest, that it was rewritten beside it."
+  "Report `outcome`, and the manifest rewrite when the environment keeps one."
   [{:keys [manifest]} & outcome]
   (apply ok outcome)
   (when (string? manifest)
@@ -336,8 +315,8 @@
 ;;;; Commands
 
 (defn- manifest-key-for
-  "`store/manifest-key-for`, saying so when a write renews the key because the
-  recipients changed."
+  "`store/manifest-key-for`, saying so when the recipients changed and the key
+  is renewed."
   [operation env store target]
   (let [manifest-key (store/manifest-key-for operation env store target)]
     (when (and (= :update operation)
@@ -352,8 +331,7 @@
   (str "security find-generic-password -s " keychain/service " -a " (shell-quote app) " -w"))
 
 (defn- keygen-lines
-  "The report after a key is stored: where, the public key, and how to back
-  it up and deploy it."
+  "The report after a key is stored."
   [{:keys [app key-file recipients-file] environment-name :name :as env} pub]
   (cond-> [[:ok "Key written:" (store/key-location env)]
            [:line]
@@ -374,12 +352,12 @@
                              (shell-quote (name environment-name)))]]])))
 
 (defn keygen!
-  "Generate an age identity where an environment keeps its key, its :key-file
-  or, on macOS, the Keychain item for the app, and print where it is and its
-  public key. Returns that location, or :aborted when an existing key is
-  kept. An existing key requires confirmation before it is replaced. An
-  environment whose key comes from :key-command fails: the command only
-  reads the key, so the key is stored with the password manager's own tools."
+  "Generate an age identity where an environment keeps its key (its :key-file
+  or, on macOS, the Keychain item for the app) and print the location and
+  public key. Returns the location, or :aborted when the user declines to
+  replace an existing key. Fails with `:usage` for an environment whose key
+  comes from :key-command, since that command only reads; store the key with
+  the password manager's own tools."
   [config env-arg]
   (let [{:keys [app key-file key-command] environment-name :name :as env}
         (store/resolve-env config env-arg)
@@ -419,8 +397,8 @@
           location)))))
 
 (defn- require-secrets-file!
-  "Fail with `:no-file` unless the environment's secrets file exists, naming
-  the command that creates it. `more` is appended to the message."
+  "Fail with `:no-file` unless the secrets file exists. `more` is appended to
+  the message."
   [{:keys [secrets-file] environment-name :name} & more]
   (when-not (.exists (io/file secrets-file))
     (fail! :no-file
@@ -431,11 +409,11 @@
             :environment environment-name})))
 
 (defn new!
-  "Create an encrypted secrets file from its template using $VISUAL, $EDITOR,
-  or vim. Returns the secrets-file path, or :aborted when an existing file is
-  kept. Plaintext is held in an owner-only temp file during editing. The new
-  store gets its own manifest key. The library's metadata line in a template is
-  dropped, never copied."
+  "Create an encrypted secrets file from its template, edited in $VISUAL,
+  $EDITOR, or vim. Returns the secrets-file path, or :aborted when the user
+  declines to overwrite an existing file. The plaintext sits in an owner-only
+  temp file. The store gets a new manifest key, and a metadata line in the
+  template is dropped."
   [config env-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
@@ -463,11 +441,10 @@
               secrets-file)))))))
 
 (defn edit!
-  "Edit an existing secrets file through an owner-only plaintext temp file.
-  Re-encrypts only when the plaintext changes. Returns the secrets-file path.
-  The editor shows the plaintext without the store's metadata, which is put
-  back on save. A plaintext that comes back holding the reserved key is
-  refused."
+  "Edit an existing secrets file through an owner-only plaintext temp file,
+  re-encrypting only when the plaintext changes. Returns the secrets-file
+  path. The editor shows the plaintext without the store's metadata, which is
+  restored on save; a result that holds the reserved key is refused."
   [config env-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
@@ -497,9 +474,9 @@
               secrets-file)))))))
 
 (defn- read-set-value!
-  "The value for `set`: one line typed at a hidden terminal prompt when
-  `interactive?`, otherwise everything on stdin minus one trailing newline.
-  Both are bounded by `store/max-plaintext-bytes`."
+  "The value for `set`: a hidden-prompt line when `interactive?`, otherwise
+  stdin minus one trailing newline. Both are bounded by
+  `store/max-plaintext-bytes`."
   [env path interactive?]
   (let [limit store/max-plaintext-bytes
         context {:environment (:name env) :key path}]
@@ -514,16 +491,15 @@
        (read-reader-bounded! *in* limit "Standard input" context)))))
 
 (defn set-secret!
-  "Set a value typed at a hidden terminal prompt when stdin and stdout are
-  both terminals, and read from stdin when stdin is not a terminal. With
-  stdin a terminal and stdout redirected it refuses, because it could not
-  hide what is typed. `key-arg` is a keyword or a non-empty vector of
-  keyword/string path elements. Piped input loses one trailing newline. The
-  value is stored verbatim as a string unless `opts` holds `:edn? true`, in
-  which case the input must be one EDN value. Blank input is rejected.
-  Creates a missing secrets file from an empty map, then re-encrypts and
-  updates the manifest. Returns the secrets-file path. Re-rendering removes
-  plaintext comments."
+  "Set a value at `key-arg`, a keyword or a non-empty vector of keyword/string
+  path elements. The value comes from a hidden prompt when stdin and stdout are
+  both terminals, otherwise from stdin minus one trailing newline. With stdin a
+  terminal and stdout redirected it refuses, since it could not hide the
+  typing. The value is stored as a string unless `opts` holds `:edn? true`,
+  which parses the input as one EDN value. Blank input is rejected with
+  `:blank-value`. Creates a missing secrets file from an empty map, then
+  re-encrypts and updates the manifest; plaintext comments are lost. Returns
+  the secrets-file path."
   [config env-arg key-arg & [{:keys [edn?]}]]
   (store/with-environment-identity config (with-set-usage #(store/resolve-env config env-arg))
     (fn [env]
@@ -540,11 +516,10 @@
                               " or pipe the value in.")))
               raw (read-set-value! env path interactive?)
               _ (when (str/blank? raw)
-                  ;; The same rule the library applies to a set-but-empty
-                  ;; SECRETS_AGE_IDENTITY: blank almost always means an unset
-                  ;; variable expanded to nothing (`echo "$KEY" | bb secrets
-                  ;; set …` in CI), and storing it produces a secret that
-                  ;; fails much later, far from the cause.
+                  ;; Blank almost always means an unset variable expanded to
+                  ;; nothing (`echo "$KEY" | bb secrets set …` in CI), and
+                  ;; storing it fails much later, far from the cause. The
+                  ;; library applies the same rule to SECRETS_AGE_IDENTITY.
                   (fail! :blank-value
                          (str (if interactive? "Nothing entered" "Nothing on stdin")
                               ": refusing to store a blank value for " (pr-str path) ".\n"
@@ -580,10 +555,9 @@
                 secrets-file))))))))
 
 (defn remove-secret!
-  "Remove a keyword or vector key path, then re-encrypt and update the
-  manifest. Throws when the file or path is absent. Empty parent maps are not
-  pruned. Returns the secrets-file path. Re-rendering removes plaintext
-  comments."
+  "Remove the keyword or vector key path, then re-encrypt and update the
+  manifest. Throws when the file or path is absent. Empty parent maps stay.
+  Returns the secrets-file path. Plaintext comments are lost."
   [config env-arg key-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
@@ -619,19 +593,18 @@
                   secrets-file)))))))))
 
 (defn- show-key-line
-  "One line per environment: its public key, or a warning that its key is
-  absent."
+  "A public-key line, or a warning when the key is absent."
   [environment-name location pub]
   (if pub
     [:line (format "  %-6s %s" (str (name environment-name) ":") pub)]
     [:warn (format "%s: no key in %s" (name environment-name) location)]))
 
 (defn show-key!
-  "Print the public key(s). Share these so teammates can encrypt to you.
-  Reads the key each environment keeps (its :key-command, :key-file, or
-  Keychain item), not an identity variable. Returns a map of env name →
-  public key (nil when the key is missing); environments sharing a key are
-  reported once, under whichever env is seen first."
+  "Print the public keys, for teammates to encrypt to. Reads the key each
+  environment keeps (its :key-command, :key-file, or Keychain item), not an
+  identity variable. Returns a map of env name to public key (nil when the key
+  is missing). Environments sharing a key are reported once, under the first
+  seen."
   [config env-arg]
   (let [envs (if env-arg
                [(store/resolve-env config env-arg)]
@@ -644,19 +617,17 @@
           (distinct-by store/key-location envs))))
 
 (defn reencrypt!
-  "Decrypt and immediately re-encrypt to the environment's current recipients.
-  Use after adding or removing a recipient (an `edit` with no change is a no-op
-  and would not pick up recipient changes). The recipient list is snapshotted
-  before the decryption, so it is exactly the list the command was started
-  against. Returns the secrets-file path.
+  "Decrypt and re-encrypt to the environment's current recipients. Use after
+  adding or removing a recipient; an `edit` with no change would not pick the
+  change up. The recipient list is snapshotted before decryption. Returns the
+  secrets-file path.
 
   Every run generates a new manifest key and rewrites the manifest, so every
   `:vhash` changes once and a removed recipient's copy of the old key says
-  nothing about values published afterwards. The existing metadata is not
-  read, which makes this the repair for a store whose metadata is missing,
-  malformed, or of another version. Metadata that is not on the library's own
-  line was written by hand: the store is then rendered again without it,
-  which drops the plaintext's comments."
+  nothing about later values. The existing metadata is not read, so this
+  repairs a store whose metadata is missing, malformed, or of another version.
+  Metadata that is not on the library's own line was written by hand; the
+  store is then rendered again without it, which drops plaintext comments."
   [config env-arg]
   (store/with-environment-identity config (store/resolve-env config env-arg)
     (fn [env]
@@ -680,8 +651,8 @@
               secrets-file)))))))
 
 (defn- recipient-added-lines
-  "The report after a recipient is appended: what to run next, which turns on
-  whether a ciphertext already exists to re-encrypt."
+  "The report after a recipient is appended, with the next step depending on
+  whether a ciphertext already exists."
   [environment-label recipients-file pub ciphertext?]
   (into [[:ok "Added recipient to" recipients-file]
          [:line "   " pub]]
@@ -694,9 +665,8 @@
            [:line [:dim (str "      bb secrets new " (shell-quote environment-label))]]])))
 
 (defn add-recipient!
-  "Add an age public key to an environment's recipients file. With no key given,
-  adds the environment's own public key (from where it keeps its key). Returns the
-  recipient added (or already present)."
+  "Add an age public key to an environment's recipients file; with no key,
+  the environment's own. Returns the recipient added or already present."
   [config env-arg pubkey]
   (let [{:keys [recipients-file secrets-file]
          environment-name :name :as env}
@@ -745,10 +715,10 @@
           recipients)))
 
 (defn recipients!
-  "List the recipients an environment encrypts to. Returns them as an eager seq
-  (nil in single-key mode). Read-only. A line encryption would reject is
+  "List the recipients an environment encrypts to. Returns them as an eager
+  seq, or nil in single-key mode. Read-only. A line encryption would reject is
   listed and marked. Throws for an unknown environment and for a recipients
-  file that is too large or cannot be read."
+  file that is too large or unreadable."
   [config env-arg]
   (let [{:keys [recipients-file] environment-name :name :as env}
         (store/resolve-env config env-arg)
@@ -854,40 +824,33 @@
 
 (defn verify!
   "Check that each environment's committed manifest matches its encrypted
-  secrets. With no env, verifies all of them. Returns
+  secrets; with no env, check all of them. Returns
   {:results {env-name status} :exit code}, where each status is :ok,
   :ok-keyless, :drift, :missing, or :error.
 
-  The exit code is 0 when everything agrees and 1 when the only problem is
-  drift. It is 2 when anything else stopped an environment from being
-  verified: a missing secrets file or manifest, an identity that does not
-  resolve, a store the identity cannot decrypt, an invalid recipients file,
-  or a file that cannot be read.
-  Such a failure is reported as that environment's :error and the other
-  environments are still verified. The one failure that throws is an unknown
-  or missing environment argument.
+  `:exit` is 0 when everything agrees, 1 when the only problem is drift, and 2
+  when anything else stopped an environment from being verified: a missing
+  secrets file or manifest, an identity that does not resolve, a store the
+  identity cannot decrypt, an invalid recipients file, or an unreadable file.
+  Such a failure is that environment's :error and the others are still
+  verified. Only an unknown or missing environment argument throws.
 
-  Every manifest has to be complete before anything is compared: the supported
+  A manifest must be complete before anything is compared: the supported
   `:version`, this project's `:app`, a `:ciphertext-sha`, and a `:keys` map
-  whose every entry has a `:type` and a `:vhash`. Anything else is drift, with
-  or without an identity. Keyless verification then compares the ciphertext
-  hash and does not require age. It applies when no identity was designated
-  and the environment's key file is absent. Full verification decrypts and
-  also compares the store's entries, hashed under the store's manifest key, so
-  a changed value fails it in solo and team stores alike.
+  whose every entry has a `:type` and a `:vhash`. Anything else is drift.
+  Keyless verification compares only the ciphertext hash and does not need
+  age; it applies when no identity was designated and the environment's own
+  key (its key file or Keychain item) is absent.
+  Full verification decrypts and also compares the entries, hashed under the
+  store's manifest key, so a changed value fails in solo and team stores alike.
 
-  A store whose metadata is missing, malformed, or of another version is
-  drift: it cannot agree with any manifest, and the report says that
-  `reencrypt` writes a current one. So is a store that records a recipient
-  set other than the one its environment encrypts to now, which is what a
-  recipients file edited without a `reencrypt` looks like.
+  Drift also covers a store whose metadata is missing, malformed, or of another
+  version (the report says `reencrypt` writes a current one), and a store that
+  records a recipient set other than the one its environment encrypts to now,
+  as after a recipients file edited without a `reencrypt`.
 
-  A pass means the ciphertext and the manifest agree, which detects drift and
-  a manifest from the wrong store. It does not establish authorship, even when
-  run with an identity: age does not sign, and everyone who can decrypt the
-  store holds its manifest key, so no run of this can say who wrote either
-  artifact. Authenticity rests on the repository and deployment channel; see
-  `doc/threat-model.md`."
+  A pass shows the ciphertext and manifest agree. It does not establish
+  authorship; see `doc/threat-model.md`."
   [config env-arg]
   (let [envs (if env-arg
                [(store/resolve-env config env-arg)]
@@ -916,18 +879,16 @@
 ;;;; Doctor
 
 (def ^:private identity-failure-reasons
-  "The reasons a failed identity resolution carries: a blank or undecodable
-  variable, a path that is not a local path, a designated file that does not
-  exist, and a key command or Keychain read that failed."
+  "The `:reason`s of a failed identity resolution."
   #{:invalid-identity :disallowed-identity :no-identity :key-command-failed :keychain-failed})
 
 (defn- doctor-report
   "Diagnose normalized environment `env`. `identity-problem` is the message of
   a failed identity resolution, or nil when `env` carries a resolved identity.
-  A warning is something an operator would act on that stops no command from
-  being tried: a file that is not there yet, or `age` not being installed. A
-  problem is an identity that does not resolve, or a recipients file that
-  lists nobody or holds a line age would refuse."
+  A warning is something to act on that stops no command from being tried (a
+  file not there yet, `age` not installed). A problem is an identity that does
+  not resolve, or a recipients file that lists nobody or holds a line age
+  would refuse."
   [{:keys [secrets-file manifest recipients-file identity-file identity-source]
     environment-name :name :as env}
    identity-problem]
@@ -978,8 +939,8 @@
                                :count (count recipients)}))))
 
 (defn- doctor-lines
-  "The `doctor` report. It prints paths and counts, and never file contents,
-  recipient lines, or environment values."
+  "The `doctor` report: paths and counts, never file contents, recipient
+  lines, or environment values."
   [{:keys [environment age secrets-file manifest recipients-file identity warnings problems
            exit]}]
   (let [artifact (fn [{:keys [path exists?]}]
@@ -1007,24 +968,22 @@
        [[:line "Run `bb secrets verify` to check the store against its manifest."]]))))
 
 (defn doctor!
-  "Diagnose the setup of one selected or default environment. Accepts raw
-  config, prints a short report, and returns it as a map. It never exits.
+  "Diagnose one selected or default environment. Takes the raw config, prints
+  a short report, returns it as a map, and never exits.
 
   The map holds `:environment`, `:age` (the installed version, or nil),
-  `:secrets-file` and `:manifest` (each `{:path :exists?}`, and `:manifest`
-  nil when disabled), `:recipients-file` in team mode (`{:path :exists?
-  :count}`), `:identity` (`{:source :path :exists?}`, with a path only for a
-  key file), `:warnings` and `:problems` (vectors of
-  messages), and `:exit`.
+  `:secrets-file` and `:manifest` (each `{:path :exists?}`; `:manifest` is nil
+  when disabled), `:recipients-file` in team mode (`{:path :exists? :count}`),
+  `:identity` (`{:source :path :exists?}`, a path only for a key file),
+  `:warnings` and `:problems` (vectors of messages), and `:exit`.
 
   `:exit` is 0 when healthy. It is 1 on a warning: `age` is not installed, or
-  the secrets file, the manifest, the recipients file, or the key is not
-  there yet. It is 2 on a problem: an identity that does not resolve, a
-  recipients file that lists nobody or holds an invalid line, or anything
-  that stopped the diagnosis, such as an invalid configuration or an unknown
-  environment, in which case the map holds only `:problems` and `:exit`. A
-  missing template is not reported. `doctor` does not open the store or the
-  manifest: `verify` does that."
+  the secrets file, manifest, recipients file, or key is not there yet. It is 2
+  on a problem: an identity that does not resolve, a recipients file that
+  lists nobody or holds an invalid line, or anything that stopped the
+  diagnosis, such as an invalid configuration or an unknown environment, in
+  which case the map holds only `:problems` and `:exit`. A missing template is
+  not reported. It does not open the store or the manifest; `verify` does."
   [config env-arg]
   (let [result (try
                  (let [config (store/normalize-config config)
@@ -1045,7 +1004,7 @@
 ;;;; Dispatch
 
 (defn- error-lines
-  "Render the error and its remediation on stderr."
+  "The error and its remediation, for stderr."
   [e]
   (let [data (ex-data e)]
     (into [[:oops (store/failure-message e)]]
@@ -1061,18 +1020,16 @@
   (fn [config [env] _flags] (f config env)))
 
 (defn- env-and-key
-  "The `[env key]` of a command that takes `[env] <key>`: one argument is the
-  key in the default environment."
+  "The `[env key]` of a `[env] <key>` command; one argument is the key."
   [args]
   (if (next args) args [nil (first args)]))
 
 (def ^:private commands
-  "Every command. `:args` is its positional arguments as usage text, `<x>`
-  required and `[x]` optional, and it is also what bounds how many are
-  accepted. `:flags` maps each flag the command takes to its help line. `:run`
-  is called with the normalized config (the config as given when `:raw-config?`),
-  the positional arguments, and the set of flags present. `help` has no `:run`:
-  the dispatcher answers it from this table."
+  "Every command. `:args` is the positional arguments as usage text, `<x>`
+  required and `[x]` optional, and it bounds how many are accepted. `:flags`
+  maps each flag to its help line. `:run` is called with the normalized config
+  (as given when `:raw-config?`), the positional arguments, and the set of
+  flags present. `help` has no `:run`; the dispatcher answers it."
   [{:name "keygen" :args "[env]"
     :doc "Generate an age key for an environment."
     :run (env-command #'keygen!)}
@@ -1139,8 +1096,8 @@
             [:line (format "  %-12s %s" flag text)])))
 
 (defn- help-lines
-  "The global help. It is built before the config is validated, so it lists
-  environments only when they have the valid shape."
+  "The global help. Built before the config is validated, so it lists
+  environments only when they have a valid shape."
   [{:keys [environments default-environment]}]
   (concat
    [[:line "Manage encrypted secrets (age)."]
@@ -1170,8 +1127,8 @@
     [:line "Every other command exits 0, or 1 on any failure."]]))
 
 (defn- find-command
-  "The table entry named `command-name`. An unknown name fails without being
-  repeated: it may be a value typed in the wrong place."
+  "The table entry named `command-name`. An unknown name is not echoed, since
+  it may be a value typed in the wrong place."
   [command-name]
   (or (some #(when (= command-name (:name %)) %) commands)
       (fail! :usage "Unknown command. Run `bb secrets help` for the list.")))
@@ -1179,12 +1136,10 @@
 (defn- dispatch!
   "Run the command `args` names against `config` and return its result.
 
-  Before a `--`, an argument that starts with `-` is a flag and every other
-  argument is positional. Everything after the `--` is positional. A flag the
-  command does not define, and a positional argument it has no place for, are
-  usage errors. Those errors print the command's usage and never the
-  argument: it is not a known command, flag, or environment name, and may be
-  a secret typed in the wrong place."
+  Before a `--`, an argument starting with `-` is a flag and the rest are
+  positional; everything after `--` is positional. An unknown flag or surplus
+  positional is a usage error that prints the command's usage and never the
+  argument, which may be a secret typed in the wrong place."
   [config [command-name & more]]
   (let [[before after] (split-with #(not= "--" %) more)
         flag? #(str/starts-with? % "-")
@@ -1214,20 +1169,18 @@
              flags))))
 
 (def ^:private status-commands
-  "The commands whose exit code is a status: 1 is drift or a warning, so a
-  failure to run them at all is 2."
+  "The commands whose exit 1 means drift or a warning, so failing to run at all
+  is 2."
   #{"verify" "doctor"})
 
 (defn run!
   "Dispatch `args` against `config` as the whole of a process: the entry point
-  for a `bb` task or a JVM `-main`, not a function to call at a REPL, where
-  the command functions are the API. This is the one place an exit code is
-  decided.
+  for a `bb` task or a JVM `-main`, not for a REPL, where the command
+  functions are the API. It decides the exit code.
 
-  A failure prints one line, and any hint the failure carries, on stderr, and
-  never a stack trace. It exits 1, or 2 from `verify` and `doctor`, which
-  keep 1 for drift and for a warning and otherwise exit with the `:exit` of
-  their result."
+  A failure prints one line plus any hint on stderr, never a stack trace, and
+  exits 1, or 2 from `verify` and `doctor`. Those two otherwise exit with the
+  `:exit` of their result."
   [config args]
   (let [status-command? (contains? status-commands (first args))
         exit (try

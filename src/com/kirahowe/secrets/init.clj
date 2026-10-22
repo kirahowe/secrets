@@ -1,9 +1,7 @@
 (ns com.kirahowe.secrets.init
-  "One-shot project bootstrapper for `bb secrets`.
-
-  It creates the files a new setup needs and never modifies a file that already
-  exists. For an existing `bb.edn` or `deps.edn` it prints what to add and
-  leaves the file alone."
+  "One-shot project bootstrapper for `bb secrets`. It creates the files a new
+  setup needs and never modifies an existing one; for an existing `bb.edn` or
+  `deps.edn` it prints what to add."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.pprint :as pprint]
@@ -22,8 +20,8 @@
 ;;;; The library's own coordinate
 
 (def ^:private coordinate-resource
-  "The library's coordinates, shipped beside this namespace and shared with the
-  release guards, so what the initializer scaffolds is what a release checks."
+  "The library's coordinates, shared with the release guards, so what the
+  initializer scaffolds is what a release checks."
   "com/kirahowe/secrets/coordinate.edn")
 
 (defn- coordinate-url
@@ -66,20 +64,18 @@
     (str/trim out)))
 
 (defn- library-dependency
-  "The dependency that resolves to the library that is running, as the single
-  `{lib coordinate}` entry a project's `:deps` needs, given the `url` its
-  coordinate resource was loaded from.
+  "The `{lib coordinate}` entry a project's `:deps` needs to resolve the
+  running library, given the `url` its coordinate resource was loaded from.
 
-  A `file:` URL is a source checkout, and the coordinate is that checkout's
-  `HEAD`: `{:git/tag \"v<version>\" :git/sha <commit>}` when the release tag
-  names it, and `{:git/sha <commit>}` otherwise. tools.deps wants the commit
-  beside a tag, and no commit can record its own hash, so the initializer asks
-  git for it. A checkout under `~/.gitlibs` is a git worktree and answers the
-  same way. Any other URL is the jar of a Maven artifact, and the version the
-  resource declares is the version that jar was built from.
+  A `file:` URL is a source checkout, and the coordinate is its `HEAD`:
+  `{:git/tag \"v<version>\" :git/sha <commit>}` when the release tag names it,
+  `{:git/sha <commit>}` otherwise. tools.deps wants the commit beside a tag and
+  no commit can record its own hash, so git supplies it. A checkout under
+  `~/.gitlibs` is a worktree and answers the same way. Any other URL is a Maven
+  jar, built from the version the resource declares.
 
-  `run` executes a git argv in a directory and returns what [[git]] does. It
-  is a parameter so each shape can be tested without a repository."
+  `run` executes a git argv in a directory and returns what [[git]] does. It is
+  a parameter so tests need no repository."
   [^java.net.URL url {:keys [lib git-lib version]} run]
   (if (= "file" (.getProtocol url))
     (let [dir (.getParentFile (io/file url))
@@ -110,10 +106,9 @@
 (def ^:private plain-name #"[A-Za-z][A-Za-z0-9._-]*")
 
 (defn- require-plain-name!
-  "The app and environment names are plain identifiers. The app name becomes a
-  macOS Keychain account and a symbol in bb.edn, and the environment name
-  becomes a keyword there, so both have to read back as written. The rejected
-  value is not echoed, so nothing the names carry reaches the terminal."
+  "Reject an app or environment name that is not a plain identifier. The app
+  name becomes a Keychain account and a bb.edn symbol, and the environment name
+  a keyword, so both must read back as written. The value is not echoed."
   [option value]
   (when-not (and (string? value) (re-matches plain-name value))
     (throw (ex-info (str option " must be a plain name: letters, digits, dots, hyphens, or "
@@ -150,11 +145,9 @@
 ;;;; What a project needs
 
 (defn- proposed-config
-  "The secrets configuration a new project starts with: one environment whose
-  ciphertext is `secrets/secrets.edn.age`. The CLI derives the template and
-  manifest paths beside it, and on macOS the app name names the Keychain item
-  that holds the identity. Throws when
-  `app` or `env` is not a plain name."
+  "The secrets config a new project starts with: one environment whose
+  ciphertext is `secrets/secrets.edn.age`. Throws when `app` or `env` is not a
+  plain name."
   [{:keys [app env] :or {env "dev"}}]
   (require-plain-name! "--app" app)
   (require-plain-name! "--env" env)
@@ -171,8 +164,7 @@
 
 (defn- self-dependency
   "The bb.edn dependency that puts the project's own deps.edn on Babashka's
-  classpath: `{myapp/myapp {:local/root \".\"}}`, keyed by the app name so
-  the entry says what it is."
+  classpath: `{myapp/myapp {:local/root \".\"}}`, keyed by the app name."
   [app]
   {(symbol app app) {:local/root "."}})
 
@@ -240,8 +232,8 @@
 
 (defn- edn-file
   "Plan one EDN project file. A missing file is created with every wanted
-  entry. An existing file is left alone, and the entries it lacks become
-  additions to print. `:entries` holds the wanted entries the plan creates or prints."
+  entry. An existing file is left alone and the entries it lacks become
+  additions to print. `:entries` holds the entries the plan creates or prints."
   [root path wanted]
   (if-not (exists? root path)
     {:path path :action :create :entries wanted
@@ -267,8 +259,9 @@
 (defn- plan
   "Decide, without writing anything, what initializing a project would do.
 
-  Returns `:root`, the proposed `:config`, and `:files`, one map per file with
-  its `:path`, relative to `:root` unless absolute, and an `:action`:
+  Returns `:root`, the proposed `:config`, and `:files`, one map per entry with
+  an `:action`. A file entry has a `:path`, relative to `:root` unless absolute;
+  a Keychain entry has a `:keychain-app` instead. The actions:
 
   - `:create` for a file that does not exist, with its `:content`. The identity
     `--keygen` asks for is an entry with `:keychain-app`, the app whose macOS
@@ -278,10 +271,10 @@
     the top-level key to put it `:under` and the `:text` to put there.
 
   Without a deps.edn, bb.edn declares the library. With one, deps.edn declares
-  it and bb.edn reaches it through a `:local/root \".\"` dependency on the
-  project, so the JVM application and the Babashka task load the same version.
-  A bb.edn that already declares the library keeps doing so. `:dependency` is
-  the library's `{lib coordinate}` entry when the plan creates or prints it."
+  it and bb.edn reaches it through a `:local/root \".\"` dependency, so the JVM
+  application and the Babashka task load the same version. A bb.edn that
+  already declares the library keeps doing so. `:dependency` is the library's
+  `{lib coordinate}` entry when the plan creates or prints it."
   [opts]
   (let [{:keys [root app keygen?] :as opts} (merge {:root "."} opts)
         config (proposed-config opts)
@@ -312,9 +305,9 @@
   ;; included, so a file that appeared after the plan was made is not replaced.
   (into-array OpenOption [StandardOpenOption/CREATE_NEW StandardOpenOption/WRITE]))
 
-;; An entry is a file (`:path`) or the Keychain item of `:keychain-app`; this
-;; is the text that names it in output and errors.
 (defn- entry-label
+  "The text that names a plan entry, a file or a Keychain item, in output and
+  errors."
   [{:keys [path keychain-app]}]
   (if keychain-app
     (str "macOS Keychain item " keychain/service ", account " keychain-app)
@@ -333,15 +326,15 @@
                   cause)))
 
 (defn- apply-plan!
-  "Create every `:create` file of `plan`, in order, and return `:created`, the
-  paths written, and `:public-key` when an identity was generated.
+  "Create every `:create` entry of `plan`, in order, and return `:created`
+  (the paths written, and the Keychain item's label) and `:public-key` when
+  an identity was generated.
 
-  A file is only ever created. If something already sits at a path, which means
-  it appeared after the plan was made, the run stops and what is there is left
-  untouched. That and every other failure is an `ex-info` naming the `:path`
-  and the files `:created` before it, in its message too. Public files get the
-  process's default permissions. The identity is generated in memory and goes
-  straight into the macOS Keychain, so it is never on disk."
+  Files are only created. Something already at a path appeared after the plan
+  was made, so the run stops and leaves it. Every failure is an `ex-info` naming
+  the `:path` and, in its data and message, the files `:created` before it. The
+  identity is generated in memory and goes straight into the Keychain, never to
+  disk."
   [{:keys [root files]}]
   (reduce
    (fn [{:keys [created] :as result} {:keys [path content keychain-app] :as entry}]
@@ -433,7 +426,7 @@
   `:keygen?`, `:apply?`, and `:root`, the project directory, which defaults to
   the current one. Without `:apply?` nothing is written.
   Returns `:status`, `:preview` or `:applied`, and after applying the `:created`
-  paths."
+  paths and Keychain item label."
   [{:keys [apply? keygen?] :as opts}]
   (when (and keygen? (not (keychain/available?)))
     (throw (ex-info (str "--keygen stores the key in the macOS Keychain, which is not available"
