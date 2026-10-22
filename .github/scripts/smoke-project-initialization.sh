@@ -41,15 +41,24 @@ assert_pin() {
   fi
 }
 
-# An empty project gets a bb.edn, the template and an identity, and the task the
-# initializer wrote then sets and verifies a first secret.
+# An empty project gets a bb.edn and the template, and the task the initializer
+# wrote then sets and verifies a first secret. The identity is a throwaway key
+# file named by SECRETS_AGE_IDENTITY_FILE: --keygen stores its key in the macOS
+# Keychain, which this script must never write to and CI does not have.
 run_new_case() {
   local consumer="${work_dir}/new-consumer"
   local isolated_home="${work_dir}/new-home"
   local clj_config="${work_dir}/new-clj-config"
 
+  local identity_file="${work_dir}/new-identity.txt"
+
   mkdir -p "${consumer}" "${isolated_home}" "${clj_config}"
   git -C "${consumer}" init --quiet
+  if ! command -v age-keygen > /dev/null; then
+    echo "age-keygen is not installed; the smoke test needs it." >&2
+    exit 1
+  fi
+  age-keygen -o "${identity_file}" 2> /dev/null
 
   (
     cd "${consumer}"
@@ -59,19 +68,59 @@ run_new_case() {
     export CLJ_CONFIG="${clj_config}"
 
     bb "-Duser.home=${isolated_home}" -cp "${repo_root}/src" -m com.kirahowe.secrets.init \
-      --app initializer-smoke-new --apply --keygen
+      --app initializer-smoke-new --apply
     assert_pin bb.edn
-    printf '%s' 'smoke-first-secret' | bb "-Duser.home=${isolated_home}" \
+    printf '%s' 'smoke-first-secret' | SECRETS_AGE_IDENTITY_FILE="${identity_file}" bb "-Duser.home=${isolated_home}" \
       -Sdeps "${checkout_override}" secrets set :example/api-key
-    bb "-Duser.home=${isolated_home}" -Sdeps "${checkout_override}" secrets verify
+    SECRETS_AGE_IDENTITY_FILE="${identity_file}" bb "-Duser.home=${isolated_home}" \
+      -Sdeps "${checkout_override}" secrets verify
   )
 
   test -f "${consumer}/bb.edn"
   test -f "${consumer}/secrets/secrets.edn.example"
   test -f "${consumer}/secrets/secrets.edn.age"
   test -f "${consumer}/secrets/secrets.edn.manifest"
-  test -f "${isolated_home}/.config/initializer-smoke-new/key.txt"
+  # There is no default key file, so nothing may appear under the home's .config.
+  if [[ -e "${isolated_home}/.config" ]]; then
+    echo "Expected no ${isolated_home}/.config, found:" >&2
+    find "${isolated_home}/.config" >&2
+    exit 1
+  fi
   assert_status "${consumer}" $'?? bb.edn\n?? secrets/secrets.edn.age\n?? secrets/secrets.edn.example\n?? secrets/secrets.edn.manifest'
+}
+
+# --keygen needs the macOS Keychain, so without one it must fail before it
+# writes anything. Skipped on macOS, where it would store a key in the real
+# login Keychain.
+run_keygen_without_keychain_case() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "Skipping the --keygen refusal check on macOS: it has a real Keychain."
+    return 0
+  fi
+
+  local consumer="${work_dir}/keygen-consumer"
+  local isolated_home="${work_dir}/keygen-home"
+  mkdir -p "${consumer}" "${isolated_home}"
+
+  local output
+  if output="$(cd "${consumer}" && bb "-Duser.home=${isolated_home}" -cp "${repo_root}/src" \
+    -m com.kirahowe.secrets.init --app initializer-smoke-keygen --apply --keygen 2>&1)"; then
+    echo "Expected init --apply --keygen to fail without a Keychain." >&2
+    exit 1
+  fi
+  if ! grep -q -F -- "--keygen stores the key in the macOS Keychain" <<< "${output}"; then
+    echo "Expected the refusal to say --keygen needs the Keychain, got:" >&2
+    printf '%s\n' "${output}" >&2
+    exit 1
+  fi
+  if [[ -n "$(find "${consumer}" -mindepth 1 -print -quit)" ]]; then
+    echo "Expected a refused --keygen to write nothing." >&2
+    exit 1
+  fi
+  if [[ -e "${isolated_home}/.config" ]]; then
+    echo "Expected a refused --keygen to create no ${isolated_home}/.config." >&2
+    exit 1
+  fi
 }
 
 # The initializer creates missing files only. A project that already has a
@@ -100,6 +149,7 @@ run_existing_case() {
 }
 
 run_new_case
+run_keygen_without_keychain_case
 run_existing_case
 
 echo "Project initialization smoke passed."
