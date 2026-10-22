@@ -26,6 +26,7 @@
               [com.kirahowe.secrets.fs-property-test]
               [com.kirahowe.secrets.init-property-test]
               [com.kirahowe.secrets.init-test]
+              [com.kirahowe.secrets.keychain-test]
               [com.kirahowe.secrets.manifest-property-test]
               [com.kirahowe.secrets.release-test]
               [com.kirahowe.secrets.safe-edn-property-test]
@@ -38,6 +39,7 @@
                                                  'com.kirahowe.secrets.aero-test
                                                  'com.kirahowe.secrets.coordinate-test
                                                  'com.kirahowe.secrets.init-test
+                                                 'com.kirahowe.secrets.keychain-test
                                                  'com.kirahowe.secrets.release-test
                                                  'com.kirahowe.secrets.site-policy-test
                                                  'com.kirahowe.secrets.workflow-policy-test

@@ -46,9 +46,18 @@
                             app result)))))
 
 (defn has-key?
-  "True when the Keychain holds an item for `app`. Reads no secret."
+  "True when the Keychain holds an item for `app`, false when it holds none.
+  Reads no secret. Any other failure, such as a locked Keychain, throws rather
+  than reading as absence."
   [app]
-  (zero? (:exit (fs/sh [security "find-generic-password" "-s" service "-a" app]))))
+  (let [{:keys [exit] :as result}
+        (fs/sh [security "find-generic-password" "-s" service "-a" app])]
+    (cond
+      (zero? exit) true
+      (= item-not-found exit) false
+      :else (throw (failure (str "Could not look up the age identity for " app
+                                 " in the macOS Keychain")
+                            app result)))))
 
 (defn- quoted
   "`s` as one argument of a `security -i` command line."

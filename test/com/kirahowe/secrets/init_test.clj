@@ -189,6 +189,19 @@
           (is (empty? (files)) "nothing is written, the project files included")
           (is (empty? @*keychain*)))))))
 
+(deftest keygen-stops-when-the-keychain-lookup-fails-test
+  (let [stores (atom [])]
+    (with-redefs [keychain/has-key? (fn [_]
+                                      (throw (ex-info "Could not look up the age identity"
+                                                      {:reason :keychain-failed :exit 36})))
+                  keychain/store-key! (fn [& args] (swap! stores conj args))]
+      (doseq [apply? [false true]]
+        (testing (if apply? "apply" "preview")
+          (let [e (test-env/thrown #(run!! {:keygen? true :apply? apply?}))]
+            (is (= :keychain-failed (:reason (ex-data e))))
+            (is (empty? @stores) "no key is stored")
+            (is (empty? (files)) "nothing is written, the project files included")))))))
+
 ;;;; The printed coordinate
 
 (deftest the-coordinate-is-the-running-library-test

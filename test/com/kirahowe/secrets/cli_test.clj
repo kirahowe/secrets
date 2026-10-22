@@ -4099,6 +4099,32 @@
             (is (str/starts-with? (str after) "AGE-SECRET-KEY-1"))
             (is (not= before after) "a confirmed replacement stores a new key")))))))
 
+(def ^:private real-has-key? keychain/has-key?)
+
+(deftest keygen-stops-when-the-keychain-lookup-fails-test
+  (let [items (atom {"cli-test" "AGE-SECRET-KEY-1EXISTING"})
+        real-sh fs/sh
+        stores (atom [])
+        confirms (atom 0)
+        config (cli/normalize-config (test-config {:key-file ::absent}))]
+    (with-keychain items
+      (fn []
+        (with-redefs-fn {#'keychain/has-key? real-has-key?
+                         #'fs/sh (fn [argv & more]
+                                   ;; only `security` fails; the age checks run for real
+                                   (if (= "/usr/bin/security" (first argv))
+                                     {:exit 36 :out "" :err "keychain is locked"}
+                                     (apply real-sh argv more)))
+                         #'keychain/store-key! (fn [& args] (swap! stores conj args))
+                         (cli-private 'confirm!) (fn [& _] (swap! confirms inc) true)}
+          (fn []
+            (let [e (test-env/thrown
+                     #(with-out-str (with-in-str "y\n" (cli/keygen! config "dev"))))]
+              (is (= :keychain-failed (:reason (ex-data e))))
+              (is (empty? @stores) "no key is stored over the one the lookup could not see")
+              (is (zero? @confirms) "a failed lookup is not read as no key, so no prompt")
+              (is (= {"cli-test" "AGE-SECRET-KEY-1EXISTING"} @items)))))))))
+
 (deftest keygen-refuses-where-it-cannot-store-a-key-test
   (testing "a :key-command environment: the command only reads the key"
     (let [items (atom {})
