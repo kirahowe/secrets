@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.1.0] - 2026-10-14
+## [0.1.0] - Unreleased
 
 ### Added
 - `com.kirahowe.secrets/load-secrets` and `get-secret`, which load an
