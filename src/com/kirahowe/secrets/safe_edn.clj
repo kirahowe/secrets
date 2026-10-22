@@ -3,21 +3,19 @@
 
   Exact-one, depth-bounded, content-free parsing for EDN that may hold secrets.
 
-  `clojure.edn/read-string` alone does not fit: parser messages can echo secret
-  tokens, it accepts the first value and ignores trailing ones, and a mistaken
-  or malformed input that nests very deeply can overflow the stack before a
-  catch can sanitize the failure. This namespace scans depth first, reads
-  exactly one value, and returns only allowlisted failure metadata."
+  `clojure.edn/read-string` alone does not fit: its messages can echo secret
+  tokens, it ignores values after the first, and deeply nested input can
+  overflow the stack before a catch can sanitize the failure."
   (:require [clojure.edn :as edn]))
 
 (def ^:private max-depth
-  "The deepest collection nesting [[parse]] accepts. It catches an accidental
-  deeply nested input before the recursive reader can overflow the stack."
+  "The deepest collection nesting [[parse]] accepts, checked before the
+  recursive reader can overflow the stack."
   100)
 
 (defn- skip-string
-  "Return the index just past the EDN string literal whose opening quote sits at
-  `i` - 1, so a `\\` escape cannot hide the closing quote."
+  "Return the index just past the string literal whose opening quote is at
+  `i` - 1, skipping `\\` escapes."
   [^String s i]
   (let [n (.length s)]
     (loop [i i]
@@ -28,8 +26,7 @@
         :else (recur (inc i))))))
 
 (defn- skip-comment
-  "Return the index of the newline ending the `;` comment that starts at `i`, or
-  the end of `s`."
+  "Return the index of the newline ending the comment at `i`, or the end of `s`."
   [^String s i]
   (let [n (.length s)]
     (loop [i i]
@@ -38,14 +35,12 @@
         (recur (inc i))))))
 
 (defn- nesting-depth
-  "Return the deepest collection nesting the EDN text `s` reaches, scanning it
-  once without parsing it.
+  "Return the deepest collection nesting in EDN text `s`, scanning once
+  without parsing.
 
-  Only delimiters that are structure count: string literals (including their
-  `\\` escapes), character literals such as `\\[`, and `;` comments are skipped,
-  so a delimiter inside any of them is text rather than depth. `#{` needs no
-  special case because its `{` is the opener. Surplus closing delimiters clamp
-  at zero: balance is `clojure.edn`'s job, not this scanner's."
+  Strings, character literals such as `\\[`, and `;` comments are skipped, so
+  delimiters inside them are not depth. Surplus closers clamp at zero:
+  balance is `clojure.edn`'s job."
   [^String s]
   (let [n (.length s)]
     (loop [i 0 depth 0 deepest 0]
@@ -60,17 +55,13 @@
           (recur (inc i) depth deepest))))))
 
 (defn parse
-  "Parse exactly one EDN value from string `s`.
+  "Parse exactly one EDN value from string `s`. Parser exceptions are never
+  retained.
 
-  The collection depth is scanned before parsing, the text is read once for the
-  value and once for EOF, and parser exceptions, messages, and causes are
-  never retained.
-
-  Returns `{:ok? true :value value}` on success. Failures are content-free maps
-  with one stable `:reason`: `:edn-empty`, `:edn-extra-values`,
-  `:edn-too-deep`, or `:edn-malformed`. Depth failures also carry numeric
-  `:depth` and `:limit`. A malformed failure carries the numeric `:line` and
-  `:column` the reader had reached when it gave up, counted from 1."
+  Returns `{:ok? true :value value}`, or a content-free failure map with
+  `:ok? false` and a `:reason` of `:edn-empty`, `:edn-extra-values`,
+  `:edn-too-deep` (with numeric `:depth` and `:limit`), or `:edn-malformed`
+  (with the 1-based `:line` and `:column` where the reader gave up)."
   [s]
   (let [depth (nesting-depth s)]
     (if (> depth max-depth)
@@ -92,13 +83,13 @@
 
 (defn failure-data
   "Return the fields of a failed [[parse]] result that may enter exception
-  data: `:reason` and the numeric `:line`, `:column`, `:depth`, and `:limit`."
+  data."
   [failure]
   (select-keys failure [:reason :line :column :depth :limit]))
 
 (defn failure-message
-  "Render a failed [[parse]] result as a clause saying what was wrong, such as
-  \"malformed EDN syntax at line 3, column 7\". It holds none of the text."
+  "Render a failed [[parse]] result as a clause, such as \"malformed EDN syntax
+  at line 3, column 7\", with none of the input text."
   [{:keys [reason depth limit line column]}]
   (case reason
     :edn-empty "expected one EDN value, found empty input"

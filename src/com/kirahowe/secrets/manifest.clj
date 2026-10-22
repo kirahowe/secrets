@@ -1,46 +1,39 @@
 (ns com.kirahowe.secrets.manifest
   "Implementation namespace; not part of the public API and may change without notice.
 
-  Pure functions for the plaintext manifest that ships next to each encrypted
-  secrets file (`secrets.edn.age` → `secrets.edn.manifest`), and for the
-  library metadata a store carries to produce it.
+  Pure functions for the plaintext manifest committed next to each encrypted
+  secrets file (`secrets.edn.age` → `secrets.edn.manifest`), and for the store
+  metadata that produces it.
 
-  The manifest records the shape of the secrets: every key path, its value
-  type, and a keyed hash of its value (`:vhash`). It never records a value. It
-  is safe to commit, so a `git diff` of the manifest shows which keys were
-  added, removed, retyped, or had their value change, while the ciphertext
-  diffs opaquely.
+  The manifest lists every key path with its value type and a keyed hash of
+  its value (`:vhash`), never the value. A `git diff` of it shows which keys
+  were added, removed, retyped, or changed.
 
-  A `:vhash` is an HMAC keyed by the store's manifest key: 256 random bits
-  held inside the encrypted EDN, in the metadata under `store-key`. Everyone who can decrypt the
-  store computes the same hashes, and someone who has only the repository
-  cannot test guesses of a low-entropy value against them. Solo and team stores
-  work the same way.
+  A `:vhash` is an HMAC keyed by the store's manifest key, 256 random bits
+  kept in the encrypted EDN under `store-key`. Everyone who can decrypt
+  computes the same hashes; someone with only the repository cannot test
+  guesses against them.
 
-  A manifest is a review aid, not an authorization check. It records what a
-  ciphertext contains, never who produced it. See `doc/threat-model.md` in the
-  repository.
-
-  Everything here uses only `clojure.core`, `clojure.string`, and the
-  platform's `java.security` and `javax.crypto`, so it loads and runs the same
-  under JVM Clojure and babashka."
+  A manifest is a review aid, not an authorization check (see
+  `doc/threat-model.md`). Only core Clojure and the JDK crypto classes are
+  used, so it runs the same under JVM Clojure and babashka."
   (:require [clojure.string :as str]))
 
 ;;;; Store metadata
 
 (def store-key
-  "The one reserved top-level key of a store. Its value is the library's
-  metadata, a map `{:version 1 :manifest-key \"<64 hex>\" :recipients
-  \"<record>\"}`, and is never user data."
+  "The reserved top-level key of a store. Its value is the library's metadata,
+  `{:version 1 :manifest-key \"<64 hex>\" :recipients \"<record>\"}`, never
+  user data."
   :com.kirahowe.secrets/store)
 
 (def store-version
-  "The one store metadata `:version` this library writes and reads."
+  "The store metadata `:version` this library writes and reads."
   1)
 
 (defn user-data
-  "Return decrypted store `value` without the library's `store-key`. A value
-  that is not a map is returned unchanged."
+  "Return decrypted store `value` without `store-key`. A non-map is returned
+  unchanged."
   [value]
   (if (map? value)
     (dissoc value store-key)
@@ -50,24 +43,22 @@
   (apply str (map #(format "%02x" (bit-and % 0xff)) bs)))
 
 (defn generate-key
-  "Return a new manifest key: 32 bytes from `SecureRandom` as 64 lowercase hex
-  characters."
+  "Return a new manifest key: 32 `SecureRandom` bytes as 64 lowercase hex."
   []
   (let [bs (byte-array 32)]
     (.nextBytes (java.security.SecureRandom.) bs)
     (hex bs)))
 
 (defn- valid-key?
-  "True when `x` is a well-formed manifest key: a string of 64 lowercase hex
-  characters."
+  "True when `x` is a string of 64 lowercase hex characters."
   [x]
   (boolean (and (string? x) (re-matches #"[0-9a-f]{64}" x))))
 
 (defn store-problem
-  "Return nil when decrypted store `value` is a map whose `store-key` holds
-  well-formed metadata of the `store-version`, and otherwise a keyword saying
-  why not: `:not-a-map`, `:missing`, `:unsupported-version` (an integer
-  `:version` other than this one), or `:malformed`."
+  "Return nil when `value` is a map with well-formed `store-key` metadata of
+  the `store-version`, otherwise why not: `:not-a-map`, `:missing`,
+  `:unsupported-version` (an integer `:version` other than this one), or
+  `:malformed`."
   [value]
   (let [found (when (map? value) (get value store-key))]
     (cond
@@ -85,11 +76,10 @@
       :malformed)))
 
 (defn recipients-id
-  "Return the string a store records for the recipient set it is encrypted to:
-  the SHA-256 hex of the distinct `recipients`, sorted and joined by newlines.
-  Single-key mode has no list and passes nil, which gives the fixed word
-  `identity`: the identity that decrypts such a store is the one it is
-  encrypted to."
+  "Return the string a store records for its recipient set: the SHA-256 hex of
+  the distinct `recipients`, sorted and newline-joined. Single-key mode passes
+  nil and gets the fixed word `identity`, since the decrypting identity is
+  the one encrypted to."
   [recipients]
   (if (nil? recipients)
     "identity"
@@ -100,8 +90,8 @@
 ;;;; Hashing
 
 (defn- key-bytes
-  "Decode manifest key `k` to its 32 bytes. Anything that is not a well-formed
-  key throws, so a missing key can never produce a manifest without hashes."
+  "Decode manifest key `k` to its 32 bytes. A malformed key throws
+  `:invalid-manifest-key`, so a missing key can never yield unhashed entries."
   ^bytes [k]
   (when-not (valid-key? k)
     (throw (ex-info "Not a well-formed manifest key." {:reason :invalid-manifest-key})))
@@ -116,8 +106,8 @@
 ;;;; Shape
 
 (defn value-type
-  "Return a keyword naming the EDN type of `v`, recorded in the manifest so a
-  change of type (e.g. string → set) is visible in the diff."
+  "Return a keyword naming the EDN type of `v`, so a type change shows in the
+  manifest diff."
   [v]
   (cond
     (nil? v) :nil
@@ -135,8 +125,8 @@
     :else :other))
 
 (def ^:private tags
-  "The frame tag of every `value-type` result. One tag per type, so a vector, a
-  list and a set holding equal elements encode differently."
+  "The frame tag of each `value-type`, so a vector, list, and set of equal
+  elements encode differently."
   {:nil "n" :boolean "b" :string "s" :keyword "k" :symbol "y" :integer "i"
    :float "f" :inst "t" :map "m" :set "S" :vector "V" :list "L" :other "o"})
 
@@ -146,11 +136,10 @@
   (str tag \: (count payload) \: payload))
 
 (defn- encode
-  "Return the canonical encoding of `v` as a `String`: one `frame` per value,
-  nested for collections. Map entries and set elements are sorted, and vector
-  and list elements keep their order. Every frame carries its type tag and
-  its length, so two values the EDN reader can produce share an encoding only
-  when they are equal."
+  "Return the canonical encoding of `v`: one `frame` per value, nested for
+  collections. Map entries and set elements are sorted; vector and list
+  elements keep their order. Tags and lengths make the encoding unambiguous,
+  so two values the EDN reader can produce share one only when equal."
   ^String [v]
   (let [t (value-type v)
         tag (tags t)]
@@ -161,9 +150,9 @@
       (frame tag (pr-str v)))))
 
 (defn- utf16-bytes
-  "Return the UTF-16 code units of `s` as big-endian byte pairs. No charset
-  encoder is used, because each one replaces an unpaired surrogate, which
-  `clojure.edn` can read, and two different strings would then hash alike."
+  "Return the UTF-16 code units of `s` as big-endian byte pairs. A charset
+  encoder would replace an unpaired surrogate (which `clojure.edn` can read),
+  making two different strings hash alike."
   ^bytes [^String s]
   (let [n (count s)
         out (byte-array (* 2 n))]
@@ -175,12 +164,10 @@
     out))
 
 (defn- vhash
-  "Return the first 8 bytes of the keyed HMAC of `v` as 16 hex characters. A
-  changed hash shows that a value changed without revealing the value or
-  letting someone who has only the repository test guesses against it. At 64
-  bits the hash can collide, so an unchanged hash is strong evidence of an
-  unchanged value, not proof. The key is the only other input, so equal values
-  at different paths in one store hash equally."
+  "Return the first 8 bytes of the keyed HMAC of `v` as 16 hex characters.
+  At 64 bits it can collide, so an unchanged hash is strong evidence of an
+  unchanged value, not proof. The path is not an input, so equal values at
+  different paths hash equally."
   [^bytes hkey v]
   (hex (take 8 (hmac-sha256 hkey (utf16-bytes (encode v))))))
 
@@ -198,11 +185,10 @@
     (assoc entries path (descriptor v hkey))))
 
 (defn entries
-  "Map a store's value to an ordered {path-vector -> descriptor} manifest map.
-  Recurses into non-empty maps; every other value is a leaf with its `:type`,
-  a `:count` when it is a collection, and its `:vhash` under `manifest-key`.
-  The store's `store-key` gets no entry. Throws when `manifest-key` is not
-  a well-formed key."
+  "Map a store's value to an ordered `{path-vector descriptor}` map. Non-empty
+  maps are recursed into; every other value is a leaf with `:type`, `:count`
+  (collections only), and `:vhash` under `manifest-key`. `store-key` gets no
+  entry. Throws `:invalid-manifest-key` for a malformed key."
   [secrets manifest-key]
   (collect-leaves (sorted-map-by (fn [a b] (compare (encode a) (encode b))))
                   []
@@ -212,7 +198,7 @@
 ;;;; The manifest file
 
 (def ^:private supported-version
-  "The one manifest `:version` this library writes and reads."
+  "The manifest `:version` this library writes and reads."
   3)
 
 (defn- hex-string?
@@ -223,16 +209,15 @@
        (some? (re-matches #"[0-9a-f]*" x))))
 
 (defn problem
-  "Return nil when `value`, a parsed manifest, is complete, and otherwise a
-  map with the `:reason` it is not.
+  "Return nil when parsed manifest `value` is complete, otherwise a map with
+  the `:reason`: `:manifest-malformed`, `:unsupported-version`, or
+  `:wrong-app`.
 
-  A complete manifest is a map with the `supported-version`, `expected-app`
-  under `:app`, a SHA-256 hex `:ciphertext-sha`, and a `:keys` map in which
-  every path is a vector and every entry has a keyword `:type` and a 16 hex
-  character `:vhash`. The `:version` check keeps a manifest in another format
-  from being compared at all. The `:app` check catches a manifest copied from
-  another project, which is an operator's wrong-file mistake and not a forged
-  manifest (see `doc/threat-model.md`, B1)."
+  Complete means the `supported-version`, `expected-app` under `:app`, a
+  SHA-256 hex `:ciphertext-sha`, and a `:keys` map of vector paths to entries
+  with a keyword `:type` and a 16-hex `:vhash`. The `:app` check catches a
+  manifest copied from another project, a wrong-file mistake rather than a
+  forgery (see `doc/threat-model.md`, B1)."
   [expected-app value]
   (cond
     (not (map? value))
@@ -255,18 +240,17 @@
     {:reason :manifest-malformed}))
 
 (defn print-whole
-  "Call `f` with the printer's length and level limits off and namespace-map
-  shorthand off. A REPL that has set `*print-length*` would otherwise write
-  `...` into a store or a manifest in place of what it holds."
+  "Call `f` with print length, level, and namespace-map shorthand off. A REPL
+  that set `*print-length*` would otherwise write `...` into a store or
+  manifest."
   [f]
   (binding [*print-length* nil *print-level* nil *print-namespace-maps* false]
     (f)))
 
 (defn render
-  "Render `entries` to the committed manifest file text, one key path per
-  line, so `git diff` is line-oriented and readable. `ciphertext-sha` is the
-  SHA-256 hex of the encrypted `.age` file: recording it lets CI check that the
-  manifest is fresh against the ciphertext alone, without holding any key."
+  "Render `entries` as manifest file text, one key path per line so diffs read
+  well. `ciphertext-sha` (SHA-256 hex of the `.age` file) lets CI check the
+  manifest is fresh without holding a key."
   [{:keys [app ciphertext-sha]} entries]
   (print-whole
    #(str ";; Auto-generated by `bb secrets`. SAFE TO COMMIT (holds no secret values).\n"
@@ -283,9 +267,9 @@
                 "}}\n")))))
 
 (defn diff
-  "Compare two manifest `entries` maps (`before` = committed, `after` = fresh);
-  return {:added :removed :changed} as sorted seqs of key paths. `:changed` =
-  present in both with a different descriptor (type, count, or value hash)."
+  "Compare manifest `entries` maps and return `{:added :removed :changed}` as
+  sorted seqs of key paths. `:changed` means present in both with a different
+  descriptor."
   [before after]
   (let [bks (set (keys before)) aks (set (keys after))
         srt #(sort-by pr-str %)]

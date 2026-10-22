@@ -1,51 +1,46 @@
 (ns com.kirahowe.secrets.source
   "Implementation namespace; not part of the public API and may change without notice.
 
-  Local-only, bounded acquisition of encrypted secrets sources.
-
-  A source is a filesystem path or a classpath resource URL whose scheme is
-  `file:` or `jar:file:`. Source values may themselves contain credentials, so
-  diagnostics cross this boundary only as allowlisted descriptors, and a URL
-  is read through its fields and never opened through its handler."
+  Local-only, size-bounded acquisition of encrypted secrets sources: a
+  filesystem path or a `file:` or `jar:file:` classpath resource URL. A source
+  value may itself contain credentials, so diagnostics carry only allowlisted
+  descriptors, and a URL is read through its fields, never opened."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.fs :as fs]))
 
 (def ^:private uri-scheme
-  "A leading URI scheme, per RFC 3986. A source string carrying one is a
-  locator whose remainder may hold a credential, never a path to keep as-is."
+  "A leading URI scheme, per RFC 3986. A string carrying one is a locator whose
+  remainder may hold a credential."
   #"^([A-Za-z][A-Za-z0-9+.\-]*):")
 
 (def ^:private windows-absolute-path
-  "A Windows drive path, which is a path rather than a one-letter URI scheme."
+  "A Windows drive path, not a one-letter URI scheme."
   #"(?i)^[a-z]:[\\/]")
 
 (def max-source-bytes
-  "The most ciphertext bytes one source may hold (16 MiB). It catches an
-  accidental huge input, such as the wrong file, before it is copied or
-  decrypted."
+  "The most ciphertext bytes one source may hold (16 MiB), to catch a wrong
+  file before it is copied or decrypted."
   16777216)
 
 (def ^:private no-store-hint
-  "One-line remediation appended to no-secrets-file errors."
+  "Remediation appended to no-file errors."
   "Create it with `bb secrets new`.")
 
 (defn- locator-scheme
-  "Return the lower-case URI scheme that string `s` begins with after
-  surrounding whitespace is trimmed, or nil when `s` is a plain filesystem
-  path. A Windows drive path such as `C:\\keys` is a path. A bare relative
-  name with a colon, such as `key:txt`, has the scheme `key`; `./key:txt` is a
-  path. A string with a scheme is a locator: its remainder may hold a
-  credential, so a diagnostic names the scheme and never the string."
+  "Return the lower-case URI scheme `s` begins with (after trimming), or nil
+  for a plain path. A Windows drive path such as `C:\\keys` is a path. A bare
+  relative name with a colon, such as `key:txt`, has the scheme `key`;
+  `./key:txt` is a path."
   [s]
   (let [s (str/trim s)]
     (when-not (re-find windows-absolute-path s)
       (some-> (second (re-find uri-scheme s)) str/lower-case))))
 
 (defn- key-contents?
-  "True when `s` holds an age secret key and so must never be echoed: the key
-  itself, its base64 encoding (ASCII whitespace ignored), or the 58 upper-case
-  bech32 characters of a key whose `AGE-SECRET-KEY-` prefix was cut off."
+  "True when `s` holds an age secret key and must never be echoed: the key,
+  its base64 encoding, or the bech32 body of a key missing its
+  `AGE-SECRET-KEY-` prefix."
   [s]
   (let [marker "AGE-SECRET-KEY-"
         packed (str/replace s #"[ \t\r\n]" "")]
@@ -58,13 +53,11 @@
               (catch IllegalArgumentException _ false))))))
 
 (defn path-problem
-  "Return nil when string `s` can name a local file, or a map saying why it
-  cannot. `{:problem :key-contents}` means it holds an age secret key, raw or
-  base64-encoded.
-  `{:problem :locator :scheme scheme :bare? boolean}` means it is URI-shaped;
-  `:bare?` is true when nothing after the scheme contains a `/`, which is what
-  a relative file name with a colon in it looks like. The map never holds any
-  part of `s` except its scheme."
+  "Return nil when string `s` can name a local file, otherwise a map saying
+  why not: `{:problem :key-contents}` (an age secret key, raw or base64) or
+  `{:problem :locator :scheme scheme :bare? boolean}` (URI-shaped; `:bare?`
+  means no `/` follows the scheme, as in a relative file name with a colon).
+  The map holds no part of `s` except its scheme."
   [s]
   (let [s (str/trim (str s))]
     (if (key-contents? s)
@@ -75,10 +68,9 @@
          :bare? (not (str/includes? (subs s (inc (count scheme))) "/"))}))))
 
 (defn path-problem-message
-  "Render a [[path-problem]] as one sentence about `subject`, the variable,
-  option, or configuration field that held the value. `expected` says what the
-  value should have been, such as \"a local filesystem path\". The value
-  itself is never rendered."
+  "Render a [[path-problem]] as a sentence about `subject` (the variable,
+  option, or field that held the value). `expected` says what it should have
+  been, such as \"a local filesystem path\". The value is never rendered."
   [subject expected {:keys [problem scheme bare?]}]
   (case problem
     :key-contents
@@ -91,8 +83,8 @@
            " For a relative file whose name contains a colon, write ./ before the name."))))
 
 (defn- decode
-  "Decode the percent-escapes of URL path `raw` without reading `+` as a
-  space. Nil when `raw` is empty or malformed."
+  "Decode percent-escapes in URL path `raw`, leaving `+` alone. Nil when `raw`
+  is empty or malformed."
   [raw]
   (when (seq raw)
     (try
@@ -100,10 +92,9 @@
       (catch IllegalArgumentException _ nil))))
 
 (defn- url-source
-  "The local source that classpath resource `url` names, or nil when it is not
-  one `clojure.java.io/resource` returns for a local classpath: a `file:` URL,
-  or a `jar:file:` URL of an entry in a local archive, with no authority,
-  query, or fragment. Only the URL's fields are read. It is never opened."
+  "The local source that classpath resource `url` names, or nil unless it is a
+  `file:` URL or a `jar:file:` entry in a local archive, with no authority,
+  query, or fragment. Only the URL's fields are read."
   [^java.net.URL url]
   (when (and (empty? (.getAuthority url)) (nil? (.getQuery url)) (nil? (.getRef url)))
     (case (.getProtocol url)
@@ -117,11 +108,10 @@
 (defn descriptor
   "Return allowlisted metadata naming `source` without rendering secret data.
 
-  A File, a Path, and a path string keep their path. A classpath resource URL
-  this namespace accepts keeps its scheme and path. A URL it refuses, and a
-  string that is URI-shaped, keep only the scheme. Any other value, a string
-  holding key contents included, keeps only its class name, never its
-  `toString`. `nil` has no descriptor."
+  A File, Path, or path string keeps its path. An accepted classpath URL keeps
+  its scheme and path. A refused URL or a URI-shaped string keeps only the
+  scheme. Anything else, including a string holding key contents, keeps only
+  its class name. `nil` has no descriptor."
   [source]
   (cond
     (nil? source) nil
@@ -141,7 +131,7 @@
     :else {:kind :object :class (.getName (class source))}))
 
 (defn- source-description
-  "Render one diagnostic phrase from `source-descriptor` and nothing else."
+  "Render a diagnostic phrase from `source-descriptor` alone."
   [{:keys [kind path scheme] class-name :class}]
   (cond
     (= :object kind) (str "an instance of " class-name)
@@ -150,8 +140,8 @@
     :else (str "a URL with the scheme " scheme)))
 
 (defn- local-source
-  "Classify `source` without opening it: `{:file f}`, or `{:archive f :entry
-  name}` for a jar entry. Anything else is refused with `:disallowed-source`."
+  "Classify `source` without opening it: `{:file f}` or `{:archive f :entry
+  name}`. Anything else throws `:disallowed-source`."
   [source source-descriptor]
   (let [problem (when (string? source) (path-problem source))]
     (or
@@ -170,7 +160,7 @@
        {:source source-descriptor :reason :disallowed-source})))))
 
 (defn- source-too-large!
-  "Throw a content-free source-size failure."
+  "Throw `:source-too-large`."
   [source-descriptor observed]
   (throw (ex-info (str "The secrets source " (source-description source-descriptor)
                        " is larger than the " max-source-bytes " byte limit.")
@@ -180,10 +170,9 @@
                    :reason :source-too-large})))
 
 (defn- copy-jar-entry!
-  "Copy entry `entry` of local jar `archive` to an owner-only temp file and
-  return `[file cleanup!]`. An entry past `max-source-bytes` is refused before
-  it is copied. Any failure, an `Error` included, deletes the temp file before
-  it propagates."
+  "Copy `entry` of local jar `archive` to an owner-only temp file and return
+  `[file cleanup!]`. An oversized entry is refused before copying. Any
+  failure, an `Error` included, deletes the temp file first."
   [source-descriptor {:keys [archive entry]}]
   (let [tmp (fs/owner-only-temp-file! "secrets-" ".age")]
     (try
@@ -201,7 +190,7 @@
         (throw t)))))
 
 (defn- unreadable-source!
-  "Throw a source-safe `:no-file` failure for unreadable allowed local input."
+  "Throw `:no-file` for an allowed but unreadable local source."
   [source-descriptor e]
   (let [path (when (= :file (:kind source-descriptor)) (:path source-descriptor))]
     (throw
@@ -219,17 +208,15 @@
 (defn acquire!
   "Acquire local `source` as `[file cleanup!]`.
 
-  `source` is a filesystem path (a String, `java.io.File`, or
-  `java.nio.file.Path`) or a classpath resource URL as
-  `clojure.java.io/resource` returns it, whose scheme is `file:` or
-  `jar:file:`. A nil or blank source, and a path that is not a file, throw
-  `:no-file`. `source-descriptor` must be the value returned by
-  [[descriptor]] for `source`; it is the only source representation admitted
-  to failures. A file is checked in place. A jar entry is copied to an
-  owner-only temporary file, and the returned cleanup function removes that
-  copy. A source past `max-source-bytes` throws `:source-too-large` with the
-  numeric `:limit` and `:observed`. Anything else throws `:disallowed-source`
-  before it is opened, and is never rendered."
+  `source` is a path (String, `File`, or `Path`) or a `file:` or `jar:file:`
+  classpath URL. A file is used in place; a jar entry is copied to an
+  owner-only temp file that `cleanup!` removes. `source-descriptor` must be
+  [[descriptor]] of `source` and is the only representation of it that enters
+  failures.
+
+  Throws `:no-file` for a nil or blank source or a path that is not a file,
+  `:source-too-large` (with `:limit` and `:observed`) past `max-source-bytes`,
+  and `:disallowed-source` for anything else, before it is opened."
   [source source-descriptor]
   (when (nil? source)
     (throw (ex-info (str "No secrets source given: source is nil. This almost always means"

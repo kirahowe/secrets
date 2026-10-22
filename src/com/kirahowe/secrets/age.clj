@@ -1,30 +1,23 @@
 (ns com.kirahowe.secrets.age
   "Implementation namespace; not part of the public API and may change without notice.
 
-  A thin wrapper over the `age` CLI (https://age-encryption.org).
+  A thin wrapper over the `age` and `age-keygen` CLIs (https://age-encryption.org).
+  It shells out, so it behaves the same under JVM Clojure and babashka, and it
+  keeps no state: where keys and secrets live is the caller's decision.
 
-  Every function runs the `age` / `age-keygen` binaries, so this
-  namespace loads and runs identically under JVM Clojure and babashka. It holds
-  no state and takes no opinion about *where* keys or secrets live. That is the
-  caller's job (see `com.kirahowe.secrets` for runtime loading and `com.kirahowe.secrets.cli`
-  for the management task).
+  An identity is a private key (`AGE-SECRET-KEY-1…`) and a recipient is its
+  public key (`age1…`). Encrypting to your own identity (`age -e -i key.txt`)
+  is the single-key workflow.
 
-  `age` is a file-encryption tool. A keypair is an
-  identity file (the private key, `AGE-SECRET-KEY-1…`) plus a recipient (the
-  public key, `age1…`). Encrypting to your own identity (`age -e -i key.txt`)
-  gives a single-key workflow: the same file both encrypts and decrypts.
-
-  age encrypts *to* a recipient and does not sign. A recipient is shareable by
-  design and authorizes *encryption*, not authorship, so nothing here, and
-  nothing built on it, can establish who produced a ciphertext."
+  age encrypts to a recipient and does not sign, so nothing here can establish
+  who produced a ciphertext."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.fs :as fs]))
 
 (defn version
   "Return the installed `age` version string, or nil when `age` is unavailable
-  or its version query fails. Only successful version output is returned:
-  subprocess arguments, environment, and failure details are never exposed."
+  or the query fails. Failure details are never exposed."
   []
   (try
     (let [{:keys [exit out err]} (fs/sh ["age" "--version"])]
@@ -34,7 +27,7 @@
     (catch Exception _ nil)))
 
 (defn installed?
-  "Return true when the `age` binary is on the PATH (the decrypt path needs only this)."
+  "Return true when the `age` binary is on the PATH."
   []
   (some? (version)))
 
@@ -49,10 +42,8 @@
                      :docs "https://age-encryption.org"}))))
 
 (defn valid-recipient?
-  "Return true when `s` looks like an age recipient: an `age1…` public key, or
-  an `ssh-ed25519`/`ssh-rsa` line with a base64 key and an optional comment.
-  This is not a full validation: `age` itself is the authority; this just
-  catches a typo or a junk line before it is written or handed to `age`."
+  "Return true when `s` looks like an age recipient: an `age1…` public key or
+  an `ssh-ed25519`/`ssh-rsa` line. Only a typo check; `age` is the authority."
   [s]
   (let [s (str/trim (str s))]
     (boolean (or (re-matches #"age1[0-9a-z]{20,}" s)
@@ -74,19 +65,18 @@
 
 (defn- identity-args
   "The age arguments and standard input that hand `identity` to age.
-  `{:identity-file path}` names a key file. `{:identity-contents s}` holds the
-  key in memory, and age reads it from standard input (`-i -`), so it is
-  never written to disk."
+  In-memory `:identity-contents` goes over standard input (`-i -`), so the key
+  never touches disk."
   [{:keys [identity-file identity-contents]}]
   (if identity-contents
     {:args ["-i" "-"] :in identity-contents}
     {:args ["-i" (path-arg :identity identity-file)]}))
 
 (defn public-key
-  "Return the public key (recipient) of `identity`, an `{:identity-file path}`
-  or `{:identity-contents s}` map, or nil when the file is missing or holds no
-  key. A key file's `# public key:` comment is read when it has one. Anything
-  else is handed to `age-keygen -y`, which needs `age` installed."
+  "Return the public key of `identity` (`{:identity-file path}` or
+  `{:identity-contents s}`), or nil when the file is missing or holds no key.
+  A key file's `# public key:` comment is used when present; otherwise
+  `age-keygen -y` derives it, which needs `age` installed."
   [{:keys [identity-file identity-contents] :as identity}]
   (let [f (some-> identity-file str io/file)]
     (when (or identity-contents (and f (.exists ^java.io.File f)))
@@ -102,8 +92,8 @@
                 (when (zero? exit) (not-empty (str/trim out)))))))))
 
 (defn generate
-  "Generate a fresh age identity in memory with `age-keygen` and return
-  `{:identity-contents secret-key-line :public-key recipient}`. Throws if
+  "Generate an identity in memory and return `{:identity-contents
+  secret-key-line :public-key recipient}`. Throws `:keygen-failed` when
   `age-keygen` is missing or fails."
   []
   (let [{:keys [exit out err]} (try
@@ -124,14 +114,12 @@
     {:identity-contents secret-key :public-key pub}))
 
 (defn keygen!
-  "Generate a fresh age identity at `path`, creating parent directories, and
-  return its public key. The key file is owner-only (0600).
+  "Generate an identity at `path` (mode 0600, parent directories created) and
+  return its public key.
 
-  Replaces `path` when it already exists, so callers own the decision about
-  whether overwriting is allowed. The key is written to a private file beside
-  `path` and moved over it atomically, so a failed generation leaves any
-  existing key untouched. Throws if `path` is blank, or if `age-keygen` is
-  missing or fails."
+  Replaces an existing `path`, so the caller decides whether overwriting is
+  allowed. The key is written beside `path` and moved over it atomically, so a
+  failed generation leaves an existing key untouched."
   [path]
   (let [f (.getAbsoluteFile (io/file (path-arg :key path)))
         parent (.getParentFile f)
@@ -146,14 +134,12 @@
           (.delete tmp))))))
 
 (defn encrypt-file!
-  "Encrypt plaintext file `in` to ciphertext file `out`. Returns `out`; throws
-  on failure.
+  "Encrypt plaintext file `in` to ciphertext file `out` and return `out`.
+  Throws `:encrypt-failed`.
 
-  `target` says who can decrypt. An identity, `{:identity-file path}` or
-  `{:identity-contents s}`, encrypts to that identity's own recipient
-  (`age -e -i`), the single-key workflow. `{:recipients [\"age1…\" …]}`
-  encrypts to each listed recipient (`-r` each), so each person holds their
-  own key and any one of them can decrypt."
+  `target` is either an identity (`{:identity-file path}` or
+  `{:identity-contents s}`), which encrypts to its own recipient, or
+  `{:recipients [\"age1…\" …]}`, where any listed recipient can decrypt."
   [{:keys [recipients] :as target} in out]
   (let [identity (when (some #(contains? target %) [:identity-file :identity-contents])
                    (identity-args target))
@@ -171,23 +157,20 @@
       out)))
 
 (defn decrypt
-  "Decrypt `encrypted-file` with `identity`, an `{:identity-file path}` or
-  `{:identity-contents s}` map, and return the plaintext as a UTF-8 string,
-  held in memory only.
+  "Decrypt `encrypted-file` with `identity` (`{:identity-file path}` or
+  `{:identity-contents s}`) and return the plaintext as a UTF-8 string, in
+  memory only.
 
-  Success establishes that the ciphertext is intact and that the identity
-  matches one of its recipients. It does not identify who encrypted it: age
-  does not sign, so this is payload integrity, never sender authenticity.
+  Success shows the ciphertext is intact and the identity is one of its
+  recipients. It says nothing about who encrypted it, since age does not sign.
 
-  age does not compress, so the plaintext is smaller than the ciphertext. The
-  caller bounds the ciphertext's size before calling, and that bounds what is
-  read here.
+  age does not compress, so the caller's bound on the ciphertext size also
+  bounds what is read here.
 
-  Both paths go through `path-arg` and `--` sits immediately before the input,
-  so no path can be read as an option or as stdin. A failure names
-  `:encrypted-file` and, for a key file, `:identity-file`, which are
-  filesystem paths and never key contents, and carries the captured stderr
-  and a wrong-key `:hint`. A failed decryption returns no partial plaintext."
+  `path-arg` and the `--` before the input keep any path from being read as an
+  option or stdin. Throws `:decrypt-failed` with `:encrypted-file`, the
+  `:identity-file` path when there is one (never key contents), the captured
+  stderr as `:error`, and a wrong-key `:hint`. No partial plaintext is returned."
   [{:keys [identity-file] :as identity} encrypted-file]
   (let [{:keys [args in]} (identity-args identity)
         argv (-> ["age" "-d"]

@@ -8,9 +8,8 @@
 (defn- user-home [] (System/getProperty "user.home"))
 
 (defn expand-home
-  "Return `path` as a string, with the user's home directory in place of the
-  `~` when it is exactly `~` or begins with `~/`. Every other string, such as
-  `~bob/x`, is returned unchanged."
+  "Return `path` as a string, with the home directory replacing a leading `~`
+  or `~/`. Anything else, such as `~bob/x`, is unchanged."
   [path]
   (let [s (str path)]
     (if (or (= s "~") (str/starts-with? s "~/"))
@@ -18,11 +17,11 @@
       s)))
 
 (defn sh
-  "Run the program `argv` and return `{:exit code :out stdout :err stderr}`.
-  It runs in directory `:dir` when one is given, and reads the string `:in` as
-  its standard input, or no input at all. Standard error is read on a daemon
-  thread, so no thread outlives the call and keeps a JVM from exiting. A
-  program that cannot be started throws `java.io.IOException`."
+  "Run `argv` and return `{:exit code :out stdout :err stderr}`. Optional
+  `:dir` is the working directory and `:in` a string for standard input.
+  Standard error is drained on a daemon thread so a full pipe cannot block the
+  process and the thread cannot keep a JVM from exiting. Throws
+  `java.io.IOException` when the program cannot be started."
   [argv & [{:keys [dir in]}]]
   (let [process (-> (ProcessBuilder. ^java.util.List (mapv str argv))
                     (cond-> dir (.directory (java.io.File. (str dir))))
@@ -59,14 +58,12 @@
                       e)))))
 
 (defn owner-only-temp-file!
-  "Create a new, empty private file and return it as a `java.io.File`.
+  "Create a new, empty file and return it as a `java.io.File`, in `dir` or the
+  system temporary directory, named from `prefix` and `suffix`.
 
-  The file is created exclusively, under a generated name that uses `prefix`
-  and `suffix`, with mode 0600 as a creation attribute, so its bytes are never
-  readable by another user. It lives in `dir` when one is given and in the
-  system temporary directory otherwise. A filesystem that cannot create an
-  owner-only file throws `ex-info` with
-  `:reason :owner-only-temp-file-unavailable`. The caller deletes the file."
+  Mode 0600 is set at creation, so no other user can ever read its contents.
+  A filesystem that cannot do that throws `:owner-only-temp-file-unavailable`.
+  The caller deletes the file."
   ([prefix suffix]
    (create-owner-only #(java.nio.file.Files/createTempFile prefix suffix owner-only)))
   ([dir prefix suffix]
@@ -89,16 +86,14 @@
   (not (.exists file)))
 
 (defn with-private-temp-file
-  "Create a private temporary file as [[owner-only-temp-file!]] does, call `f`
-  with it, delete it, and return what `f` returned.
+  "Create a file as [[owner-only-temp-file!]] does, call `f` with it, delete
+  it, and return what `f` returned. The file is deleted whether `f` returns or
+  throws, and by a shutdown hook if a signal ends the process first.
 
-  The file is deleted whether `f` returns or throws, and by a shutdown hook
-  when a signal ends the process first. When the delete fails and
-  the file still exists, the operator has to remove it, so the path is
-  reported under `:remaining-file` in an `ex-info` with `:reason
-  :private-file-remains`. After a failed `f` that `ex-info` carries the
-  failure's message (its class name, unless it is an `ex-info`) with the path
-  added, the failure's other data, and the failure as its cause."
+  If the delete fails, the operator has to remove the file, so an `ex-info`
+  with `:reason :private-file-remains` and `:remaining-file` reports the path.
+  After a failed `f`, that `ex-info` keeps the failure's message (its class
+  name unless it is an `ex-info`), its data, and the failure as its cause."
   [prefix suffix f]
   (let [file (owner-only-temp-file! prefix suffix)
         path (.getAbsolutePath ^java.io.File file)
@@ -123,10 +118,9 @@
 
 (defn staging-file
   "Return a `java.io.File` beside `target` under an unpredictable name, for
-  staging a public artifact before [[atomic-move!]] puts it in place. Parent
-  directories are created. The file itself is not: whoever writes it creates
-  it with the ordinary default permissions, so the artifact that replaces
-  `target` is as readable as any other new file. The caller deletes it if the
+  staging a public artifact before [[atomic-move!]]. Parent directories are
+  created, but the file is not, so the writer's default permissions apply and
+  the artifact is as readable as any new file. The caller deletes it if the
   move does not happen."
   ^java.io.File [target]
   (let [target (.getAbsoluteFile (java.io.File. (str target)))
@@ -141,15 +135,14 @@
   (= "java.nio.file.AtomicMoveNotSupportedException" (.getName (class e))))
 
 (defn atomic-move!
-  "Atomically move the file `source` to `target` and return `target`.
+  "Atomically move `source` to `target` (each a `Path`, `File`, or string, on
+  one filesystem) and return `target`.
 
-  Each argument is a `Path`, a `File`, or a path string, and both must be on
-  one filesystem. The move replaces whatever entry sits at `target`. A symbolic
-  link there is replaced as a link and never written through, and `target`
-  keeps its previous contents until the move succeeds. There is no copy
-  fallback: a filesystem that cannot move atomically throws `ex-info` with
-  `:reason :atomic-move-unsupported`, the `:source` and `:target` paths, and
-  the NIO exception as its cause. Every other failure propagates unchanged."
+  The move replaces whatever is at `target`; a symbolic link there is replaced
+  as a link, never written through. `target` keeps its old contents until the
+  move succeeds. There is no copy fallback: a filesystem that cannot move
+  atomically throws `:atomic-move-unsupported` with `:source`, `:target`, and
+  the NIO exception as cause. Other failures propagate unchanged."
   [source target]
   (try
     (java.nio.file.Files/move

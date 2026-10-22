@@ -2,9 +2,9 @@
   "Optional Aero integration: `#secret/req` and `#secret/opt` inside an Aero
   config.
 
-  Aero is not a dependency of this library. Add it to your own project, then
-  read the config with this namespace's `read-config` in place of
-  `aero.core/read-config`, putting the secrets options under `:secrets`:
+  Aero is not a dependency of this library; add it to your project. Read the
+  config with this namespace's `read-config` instead of `aero.core/read-config`,
+  with the secrets options under `:secrets`:
 
       (require '[com.kirahowe.secrets.aero :as secrets-aero])
 
@@ -14,26 +14,23 @@
                                            :resource \"secrets.edn.age\"}})
 
   `:secrets` takes the options of `com.kirahowe.secrets/reader-literals`, and
-  the two tags behave as they do there, with the same errors. Every other key
-  goes to Aero untouched.
+  the tags behave and fail as they do there. Every other key goes to Aero.
 
-  Each call decrypts the store at most once, when it reaches the first secret
-  tag, and a config without secret tags never opens it. Nothing is kept
-  between calls, so a second read sees an edited store and a read that failed
-  can be retried.
+  Each call decrypts the store at most once, at the first secret tag, and a
+  config without secret tags never opens it. Nothing is cached between calls,
+  so a second read sees an edited store and a failed read can be retried.
 
-  Requiring this namespace registers the two tags on `aero.core/reader`. A
-  config with secret tags read through `aero.core/read-config` directly throws
-  an error that names `read-config` here."
+  Requiring this namespace registers both tags on `aero.core/reader`. Reading
+  a config with secret tags through `aero.core/read-config` directly throws an
+  error that names this `read-config`."
   (:require [aero.core :as aero]
             [com.kirahowe.secrets :as secrets]))
 
 (defn read-config
   "Read the Aero config `source` as `aero.core/read-config` does, resolving
   `#secret/req` and `#secret/opt` against the store that `(:secrets opts)`
-  describes. See the namespace docstring. Without a `:secrets` option there
-  is no store: `#secret/opt` reads nil and `#secret/req` throws
-  `:invalid-config`, naming the missing option."
+  describes. Without `:secrets` there is no store: `#secret/opt` reads nil and
+  `#secret/req` throws `:invalid-config` naming the missing option."
   [source opts]
   (aero/read-config
    source
