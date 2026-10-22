@@ -39,8 +39,13 @@
 ;; There is no `reencrypt` step yet because no ciphertext exists. `new` (or the
 ;; first `set`) encrypts directly to the recipients already in the file.
 
+;; `keygen` stores each person's key in their own macOS Keychain, or in a
+;; `:key-file` if the environment sets one. Someone who keeps the key in a
+;; password manager sets `:key-command` instead.
+
 ;; Let's run that with the command functions, in a temporary directory. Alice
-;; and Bob each have a key, as if each had run `keygen` on their own machine:
+;; and Bob each have a key, as if each had run `keygen` on their own machine.
+;; The book gives each of them a throwaway key file:
 
 (def dir
   (str (java.nio.file.Files/createTempDirectory
@@ -208,12 +213,14 @@
 ;; Deployment and CI can use a dedicated recipient instead of a person's key:
 
 ;; ```sh
-;; age-keygen -o deploy-key.txt
+;; key="$(age-keygen)"                      # prints "Public key: age1..." on stderr
 ;; bb secrets add-recipient prod age1...   # the deploy key's public half
 ;; bb secrets reencrypt prod
-;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- deploy-key.txt)"
-;; # store deploy-key.txt in the team password manager, then delete it locally
+;; flyctl secrets set SECRETS_AGE_IDENTITY="$key"
+;; # store "$key" in the team password manager, then: unset key
 ;; ```
+
+;; The deploy key stays in a shell variable and never reaches a file.
 
 ;; A dedicated deploy key keeps production independent of any person's
 ;; identity and can be replaced separately.

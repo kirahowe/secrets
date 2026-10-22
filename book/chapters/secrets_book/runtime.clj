@@ -106,13 +106,15 @@
 
 ;; ## How the key is found
 
-;; The identity argument accepts three shapes. A path string or `File` names
-;; the key file directly. A map lets you provide an explicit identity file or
-;; use the conventional path for an app:
+;; The identity argument is a path string or `File` that names the key file
+;; directly, or a map. The map can name an identity file, a command that
+;; prints the key, a key file, or the app whose macOS Keychain item holds the
+;; key:
 
 ;; ```clojure
 ;; (secrets/load-secrets src {:identity-file "/etc/keys/age.txt"})  ; explicit
-;; (secrets/load-secrets src {:app "myapp"})   ; ~/.config/myapp/key.txt
+;; (secrets/load-secrets src {:key-command ["op" "read" "op://Private/myapp age key/password"]})
+;; (secrets/load-secrets src {:app "myapp"})   ; the Keychain item for myapp
 ;; ```
 
 ;; The identity is resolved for each operation, from the first of these that
@@ -122,15 +124,26 @@
 ;; 2. `SECRETS_AGE_IDENTITY_FILE`, a path;
 ;; 3. `SECRETS_AGE_IDENTITY`, the key file's contents;
 ;; 4. `SECRETS_AGE_IDENTITY_B64`, the contents in base64;
-;; 5. a `:key-file` option, which is how the CLI passes an environment's
+;; 5. a `:key-command`, a vector of a program and its arguments whose standard
+;;    output is the key;
+;; 6. a `:key-file` option, which is how the CLI passes an environment's
 ;;    configured key file;
-;; 6. `~/.config/<app>/key.txt`, when an app is named.
+;; 7. on macOS, the login Keychain item with service `com.kirahowe.secrets`
+;;    and the app name as its account, when an app is named.
 ;;
-;; With no explicit path and no app, the environment variables are the only
-;; sources. There is no default key path when no app is named, which keeps
-;; unrelated applications from sharing one by accident. The
-;; [production chapter](secrets_book.production.html#injecting-the-key)
+;; There is no default key file. With no explicit path, no `:key-command` or
+;; `:key-file`, and no app, the environment variables are the only sources.
+;; The [production chapter](secrets_book.production.html#injecting-the-key)
 ;; describes each variable and when to use it.
+
+;; The `:key-command` runs without a shell and with no standard input, each
+;; time an operation needs the key. Any password manager with a command that
+;; prints a stored value works. Here `cat` stands in for one:
+
+(secrets/load-secrets (str dir "/secrets.edn.age") {:key-command ["cat" key-file]})
+
+;; A command that cannot start, exits with an error, or prints nothing is an
+;; error that names the program and never repeats its output.
 
 ;; A path you name has to exist. An explicit path or
 ;; `SECRETS_AGE_IDENTITY_FILE` that points at a missing file is an error, and
@@ -141,8 +154,9 @@
                         {:identity-file (str dir "/no-such-key.txt")})
   (catch Exception e (ex-message e)))
 
-;; When nothing is named and the app's default key file is absent, no identity
-;; is available, and `load-secrets` throws with the list of ways to supply one.
+;; A `:key-file` or a Keychain item only says where the key normally lives.
+;; When nothing is named and that key is absent, no identity is available,
+;; and `load-secrets` throws with the list of ways to supply one.
 
 ;; Identity paths are local filesystem paths, and a leading `~` is expanded. A
 ;; value that starts with a URI scheme is refused. A bare relative name with a
@@ -155,28 +169,30 @@
 ;; Key contents put where a path belongs are refused the same way, and the
 ;; error doesn't repeat them.
 
-;; ### Injected identities
+;; ### Keys held in memory
 
-;; `age` reads an identity from a file. When the key arrives as contents, in
-;; `SECRETS_AGE_IDENTITY` or `SECRETS_AGE_IDENTITY_B64`, each operation writes
-;; it to an owner-only temporary file, uses it, and deletes it before
-;; returning. Nothing is kept between operations. The library never deletes an
-;; identity file you named.
+;; A key that does not come from a file, whether from `SECRETS_AGE_IDENTITY`,
+;; `SECRETS_AGE_IDENTITY_B64`, a `:key-command`, or the Keychain, stays in
+;; memory. The library hands it to `age` on standard input (`age -i -`), so
+;; it is never written to disk, not even to a temporary file. The library
+;; never deletes or changes an identity file you named.
 
-;; `load-secrets` does this for you. Code that needs the identity file itself,
-;; to hand to another tool, can use the same scope through `with-identity`:
+;; `load-secrets` resolves the identity for you. Code that wants to know which
+;; identity an operation would use can call `resolve-identity` with the same
+;; argument. For a key file, the result names the path and where it came
+;; from:
 
-(secrets/with-identity key-file
-  (fn [{:keys [identity-file identity-source]}]
-    {:source identity-source
-     :file-exists? (.exists (io/file identity-file))}))
+(secrets/resolve-identity key-file)
 
-;; The callback receives the resolved path and a keyword naming where it came
-;; from. If the temporary file can't be deleted, the error carries its path
-;; under `:remaining-file` so you can remove it. A process that crashes during
-;; an operation can leave the file behind, and deleting a file is not secure
-;; erasure. When your platform can mount a secret as a file, prefer
-;; `SECRETS_AGE_IDENTITY_FILE`.
+;; For a key held in memory, the result has `:identity-contents` in place of
+;; `:identity-file`. `identity-available?` says whether a resolved identity
+;; holds a usable key. This example leaves the key itself out of the result,
+;; so the book doesn't print it:
+
+(let [identity (secrets/resolve-identity {:key-command ["cat" key-file]})]
+  {:identity-source (:identity-source identity)
+   :in-memory? (contains? identity :identity-contents)
+   :available? (secrets/identity-available? identity)})
 
 ;; ## Size bounds
 
@@ -192,7 +208,8 @@
 ;; Every failure is an `ex-info` whose data has a `:reason` keyword. The
 ;; [reference](secrets_book.reference.html#failure-reasons) lists the reasons
 ;; worth branching on. For loading they are `:no-identity`,
-;; `:invalid-identity`, `:disallowed-identity`, `:no-file`,
+;; `:invalid-identity`, `:disallowed-identity`, `:key-command-failed`,
+;; `:keychain-failed`, `:no-file`,
 ;; `:disallowed-source`, `:source-too-large`, `:decrypt-failed`,
 ;; `:age-not-installed`, and the EDN reasons.
 
@@ -219,7 +236,8 @@
 
 ;; Both tags accept the same key forms as `get-secret`, including vector
 ;; paths. The options are `:file` (a path) or `:resource` (a classpath
-;; resource name), plus `:identity-file` or `:app`.
+;; resource name), plus `:identity-file`, `:key-command`, `:key-file`, or
+;; `:app`.
 
 ;; ## Required versus optional
 
@@ -232,7 +250,7 @@
 ;; | key present in the store | the value | the value |
 ;; | key missing from the store | throws | nil |
 ;; | secrets file not found | throws | nil |
-;; | no identity named, and the app's default key file is absent | throws | nil |
+;; | no identity named, and the app's key (its `:key-file` or Keychain item) is absent | throws | nil |
 ;; | a named identity file does not exist | throws | throws |
 ;; | decryption fails | throws | throws |
 

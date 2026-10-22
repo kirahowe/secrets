@@ -137,6 +137,23 @@ is published. The chosen manifest contract below states the rule. The operator
 still rotates credentials at their provider; manifest-key handling cannot revoke
 an already disclosed provider credential.
 
+### A6. A reader of the developer's files at rest
+
+Backups, synced or version-controlled dotfiles, disk images, and tools that
+index or upload a home directory copy files without anyone deciding to share
+a key. A private identity kept as a plaintext file travels with those copies.
+
+So the library keeps no plaintext key by default. On macOS a key lives in the
+login Keychain, and a password manager can supply one through `:key-command`.
+A key held in memory reaches `age` on its standard input and is never written
+to a file. A `:key-file` remains for when nothing else is available, and it is
+the operator's explicit choice.
+
+This does not defend against code running as the developer. The Keychain item
+trusts `/usr/bin/security`, which any process of that user can run while the
+keychain is unlocked, and a password manager's command is equally available to
+it. That is B3.
+
 ## Threats out of scope
 
 ### B1. An attacker who can replace the deployed configuration artifact
@@ -254,46 +271,57 @@ items to evaluate individually, not instructions to implement them all:
 
 ## Chosen identity contract
 
-Identity resolution is scoped to one operation. `with-identity` accepts an
-identity path or options and calls its function with
-`{:identity-file path :identity-source source}`. Resolution uses an explicit
-path or `:identity-file` first, then `SECRETS_AGE_IDENTITY_FILE`,
-`SECRETS_AGE_IDENTITY`, and `SECRETS_AGE_IDENTITY_B64`, then a `:key-file` or
-the app default. `:identity-file` is a runtime option of `load-secrets`, the
-readers, and `with-identity`. The CLI config has no such key, so a command's
-identity comes from the three variables and then the environment's
-`:key-file` or the app default.
+Identity resolution happens once per operation, when it starts.
+`resolve-identity` accepts an identity path or options and returns
+`{:identity-file path :identity-source source}` for a key file, or
+`{:identity-contents key :identity-source source}` for a key held in memory.
+Resolution uses an explicit path or `:identity-file` first, then
+`SECRETS_AGE_IDENTITY_FILE`, `SECRETS_AGE_IDENTITY`, and
+`SECRETS_AGE_IDENTITY_B64`, then the project's own key: a `:key-command`, a
+`:key-file`, or on macOS the login Keychain item whose service is
+`com.kirahowe.secrets` and whose account is the app name. `:identity-file` is
+a runtime option of `load-secrets` and the readers. The CLI config has no such
+key, so a command's identity comes from the three variables and then the
+environment's own key. There is no default key file (A6).
 
 An explicit path, `:identity-file`, and `SECRETS_AGE_IDENTITY_FILE` each
 designate a file, and a designated file that does not exist is an error, so a
 typo in a deployment cannot pass a keyless check. A configured `:key-file` and
-the app default are the project's default key location and not a designation.
-When no file is there, no identity is available: keyless verification still
-runs and `#secret/opt` reads nil, while a command that needs the key says
-where it looked. Every identity path has a leading `~` expanded. A URI-shaped
-path, and key contents in a path setting, are refused without being echoed
-(A2, A3). Key contents are recognized raw, base64-encoded, and as a key body
-whose `AGE-SECRET-KEY-` prefix was cut off.
+the Keychain item are the project's usual key location and not a designation.
+When the file or the item is not there, no identity is available: keyless
+verification still runs and `#secret/opt` reads nil, while a command that
+needs the key says where it looked. A `:key-command` is a designation: one
+that cannot start, exits nonzero, or prints nothing is an error that names the
+program and never repeats its output (A3). It runs without a shell and with
+no standard input, so it cannot consume a value piped to `set`. Every identity
+path has a leading `~` expanded. A URI-shaped path, and key contents in a path
+setting, are refused without being echoed (A2, A3). Key contents are
+recognized raw, base64-encoded, and as a key body whose `AGE-SECRET-KEY-`
+prefix was cut off.
 
-Raw and base64 identities are materialized for each operation in an exclusive
-0600 temporary file. The operation deletes it with an ordinary delete and
+A key held in memory, from a variable, a command, or the Keychain, reaches
+`age` on its standard input (`-i -`). Nothing writes it to a file, so there is
+no temporary identity to delete and nothing for a crash or SIGKILL to leave
+behind. `keygen` and the initializer generate a Keychain key in memory and
+hand it to `security -i` on standard input, so it appears neither on disk nor
+in a process's arguments, and read it back to check it arrived. A `:key-file`
+that `keygen` writes is owner-only from creation and moved into place
+atomically.
+
+The plaintext temporary file that `new`, `edit`, `set`, `rm`, and `reencrypt`
+use is exclusive and 0600. The command deletes it with an ordinary delete and
 checks the deletion on both success and failure. It does not try to overwrite
 the file first: that protects nothing on a copy-on-write or flash filesystem.
-Caller-owned paths are never deleted. A cleanup failure carries structured
-error data with the temporary path so an operator can remove the remaining
-file. Paths are permitted diagnostic metadata; identity contents are never
-included. A shutdown hook deletes the private temporary files that are live
-when SIGINT, SIGTERM, or SIGHUP ends the process, so Ctrl-C or a closed
-terminal during `edit` leaves no plaintext. A crash or SIGKILL can still leave
-a temporary file behind, and deletion is not secure erasure on every
-filesystem. The extra temporary-file write per operation is the accepted cost
-of removing shared identity state. The plaintext temporary file that `new`,
-`edit`, `set`, `rm`, and `reencrypt` use follows the same rule.
+A cleanup failure carries structured error data with the temporary path so an
+operator can remove the remaining file. A shutdown hook deletes the private
+temporary files that are live when SIGINT, SIGTERM, or SIGHUP ends the
+process, so Ctrl-C or a closed terminal during `edit` leaves no plaintext. A
+crash or SIGKILL can still leave one behind, and deletion is not secure
+erasure on every filesystem.
 
-`load-secrets` owns this scope automatically. CLI normalization validates and
-canonicalizes configured paths without selecting an environment identity or
-materializing one. A CLI command selects its environment, resolves its
-identity, and then owns the operation scope. A path that came from
+CLI normalization validates and canonicalizes configured paths without
+resolving an identity. A CLI command selects its environment and resolves its
+identity once, before it reads stdin or opens an editor. A path that came from
 `SECRETS_AGE_IDENTITY_FILE` was not in the config when its paths were checked,
 so the command checks it against the rule that no file serves two purposes.
 There is no identity cache or reset lifecycle.

@@ -29,17 +29,23 @@
 ;; bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen --apply
 ;; ```
 
-;; In a project with no `bb.edn`, this creates three files:
+;; In a project with no `bb.edn`, this creates two files and a key:
 ;;
 ;; - a `bb.edn` that declares the library and a `bb secrets` task,
 ;; - a plaintext template with a placeholder value at `secrets/secrets.edn.example`, and
-;; - the age identity at `~/.config/myapp/key.txt`.
+;; - an age identity in your macOS login Keychain, as the item `com.kirahowe.secrets` with account `myapp`.
+;;
+;; The key goes from `age-keygen` into the Keychain without touching the disk. `--keygen` needs the macOS Keychain. On another system, leave it off, store a key in your password manager, and tell the environment how to read it with `:key-command`, as the [CLI chapter](secrets_book.cli.html#the-config-map) shows.
 
 ;; The initializer only creates files that don't exist. If you already have a `bb.edn`, it prints the dependency and the task for you to add and leaves your file alone. The [CLI chapter](secrets_book.cli.html#the-initializer) covers that case, and projects with a `deps.edn`.
 
 ;; The dependency it writes pins the commit your clone is at. If that commit isn't a release tag, the output says so, and the commit has to be on GitHub before another machine can resolve it.
 
-;; You'll want to back up `~/.config/myapp/key.txt` somewhere outside of version control, such as a password manager. Treat it like a password: it decrypts all of your app's secrets, and **it is unrecoverable if you lose it**.
+;; You'll want to back up the key somewhere outside of version control, such as a password manager. Treat it like a password: it decrypts all of your app's secrets, and **it is unrecoverable if you lose it**. This prints it from the Keychain:
+;;
+;; ```sh
+;; security find-generic-password -s com.kirahowe.secrets -a myapp -w
+;; ```
 
 ;; ## Create the first secrets file
 
@@ -62,7 +68,7 @@
 ;; secrets/secrets.edn.manifest  # key paths, types, and keyed value hashes
 ;; ```
 
-;; You commit both of these. **Be sure to keep `~/.config/myapp/key.txt` out of the repository.**
+;; You commit both of these. The private key stays in the Keychain and never goes into the repository.
 
 ;; If you would rather not open an editor, `set` stores one value at a time, and creates the store if there isn't one yet. Run it from a terminal and it prompts for the value with echo turned off:
 ;;
@@ -111,7 +117,7 @@
 ;;    :email {:api-key #secret/opt :postmark/api-key}}")
 ;; ```
 
-;; `#secret/req` throws when the value cannot be loaded. `#secret/opt` returns `nil` when the key isn't in the store, when there is no secrets file, or when the app's default key file is absent. It still throws when decryption fails, and when you named an identity file that doesn't exist. The [runtime chapter](secrets_book.runtime.html) covers both APIs, classpath resources, Aero, and how the key is found.
+;; `#secret/req` throws when the value cannot be loaded. `#secret/opt` returns `nil` when the key isn't in the store, when there is no secrets file, or when the app has no key on this machine. It still throws when decryption fails, and when you named an identity file that doesn't exist. The [runtime chapter](secrets_book.runtime.html) covers both APIs, classpath resources, Aero, and how the key is found.
 
 ;; ## Check the setup
 

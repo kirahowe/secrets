@@ -21,7 +21,8 @@
   [_ {:keys [app identity-file] :as opts}]
   ;; `load-secrets` accepts a classpath URL, which also works when this example
   ;; is packaged as an uberjar.  An explicit identity path wins; otherwise the
-  ;; library resolves the documented environment variables and app fallback.
+  ;; library resolves the documented environment variables, then the app's
+  ;; macOS Keychain item.
   (let [identity-or-options (cond-> {}
                               app (assoc :app app)
                               identity-file (assoc :identity-file identity-file))]

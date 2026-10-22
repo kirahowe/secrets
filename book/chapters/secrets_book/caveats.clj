@@ -72,10 +72,11 @@
 ;; disk. If the delete fails, the command reports the path so you can remove
 ;; the file yourself.
 
-;; An identity injected as contents, through `SECRETS_AGE_IDENTITY` or
-;; `SECRETS_AGE_IDENTITY_B64`, is written to a temporary file in the same way
-;; for each operation. A process that crashes during the operation can leave
-;; it behind.
+;; The private key is handled differently. A key from `SECRETS_AGE_IDENTITY`,
+;; `SECRETS_AGE_IDENTITY_B64`, a `:key-command`, or the macOS Keychain stays
+;; in memory, reaches `age` on standard input, and is never written to disk.
+;; Only a `:key-file` you configure, or an identity file you name, is a
+;; plaintext key on disk.
 
 ;; ## The manifest discloses structure and change
 
@@ -163,9 +164,9 @@
 ;; The library assumes POSIX file permissions. Private temporary files are
 ;; created owner-only, and where the filesystem can't do that the operation
 ;; fails instead of writing with default permissions. That affects every CLI
-;; command that writes a store, key generation, and identities injected as
-;; contents. Loading with an identity file you named needs no private file
-;; unless the ciphertext is inside a jar. Treat Windows as unsupported.
+;; command that writes a store, and key generation into a `:key-file`.
+;; Loading needs no private file unless the ciphertext is inside a jar. Treat
+;; Windows as unsupported.
 
 ;; If you find a vulnerability in the library itself, follow the project's
 ;; [security policy](https://github.com/kirahowe/secrets/blob/main/SECURITY.md)

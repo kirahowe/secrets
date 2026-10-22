@@ -8,6 +8,7 @@
 ;; ## Features
 
 ;; - You supply one private key to production, through an environment variable or a mounted file.
+;; - On your own machine the private key is not a plaintext file. It lives in the macOS Keychain, or in a password manager that prints it on request, and reaches `age` on standard input.
 ;; - Secrets are ordinary EDN, so you can use sets, vectors, nested maps, and numbers. Load the whole map, or reference individual values in your EDN config with `#secret/req` and `#secret/opt`. There's an Aero integration, and the map works with Integrant or Component.
 ;; - The encrypted files live in git alongside the code that uses them, with one file per environment. You can load them from disk or from inside a jar.
 ;; - Every write updates a manifest that shows which keys were added, removed, or changed without exposing their values. CI can check that the manifest matches the ciphertext without a private key.

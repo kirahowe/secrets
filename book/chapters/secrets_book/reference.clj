@@ -17,7 +17,8 @@
 ;; `com.kirahowe.secrets.aero`, `com.kirahowe.secrets.cli`, and
 ;; `com.kirahowe.secrets.init`. They are listed below.
 ;;
-;; `com.kirahowe.secrets.age`, `com.kirahowe.secrets.manifest`,
+;; `com.kirahowe.secrets.age`, `com.kirahowe.secrets.keychain`,
+;; `com.kirahowe.secrets.manifest`,
 ;; `com.kirahowe.secrets.store`, `com.kirahowe.secrets.fs`,
 ;; `com.kirahowe.secrets.safe-edn`, and `com.kirahowe.secrets.source` are
 ;; implementation namespaces. Their vars are
@@ -62,7 +63,9 @@
                get-secret
                reader-literals
                merge-readers
-               with-identity])
+               resolve-identity
+               identity-available?
+               key-identity])
 
 ;; ## com.kirahowe.secrets.aero
 
@@ -110,7 +113,7 @@
 
 ;; | Key | Required | Meaning |
 ;; |-----|----------|---------|
-;; | `:app` | yes | names the default key path `~/.config/<app>/key.txt`; recorded in the manifest |
+;; | `:app` | yes | names the app's macOS Keychain item (service `com.kirahowe.secrets`, account `<app>`); recorded in the manifest |
 ;; | `:default-environment` | no | environment keyword used when a command omits `[env]`; it has to name a configured environment |
 ;; | `:environments` | yes | map of environment keyword to environment config, itself a map |
 
@@ -119,17 +122,21 @@
 ;; | Key | Required | Meaning |
 ;; |-----|----------|---------|
 ;; | `:secrets-file` | yes | path to the ciphertext; must end in `.age` unless both `:template` and `:manifest` are explicit |
-;; | `:key-file` | no | where the key normally lives: `keygen` writes it, `show-key` reads it, and commands use it when no identity is named; default `~/.config/<app>/key.txt` |
+;; | `:key-command` | no | a vector of a program and its arguments, run without a shell, whose standard output is the key; commands read the key with it when no identity variable is set, and `keygen` refuses to run; no default |
+;; | `:key-file` | no | a file that holds the key: `keygen` writes it, `show-key` reads it, and commands use it when no identity variable is set; no default |
 ;; | `:template` | no | what `new` opens; default `<secrets-file>` with `.example` in place of `.age` |
 ;; | `:manifest` | no | manifest path, or `false` to keep none; default `<secrets-file>` with `.manifest` in place of `.age` |
 ;; | `:recipients-file` | no | committed list of age public keys; enables team mode |
 
-;; Every environment setting is a string holding a local filesystem path, with
-;; a leading `~` expanded, and `:manifest` may also be `false`. A URI-shaped
-;; path is refused with `:invalid-config` (`:disallowed-identity` for
-;; `:key-file`). A command's identity comes from the `SECRETS_AGE_IDENTITY*`
-;; variables and then `:key-file`: `:identity-file` is a runtime option, not a
-;; config key. No file may serve two purposes across the
+;; Every environment setting except `:key-command` is a string holding a local
+;; filesystem path, with a leading `~` expanded, and `:manifest` may also be
+;; `false`. `:key-command` is a vector of non-blank strings, and an
+;; environment sets at most one of `:key-command` and `:key-file`. A
+;; URI-shaped path is refused with `:invalid-config` (`:disallowed-identity`
+;; for `:key-file`). A command's identity comes from the
+;; `SECRETS_AGE_IDENTITY*` variables, then `:key-command`, then `:key-file`,
+;; then on macOS the Keychain item for the app. `:identity-file` is a runtime
+;; option, not a config key. No file may serve two purposes across the
 ;; environments. They may share a template, a key or identity file, or a
 ;; recipients file, and two of them may name the same secrets file or manifest
 ;; only when they name both the same.
@@ -155,7 +162,9 @@
 ;; | `SECRETS_AGE_IDENTITY_B64` | base64 of the key file contents; invalid base64 throws |
 
 ;; They are checked in that order, after an explicit identity path and before
-;; the key file. A variable that is set but empty is an error
+;; a `:key-command`, a `:key-file`, and the Keychain. The two that carry the
+;; key itself reach `age` on standard input and are never written to a file.
+;; A variable that is set but empty is an error
 ;; (`:invalid-identity`). `VISUAL` and
 ;; `EDITOR` choose the editor for `new` and `edit`.
 
@@ -164,7 +173,7 @@
 ;; | Situation | `#secret/req` | `#secret/opt` |
 ;; |-----------|---------------|---------------|
 ;; | key present | the value | the value |
-;; | key missing, no secrets file, or no identity named and no key file present | throws | nil |
+;; | key missing, no secrets file, or no identity named and the app's key (its `:key-file` or Keychain item) absent | throws | nil |
 ;; | a named identity file does not exist | throws | throws |
 ;; | decryption fails | throws | throws |
 
@@ -188,7 +197,8 @@
 
 ;; | Reasons | Meaning |
 ;; |---------|---------|
-;; | `:no-identity`, `:invalid-identity`, `:disallowed-identity` | no identity is available, or a named identity file is missing; an identity variable is blank or not base64; an identity path is URI-shaped or holds key contents |
+;; | `:no-identity`, `:invalid-identity`, `:disallowed-identity` | no identity is available, or a named identity file is missing; an identity variable is blank or not base64, or a `:key-command` is malformed or printed nothing; an identity path is URI-shaped or holds key contents |
+;; | `:key-command-failed`, `:keychain-failed` | the `:key-command` could not start or exited with an error; the macOS Keychain could not be read or written |
 ;; | `:no-file`, `:disallowed-source`, `:source-too-large` | the source is nil, blank, absent, a directory, or unreadable, or a file the CLI needs cannot be read; it is not a local path or a classpath resource; the ciphertext is past 16 MiB, at runtime or in the CLI |
 ;; | `:decrypt-failed`, `:age-not-installed` | `age` could not decrypt with this identity; the `age` binary is not on the `PATH` |
 ;; | `:edn-empty`, `:edn-extra-values`, `:edn-malformed`, `:edn-too-deep` | the plaintext is not exactly one well-formed EDN value |
@@ -208,5 +218,5 @@
 ;; | `secrets.edn.manifest` | by default | key paths, types, and keyed value hashes; updated by every write |
 ;; | `secrets.edn.example` | when used | optional template for `bb secrets new` |
 ;; | `recipients.txt` | yes | age public keys, one per line, team mode |
-;; | `~/.config/<app>/key.txt` | never | the private key |
+;; | a `:key-file`, if you set one | never | the private key, in plaintext; by default the key lives in the macOS Keychain or a password manager instead |
 ;; | `.<name>.<uuid>.tmp` | never | a staging file a killed command left behind; safe to delete |

@@ -33,9 +33,10 @@ own configuration. `run!` hands them to
 `com.kirahowe.secrets.aero/read-config` under `:secrets`, next to Aero's own
 `:profile`. They cannot sit inside `config.edn`, because Aero needs them
 before it can read that file. With no explicit identity path, the key is found
-through the identity environment variables first, then
-`~/.config/aero-profiles/key.txt`. The `export` above points the demo at the
-disposable key instead of a real one under `~/.config`.
+through the identity environment variables first. Outside the demo it then
+comes from the macOS Keychain item for `aero-profiles`, or from a
+`:key-command` that prints it from a password manager. There is no default key
+file. The `export` above points the demo at the disposable key instead.
 
 `bb bootstrap` is safe to rerun: it removes and recreates only those exact
 disposable files. `bb clean` removes them explicitly. The bootstrap encrypts

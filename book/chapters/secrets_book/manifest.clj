@@ -119,7 +119,7 @@
 ;; Decrypting the file with `age` directly shows what the library added beside
 ;; our two values:
 
-(keys (edn/read-string (age/decrypt key-file store)))
+(keys (edn/read-string (age/decrypt {:identity-file key-file} store)))
 
 ;; `:com.kirahowe.secrets/store` is the one key the library reserves. Its
 ;; value is a small map: a format version, the manifest key, and a record of
@@ -182,7 +182,7 @@
 ;; encrypting with `age` directly, without updating the manifest:
 
 (let [plain (str dir "/p2.edn")]
-  (spit plain (str/replace (age/decrypt key-file store) "db/app" "db/other"))
+  (spit plain (str/replace (age/decrypt {:identity-file key-file} store) "db/app" "db/other"))
   (age/encrypt-file! {:identity-file key-file} plain store)
   (io/delete-file plain))
 
@@ -216,9 +216,10 @@
 ;; ciphertext that changed without its manifest.
 
 ;; "No identity is available" means that none was named by an identity
-;; environment variable and no key file is present. A named
-;; identity that doesn't exist is an error. This config, for the same app and
-;; store, has no key file to find:
+;; environment variable and the environment's own key is not there: no
+;; `:key-file` on disk, and no Keychain item for the app. A named identity
+;; that doesn't exist is an error. This config, for the same app and store,
+;; names no key file, and the app has no Keychain item:
 
 (def keyless-config
   (cli/normalize-config

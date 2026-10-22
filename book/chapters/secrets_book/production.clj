@@ -27,13 +27,9 @@
 ;; wrapped value works. Using separate variables means the library doesn't
 ;; have to guess whether a value is encoded.
 
-;; `age` takes identities as file paths. For the two variables that carry
-;; contents, each operation writes them to an owner-only temporary file, uses
-;; it, and deletes it before the operation returns. If the delete fails, the
-;; error names the file that remains so you can remove it. A process that
-;; crashes mid-operation can leave the file behind, and deleting a file is not
-;; secure erasure. `SECRETS_AGE_IDENTITY_FILE` avoids the temporary file, so
-;; prefer it when the platform can mount a secret.
+;; The two variables that carry contents keep the key in memory. The library
+;; hands it to `age` on standard input (`age -i -`), so the key is never
+;; written to a file, not even a temporary one.
 
 ;; `SECRETS_AGE_IDENTITY_FILE` has to name a file that exists. A path to a
 ;; missing file is an error that names the variable and the path. The library
@@ -45,22 +41,26 @@
 ;; workflow later in this chapter maps a repository secret to
 ;; `SECRETS_AGE_IDENTITY`; if that secret is missing or misspelled, the runner
 ;; expands it to an empty string rather than leaving it unset. Falling through
-;; to the next variable, and eventually to the local
-;; `~/.config/<app>/key.txt`, could make a broken deployment appear to work on
-;; a developer's machine with the wrong key. If you want fallback behaviour,
-;; leave the variable unset.
+;; to the next variable, and eventually to the app's own key in the macOS
+;; Keychain, could make a broken deployment appear to work on a developer's
+;; machine with the wrong key. If you want fallback behaviour, leave the
+;; variable unset.
 
-;; On Fly, for example, that is one command:
+;; With the key in the macOS Keychain, it can go from there to the platform
+;; without passing through a file. On Fly, for example, that is one command:
 
 ;; ```sh
-;; flyctl secrets set SECRETS_AGE_IDENTITY="$(cat -- ~/.config/myapp/key.txt)"
+;; flyctl secrets set SECRETS_AGE_IDENTITY="$(security find-generic-password -s com.kirahowe.secrets -a myapp -w)"
 ;; ```
 
 ;; If the store mangles newlines, use the base64 variable instead:
 
 ;; ```sh
-;; some-platform set SECRETS_AGE_IDENTITY_B64="$(base64 < ~/.config/myapp/key.txt)"
+;; some-platform set SECRETS_AGE_IDENTITY_B64="$(security find-generic-password -s com.kirahowe.secrets -a myapp -w | base64)"
 ;; ```
+
+;; With the key in a password manager, use its read command in place of
+;; `security`, the same command an environment's `:key-command` runs.
 
 ;; ## The image
 
@@ -87,7 +87,7 @@
 
 ;; | Where | How the identity gets there |
 ;; |-------|------------------------------|
-;; | Laptop | `~/.config/<app>/key.txt` |
+;; | Laptop | the macOS Keychain, or a password manager through `:key-command` |
 ;; | GitHub Actions | `SECRETS_AGE_IDENTITY` repository secret |
 ;; | Container / VM | env var, `age` installed in the image |
 ;; | Runtime without subprocess support | platform secret store; use this library in dev and CI |
@@ -132,9 +132,10 @@
 ;; Application code can pass `{:app "myapp"}`, as the
 ;; [runtime chapter](secrets_book.runtime.html#reading-values) shows for an
 ;; Integrant component. An explicit identity path wins, followed by the
-;; environment variables, then `~/.config/myapp/key.txt`. The application code
-;; can stay the same in a laptop and a container while the deployment supplies
-;; an injected identity.
+;; environment variables, then the project's own key: a `:key-command`, a
+;; `:key-file`, or on macOS the Keychain item for `myapp`. The application
+;; code can stay the same in a laptop and a container while the deployment
+;; supplies an injected identity.
 
 ;; The component decrypts the secrets during startup. `load-secrets` has no
 ;; cache and nothing reloads the store, so changing a secret normally requires
@@ -173,10 +174,11 @@
 ;; [team-ci example](https://github.com/kirahowe/secrets/tree/main/examples/team-ci)
 ;; commits such a fixture and uses it as a gate.
 
-;; The keyless check runs when no identity was named and no key file is
-;; present, which is the normal state of a CI runner. A configured `:key-file`
-;; only says where the key normally lives, so an environment can set one and
-;; still be checked keyless on a machine that doesn't have the file. An
+;; The keyless check runs when no identity was named and the project's own key
+;; is not there, which is the normal state of a CI runner. A configured
+;; `:key-file`, like the Keychain item, only says where the key normally lives,
+;; so an environment can set one and still be checked keyless on a machine
+;; that doesn't have the file. An
 ;; identity you name has to exist: a job that sets `SECRETS_AGE_IDENTITY_FILE`
 ;; to a path that isn't there, or sets an identity variable to an empty
 ;; string, exits 2 instead of passing keyless.
@@ -270,14 +272,15 @@
 ;;         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ;; ```
 
-;; The repository secret's value is the *contents* of
-;; `~/.config/<app>/key.txt`, rather than a path. It decrypts the ciphertext
-;; already committed to the repository. GitHub therefore receives an identity
-;; that can decrypt the ciphertext in the checkout, so protect the repository
-;; secret accordingly. Set it with:
+;; The repository secret's value is the key itself, the `AGE-SECRET-KEY-1…`
+;; line, rather than a path. It decrypts the ciphertext already committed to
+;; the repository. GitHub therefore receives an identity that can decrypt the
+;; ciphertext in the checkout, so protect the repository secret accordingly.
+;; With the key in the macOS Keychain, set it with:
 
 ;; ```sh
-;; gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
+;; security find-generic-password -s com.kirahowe.secrets -a myapp -w | \
+;;   gh secret set SECRETS_AGE_IDENTITY
 ;; ```
 
 ;; These precautions apply to the private identity. The lines in
@@ -289,8 +292,8 @@
 
 ;; ## Back up the identity
 
-;; The identity is a small text file that is not stored in git. If every copy
-;; is lost, you will have to recover or replace each secret value at its source.
+;; The identity is one short line of text that is not stored in git. If every
+;; copy is lost, you will have to recover or replace each secret value at its source.
 ;; Back it up in the team's approved secret storage when you create it.
 
 ^:kindly/hide-code

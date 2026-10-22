@@ -80,17 +80,20 @@
 
 ;; ```
 ;; secrets.edn        temporary plaintext during management operations
-;;      |  age -e -i key.txt
+;;      |  age -e -i -   (the identity on standard input)
 ;;      v
 ;; secrets.edn.age    ciphertext, committed
-;;      |  age -d -i key.txt
+;;      |  age -d -i -
 ;;      v
 ;; {:database/url "..." :auth/admins #{...}}    a plain Clojure map, in memory
 ;; ```
 
 ;; The repository now records the encrypted store along with the code that uses
 ;; it. Private identities stay outside git: one identity in the basic setup, or
-;; one per person in team mode.
+;; one per person in team mode. By default an identity is not a file at all. On
+;; macOS it lives in the login Keychain, and elsewhere a password manager
+;; prints it through a `:key-command`. The library hands it to `age` on
+;; standard input, so the key never sits on disk in plaintext.
 
 ;; ## Why age
 
@@ -98,8 +101,8 @@
 ;; keys and support for X25519 and SSH recipients. It does not require a
 ;; keyring or trust database.
 
-;; An identity file contains enough information to encrypt a file to its own
-;; recipient and decrypt the result, so we only need one key file for a
+;; An identity contains enough information to encrypt a file to its own
+;; recipient and decrypt the result, so we only need one key for a
 ;; single-key setup. Age can also encrypt to multiple recipients. In the
 ;; [teams chapter](secrets_book.teams.html), we'll use a committed list of
 ;; public keys so each person can keep their own private identity.
@@ -110,7 +113,8 @@
 ;; ## Why one file per environment
 
 ;; Each environment has one EDN map and one ciphertext. Environments share the
-;; app's default key unless you set a separate `:key-file` for an environment.
+;; app's key unless you set a separate `:key-command` or `:key-file` for an
+;; environment.
 ;; There are no overlays or partially shared files to combine when loading
 ;; secrets. The decrypted map contains everything the application receives.
 

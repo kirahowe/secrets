@@ -20,7 +20,7 @@
 ;; |--------|---------|
 ;; | `--app NAME` | the application name; required |
 ;; | `--env NAME` | the environment name; default `dev` |
-;; | `--keygen` | also generate an age identity at `~/.config/<app>/key.txt` |
+;; | `--keygen` | also generate an age identity in the macOS Keychain, as the item `com.kirahowe.secrets` with the app name as its account; macOS only |
 ;; | `--apply` | create the files instead of previewing |
 ;; | `--help` | show usage |
 
@@ -72,11 +72,23 @@
     (get-in [:environments :prod]))
 
 ;; In that output, `:template` and `:manifest` are derived from the secrets
-;; file name. `:key-file` is the path where `keygen` writes and `show-key`
-;; reads. Normalization validates the configured paths and expands a leading
-;; `~` in each. It does not read the identity environment variables or create
-;; any file. Each command resolves its identity when it runs: the environment
-;; variables, then `:key-file` or the app default. The
+;; file name. There is no `:key-file`, because there is no default key file.
+;; An environment's own key comes from the first of these that is set:
+;;
+;; 1. `:key-command`, a vector of a program and its arguments that prints the
+;;    key, such as `["op" "read" "op://Private/myapp age key/password"]`;
+;; 2. `:key-file`, a file that holds the key;
+;; 3. on macOS, the login Keychain item with service `com.kirahowe.secrets`
+;;    and the app name as its account.
+;;
+;; An environment can set `:key-command` or `:key-file`, not both. Off macOS,
+;; with neither, it has no key of its own, and only the identity environment
+;; variables supply one.
+;;
+;; Normalization validates the configured paths and expands a leading `~` in
+;; each. It does not read the identity environment variables, run the key
+;; command, or create any file. Each command resolves its identity when it
+;; runs: the environment variables first, then the environment's own key. The
 ;; [runtime chapter](secrets_book.runtime.html#how-the-key-is-found) has the
 ;; full rule.
 
@@ -85,8 +97,8 @@
 
 ;; ## Validating the configuration {#validation-catches-the-dangerous-config}
 
-;; `:app` is required. It names the default key path, and an implicit app name
-;; could make unrelated projects share `~/.config/<app>/key.txt`.
+;; `:app` is required. It names the app's macOS Keychain item, and an implicit
+;; app name could make unrelated projects share one key.
 
 (try
   (cli/normalize-config {:environments {:dev {:secrets-file "s.edn.age"}}})
@@ -113,7 +125,8 @@
                          :environments {:dev {:secrets-fle "s.edn.age"}}})
   (catch Exception e (ex-message e)))
 
-;; Every environment setting is a path, so each value has to be a string.
+;; Every environment setting except `:key-command` is a path, so each value
+;; has to be a string. `:key-command` is a vector of non-blank strings.
 ;; `:manifest` may also be `false`, which keeps no manifest. `:manifest true`
 ;; is an error, where it could have been read as a silent "off":
 
@@ -147,7 +160,7 @@
 
 ;; | Command | Args | What it does |
 ;; |---------|------|--------------|
-;; | `keygen` | `[env]` | generate the age key for an environment and print its public key |
+;; | `keygen` | `[env]` | generate the age key for an environment, store it in its `:key-file` or, without one, the macOS Keychain, and print its public key |
 ;; | `new` | `[env]` | create a secrets file from a template, using `$VISUAL`, `$EDITOR`, or `vim` |
 ;; | `edit` | `[env]` | decrypt, edit, re-encrypt |
 ;; | `set` | `[env] <key> [--edn]` | set a key's value from a hidden prompt or stdin (creates the file if missing) |
@@ -181,6 +194,27 @@
 ;; that caused it. That covers an unknown command and an unknown environment
 ;; too. A value typed in the wrong place is the likeliest thing to end up
 ;; there, and it shouldn't be printed back to the terminal.
+
+;; ### `keygen` and `show-key`
+
+;; `keygen` stores a new key where the environment keeps its key: its
+;; `:key-file` when one is set, or else the macOS Keychain item for the app.
+;; A key bound for the Keychain is generated in memory and goes to
+;; `security` on standard input, so it never touches the disk. `keygen` asks
+;; before it replaces an existing key. It refuses for an environment with a
+;; `:key-command`, because the command only reads the key. Store a new key
+;; with that password manager's own tools instead. Off macOS, with neither
+;; setting, there is nowhere to store a key, and `keygen` says so.
+
+;; Back the key up when you create it. A Keychain key can be printed for a
+;; backup or a deployment secret:
+
+;; ```sh
+;; security find-generic-password -s com.kirahowe.secrets -a myapp -w
+;; ```
+
+;; `show-key` prints the public key of each environment's own key, read from
+;; the same place. It ignores the `SECRETS_AGE_IDENTITY*` variables.
 
 ;; ### `new` and `edit`
 
@@ -349,9 +383,9 @@
 ;; file that lists nobody or holds an invalid line, an invalid configuration,
 ;; or an unknown environment.
 
-;; A configured `:key-file` says where the key normally lives. When no file is
-;; there, commands that need the key fail and say where they looked, and
-;; `verify` checks what it can without one:
+;; A configured `:key-file`, like the Keychain item, says where the key
+;; normally lives. When the key is not there, commands that need it fail and
+;; say where they looked, and `verify` checks what it can without one:
 
 (cli/verify! no-key-config "dev")
 

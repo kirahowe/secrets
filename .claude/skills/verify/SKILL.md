@@ -10,8 +10,17 @@ check every command's output, exit code, and error message against what the
 README says. Run this before tagging a release.
 
 Work in a scratch directory, never inside this repo. Use a throwaway `--app`
-name such as `verifydemo` and delete `~/.config/<app>/` when done, because
-keygen writes there.
+name such as `verifydemo`. On macOS, `--keygen` and `keygen` without a
+`:key-file` store the key in the login Keychain as the generic password item
+with service `com.kirahowe.secrets` and account `<app>`. Check that no item
+exists for the name before you start, and delete it when you are done:
+
+```sh
+security find-generic-password -s com.kirahowe.secrets -a verifydemo   # exit 44: none
+security delete-generic-password -s com.kirahowe.secrets -a verifydemo
+```
+
+Never delete or overwrite an item for an app name you did not create.
 
 In every command that can open an editor, set both `VISUAL` and `EDITOR` to a
 script of your own. The user's shell exports `VISUAL=emacsclient …`, a
@@ -39,10 +48,15 @@ bb -cp <checkout>/src -m com.kirahowe.secrets.init --app verifydemo --keygen --a
 ```
 
 The preview must say "Nothing is written without --apply" and leave the
-directory empty. After `--apply`, check that `bb.edn` and
-`secrets/secrets.edn.example` exist, that `~/.config/verifydemo/key.txt` has
-mode 0600, and that the public key is printed with the backup warning. A
-third run must report all three under "Already there, left as they are".
+directory empty, and the preview must list the Keychain item without
+creating it. After `--apply`, check that `bb.edn` and
+`secrets/secrets.edn.example` exist, that
+`security find-generic-password -s com.kirahowe.secrets -a verifydemo` finds
+the item, and that the public key is printed with the backup warning and the
+`security find-generic-password … -w` command that prints the key. No key file
+may appear anywhere: nothing under `~/.config/verifydemo/` and nothing new in
+the scratch directory. A third run must report all three under "Already
+there, left as they are".
 
 Usage errors exit 1 with one line and must not repeat the argument:
 `--app=verifydemo`, `--team`, and a stray word each give "Unknown option or
@@ -104,28 +118,63 @@ must match what you see.
   refused and leave the files unchanged. `new` with no template must seed
   the editor from the built-in commented placeholder, and with a template,
   from the template.
-- The decrypted store (`age -d -i <key> <store>`) must hold one metadata
+- The decrypted store must hold one metadata
   line, `:com.kirahowe.secrets/store {:version 1 :manifest-key … :recipients
-  …}`, as the first entry of the map.
+  …}`, as the first entry of the map. Decrypt it without a key file:
+  `security find-generic-password -s com.kirahowe.secrets -a verifydemo -w |
+  age -d -i - <store>`.
 - `show-key`, and `doctor`. A healthy solo store prints the environment, the
-  `age` version, the secrets file and manifest as "(present)", the identity's
-  source and path, "Status: healthy", and exits 0. No line holds file
-  contents. A project without a template must still be healthy.
+  `age` version, the secrets file and manifest as "(present)", the identity
+  as "macOS Keychain (present)" with no path, "Status: healthy", and exits 0.
+  No line holds file contents or the key. A project without a template must
+  still be healthy.
 - Manifest: version 3, with a `:vhash` on every entry.
 - Drift, each exiting 1: change `:ciphertext-sha` in the manifest, change a
   `:vhash`, change `:version`. Restore between each. Delete the manifest:
   `verify` exits 2 and names `reencrypt`, `doctor` warns and exits 1, and
   `reencrypt` writes it again.
 - A store without metadata: encrypt `{:a 1}` over the ciphertext with
-  `age -e -i <key>`. `verify` exits 1, `set` and `edit` exit 1 with the same
-  message, and `reencrypt` repairs it. Then encrypt `[1 2]` over it: `verify`
-  exits 1 and names `bb secrets new`, and `reencrypt` is refused.
-- Keyless: move `~/.config/<app>/key.txt` away. `verify` must pass as
-  "freshness only" with exit 0, a changed `:ciphertext-sha` must exit 1,
-  `doctor` must warn that there is no identity and exit 1, and `set` must
-  exit 1 for lack of an identity. With `SECRETS_AGE_IDENTITY` set to the
-  key's contents, `verify` and `doctor` must both exit 0, and `doctor` must
-  name the variable and print no path. Move the key back.
+  `age -e -i -`, the Keychain key piped in as above. `verify` exits 1, `set`
+  and `edit` exit 1 with the same message, and `reencrypt` repairs it. Then
+  encrypt `[1 2]` over it: `verify` exits 1 and names `bb secrets new`, and
+  `reencrypt` is refused.
+- Keyless: take the Keychain item away and put it back afterwards. Renaming
+  `:app` is not a substitute, because the manifest records the app and
+  `verify` reports a manifest for another app. Save the key in a shell
+  variable, then delete the item:
+
+  ```sh
+  key="$(security find-generic-password -s com.kirahowe.secrets -a verifydemo -w)"
+  security delete-generic-password -s com.kirahowe.secrets -a verifydemo
+  ```
+
+  `verify` must pass as "freshness only" with exit 0, a changed
+  `:ciphertext-sha` must exit 1, `doctor` must warn that there is no identity
+  and exit 1, and `set` must exit 1 for lack of an identity and name the
+  Keychain item it looked in. With `SECRETS_AGE_IDENTITY="$key"`
+  exported, `verify` and `doctor` must both exit 0, and `doctor` must name
+  the variable and print no path. Unset the variable, then restore the item
+  through `security -i`, which keeps the key out of the process arguments:
+
+  ```sh
+  printf 'add-generic-password -U -s com.kirahowe.secrets -a verifydemo -w "%s"\n' "$key" \
+    | security -i
+  unset key
+  ```
+- `:key-command`: set the environment's `:key-command` to
+  `["security" "find-generic-password" "-s" "com.kirahowe.secrets" "-a"
+  "verifydemo" "-w"]`. `verify`, `set`, and `edit` must work, `show-key` must
+  print the same public key as before, and `doctor` must name `:key-command`
+  as the identity source. Repeat with `["cat" "<file>"]`, where `<file>` is
+  an owner-only copy of the Keychain key inside scratch
+  (`(umask 077; security find-generic-password -s com.kirahowe.secrets -a
+  verifydemo -w > good.txt)`). Then check the failures, each exit 1 for `set` and 2
+  for `verify`, with a message that names the program and never repeats its
+  output: a program that is not installed, one that exits nonzero (`["false"]`),
+  and one that prints nothing (`["true"]`). `keygen` must refuse an
+  environment with a `:key-command`, and a config with both `:key-command`
+  and `:key-file`, or a `:key-command` that is a string or an empty vector,
+  must be refused as invalid. Remove the `:key-command` afterwards.
 - Identity failures: `SECRETS_AGE_IDENTITY=""` and
   `SECRETS_AGE_IDENTITY_FILE=/nope/key.txt` must each make `verify`,
   `verify <env>`, and `doctor` exit 2, and `edit` exit 1, with a message
@@ -135,13 +184,15 @@ must match what you see.
   `:manifest true`, `:key-file 42`, an environment whose value is a string,
   `:environments` as a vector, a `:default-environment` that is not
   configured, a URL as `:secrets-file`, a missing `:app`, one manifest named
-  by two environments with different secrets files, and a `:key-file` equal
-  to the `:secrets-file`. `doctor` must print the problem and exit 2. Two
+  by two environments with different secrets files, a `:key-file` equal
+  to the `:secrets-file`, and an environment with both `:key-file` and
+  `:key-command`. `doctor` must print the problem and exit 2. Two
   environments sharing a template must be accepted. With two environments
   and no default, `edit` and `keygen` must fail with "Missing environment."
 - Team flow, in a config with a `:recipients-file` and a `:key-file` inside
   scratch:
-  - `keygen` prints the path and the public key, and nothing about other
+  - `keygen` writes the `:key-file`, not the Keychain, and prints its path
+    and the public key, and nothing about other
     environments. `add-recipient` must not recommend `reencrypt` yet. Then
     the first `set`, and `recipients`. `doctor` must show the recipients
     file and "Recipients: 1" and be healthy.
@@ -207,30 +258,41 @@ public var must be `read-config`.
 
 ## Phase 4: identity injection
 
-Each of these must decrypt with no app name given:
+For this phase, `<path>` is the owner-only copy of the Keychain key,
+`good.txt`, made in the `:key-command` step above. Each of these must decrypt
+with no app name given:
 
 - `SECRETS_AGE_IDENTITY_FILE=<path>`, and the same path written with `~`
-- `SECRETS_AGE_IDENTITY="$(cat <path>)"`
+- `SECRETS_AGE_IDENTITY="$(cat <path>)"`, and
+  `SECRETS_AGE_IDENTITY="$(security find-generic-password -s com.kirahowe.secrets -a verifydemo -w)"`
 - `SECRETS_AGE_IDENTITY_B64="$(base64 < <path>)"`
+- `{:key-command ["cat" "<path>"]}` and
+  `{:key-command ["security" "find-generic-password" "-s" "com.kirahowe.secrets" "-a" "verifydemo" "-w"]}`
+  as the options of `load-secrets`, with no variable set
 
 And each of these must fail, naming the variable: a variable that is set but
 empty, a `_B64` value that isn't base64, a `_FILE` that names a missing file,
 and a `_FILE` that holds key contents (the message must not repeat them).
 
-Precedence and cleanup, with a second key (`age-keygen -o other.txt`) that is
-not a recipient of the store under test:
+Precedence and key handling, with a second key (`age-keygen -o other.txt`)
+that is not a recipient of the store under test:
 
 - An explicit `:identity-file` wins over a set variable. With
   `SECRETS_AGE_IDENTITY="$(cat other.txt)"` exported, `load-secrets` with
-  `{:identity-file "<good key>"}` must succeed. The same call with `{:app …}`
+  `{:identity-file "<path>"}` must succeed. The same call with `{:app …}`
   must fail with `age decryption failed`, which shows the variable was the
-  identity in use.
+  identity in use, not the Keychain item.
+- A variable also wins over a `:key-command`: the same exported variable with
+  `{:key-command ["cat" "<path>"]}` must fail the same way.
 - A blank `SECRETS_AGE_IDENTITY=""` must fail with "is set but empty", even
-  when `~/.config/<app>/key.txt` would have decrypted the store.
-- No `age-identity-*` temp file survives the operation. Save this as `c.clj`
-  and run it from the scratch project with `bb -cp <checkout>/src c.clj`,
-  once with `SECRETS_AGE_IDENTITY="$(cat <good key>)"` (success) and once
-  with `SECRETS_AGE_IDENTITY_B64="$(base64 < other.txt)"` (the load throws):
+  when the app's Keychain item would have decrypted the store.
+- A key held in memory never reaches a file. `grep -rn '"age-identity-'
+  <checkout>/src` (the string literal, not the `:secrets-age-identity-…`
+  keywords) must find nothing. Save this as `c.clj` and run it from the
+  scratch project with `bb -cp <checkout>/src c.clj`, once with
+  `SECRETS_AGE_IDENTITY="$(cat <path>)"` exported (success), once with
+  `SECRETS_AGE_IDENTITY_B64="$(base64 < other.txt)"` (the load throws), and
+  once with no variable set (the Keychain item, success):
 
   ```clojure
   (require '[com.kirahowe.secrets :as s])
@@ -238,21 +300,30 @@ not a recipient of the store under test:
     (count (filter #(.startsWith ^String % "age-identity-")
                    (.list (java.io.File. (System/getProperty "java.io.tmpdir"))))))
   (let [before (strays)
-        inside (s/with-identity {} (fn [_] (- (strays) before)))
-        result (try (some? (s/load-secrets "secrets/secrets.edn.age" {}))
+        identity (s/resolve-identity {:app "verifydemo"})
+        result (try (some? (s/load-secrets "secrets/secrets.edn.age" {:app "verifydemo"}))
                     (catch Exception _ :threw))]
-    (println "inside callback:" inside "after load:" (- (strays) before) result))
+    (println "source:" (:identity-source identity)
+             "in memory:" (contains? identity :identity-contents)
+             "file:" (:identity-file identity)
+             "available:" (s/identity-available? identity)
+             "new temp files:" (- (strays) before)
+             result))
   ```
 
-  `inside callback` must be 1, which shows the counter can see the file, and
-  `after load` must be 0 in both runs.
+  Every run must print `in memory: true`, `file: nil`, and
+  `new temp files: 0`, with the source `:secrets-age-identity`,
+  `:secrets-age-identity-b64`, or `:keychain`. The same script with
+  `{:key-command ["cat" "<path>"]}` in place of `{:app "verifydemo"}`, and no
+  variable set, must print the source `:key-command` and the same three
+  values. Delete `good.txt` and `other.txt` when this phase is done.
 
 ## Phase 5: the library's own gates
 
 In the checkout: `bb test`, `clojure -M:test`, `bb lint`, `bb format:check`,
 and `bb book:build`. Wrap the long ones in `caffeinate -is timeout …`, because
-this Mac sleeps mid-run and inflates the timings. Capture test output to a file and read the exit code of
-the test command itself: a pipe through `tail` or `grep` replaces it with the
+this Mac sleeps mid-run and inflates the timings. Capture test output to a
+file and read the exit code of the test command itself: a pipe through `tail` or `grep` replaces it with the
 filter's. Rerun a failure before concluding anything from it, since a
 generated property can fail on one seed.
 
@@ -279,7 +350,11 @@ tracked behind (`git status` stays clean):
 
 ## Wrap-up
 
-- Remove `~/.config/<app>/` and the scratch directory.
+- Delete the Keychain item, `security delete-generic-password -s
+  com.kirahowe.secrets -a verifydemo`, then run `bb secrets verify` once more
+  in the scratch project: it must pass keyless. Remove the scratch directory.
+  `security find-generic-password -s com.kirahowe.secrets -a verifydemo` must
+  then exit 44, and `~/.config/verifydemo` must not exist.
 - Report each phase as pass or fail, every README statement that did not
   hold, and any release-critical item, such as a pin whose commit is not yet
   pushed.

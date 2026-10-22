@@ -14,6 +14,10 @@ the repository is an [age](https://age-encryption.org) private key.
   check it against the ciphertext without holding a key.
 - A store is encrypted to your own key, or to a committed list of public keys
   so each teammate decrypts with their own.
+- The private key is not kept in a plaintext file. On macOS it lives in the
+  login Keychain. Elsewhere, a password manager hands it over through a
+  command such as `op read` or `secret-tool lookup`. The library passes it to
+  `age` on standard input and never writes it to disk.
 
 The library shells out to the `age` binary and otherwise needs only Clojure or
 Babashka. It is alpha software: the API, the commands, and the file formats
@@ -55,10 +59,10 @@ directory. It previews by default:
 bb -cp /path/to/secrets/src -m com.kirahowe.secrets.init --app myapp --keygen
 ```
 
-In an empty project the preview lists three files it would create: a `bb.edn`
-that declares the library and a `secrets` task, a template at
-`secrets/secrets.edn.example`, and the identity at `~/.config/myapp/key.txt`.
-This is the task it writes:
+In an empty project the preview lists two files it would create, a `bb.edn`
+that declares the library and a `secrets` task and a template at
+`secrets/secrets.edn.example`, plus an identity in the macOS Keychain. This is
+the task it writes:
 
 ```clojure
 {secrets
@@ -83,12 +87,22 @@ The dependency it writes is the commit the checkout is at: `:git/tag` and
 `:git/sha` when that commit is the release tag, and `:git/sha` alone otherwise.
 A commit that is not a release tag has to be pushed before another machine can
 resolve it. `--env NAME` names the environment (default `dev`), and `--keygen`
-generates the identity at `~/.config/myapp/key.txt`. Without `--keygen`, run
+generates the identity and stores it in your login Keychain, as the item
+`com.kirahowe.secrets` with account `myapp`. The key goes from `age-keygen`
+into the Keychain without touching the disk. Without `--keygen`, run
 `bb secrets keygen` later. An option's value is a separate argument:
 `--app myapp`, not `--app=myapp`.
 
 Back the identity up, for example in a password manager. It is not in git and
-cannot be recovered.
+cannot be recovered. This prints it:
+
+```sh
+security find-generic-password -s com.kirahowe.secrets -a myapp -w
+```
+
+`--keygen` needs the macOS Keychain. On another system, store a key in your
+password manager and tell the environment how to read it with `:key-command`
+([Where the key lives](#where-the-key-lives)).
 
 Set a first value. From a terminal, `set` prompts for it with echo turned off:
 
@@ -143,16 +157,17 @@ The `secrets` task passes one map to `com.kirahowe.secrets.cli/run!`:
          :recipients-file "env/prod/recipients.txt"}}}
 ```
 
-`:app` and `:environments` are required. `:app` names the default identity
-path, `~/.config/<app>/key.txt`, and is recorded in each manifest. A command
-that omits its environment argument uses `:default-environment`.
+`:app` and `:environments` are required. `:app` names the app's macOS
+Keychain item and is recorded in each manifest. A command that omits its
+environment argument uses `:default-environment`.
 
 | Environment key | Meaning |
 | --- | --- |
 | `:secrets-file` | Required. Path to the ciphertext. It must end in `.age` unless `:template` and `:manifest` are both set. |
 | `:template` | What `new` opens in the editor. Default: the secrets file with `.example` in place of `.age`. |
 | `:manifest` | Path to the manifest, or `false` to keep none. Default: the secrets file with `.manifest` in place of `.age`. |
-| `:key-file` | Where `keygen` writes and `show-key` reads. Default: `~/.config/<app>/key.txt`. |
+| `:key-command` | A program and its arguments, as a vector of strings, that prints the private key. Commands read the key with it. |
+| `:key-file` | A file that holds the private key, where `keygen` writes and commands read. |
 | `:recipients-file` | A committed file of age public keys, one per line. When set, the store is encrypted to all of them. |
 
 The config is validated before a command runs:
@@ -161,9 +176,11 @@ The config is validated before a command runs:
   an error that names it, so a misspelling cannot be ignored silently.
 - `:environments` is a map from a keyword to a map, and `:default-environment`
   has to name one of them.
-- Every environment setting is a string holding a local filesystem path, and
-  `:manifest` may also be `false`. A leading `~` is expanded in every one of
-  them.
+- Every environment setting except `:key-command` is a string holding a local
+  filesystem path, and `:manifest` may also be `false`. A leading `~` is
+  expanded in every one of them. `:key-command` is a vector of non-blank
+  strings, and an environment sets at most one of `:key-command` and
+  `:key-file`.
 - A path that is URI-shaped, such as `https://…` or `file:/…`, is refused
   with `:invalid-config` (`:disallowed-identity` for `:key-file`).
 - No file may serve two purposes. Environments may share a template, a key or
@@ -172,7 +189,52 @@ The config is validated before a command runs:
   them one store under two names.
 
 Each environment is a separate encrypted file. Environments share the app's
-default key unless one sets its own `:key-file`.
+Keychain key unless one sets its own `:key-command` or `:key-file`.
+
+### Where the key lives
+
+An environment's own key comes from the first of these that is set:
+
+1. `:key-command`, a command that prints the key.
+2. `:key-file`, a file that holds it.
+3. On macOS, the login Keychain item with service `com.kirahowe.secrets` and
+   the app name as its account. `keygen` creates it.
+
+Off macOS, with neither setting, an environment has no key of its own. It can
+still verify without a key, and the `SECRETS_AGE_IDENTITY*` variables still
+supply one ([Identity resolution](#identity-resolution)).
+
+`:key-command` works with any password manager that has a command to print
+a stored value. The command runs without a shell and with no standard input,
+and whatever it prints to standard output is the key. Store the key's
+`AGE-SECRET-KEY-1…` line as the item's value. Some examples:
+
+```clojure
+;; 1Password
+{:key-command ["op" "read" "op://Private/myapp age key/password"]}
+;; Bitwarden (with BW_SESSION set), or rbw
+{:key-command ["bw" "get" "password" "myapp age key"]}
+{:key-command ["rbw" "get" "myapp age key"]}
+;; pass
+{:key-command ["pass" "show" "myapp/age-key"]}
+;; the Linux secret service (GNOME Keyring, KWallet)
+{:key-command ["secret-tool" "lookup" "service" "com.kirahowe.secrets" "account" "myapp"]}
+```
+
+`keygen` cannot write through a command, so store a new key with the password
+manager's own tools. `secret-tool` reads the value from standard input, so a
+key can go from `age-keygen` into the store without touching the disk:
+
+```sh
+age-keygen | grep AGE-SECRET-KEY | \
+  secret-tool store --label="myapp age key" service com.kirahowe.secrets account myapp
+```
+
+The command runs each time a command or a load needs the key. A password
+manager that asks to be unlocked asks then.
+
+A `:key-file` is a plaintext key on disk, written readable by its owner only.
+Use it when nothing else is available, or for a throwaway key in tests.
 
 ## Using secrets in an application
 
@@ -196,7 +258,7 @@ Anything else, such as an HTTP URL or a `file:` string, is refused with
 `:reason :disallowed-source` before it is opened.
 
 The second argument chooses the identity. It is a path, or a map with
-`:identity-file`, `:key-file`, or `:app`.
+`:identity-file`, `:key-command`, `:key-file`, or `:app`.
 [Identity resolution](#identity-resolution) gives the full order.
 
 A vector path walks maps by key and vectors by integer index. It does not
@@ -231,14 +293,15 @@ and `merge-readers` adds them to a readers map you already have:
 ```
 
 The options are `:resource` (a classpath resource name) or `:file` (a path),
-plus `:app` or `:identity-file`. Both tags take a keyword or a vector path.
+plus `:app`, `:key-command`, `:key-file`, or `:identity-file`. Both tags take
+a keyword or a vector path.
 
 | Situation | `#secret/req` | `#secret/opt` |
 | --- | --- | --- |
 | The key is in the store | the value | the value |
 | The key is not in the store | throws | `nil` |
 | The secrets file is not found | throws | `nil` |
-| No identity was named and the app's default key file is absent | throws | `nil` |
+| No identity was named and the app's key (its Keychain item or `:key-file`) is absent | throws | `nil` |
 | A named identity file does not exist | throws | throws |
 | Decryption fails | throws | throws |
 
@@ -300,22 +363,25 @@ first of these that applies:
 
 1. An explicit path: the second argument of `load-secrets`, or `:identity-file`
    in the options. The CLI config has no such key: a command's identity comes
-   from 2 to 6.
+   from 2 to 7.
 2. `SECRETS_AGE_IDENTITY_FILE`, a path to the key file.
 3. `SECRETS_AGE_IDENTITY`, the key file's contents.
 4. `SECRETS_AGE_IDENTITY_B64`, the key file's contents in base64.
-5. A `:key-file`: the environment's configured one in the CLI, or a
-   `:key-file` option at runtime.
-6. `~/.config/<app>/key.txt`, when an app name is known.
+5. A `:key-command`: the environment's in the CLI, or the option at runtime.
+6. A `:key-file`, likewise.
+7. On macOS, the Keychain item for the app, when an app name is known.
 
 A path from 1 or 2 names a specific file, and it is an error (`:no-identity`)
-if that file does not exist. 5 and 6 say where the key normally lives. When
-no file is there, no identity is available: `#secret/opt` reads `nil`,
-`verify` checks without a key, and a command that needs the key says where it
-looked. An identity variable that is set
-but empty is an error that names the variable: a CI runner expands a missing
-secret to the empty string, and falling through to another key would hide
-that. Unset the variable to fall back.
+if that file does not exist. 6 and 7 say where the key normally lives. When
+the file or the Keychain item is not there, no identity is available:
+`#secret/opt` reads `nil`, `verify` checks without a key, and a command that
+needs the key says where it looked. A `:key-command` that fails or prints
+nothing is an error that names the program. There is no default key file.
+
+An identity variable that is set but empty is an error that names the
+variable: a CI runner expands a missing secret to the empty string, and
+falling through to another key would hide that. Unset the variable to fall
+back.
 
 Identity paths are local paths with a leading `~` expanded. A value that
 starts with a URI scheme is refused with `:disallowed-identity`. A bare
@@ -323,13 +389,8 @@ relative name with a colon in it, such as `key:txt`, reads as a scheme, so
 write `./key:txt`. Key contents placed in a path setting, raw or
 base64-encoded, are refused the same way and are not echoed.
 
-`age` reads identities from files, so the contents from 3 and 4 are written to
-an owner-only temporary file for the one operation and deleted when it ends.
-If the delete fails, the error names the file that remains. A process ended by
-Ctrl-C, a closed terminal, or `SIGTERM` deletes the file on its way out. One
-that crashes or is killed with `SIGKILL` can leave it behind, and deleting a
-file does not erase it from the disk. Use `SECRETS_AGE_IDENTITY_FILE` with a
-mounted secret when the platform offers one.
+A key from 3, 4, 5, or 7 stays in memory. It reaches `age` on its standard
+input (`age -i -`), so the library never writes it to a file.
 
 ### Size bounds
 
@@ -397,10 +458,12 @@ verify-secrets:
         SECRETS_AGE_IDENTITY: ${{ secrets.SECRETS_AGE_IDENTITY }}
 ```
 
-The repository secret holds the contents of the key file, not a path:
+The repository secret holds the key itself, not a path. With the key in the
+macOS Keychain, it can go straight from there to GitHub:
 
 ```sh
-gh secret set SECRETS_AGE_IDENTITY < ~/.config/myapp/key.txt
+security find-generic-password -s com.kirahowe.secrets -a myapp -w | \
+  gh secret set SECRETS_AGE_IDENTITY
 ```
 
 For the keyless job, drop the `env:`, the `age` install, and the `if:`. The
@@ -558,6 +621,9 @@ and what it leaves to the deployment. In short:
   encrypted to it. Rotate the secret values, not only the key.
 - One identity decrypts a whole environment. There is no access control per
   secret.
+- A key in the Keychain or a password manager stays out of backups and synced
+  or committed dotfiles. Code running as you can still read it, the same way
+  the library does.
 - The decrypted map sits in process memory like any other config. The library
   does not defend a compromised host or application process.
 - `edit` and `new` put plaintext in an owner-only temporary file while the
@@ -586,14 +652,14 @@ an unknown command and an unknown environment.
 
 | Command | What it does |
 | --- | --- |
-| `keygen [env]` | Generate an identity at the environment's `:key-file` and print its public key. Asks before replacing one. |
+| `keygen [env]` | Generate an identity, store it in the environment's `:key-file` or, without one, the macOS Keychain, and print its public key. Asks before replacing one. Refuses for an environment with a `:key-command`. |
 | `new [env]` | Create the store from its template in `$VISUAL`, `$EDITOR`, or `vim`. |
 | `edit [env]` | Decrypt, open the editor, and re-encrypt if the text changed. Comments are kept. |
 | `set [env] <key> [--edn]` | Set one value from a hidden prompt, or from stdin when it is not a terminal. The prompt needs stdin and stdout both to be terminals: with stdout redirected, pipe the value in. Creates the store if there is none. |
 | `rm [env] <key>` | Remove one key. Fails if the key or the store is absent. |
 | `verify [env]` | Check manifests against ciphertexts. With no `env`, checks every environment. |
 | `doctor [env]` | Report on the setup: `age`, the files, the identity, and the recipients. |
-| `show-key [env]` | Print the public key of the configured `:key-file`. |
+| `show-key [env]` | Print the public key of the environment's own key. |
 | `add-recipient [env] [public-key]` | Append a public key to the recipients file. With no key, the environment's own. A single argument that is a public key goes to the default environment, and any other single argument is the environment. |
 | `recipients [env]` | List the recipients file. |
 | `reencrypt [env]` | Re-encrypt to the current recipients with a new manifest key. |
@@ -638,8 +704,12 @@ Exit codes:
 - `(load-secrets source)`, `(load-secrets source identity-or-opts)`
 - `(get-secret secrets key-path)`, `(get-secret secrets key-path default)`
 - `(reader-literals opts)`, `(merge-readers readers opts)`
-- `(with-identity identity-or-opts f)` calls `f` with
-  `{:identity-file path :identity-source source}` for one operation
+- `(resolve-identity identity-or-opts)` returns the identity an operation
+  would use: `{:identity-file path :identity-source source}`, or
+  `{:identity-contents key :identity-source source}` for a key held in memory.
+  `(identity-available? identity)` says whether it holds a usable key, and
+  `(key-identity opts)` resolves only the project's own key, ignoring the
+  `SECRETS_AGE_IDENTITY*` variables.
 
 `com.kirahowe.secrets.aero` has `(read-config source opts)`.
 
@@ -655,7 +725,7 @@ the one place that exits.
 
 `com.kirahowe.secrets.init` has `-main` and `(init! opts)`.
 
-Those four namespaces are the public API. `com.kirahowe.secrets.age`,
+Those four namespaces are the public API. `com.kirahowe.secrets.age`, `.keychain`,
 `.manifest`, `.store`, `.fs`, `.safe-edn`, and `.source` are implementation
 namespaces and can change without notice. The book's reference chapter lists
 every public API var with its docstring.
@@ -667,7 +737,8 @@ are the ones a caller can usefully branch on:
 
 | Reasons | Meaning |
 | --- | --- |
-| `:no-identity`, `:invalid-identity`, `:disallowed-identity` | No identity is available, or a named identity file is missing. An identity variable is blank or not base64. An identity path is URI-shaped or holds key contents. |
+| `:no-identity`, `:invalid-identity`, `:disallowed-identity` | No identity is available, or a named identity file is missing. An identity variable is blank or not base64, or a `:key-command` is malformed or printed nothing. An identity path is URI-shaped or holds key contents. |
+| `:key-command-failed`, `:keychain-failed` | The `:key-command` could not start or exited with an error. The macOS Keychain could not be read or written. |
 | `:no-file`, `:disallowed-source`, `:source-too-large` | The source is nil, blank, absent, a directory, or unreadable, or a file the CLI needs cannot be read. It is not a local path or a classpath resource. The ciphertext is past 16 MiB, at runtime or in the CLI. |
 | `:decrypt-failed`, `:age-not-installed` | `age` could not decrypt with this identity. The `age` binary is not on the `PATH`. |
 | `:edn-empty`, `:edn-extra-values`, `:edn-malformed`, `:edn-too-deep` | The plaintext is not exactly one well-formed EDN value. |
