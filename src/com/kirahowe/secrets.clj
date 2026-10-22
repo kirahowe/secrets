@@ -1,56 +1,58 @@
 (ns com.kirahowe.secrets
   "Runtime loading of age-encrypted EDN secrets.
 
-  Secrets live in a single version-controlled, age-encrypted EDN file
-  (`secrets.edn.age`). At runtime they are decrypted once with your age
-  identity (private key) and read into a plain Clojure map. The plaintext is
-  never written to disk and never committed.
+  Secrets live in one version-controlled, age-encrypted EDN file
+  (`secrets.edn.age`). At runtime they are decrypted with your age identity
+  (private key) and read into a plain Clojure map. The plaintext is never
+  written to disk.
 
-  A successful decryption proves the ciphertext was readable with your
-  identity, not who wrote it: age encrypts to recipients and does not sign. The
-  loaded map is therefore only as trustworthy as the commit and deployment
-  channel that delivered the ciphertext. See `doc/threat-model.md` in the
-  repository.
+  Decryption shows the ciphertext was readable with your identity, not who
+  wrote it: age does not sign. The loaded map is only as trustworthy as the
+  channel that delivered the ciphertext. See `doc/threat-model.md`.
 
   Two ways to consume secrets:
 
-  • As an Integrant/component value: call `load-secrets` to get the map and
-    `get-secret` to read keys from it. (See the README for a two-line init-key.)
-
-  • As EDN reader literals: call `reader-literals` (or `merge-readers`) to get
-    `#secret/req` / `#secret/opt` tags you can register with your config
-    reader, so config files reference secrets inline:
+  - As a value: `load-secrets` returns the map and `get-secret` reads keys
+    from it. (See the README for a two-line Integrant init-key.)
+  - As EDN reader literals: `reader-literals` (or `merge-readers`) returns
+    the `#secret/req` / `#secret/opt` tags to register with your config
+    reader:
 
         :jdbc-url #secret/req :database/url  ; required: throws if absent
         :api-key  #secret/opt :llm/api-key   ; optional: nil if absent
 
-  An explicit identity path takes precedence. Otherwise resolution uses:
+  ## Identity resolution
+
+  An explicit identity path takes precedence. Otherwise the first of these
+  that applies wins:
     1. $SECRETS_AGE_IDENTITY_FILE, a path to the key file.
-    2. $SECRETS_AGE_IDENTITY, the raw key file *contents*, used verbatim. Lets
-       a deploy inject the key as one secret/env var.
-    3. $SECRETS_AGE_IDENTITY_B64, canonical base64-encoded key file contents.
-       ASCII space, horizontal tab, carriage return, and line feed are permitted
-       for wrapping; every other nonalphabet character or malformed encoding throws.
-    4. where the project keeps its key: the output of a `:key-command`, such as
-       a password manager's read command, else a `:key-file`, else on macOS the
-       login Keychain item for the `:app` option.
-  When none of these yields an identity, loading throws with the options above
-  rather than guessing a path. There is no default key file.
-
-  An identity path is a local filesystem path, with a leading `~` expanded. A
-  URI-shaped value, which includes a bare relative name with a colon such as
-  `key:txt`, fails with `:disallowed-identity` and the error names its source
-  and scheme; write `./key:txt` for such a file. Key contents in a path
-  setting, raw or base64-encoded, fail the same way and are never echoed.
-
-  A path you designate has to exist. An explicit path, `:identity-file`, or
-  $SECRETS_AGE_IDENTITY_FILE that names a missing file fails with
-  `:no-identity`, naming the source and the path. A `:key-file` may be
-  absent, and so may the Keychain item, and then no identity is available.
+    2. $SECRETS_AGE_IDENTITY, the raw key file contents, used verbatim, so a
+       deploy can inject the key as one env var.
+    3. $SECRETS_AGE_IDENTITY_B64, canonical base64 of the key file contents.
+       Space, tab, CR, and LF may wrap it; any other nonalphabet character or
+       malformed encoding throws.
+    4. The project's own key: the output of a `:key-command` (such as a
+       password manager's read command), else a `:key-file`, else on macOS
+       the login Keychain item for the `:app` option.
+  When none yields an identity, loading throws and lists these options. There
+  is no default key file.
 
   A key that is not in a file (sources 2 and 3, a `:key-command`, the
-  Keychain) is held in memory and handed to `age` on its standard input. The
-  library never writes it to disk."
+  Keychain) is held in memory and handed to `age` on its standard input. It
+  is never written to disk.
+
+  ## Identity paths
+
+  A path is a local filesystem path with a leading `~` expanded. A URI-shaped
+  value, including a bare name with a colon such as `key:txt` (write
+  `./key:txt`), fails with `:disallowed-identity`, naming its source and
+  scheme. Key contents in a path setting, raw or base64, fail the same way
+  and are never echoed.
+
+  A path you designate must exist: an explicit path, `:identity-file`, or
+  $SECRETS_AGE_IDENTITY_FILE naming a missing file fails with `:no-identity`,
+  naming the source and path. A `:key-file` or Keychain item may be absent,
+  and then no identity is available."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.age :as age]
@@ -65,12 +67,11 @@
 ;;;; Identity resolution
 
 (def ^:private identity-b64-whitespace-re
-  "ASCII whitespace permitted in base64 identity transport: space, horizontal
-  tab, carriage return, and line feed."
+  "Whitespace allowed in base64 identity transport."
   #"[ \t\r\n]")
 
 (defn- invalid-b64-identity
-  "Return the content-free error for invalid base64 identity input."
+  "The content-free error for invalid base64 identity input."
   []
   (ex-info (str "SECRETS_AGE_IDENTITY_B64 is not valid base64. Set it to the"
                 " base64-encoded age key file contents, or use"
@@ -79,12 +80,9 @@
            {:reason :invalid-identity :env "SECRETS_AGE_IDENTITY_B64"}))
 
 (defn- decode-b64-identity
-  "Decode canonical base64 identity contents to raw identity text.
-
-  ASCII space, horizontal tab, carriage return, and line feed are removed for
-  environment transport. Every other nonalphabet character, noncanonical
-  encoding, malformed length, or padding error throws without retaining the
-  input or a decoder cause."
+  "Decode canonical base64 identity contents to raw identity text. Anything
+  but canonical base64 (after stripping wrapping whitespace) throws without
+  retaining the input or a decoder cause."
   [contents]
   (let [normalized (str/replace contents identity-b64-whitespace-re "")
         decoded (try
@@ -97,7 +95,7 @@
     (String. decoded "UTF-8")))
 
 (def ^:private identity-env-help
-  "What each identity variable should contain, for the set-but-empty error."
+  "What each identity variable holds, for the set-but-empty error."
   {"SECRETS_AGE_IDENTITY_FILE" "a path to the age key file"
    "SECRETS_AGE_IDENTITY" "the age key file contents"
    "SECRETS_AGE_IDENTITY_B64" "the base64-encoded age key file contents"})
@@ -115,8 +113,7 @@
   v)
 
 (defn- getenv
-  "Read environment variable `k`. This is the only raw environment read in the
-  namespace, and the seam tests redefine."
+  "The only raw environment read here, and the seam tests redefine."
   [k]
   (System/getenv k))
 
@@ -126,14 +123,14 @@
   (identity-env-value k (getenv k)))
 
 (def ^:private identity-source-subject
-  "How an error names the place an identity path came from."
+  "How an error names where an identity path came from."
   {:identity-file "The explicit identity path"
    :secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
    :configured-key-file "The configured :key-file"})
 
 (defn- identity-candidate
   "Choose an identity. An explicit path and SECRETS_AGE_IDENTITY_FILE are
-  `:designated?`: the file has to exist. Everything else comes from
+  `:designated?`, so the file must exist. The rest comes from
   [[identity/key-identity]]."
   [identity-or-opts]
   (let [opts (if (map? identity-or-opts) identity-or-opts {})
@@ -154,9 +151,9 @@
         (identity/key-identity opts))))
 
 (defn- validate-identity-path!
-  "Throw `:disallowed-identity` when `path` cannot name a local identity file:
-  it holds key contents, or it is URI-shaped. The error names where the value
-  came from and, for a URI, its `:scheme`. It never renders the value."
+  "Throw `:disallowed-identity` when `path` holds key contents or is
+  URI-shaped. The error names the source and, for a URI, its `:scheme`, never
+  the value."
   [path identity-source]
   (when-let [problem (some-> path str source/path-problem)]
     (throw (ex-info (source/path-problem-message (identity-source-subject identity-source)
@@ -175,22 +172,18 @@
 
 (defn resolve-identity
   "Resolve `identity-or-opts`, an explicit path or an options map, to the
-  identity an operation decrypts with, and return it.
+  identity an operation decrypts with. The first source that applies wins:
+  `:identity-file`, SECRETS_AGE_IDENTITY_FILE, SECRETS_AGE_IDENTITY,
+  SECRETS_AGE_IDENTITY_B64, then `:key-command`, `:key-file`, and on macOS
+  the Keychain item for `:app`. The namespace docstring has the details.
 
-  The result is `{:identity-file path :identity-source source}` for a key
-  file, or `{:identity-contents key :identity-source source}` for a key held
-  in memory, which is handed to `age` on its standard input and never written
-  to disk. Resolution is an explicit path (`:identity-file`), then
-  SECRETS_AGE_IDENTITY_FILE, SECRETS_AGE_IDENTITY, SECRETS_AGE_IDENTITY_B64,
-  then `:key-command`, `:key-file`, and on macOS the Keychain item for `:app`.
-  Every path has a leading `~` expanded.
+  Returns `{:identity-file path :identity-source source}` for a key file, or
+  `{:identity-contents key :identity-source source}` for a key held in memory.
 
-  A path that is URI-shaped or holds key contents throws
-  `:disallowed-identity`. An explicit path and SECRETS_AGE_IDENTITY_FILE each
-  designate a file, and one that does not exist throws `:no-identity` naming
-  its source and the path. A `:key-file` that does not exist, or a Keychain
-  with no item for the app, means only that no identity is available
-  ([[identity-available?]] is false), so keyless operations stay possible."
+  Throws `:disallowed-identity` for a bad path and `:no-identity` for a
+  designated file that does not exist. A missing `:key-file` or Keychain item
+  only makes [[identity-available?]] false, so keyless operations stay
+  possible."
   [identity-or-opts]
   (let [{:keys [identity-file identity-source designated?] :as candidate}
         (identity-candidate identity-or-opts)]
@@ -205,7 +198,7 @@
     (dissoc candidate :designated?)))
 
 (def ^:private identity-options
-  "One-line remediation appended to \"no identity\" errors."
+  "Remediation appended to \"no identity\" errors."
   (str "Store a key with `bb secrets keygen` (the macOS Keychain, or the configured "
        ":key-file), or pass {:key-command [...]} or {:key-file ...}; or set "
        "SECRETS_AGE_IDENTITY_FILE (key path), SECRETS_AGE_IDENTITY (raw key contents), or "
@@ -214,7 +207,7 @@
 ;;;; Loading
 
 (defn- validate-load-identity!
-  "Throw unless `identity` is available, naming the key file it looked for."
+  "Throw `:no-identity` unless `identity` is available."
   [descriptor {:keys [identity-file identity-source] :as identity}]
   (when-not (identity-available? identity)
     (let [nameable (some-> identity-file str)]
@@ -232,10 +225,10 @@
   #{:edn-empty :edn-extra-values :edn-too-deep :edn-malformed})
 
 (defn- read-secrets-edn
-  "Parse decrypted `plaintext` under the shared, content-free EDN policy and
-  return the user's data. This is the one place decrypted EDN becomes a
-  returned value, so it is where the library's reserved metadata key
-  ([[com.kirahowe.secrets.manifest/store-key]]) is dropped."
+  "Parse decrypted `plaintext` under the shared content-free EDN policy. The
+  one place decrypted EDN becomes a returned value, so it is where the
+  reserved metadata key ([[com.kirahowe.secrets.manifest/store-key]]) is
+  dropped."
   [plaintext]
   (let [{:keys [ok? value] :as parsed} (safe-edn/parse plaintext)]
     (if ok?
@@ -245,12 +238,11 @@
                       (safe-edn/failure-data parsed))))))
 
 (defn- decrypt-and-read!
-  "Decrypt and read `file`, always running its source cleanup function.
+  "Decrypt and read `file`, always running `cleanup!`.
 
-  A failure below here knows the file `age` was handed, which for a copied
-  source is a temp file the caller never named, so it is re-thrown with the
-  `source` descriptor added. Content-free EDN failures drop their intermediate
-  exception; other failures retain their cause."
+  Failures are re-thrown with the `source` descriptor added, since `file` may
+  be a temp copy the caller never named. Content-free EDN failures drop their
+  cause; others keep it."
   [identity file source cleanup!]
   (try
     (read-secrets-edn (age/decrypt identity (.getAbsolutePath ^java.io.File file)))
@@ -272,22 +264,22 @@
 
 (defn load-secrets
   "Decrypt an age-encrypted EDN source and return its value. The reserved
-  top-level key `:com.kirahowe.secrets/store`, under which the CLI keeps a
-  store's metadata, is library data and is never returned.
+  top-level key `:com.kirahowe.secrets/store`, where the CLI keeps a store's
+  metadata, is never returned.
 
-  `source` is local-only: a filesystem path as a String, `java.io.File`, or
-  `java.nio.file.Path`, or a classpath resource as the `java.net.URL` that
-  `clojure.java.io/resource` returns, whose scheme is `file:` or `jar:file:`.
-  Anything else is rejected with `:disallowed-source` before it is opened.
-  `identity-or-opts` is an identity path or an options map:
+  `source` is local-only: a filesystem path (String, `java.io.File`, or
+  `java.nio.file.Path`), or a classpath resource as the `java.net.URL` from
+  `clojure.java.io/resource`, with scheme `file:` or `jar:file:`. Anything
+  else is rejected with `:disallowed-source` before it is opened.
+
+  `identity-or-opts` is an identity path or an options map, resolved as
+  [[resolve-identity]] describes.
     :identity-file  explicit identity path (wins over the env vars)
     :key-command    a program and its arguments, as a vector of strings, that
-                    prints the key, used when no env var is set
-    :key-file       the project's key path, used when no env var is set
+                    prints the key
+    :key-file       the project's key path
     :app            app name; on macOS, its login Keychain item holds the key
-                    when neither of the two above is given
-  Without one of these, only the SECRETS_AGE_IDENTITY* environment variables
-  are used.
+  Without any of these, only the SECRETS_AGE_IDENTITY* variables are used.
 
   Missing or invalid inputs throw ex-info with a :reason:
     :no-identity        no identity resolves, or a designated identity file
@@ -303,33 +295,28 @@
     :no-file            `source` is nil or blank, or names no file, or an
                         allowed local source cannot be read.
     :disallowed-source  `source` is outside the local-only provenance contract.
-  Fixed bounds catch an accidental huge or deeply nested input: a source past
-  16 MiB throws `:source-too-large`, which bounds the plaintext too because
-  age does not compress, and EDN nested past 100 collections throws
-  `:edn-too-deep`. Each carries the numeric `:limit`. The identity is resolved
-  first, then source policy and opening. The plaintext is read with
-  `clojure.edn`, not `eval`.
+  Fixed bounds catch accidental huge input: a source past 16 MiB throws
+  `:source-too-large` (which bounds the plaintext too, as age does not
+  compress), and EDN nested past 100 collections throws `:edn-too-deep`. Each
+  carries the numeric `:limit`. The identity is resolved first, then source
+  policy and opening. The plaintext is read with `clojure.edn`, not `eval`.
 
   Every failure about a source carries `:source`, allowlisted metadata naming
-  which source failed (a file's path, a resource URL's scheme and path, a
-  refused URL's or string's scheme alone, or a rejected object's class) and
-  never the source value, whose userinfo, query, or `toString` can be a
-  credential. A key that is not in a file reaches `age` on its standard
-  input and is never written to disk."
+  it (a file's path, a resource URL's scheme and path, a refused URL's or
+  string's scheme alone, or a rejected object's class), never the source
+  value itself, whose userinfo or query can be a credential."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
    (load-with-identity source (resolve-identity identity-or-opts))))
 
 (defn get-secret
   "Read a secret from a loaded store. `key-path` is a vector path
-  (`[:database :url]`) or a single key (`:database/url`), which is a path of
-  one element.
+  (`[:database :url]`) or a single key (`:database/url`).
 
-  A vector path walks maps by key and vectors by integer index, and nothing
-  else. It does not index into a string, a set, a list, or any other value, so
-  a path that continues past such a leaf is not found. Returns `default` (nil
-  unless given) when the path is not found, and the stored value, which may be
-  nil, when it is."
+  A path walks maps by key and vectors by integer index only; it does not
+  index into strings, sets, or lists. Returns `default` (nil unless given)
+  when the path is not found, and the stored value, which may be nil, when it
+  is."
   ([secrets key-path] (get-secret secrets key-path nil))
   ([secrets key-path default]
    (reduce (fn [value k]
@@ -343,8 +330,7 @@
 ;;;; EDN reader literals
 
 (defn- reader-loaded-state
-  "Load one readers map's source in an operation-owned identity scope, or
-  describe why it is unavailable."
+  "Load the readers' source, or describe why it is unavailable."
   [{:keys [resource file] :as opts}]
   (let [source (cond
                  file (when (.isFile (io/file (str file)))
@@ -362,8 +348,8 @@
 
 (defn- validate-reader-source!
   "Throw `:disallowed-source` when the readers' `:file` or `:resource` is
-  URI-shaped or holds key contents. `:source` is its descriptor, which drops
-  userinfo, query, and fragment, and the message names only the scheme."
+  URI-shaped or holds key contents. `:source` is its credential-free
+  descriptor and the message names only the scheme."
   [{:keys [file resource]}]
   (doseq [[option value expected]
           [[:file file "a local filesystem path"]
@@ -377,11 +363,11 @@
                         (assoc :source (source/descriptor (str value)))))))))
 
 (defn- required-secret-handler
-  "Build the required-secret reader around a shared delayed loaded state.
+  "Build the `#secret/req` reader around a shared delayed loaded state.
 
   A failure names the configured store under `:store`, never `:source`: a load
-  failure surfacing through this same reader carries `:source`, the allowlisted
-  descriptor of the source that failed, and one key must not mean two shapes."
+  failure surfacing through this reader already carries `:source`, and one key
+  must not mean two shapes."
   [loaded describe]
   (fn [key-path]
     (let [{:keys [present? reason secrets]} @loaded]
@@ -401,7 +387,7 @@
         value))))
 
 (defn- optional-secret-handler
-  "Build the optional-secret reader around a shared delayed loaded state."
+  "Build the `#secret/opt` reader around a shared delayed loaded state."
   [loaded]
   (fn [key-path]
     (let [{:keys [present? secrets]} @loaded]
@@ -415,30 +401,29 @@
 
   Options:
     :resource      classpath resource name to decrypt, e.g. \"secrets.edn.age\"
-                   (resolved lazily with io/resource; nil/absent ⇒ no secrets).
-    :file          an explicit local file path, used instead of :resource.
-                   A URI-shaped :file or :resource throws `:disallowed-source`
-                   here, with the same credential-free `:source` descriptor a
-                   load failure carries.
-    :app           app name; on macOS its Keychain item holds the key.
-    :key-command   a program and its arguments that print the key.
-    :key-file      the project's key path, used when no env var is set.
-    :identity-file explicit identity path (overrides resolution).
+                   (resolved lazily with io/resource; nil/absent means no
+                   secrets).
+    :file          a local file path, used instead of :resource. A URI-shaped
+                   :file or :resource throws `:disallowed-source` here, with
+                   the same credential-free `:source` descriptor a load
+                   failure carries.
+    :app, :key-command, :key-file, :identity-file
+                   as in `load-secrets`.
 
   The source is resolved and decrypted at most once, when the first tag is
   read. That first successful load or decryption failure is cached for the
-  lifetime of the returned readers map; recreate it after editing or repairing
-  ciphertext. Configs with no secret tags do not access the source or identity.
+  life of the returned map; recreate it after editing or repairing
+  ciphertext. A config with no secret tags never touches the source or
+  identity.
 
   Semantics, mirroring required/optional env reads:
-    #secret/req k → required: throws when no secrets file is found, when no
-                    identity (key) is available, or when the key is missing
-                    from the decrypted map.
-    #secret/opt k → optional: nil in all three of those cases.
+    #secret/req k  throws when no secrets file is found, when no identity is
+                   available, or when the key is missing from the map.
+    #secret/opt k  returns nil in all three of those cases.
   \"No identity is available\" means none was designated and the project's
-  key file or Keychain item is absent. A designated identity file that does not exist makes both
-  tags throw `:no-identity`, and a decryption that fails makes both throw
-  `:decrypt-failed`."
+  key file or Keychain item is absent. A designated identity file that does
+  not exist makes both tags throw `:no-identity`, and a failed decryption
+  makes both throw `:decrypt-failed`."
   [opts]
   (let [loaded (delay (reader-loaded-state opts))
         _ (validate-reader-source! opts)
@@ -447,8 +432,7 @@
      'secret/opt (optional-secret-handler loaded)}))
 
 (defn merge-readers
-  "Merge `reader-literals` into an existing `:readers` map. The returned map
-  owns a fresh lazy load/cache; call `merge-readers` again after editing or
-  repairing ciphertext."
+  "Merge `reader-literals` into an existing `:readers` map. The result has
+  its own fresh cache; call again after editing or repairing ciphertext."
   [readers opts]
   (merge readers (reader-literals opts)))

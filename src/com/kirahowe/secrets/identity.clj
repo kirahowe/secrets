@@ -14,10 +14,11 @@
                 (every? #(and (string? %) (not (str/blank? %))) argv))))
 
 (defn- run-key-command!
-  "Run `argv`, a `:key-command`, and return what it prints: the age identity.
+  "Run `argv`, a `:key-command`, and return its output as the age identity.
   It gets no standard input, so it cannot consume a value piped to the CLI.
-  A command that is not a vector of strings, cannot start, fails, or prints
-  nothing throws, naming the program and never its output."
+  Throws, naming the program and never its output, when `argv` is invalid
+  (`:invalid-identity`), the command cannot start or exits nonzero
+  (`:key-command-failed`), or it prints nothing (`:invalid-identity`)."
   [argv]
   (when-not (valid-key-command? argv)
     (throw (ex-info (str ":key-command must be a vector of non-blank strings, a program and"
@@ -46,12 +47,11 @@
 
 (defn key-identity
   "Return the identity a project keeps for itself, ignoring the
-  SECRETS_AGE_IDENTITY* variables: the output of `:key-command`, else the
-  `:key-file`, else on macOS the Keychain item for `:app`. A command or the
-  Keychain is read now, and its key is held in memory as
-  `:identity-contents`. A key file is named by `:identity-file` whether or
-  not it exists. When the Keychain has no item for the app, or nothing names
-  a key, the result has only `:identity-source`."
+  SECRETS_AGE_IDENTITY* variables: `:key-command`, else `:key-file`, else on
+  macOS the Keychain item for `:app`. A command or the Keychain is read now
+  and held as `:identity-contents`. A key file is named by `:identity-file`
+  whether or not it exists. With no Keychain item or nothing configured, the
+  result has only `:identity-source`."
   [{:keys [key-command key-file app]}]
   (cond
     key-command

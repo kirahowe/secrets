@@ -1,12 +1,10 @@
 (ns com.kirahowe.secrets.keychain
   "Implementation namespace; not part of the public API and may change without notice.
 
-  The macOS login Keychain, the default home of an app's age identity on a
-  Mac. Each app's key is one generic password item whose service is
-  `com.kirahowe.secrets` and whose account is the app name. The key is read
-  and written through `/usr/bin/security`, which creates the item and so can
-  read it back without a prompt. The key goes to `security` on its standard
-  input and never appears in a process's arguments or on disk."
+  The macOS login Keychain as the home of an app's age identity: one generic
+  password item per app, service `com.kirahowe.secrets`, account the app name.
+  Everything goes through `/usr/bin/security`, which created the item and so
+  can read it back without a prompt."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.fs :as fs]))
@@ -72,8 +70,9 @@
   "Store `contents`, an age secret key, as the Keychain item for `app`,
   replacing any item already there, and read it back to check it arrived.
 
-  `security add-generic-password` takes the password only as an argument, so
-  the command goes to `security -i` on its standard input instead."
+  `security add-generic-password` takes the password only as an argument,
+  which any process could read. The command goes to `security -i` on stdin
+  instead, so the key is never in a process's arguments or on disk."
   [app contents]
   (let [line (str/join " " ["add-generic-password" "-U"
                             "-s" (quoted service) "-a" (quoted app)
