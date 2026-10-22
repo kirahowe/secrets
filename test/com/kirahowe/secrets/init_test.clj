@@ -147,7 +147,7 @@
         "the template the initializer creates is the one the CLI reads")
     (is (= "secrets/secrets.edn.manifest" (:manifest environment)))
     (is (not (contains? proposal :key-file)) "there is no key file to plan")
-    (is (= {:path key-item :action :create :keychain-app "reader"} (last files)))
+    (is (= {:keychain-app "reader" :action :create} (last files)))
     (is (not (contains? environment :key-file)))
     (is (= "the macOS Keychain (com.kirahowe.secrets, account reader)"
            (store/key-location environment))

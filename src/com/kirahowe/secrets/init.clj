@@ -271,8 +271,8 @@
   its `:path`, relative to `:root` unless absolute, and an `:action`:
 
   - `:create` for a file that does not exist, with its `:content`. The identity
-    `--keygen` asks for is a `:create` entry with `:keychain-app`, the app
-    whose macOS Keychain item it becomes, and no content.
+    `--keygen` asks for is an entry with `:keychain-app`, the app whose macOS
+    Keychain item it becomes, and no `:path` or `:content`.
   - `:exists` for a file that is already there and needs nothing.
   - `:add` for an existing file that lacks something, with `:additions`, each
     the top-level key to put it `:under` and the `:text` to put there.
@@ -296,13 +296,12 @@
                             library)
                           task])
         deps-edn (when deps-owns? (edn-file root "deps.edn" [library]))
-        key-item (str "macOS Keychain item " keychain/service ", account " app)
         files (cond-> (filterv some? [deps-edn
                                       bb-edn
                                       (plain-file root template-path template-content)])
                 keygen? (conj (if (keychain/has-key? app)
-                                {:path key-item :action :exists}
-                                {:path key-item :action :create :keychain-app app})))]
+                                {:keychain-app app :action :exists}
+                                {:keychain-app app :action :create})))]
     (cond-> {:root root :config config :files files}
       (some #{library} (mapcat :entries files)) (assoc :dependency @default-dependency))))
 
@@ -312,6 +311,14 @@
   ;; O_CREAT|O_EXCL: the open fails on any existing entry, a symbolic link
   ;; included, so a file that appeared after the plan was made is not replaced.
   (into-array OpenOption [StandardOpenOption/CREATE_NEW StandardOpenOption/WRITE]))
+
+;; An entry is a file (`:path`) or the Keychain item of `:keychain-app`; this
+;; is the text that names it in output and errors.
+(defn- entry-label
+  [{:keys [path keychain-app]}]
+  (if keychain-app
+    (str "macOS Keychain item " keychain/service ", account " keychain-app)
+    path))
 
 (defn- stop!
   "Throw because creating `path` failed, with `message` and then the files
@@ -337,28 +344,29 @@
   straight into the macOS Keychain, so it is never on disk."
   [{:keys [root files]}]
   (reduce
-   (fn [{:keys [created] :as result} {:keys [path content keychain-app]}]
-     (let [exists (str path " already exists, so the initializer did not write it.")]
+   (fn [{:keys [created] :as result} {:keys [path content keychain-app] :as entry}]
+     (let [label (entry-label entry)
+           exists (str label " already exists, so the initializer did not write it.")]
        (try
          (if keychain-app
            (do (when (keychain/has-key? keychain-app)
-                 (stop! exists :file-exists path created nil))
+                 (stop! exists :file-exists label created nil))
                (let [{:keys [identity-contents public-key]} (age/generate)]
                  (keychain/store-key! keychain-app identity-contents)
                  (-> result
                      (assoc :public-key public-key)
-                     (update :created conj path))))
+                     (update :created conj label))))
            (let [file (target root path)]
              (when-let [parent (.getParent file)]
                (Files/createDirectories parent (make-array FileAttribute 0)))
              (Files/write file (.getBytes ^String content StandardCharsets/UTF_8) create-new)
-             (update result :created conj path)))
+             (update result :created conj label)))
          (catch FileAlreadyExistsException e
-           (stop! exists :file-exists path created e))
+           (stop! exists :file-exists label created e))
          (catch Exception e
            (if (:created (ex-data e))
              (throw e)
-             (stop! (store/failure-message e) nil path created e))))))
+             (stop! (store/failure-message e) nil label created e))))))
    {:created []}
    (filter #(= :create (:action %)) files)))
 
@@ -384,15 +392,15 @@
         "Secrets initializer"
         "Secrets initializer preview. Nothing is written without --apply.")]
      (section (if result "Created:" "Would create:")
-              (mapcat (fn [{:keys [path content keychain-app]}]
-                        (cons (str "  " path)
+              (mapcat (fn [{:keys [content keychain-app] :as entry}]
+                        (cons (str "  " (entry-label entry))
                               (cond
                                 keychain-app ["      a new age identity, never written to disk"]
                                 result nil
                                 :else (indented 6 content))))
                       (:create by-action)))
      (section "Already there, left as they are:"
-              (map #(str "  " (:path %)) (:exists by-action)))
+              (map #(str "  " (entry-label %)) (:exists by-action)))
      (section "Add these yourself. The initializer does not edit existing files."
               (for [{:keys [path additions]} (:add by-action)
                     {:keys [under text]} additions
