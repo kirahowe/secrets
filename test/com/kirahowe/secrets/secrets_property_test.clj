@@ -337,7 +337,7 @@
                  path missing-path-text]
     (let [seen (with-env {} #(secrets/resolve-identity {:app (str "kira-missing-" app)}))
           configured (with-env {} #(secrets/resolve-identity {:key-file path :app app}))]
-      (and (= {:identity-file nil :identity-source :keychain} seen)
+      (and (= {:identity-source :keychain} seen)
            (= {:identity-file path :identity-source :configured-key-file} configured)))))
 
 ;;;; get-secret

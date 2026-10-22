@@ -17,7 +17,8 @@
 ;; `com.kirahowe.secrets.aero`, `com.kirahowe.secrets.cli`, and
 ;; `com.kirahowe.secrets.init`. They are listed below.
 ;;
-;; `com.kirahowe.secrets.age`, `com.kirahowe.secrets.keychain`,
+;; `com.kirahowe.secrets.age`, `com.kirahowe.secrets.identity`,
+;; `com.kirahowe.secrets.keychain`,
 ;; `com.kirahowe.secrets.manifest`,
 ;; `com.kirahowe.secrets.store`, `com.kirahowe.secrets.fs`,
 ;; `com.kirahowe.secrets.safe-edn`, and `com.kirahowe.secrets.source` are
@@ -64,8 +65,7 @@
                reader-literals
                merge-readers
                resolve-identity
-               identity-available?
-               key-identity])
+               identity-available?])
 
 ;; ## com.kirahowe.secrets.aero
 

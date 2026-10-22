@@ -707,9 +707,7 @@ Exit codes:
 - `(resolve-identity identity-or-opts)` returns the identity an operation
   would use: `{:identity-file path :identity-source source}`, or
   `{:identity-contents key :identity-source source}` for a key held in memory.
-  `(identity-available? identity)` says whether it holds a usable key, and
-  `(key-identity opts)` resolves only the project's own key, ignoring the
-  `SECRETS_AGE_IDENTITY*` variables.
+  `(identity-available? identity)` says whether it holds a usable key.
 
 `com.kirahowe.secrets.aero` has `(read-config source opts)`.
 
@@ -725,9 +723,9 @@ the one place that exits.
 
 `com.kirahowe.secrets.init` has `-main` and `(init! opts)`.
 
-Those four namespaces are the public API. `com.kirahowe.secrets.age`, `.keychain`,
-`.manifest`, `.store`, `.fs`, `.safe-edn`, and `.source` are implementation
-namespaces and can change without notice. The book's reference chapter lists
+Those four namespaces are the public API. `com.kirahowe.secrets.age`,
+`.identity`, `.keychain`, `.manifest`, `.store`, `.fs`, `.safe-edn`, and
+`.source` are implementation namespaces and can change without notice. The book's reference chapter lists
 every public API var with its docstring.
 
 ### Failure reasons

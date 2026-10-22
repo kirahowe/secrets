@@ -11,6 +11,7 @@
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.identity :as identity]
             [com.kirahowe.secrets.keychain :as keychain]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
@@ -178,8 +179,7 @@
   (let [label (name environment-name)]
     (reject-unknown-keys! (str "Environment " label) environment-keys env-config)
     (when-let [command (:key-command env-config)]
-      (when-not (and (vector? command) (seq command)
-                     (every? #(and (string? %) (not (str/blank? %))) command))
+      (when-not (identity/valid-key-command? command)
         (fail! :invalid-config
                (str "Environment " label " :key-command must be a vector of non-blank strings,"
                     " a program and its arguments.")
@@ -312,12 +312,12 @@
 
 (defn own-public-key
   "The public key of the key the environment keeps for itself (see
-  [[com.kirahowe.secrets/key-identity]]), ignoring the SECRETS_AGE_IDENTITY*
+  [[com.kirahowe.secrets.identity/key-identity]]), ignoring the SECRETS_AGE_IDENTITY*
   variables, or nil when there is no such key."
   [env]
-  (let [identity (secrets/key-identity env)]
-    (when (secrets/identity-available? identity)
-      (age/public-key identity))))
+  (let [own (identity/key-identity env)]
+    (when (secrets/identity-available? own)
+      (age/public-key own))))
 
 (defn key-location
   "Describe where the environment's own key lives, for messages: its

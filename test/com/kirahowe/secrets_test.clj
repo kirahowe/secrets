@@ -754,7 +754,7 @@
         (fn []
           (is (= {:identity-file missing :identity-source :configured-key-file}
                  (secrets/resolve-identity {:key-file missing :app "load-test"})))
-          (is (= {:identity-file nil :identity-source :keychain}
+          (is (= {:identity-source :keychain}
                  (secrets/resolve-identity {:app "load-test"}))))))))
 
 (deftest load-secrets-success-unaffected-test
@@ -1412,7 +1412,7 @@
     (with-redefs-fn (assoc (test-env/getenv-redefs {})
                            #'keychain/available? (constantly false))
       (fn []
-        (is (= {:identity-file nil :identity-source nil}
+        (is (= {:identity-source nil}
                (secrets/resolve-identity {:app "myapp"})))))))
 
 (deftest identity-and-file-locators-are-refused-by-scheme-test

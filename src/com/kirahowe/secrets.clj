@@ -55,7 +55,7 @@
             [clojure.string :as str]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
-            [com.kirahowe.secrets.keychain :as keychain]
+            [com.kirahowe.secrets.identity :as identity]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]))
@@ -131,65 +131,10 @@
    :secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
    :configured-key-file "The configured :key-file"})
 
-(defn- run-key-command!
-  "Run `argv`, a `:key-command`, and return what it prints: the age identity.
-  It gets no standard input, so it cannot consume a value piped to the CLI.
-  A command that is not a vector of strings, cannot start, fails, or prints
-  nothing throws, naming the program and never its output."
-  [argv]
-  (when-not (and (vector? argv) (seq argv) (every? #(and (string? %) (not (str/blank? %))) argv))
-    (throw (ex-info (str ":key-command must be a vector of non-blank strings, a program and"
-                         " its arguments, such as [\"op\" \"read\" \"op://vault/myapp/key\"].")
-                    {:reason :invalid-identity :identity-source :key-command})))
-  (let [program (first argv)
-        fail (fn [why] (ex-info (str "The :key-command " program " " why)
-                                {:reason :key-command-failed
-                                 :identity-source :key-command
-                                 :program program}))
-        {:keys [exit out err]} (try
-                                 (fs/sh argv)
-                                 (catch java.io.IOException _
-                                   (throw (fail "could not be started. Is it installed?"))))]
-    (cond
-      (not (zero? exit))
-      (throw (fail (str "exited " exit (when-not (str/blank? err) (str ": " (str/trim err))))))
-
-      (str/blank? out)
-      (throw (ex-info (str "The :key-command " program " printed no age identity.")
-                      {:reason :invalid-identity
-                       :identity-source :key-command
-                       :program program}))
-
-      :else out)))
-
-(defn key-identity
-  "Return the identity a project keeps for itself, ignoring the
-  SECRETS_AGE_IDENTITY* variables: the output of `:key-command`, else the
-  `:key-file`, else on macOS the Keychain item for `:app`. A command or the
-  Keychain is read now, and its key is held in memory as
-  `:identity-contents`. A key file is named by `:identity-file` whether or
-  not it exists. When the Keychain has no item for the app, or nothing names
-  a key, the result has no `:identity-contents` and a nil `:identity-file`."
-  [{:keys [key-command key-file app]}]
-  (cond
-    key-command
-    {:identity-contents (run-key-command! key-command) :identity-source :key-command}
-
-    key-file
-    {:identity-file (fs/expand-home key-file) :identity-source :configured-key-file}
-
-    (and app (keychain/available?))
-    (if-let [contents (keychain/read-key app)]
-      {:identity-contents contents :identity-source :keychain}
-      {:identity-file nil :identity-source :keychain})
-
-    :else
-    {:identity-file nil :identity-source nil}))
-
 (defn- identity-candidate
   "Choose an identity. An explicit path and SECRETS_AGE_IDENTITY_FILE are
   `:designated?`: the file has to exist. Everything else comes from
-  [[key-identity]]."
+  [[identity/key-identity]]."
   [identity-or-opts]
   (let [opts (if (map? identity-or-opts) identity-or-opts {})
         explicit (if (map? identity-or-opts) (:identity-file opts) identity-or-opts)
@@ -206,7 +151,7 @@
         (when-let [contents (identity-env "SECRETS_AGE_IDENTITY_B64")]
           {:identity-contents (decode-b64-identity contents)
            :identity-source :secrets-age-identity-b64})
-        (key-identity opts))))
+        (identity/key-identity opts))))
 
 (defn- validate-identity-path!
   "Throw `:disallowed-identity` when `path` cannot name a local identity file:
