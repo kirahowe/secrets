@@ -12,6 +12,7 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.generators :as g]
+            [com.kirahowe.secrets.keychain :as keychain]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]
@@ -33,7 +34,7 @@
           (doseq [path (reverse (file-seq (io/file dir)))]
             (.delete path)))))))
 
-(use-fixtures :each with-tmp-key)
+(use-fixtures :each with-tmp-key test-env/with-fake-keychain)
 
 ;;;; Core runtime
 
@@ -73,8 +74,7 @@
     (testing "nil becomes the empty string"
       (is (= "" (fs/expand-home nil))))
     (testing "the runtime namespace does not publish the path helpers"
-      (is (nil? (ns-resolve 'com.kirahowe.secrets 'expand-home)))
-      (is (nil? (ns-resolve 'com.kirahowe.secrets 'default-key-file))))))
+      (is (nil? (ns-resolve 'com.kirahowe.secrets 'expand-home))))))
 
 (deftest age-version-test
   (testing "successful stdout is trimmed"
@@ -158,7 +158,7 @@
         (is (nil? (edn/read-string {:readers readers} "#secret/opt [:a 0]")))))))
 
 (deftest public-key-test
-  (is (re-find #"^age1" (age/public-key *key*)))
+  (is (re-find #"^age1" (age/public-key {:identity-file *key*})))
   (is (nil? (age/public-key (str *dir* "/does-not-exist")))))
 
 ;;;; Command-line option boundary
@@ -187,7 +187,7 @@
         (fn [in]
           (spit in payload)
           (age/encrypt-file! {:identity-file *key*} (str in) out)
-          (is (= payload (age/decrypt *key* out))
+          (is (= payload (age/decrypt {:identity-file *key*} out))
               "age encrypts the file rather than armoring an encryption of stdin"))))))
 
 (deftest decrypt-input-named-like-an-age-option-test
@@ -201,7 +201,7 @@
         (with-cwd-entry entry-name
           (fn [ct]
             (io/copy (io/file enc) ct)
-            (let [plaintext (age/decrypt *key* (str ct))]
+            (let [plaintext (age/decrypt {:identity-file *key*} (str ct))]
               (is (= payload plaintext) "the authenticated plaintext is returned")
               (is (seq plaintext) "age's empty option output is never plaintext")
               (is (not (re-find #"^v?\d+\.\d+\.\d+" plaintext))
@@ -215,7 +215,7 @@
           (fn [in]
             (spit in payload)
             (age/encrypt-file! {:identity-file *key*} (str in) out)
-            (is (= payload (age/decrypt *key* out)))))))
+            (is (= payload (age/decrypt {:identity-file *key*} out)))))))
     (testing "a ciphertext named - is decrypted instead of reading stdin"
       (let [plain (str *dir* "/dash-plain.edn")
             enc (str *dir* "/dash-plain.age")]
@@ -224,7 +224,7 @@
         (with-cwd-entry "-"
           (fn [ct]
             (io/copy (io/file enc) ct)
-            (is (= payload (age/decrypt *key* (str ct))))))))))
+            (is (= payload (age/decrypt {:identity-file *key*} (str ct))))))))))
 
 (deftest dash-leading-relative-paths-work-for-every-path-argument-test
   (let [payload "{:option/boundary \"relative\"}"
@@ -238,7 +238,7 @@
         (testing "input, output and identity file may all start with a dash"
           (let [out "-secrets-boundary/identity.age"]
             (age/encrypt-file! {:identity-file identity-file} plain out)
-            (is (= payload (age/decrypt identity-file out)))))))))
+            (is (= payload (age/decrypt {:identity-file identity-file} out)))))))))
 
 (deftest a-file-named-dash-is-a-path-for-every-age-path-role-test
   (let [payload "{:option/boundary \"dash-roles\"}"
@@ -250,13 +250,13 @@
         (with-cwd-entry "-"
           (fn [id]
             (io/copy (io/file *key*) id)
-            (is (= payload (age/decrypt "-" enc)))))))
+            (is (= payload (age/decrypt {:identity-file "-"} enc)))))))
     (testing "an output named - is a file, never stdout"
       (with-cwd-entry "-"
         (fn [out]
           (age/encrypt-file! {:identity-file *key*} plain "-")
           (is (.isFile out) "age wrote a file rather than streaming to stdout")
-          (is (= payload (age/decrypt *key* "-"))))))))
+          (is (= payload (age/decrypt {:identity-file *key*} "-"))))))))
 
 ;; A deliberate argv-shape test. `path-arg` already rewrites a dash-leading
 ;; positional to `./-name`, so dropping the `--` terminator changes nothing a
@@ -279,7 +279,7 @@
         decrypt-argv (fn [identity-file in]
                        (reset! calls [])
                        (with-redefs [fs/sh (recording {:exit 0 :out "" :err ""})]
-                         (age/decrypt identity-file in))
+                         (age/decrypt {:identity-file identity-file} in))
                        (first @calls))]
     (testing "the encrypt terminator sits immediately before the input operand"
       (let [argv (encrypt-argv {:identity-file "key.txt"} "-in.edn" "out.age")]
@@ -295,7 +295,21 @@
     (testing "-i and -o render an exact - as ./-"
       (is (= ["age" "-e" "-i" "./-" "-o" "./-" "--" "plain.edn"]
              (encrypt-argv {:identity-file "-"} "plain.edn" "-")))
-      (is (= ["age" "-d" "-i" "./-" "--" "plain.age"] (decrypt-argv "-" "plain.age"))))))
+      (is (= ["age" "-d" "-i" "./-" "--" "plain.age"] (decrypt-argv "-" "plain.age"))))
+    (testing "a key held in memory is -i - on standard input, and never an argument"
+      (let [stdin (atom nil)]
+        (with-redefs [fs/sh (fn [argv & [{:keys [in]}]]
+                              (if (= ["age" "--version"] (vec argv))
+                                {:exit 0 :out "v1.3.1" :err ""}
+                                (do (reset! calls [(vec argv)])
+                                    (reset! stdin in)
+                                    {:exit 0 :out "" :err ""})))]
+          (age/decrypt {:identity-contents "AGE-SECRET-KEY-1MEMORY"} "plain.age")
+          (is (= ["age" "-d" "-i" "-" "--" "plain.age"] (first @calls)))
+          (is (= "AGE-SECRET-KEY-1MEMORY" @stdin))
+          (age/encrypt-file! {:identity-contents "AGE-SECRET-KEY-1MEMORY"} "plain.edn" "out.age")
+          (is (= ["age" "-e" "-i" "-" "-o" "out.age" "--" "plain.edn"] (first @calls)))
+          (is (= "AGE-SECRET-KEY-1MEMORY" @stdin)))))))
 
 (deftest blank-and-nil-age-paths-fail-closed-test
   (let [plain (str *dir* "/blank-source.edn")
@@ -313,7 +327,7 @@
     (testing "a blank or nil decrypt input is refused, never taken as stdin"
       (doseq [in ["" "   " nil]]
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"blank"
-                              (age/decrypt *key* in))
+                              (age/decrypt {:identity-file *key*} in))
             (str "input " (pr-str in) " names no file"))))
     (testing "a blank identity file is refused on both paths"
       (let [out (str *dir* "/blank-identity.age")]
@@ -351,10 +365,10 @@
          ["whitespace encrypt output" #(age/encrypt-file! {:identity-file "key"} "plain" "   ")]
          ["nil encrypt input" #(age/encrypt-file! {:identity-file "key"} nil "out")]
          ["whitespace encrypt input" #(age/encrypt-file! {:identity-file "key"} "   " "out")]
-         ["nil decrypt identity" #(age/decrypt nil "cipher")]
-         ["whitespace decrypt identity" #(age/decrypt "   " "cipher")]
-         ["nil decrypt input" #(age/decrypt "key" nil)]
-         ["whitespace decrypt input" #(age/decrypt "key" "   ")]]]
+         ["nil decrypt identity" #(age/decrypt {:identity-file nil} "cipher")]
+         ["whitespace decrypt identity" #(age/decrypt {:identity-file "   "} "cipher")]
+         ["nil decrypt input" #(age/decrypt {:identity-file "key"} nil)]
+         ["whitespace decrypt input" #(age/decrypt {:identity-file "key"} "   ")]]]
     (with-redefs [fs/sh (fn [& _]
                           (swap! shell-calls inc)
                           (throw (ex-info "subprocess ran" {})))]
@@ -371,16 +385,16 @@
           out (str *dir* "/control.age")]
       (spit plain payload)
       (age/encrypt-file! {:identity-file *key*} plain out)
-      (is (= payload (age/decrypt *key* out)))
+      (is (= payload (age/decrypt {:identity-file *key*} out)))
       (testing "and a :recipients list of literal age1… strings is untouched"
         (let [multi (str *dir* "/control-multi.age")]
-          (age/encrypt-file! {:recipients [(age/public-key *key*)]} plain multi)
-          (is (= payload (age/decrypt *key* multi)))))
+          (age/encrypt-file! {:recipients [(age/public-key {:identity-file *key*})]} plain multi)
+          (is (= payload (age/decrypt {:identity-file *key*} multi)))))
       (testing "and the wrong key still fails with the original message"
         (let [other (str *dir* "/control-other-key.txt")]
           (age/keygen! other)
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"age decryption failed"
-                                (age/decrypt other out))))))))
+                                (age/decrypt {:identity-file other} out))))))))
 
 ;;;; Reader literals
 
@@ -417,9 +431,8 @@
   (let [enc (encrypt-edn! {:k "v"})
         missing (str *dir* "/no-such-key.txt")
         read-tag (fn [readers tag] (edn/read-string {:readers readers} (str tag " :k")))]
-    (testing "no identity designated and the app default absent: opt is nil, req throws"
-      (with-redefs-fn (assoc (test-env/getenv-redefs {})
-                             #'fs/default-key-file (constantly missing))
+    (testing "no identity designated and no Keychain item for the app: opt is nil, req throws"
+      (with-redefs-fn (test-env/getenv-redefs {})
         (fn []
           (let [readers (secrets/reader-literals {:file enc :app "reader-test"})]
             (is (nil? (read-tag readers "#secret/opt")))
@@ -511,154 +524,93 @@
           (is (= 2 @calls)
               "only the new readers map performs the successful retry"))))))
 
-;;;; Operation-owned identities
+;;;; Identities held in memory
 
-(deftest operation-owned-identity-test
+(defn- key-line
+  "The `AGE-SECRET-KEY-1…` line of the key file at `path`."
+  [path]
+  (some #(re-matches #"AGE-SECRET-KEY-1.*" %) (str/split-lines (slurp path))))
+
+(deftest in-memory-identity-test
   (let [enc (encrypt-edn! {:k "v"})
         contents (slurp *key*)
-        paths (atom [])
-        real-decrypt age/decrypt]
-    (testing "raw injected identity decrypts and is private only while used"
-      (with-redefs-fn
-        (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-               {#'age/decrypt (fn [identity & args]
-                                (swap! paths conj identity)
-                                (is (= owner-only-names (permission-names identity)))
-                                (apply real-decrypt identity args))})
+        encoded (.encodeToString (java.util.Base64/getEncoder) (.getBytes contents "UTF-8"))
+        created (atom 0)
+        real-temp fs/owner-only-temp-file!]
+    (doseq [[label environment opts source]
+            [["SECRETS_AGE_IDENTITY" {"SECRETS_AGE_IDENTITY" contents} nil
+              :secrets-age-identity]
+             ["SECRETS_AGE_IDENTITY_B64" {"SECRETS_AGE_IDENTITY_B64" encoded} nil
+              :secrets-age-identity-b64]
+             [":key-command" {} {:key-command ["cat" *key*]} :key-command]]]
+      (testing (str label " reaches age in memory and leaves no file behind")
+        (with-redefs-fn (assoc (test-env/getenv-redefs environment)
+                               #'fs/owner-only-temp-file! (fn [& args]
+                                                            (swap! created inc)
+                                                            (apply real-temp args)))
+          (fn []
+            (let [_ (reset! created 0)
+                  identity (secrets/resolve-identity opts)]
+              (is (= source (:identity-source identity)))
+              (is (= (str/trim contents) (str/trim (:identity-contents identity))))
+              (is (not (contains? identity :identity-file)))
+              (is (= {:k "v"} (secrets/load-secrets enc opts)))
+              (is (zero? @created) "no private file was created for the key"))))))
+    (testing "the macOS Keychain item for :app is read when nothing else names a key"
+      (with-redefs-fn (merge (test-env/getenv-redefs {})
+                             (test-env/keychain-redefs (atom {"kc-app" (key-line *key*)})))
         (fn []
-          (is (= {:k "v"} (secrets/load-secrets enc nil)))))
-      (is (= 1 (count @paths)))
-      (is (not (.exists (io/file (first @paths))))))
-    (testing "base64 has the same scoped lifecycle"
-      (let [encoded (.encodeToString (java.util.Base64/getEncoder)
-                                     (.getBytes contents "UTF-8"))
-            path (atom nil)]
-        (with-redefs-fn
-          (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_B64" encoded})
-          (fn []
-            (is (= {:k "v"}
-                   (secrets/with-identity nil
-                     (fn [{:keys [identity-file]}]
-                       (reset! path identity-file)
-                       (secrets/load-secrets enc identity-file)))))))
-        (is (not (.exists (io/file @path))))))))
-
-(deftest operation-owned-identity-cleanup-test
-  (let [contents (slurp *key*)
-        path (atom nil)]
-    (testing "callback failures still delete the temporary identity"
-      (with-redefs-fn
-        (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+          (is (= {:identity-contents (key-line *key*) :identity-source :keychain}
+                 (secrets/resolve-identity {:app "kc-app"})))
+          (is (= {:k "v"} (secrets/load-secrets enc {:app "kc-app"})))
+          (testing "and an absent item means no identity is available"
+            (let [identity (secrets/resolve-identity {:app "other-app"})]
+              (is (= :keychain (:identity-source identity)))
+              (is (not (secrets/identity-available? identity))))))))
+    (testing "the precedence: variables, then :key-command, then :key-file, then the Keychain"
+      (with-redefs-fn (merge (test-env/getenv-redefs {})
+                             (test-env/keychain-redefs (atom {"kc-app" (key-line *key*)})))
         (fn []
-          (let [e (try
-                    (secrets/with-identity nil
-                      (fn [{:keys [identity-file]}]
-                        (reset! path identity-file)
-                        (throw (ex-info "callback failed" {:reason :callback-failed}))))
-                    (catch clojure.lang.ExceptionInfo e e))]
-            (is (= :callback-failed (:reason (ex-data e)))))))
-      (is (not (.exists (io/file @path)))))
-    (testing "a failed write removes its partial temporary file"
-      (let [created (atom nil)
-            real-temp fs/owner-only-temp-file!
-            real-spit spit
-            write-sentinel "SENSITIVE-IDENTITY-WRITE-FAILURE"]
-        (with-redefs-fn
-          (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-                 {#'fs/owner-only-temp-file! (fn [& args]
-                                               (let [file (apply real-temp args)]
-                                                 (reset! created file)
-                                                 file))
-                  #'clojure.core/spit (fn [file _]
-                                        (real-spit file "partial identity")
-                                        (throw (java.io.IOException. write-sentinel)))})
-          (fn []
-            (let [e (try (secrets/with-identity nil identity)
-                         (catch clojure.lang.ExceptionInfo e e))]
-              (is (= :identity-not-materialized (:reason (ex-data e))))
-              (is (nil? (ex-cause e)))
-              (is (not (str/includes? (pr-str e) write-sentinel))))))
-        (is (not (.exists ^java.io.File @created)))))
-    (testing "an Error during the write removes the file and propagates as itself"
-      (let [created (atom nil)
-            real-temp fs/owner-only-temp-file!
-            real-spit spit
-            failure (Error. "forced write error")]
-        (with-redefs-fn
-          (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-                 {#'fs/owner-only-temp-file! (fn [& args]
-                                               (reset! created (apply real-temp args)))
-                  #'clojure.core/spit (fn [file _]
-                                        (real-spit file "partial identity")
-                                        (throw failure))})
-          (fn []
-            (is (identical? failure (try (secrets/with-identity nil identity)
-                                         (catch Throwable t t))))))
-        (is (some? @created))
-        (is (not (.exists ^java.io.File @created)))))
-    (testing "a failed delete names the remaining file, whatever the callback did"
-      (doseq [[label body expected-reason]
-              [["after success" (fn [] :completed) :private-file-remains]
-               ["after an ex-info" #(throw (ex-info "callback failed" {:reason :callback-failed}))
-                :private-file-remains]
-               ["after another exception" #(throw (IllegalStateException. "callback failed"))
-                :private-file-remains]
-               ["after a failed write" nil :private-file-remains]]]
-        (testing label
-          (with-redefs-fn
-            (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-                   {#'fs/try-delete! (constantly false)}
-                   (when-not body
-                     {#'clojure.core/spit (fn [_ _] (throw (java.io.IOException. "forced")))}))
-            (fn []
-              (reset! path nil)
-              (let [created (atom nil)
-                    real-temp fs/owner-only-temp-file!
-                    e (with-redefs-fn
-                        {#'fs/owner-only-temp-file!
-                         (fn [& args] (reset! created (apply real-temp args)))}
-                        (fn []
-                          (try
-                            (secrets/with-identity nil
-                              (fn [{:keys [identity-file]}]
-                                (reset! path identity-file)
-                                (body)))
-                            (catch clojure.lang.ExceptionInfo e e))))
-                    leftover (.getAbsolutePath ^java.io.File @created)]
-                (try
-                  (is (= expected-reason (:reason (ex-data e))))
-                  (is (= leftover (:remaining-file (ex-data e))))
-                  (is (str/includes? (ex-message e) leftover)
-                      "the message tells the operator which file to remove")
-                  (is (not (str/includes? (pr-str e) "AGE-SECRET-KEY-")))
-                  (is (.exists (io/file leftover)))
-                  (finally
-                    (.delete (io/file leftover))))))))))))
+          (is (= :key-command (:identity-source
+                               (secrets/resolve-identity {:key-command ["cat" *key*]
+                                                          :key-file *key*
+                                                          :app "kc-app"}))))
+          (is (= :configured-key-file (:identity-source
+                                       (secrets/resolve-identity {:key-file *key*
+                                                                  :app "kc-app"}))))))
+      (with-redefs-fn (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
+        (fn []
+          (is (= :secrets-age-identity
+                 (:identity-source (secrets/resolve-identity {:key-command ["false"]})))))))))
 
-(deftest operation-owned-identities-are-independent-test
-  (let [contents (slurp *key*)
-        entered (promise)
-        release (promise)
-        work (fn []
-               (secrets/with-identity nil
-                 (fn [{:keys [identity-file]}]
-                   (deliver entered identity-file)
-                   (deref release 10000 :timed-out))))]
-    (with-redefs-fn
-      (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
-      (fn []
-        (let [one (future (work))
-              first-path (deref entered 10000 nil)
-              second-path (secrets/with-identity nil
-                            (fn [{:keys [identity-file]}] identity-file))]
-          (try
-            (is (not= first-path second-path))
-            (is (not (.exists (io/file second-path))) "the second scope already cleaned up")
-            (is (.exists (io/file first-path)) "the first scope still owns its file")
-            (finally
-              (deliver release :done)))
-          (is (= :done (deref one 10000 :timed-out)))
-          (is (not (.exists (io/file first-path)))))))))
+(deftest key-command-failures-test
+  (let [enc (encrypt-edn! {:k "v"})
+        failure (fn [opts]
+                  (with-redefs-fn (test-env/getenv-redefs {})
+                    #(try (secrets/load-secrets enc opts) nil
+                          (catch clojure.lang.ExceptionInfo e e))))]
+    (testing "a command that fails names the program and its error, and never its output"
+      (let [e (failure {:key-command ["sh" "-c"
+                                      "echo AGE-SECRET-KEY-1LEAK; echo locked >&2; exit 3"]})]
+        (is (= :key-command-failed (:reason (ex-data e))))
+        (is (re-find #"exited 3: locked" (ex-message e)))
+        (is (not (str/includes? (test-env/rendered e) "AGE-SECRET-KEY-1LEAK")))))
+    (testing "a command that cannot start"
+      (let [e (failure {:key-command ["kira-no-such-password-manager"]})]
+        (is (= :key-command-failed (:reason (ex-data e))))
+        (is (re-find #"could not be started" (ex-message e)))))
+    (testing "a command that prints nothing"
+      (is (= :invalid-identity (:reason (ex-data (failure {:key-command ["true"]}))))))
+    (testing "a malformed command"
+      (doseq [command ["cat key.txt" [] ["cat" ""] ["cat" :key]]]
+        (is (= :invalid-identity (:reason (ex-data (failure {:key-command command})))))))
+    (testing "a command that prints the wrong key fails to decrypt like a wrong key file"
+      (let [other (str *dir* "/other-key.txt")]
+        (age/keygen! other)
+        (let [e (failure {:key-command ["cat" other]})]
+          (is (= :decrypt-failed (:reason (ex-data e))))
+          (is (not (contains? (ex-data e) :identity-file)))
+          (is (not (str/includes? (test-env/rendered e) (key-line other)))))))))
 
 (deftest b64-identity-decode-test
   (let [decode @#'secrets/decode-b64-identity
@@ -711,16 +663,11 @@
             (is (nil? (ex-cause e)) label)))))))
 
 (deftest b64-identity-input-boundary-test
-  (let [invalid "QUJD%%%identity-token-sentinel"
-        materializations (atom 0)]
+  (let [invalid "QUJD%%%identity-token-sentinel"]
     (with-redefs-fn
-      (merge (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_B64" invalid})
-             {#'fs/owner-only-temp-file!
-              (fn [& _]
-                (swap! materializations inc)
-                "unreachable")})
+      (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY_B64" invalid})
       (fn []
-        (let [e (try (secrets/with-identity nil identity)
+        (let [e (try (secrets/resolve-identity nil)
                      nil
                      (catch clojure.lang.ExceptionInfo e e))
               rendered (str (pr-str e) (pr-str (ex-data e)) (ex-message e))]
@@ -728,9 +675,7 @@
           (is (re-find #"base64-encoded age key file contents" (ex-message e)))
           (is (str/includes? (ex-message e) "SECRETS_AGE_IDENTITY"))
           (is (nil? (ex-cause e)))
-          (is (not (str/includes? rendered invalid)))
-          (is (zero? @materializations)
-              "invalid input is rejected before identity materialization"))))))
+          (is (not (str/includes? rendered invalid))))))))
 
 (deftest load-secrets-opts-map-test
   (let [enc (encrypt-edn! {:k "v"})]
@@ -753,7 +698,7 @@
                    #(secrets/load-secrets enc nil))))
           (is (= {:identity-file (str key-in-home) :identity-source :configured-key-file}
                  (with-redefs-fn (test-env/getenv-redefs {})
-                   #(secrets/with-identity {:key-file "~/keys/k.txt"} identity)))))))))
+                   #(secrets/resolve-identity {:key-file "~/keys/k.txt"})))))))))
 
 ;;;; Load-secrets errors
 
@@ -784,12 +729,11 @@
   (let [enc (encrypt-edn! {:k "v"})
         missing (str *dir* "/no-such-key.txt")
         failure (fn [environment identity-or-opts]
-                  (with-redefs-fn (assoc (test-env/getenv-redefs environment)
-                                         #'fs/default-key-file (constantly missing))
+                  (with-redefs-fn (test-env/getenv-redefs environment)
                     #(try (secrets/load-secrets enc identity-or-opts)
                           nil
                           (catch clojure.lang.ExceptionInfo e e))))]
-    (testing "nothing designated and no app default: the remediation options"
+    (testing "nothing designated and no Keychain item: the remediation options"
       (doseq [opts [nil {:app "load-test"}]]
         (let [e (failure {} opts)]
           (is (= :no-identity (:reason (ex-data e))))
@@ -805,14 +749,13 @@
                  (ex-data e)))
           (is (= (str subject " names an age identity file that does not exist: " missing)
                  (ex-message e))))))
-    (testing "a :key-file and the app default are default locations, not designations"
-      (with-redefs-fn (assoc (test-env/getenv-redefs {})
-                             #'fs/default-key-file (constantly missing))
+    (testing "a :key-file and the Keychain are default locations, not designations"
+      (with-redefs-fn (test-env/getenv-redefs {})
         (fn []
           (is (= {:identity-file missing :identity-source :configured-key-file}
-                 (secrets/with-identity {:key-file missing :app "load-test"} identity)))
-          (is (= {:identity-file missing :identity-source :default-key-file}
-                 (secrets/with-identity {:app "load-test"} identity))))))))
+                 (secrets/resolve-identity {:key-file missing :app "load-test"})))
+          (is (= {:identity-file nil :identity-source :keychain}
+                 (secrets/resolve-identity {:app "load-test"}))))))))
 
 (deftest load-secrets-success-unaffected-test
   (testing "a successful load is unaffected by the new error paths"
@@ -924,7 +867,7 @@
 ;;;; Multi-recipient encryption
 
 (deftest valid-recipient?-test
-  (is (age/valid-recipient? (age/public-key *key*)))
+  (is (age/valid-recipient? (age/public-key {:identity-file *key*})))
   (is (age/valid-recipient? "  age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p  "))
   (is (not (age/valid-recipient? "not-a-key")))
   (is (not (age/valid-recipient? nil))))
@@ -933,8 +876,8 @@
   (testing "a file encrypted to two recipients decrypts with either key"
     (let [key2 (str *dir* "/key2.txt")
           _ (age/keygen! key2)
-          pub1 (age/public-key *key*)
-          pub2 (age/public-key key2)
+          pub1 (age/public-key {:identity-file *key*})
+          pub2 (age/public-key {:identity-file key2})
           plain (str *dir* "/p.edn")
           enc (str *dir* "/multi.edn.age")]
       (spit plain (pr-str {:x 1}))
@@ -1037,7 +980,7 @@
                                                          (io/file (str target))])
                                       (real-move source target))]
         (let [recipient (age/keygen! key-file)]
-          (is (= recipient (age/public-key key-file)))))
+          (is (= recipient (age/public-key {:identity-file key-file})))))
       (let [[[source target]] @moves]
         (is (= 1 (count @moves)))
         (is (= (.getAbsoluteFile key-file) target))
@@ -1464,15 +1407,13 @@
     "/keys/a:b/id.txt" nil
     "  /keys/id.txt" nil))
 
-(deftest default-key-file-test
-  (is (= (str (System/getProperty "user.home") "/.config/myapp/key.txt")
-         (fs/default-key-file "myapp")))
-  (testing "an :app option resolves to it when no identity variable is set"
-    (with-redefs-fn (test-env/getenv-redefs {})
+(deftest no-default-key-file-test
+  (testing "without the macOS Keychain, an :app alone names no key"
+    (with-redefs-fn (assoc (test-env/getenv-redefs {})
+                           #'keychain/available? (constantly false))
       (fn []
-        (is (= {:identity-file (fs/default-key-file "myapp")
-                :identity-source :default-key-file}
-               (secrets/with-identity {:app "myapp"} identity)))))))
+        (is (= {:identity-file nil :identity-source nil}
+               (secrets/resolve-identity {:app "myapp"})))))))
 
 (deftest identity-and-file-locators-are-refused-by-scheme-test
   (let [enc (encrypt-edn! {:k "v"})
@@ -1498,7 +1439,7 @@
                  ["SECRETS_AGE_IDENTITY_FILE" :secrets-age-identity-file
                   #(with-env locator (fn [] (secrets/load-secrets enc nil)))]
                  ["a :key-file option" :configured-key-file
-                  #(secrets/with-identity {:key-file locator} identity)]
+                  #(secrets/resolve-identity {:key-file locator})]
                  ["a reader identity, at the first tag read" :identity-file
                   #(edn/read-string
                     {:readers (secrets/reader-literals {:file enc :identity-file locator})}
@@ -1550,7 +1491,7 @@
         (is (not (str/includes? (ex-message e) "./")) "a resource name is not a path")))
     (testing "a ./ prefix or an absolute path makes a name with a colon a path"
       (is (= :no-identity
-             (:reason (ex-data (failure #(secrets/with-identity "./key:txt" identity)))))
+             (:reason (ex-data (failure #(secrets/resolve-identity "./key:txt")))))
           "it is read as a path, and that file does not exist")
       (let [colon-dir (io/file *dir* "a:b")
             colon-key (io/file colon-dir "key:txt")]
@@ -1589,7 +1530,7 @@
              ["SECRETS_AGE_IDENTITY_FILE" :secrets-age-identity-file
               #(with-env contents (fn [] (secrets/load-secrets enc nil)))]
              ["a :key-file option" :configured-key-file
-              #(secrets/with-identity {:key-file contents} identity)]]]
+              #(secrets/resolve-identity {:key-file contents})]]]
       (testing (str shape " in " label)
         (let [e (try (thunk) nil (catch Exception e e))]
           (is (some? e) "the case under test really failed")
@@ -1787,12 +1728,12 @@
     (testing "a store that is not a map loads as it is"
       (is (= [1 2] (secrets/load-secrets (encrypt-edn! [1 2]) *key*))))))
 
-(deftest blank-identity-variable-fails-through-with-identity-test
+(deftest blank-identity-variable-fails-identity-resolution-test
   (let [resolve-under (fn [environment identity-or-opts]
                         (with-redefs-fn (test-env/getenv-redefs environment)
                           (fn []
                             (try
-                              (secrets/with-identity identity-or-opts identity)
+                              (secrets/resolve-identity identity-or-opts)
                               (catch clojure.lang.ExceptionInfo e e)))))]
     (doseq [variable ["SECRETS_AGE_IDENTITY_FILE" "SECRETS_AGE_IDENTITY" "SECRETS_AGE_IDENTITY_B64"]
             blank ["" " \n"]
@@ -1826,7 +1767,7 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is set but empty"
                             (check "SECRETS_AGE_IDENTITY" "   \n"))))))
 
-(deftest injected-load-failures-clean-up-without-disclosing-keys-test
+(deftest injected-load-failures-do-not-disclose-keys-test
   (let [wrong-key (str *dir* "/wrong-key.txt")
         enc (encrypt-edn! {:pad (apply str (repeat 2048 \a))})]
     (age/keygen! wrong-key)
@@ -1838,11 +1779,8 @@
                       (assoc (test-env/getenv-redefs {"SECRETS_AGE_IDENTITY" contents})
                              #'source/max-source-bytes bound)
                       (fn [] (load-failure enc nil)))
-            data (ex-data failure)
-            path (:identity-file data)]
-        (is (string? path))
-        (when (string? path)
-          (is (not (.exists (io/file path))) "failed decryption deletes its temporary identity"))
+            data (ex-data failure)]
+        (is (not (contains? data :identity-file)) "a key in memory has no file to name")
         (is (not (str/includes? (rendered-chain failure) secret-line)))
         (if reason
           (is (= reason (:reason data)))
@@ -1897,7 +1835,7 @@
              [":key-file" (load {:key-file value})]
              ["SECRETS_AGE_IDENTITY_FILE"
               #(under {"SECRETS_AGE_IDENTITY_FILE" value} (fn [] (secrets/load-secrets enc)))]
-             ["with-identity" #(under {} (fn [] (secrets/with-identity value identity)))]
+             ["resolve-identity" #(under {} (fn [] (secrets/resolve-identity value)))]
              ["a reader's :identity-file"
               #(under {} (fn []
                            ((get (secrets/reader-literals {:file enc :identity-file value})

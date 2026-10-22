@@ -21,8 +21,10 @@
   (:require [clojure.java.io :as io]
             [clojure.pprint :as pprint]
             [clojure.string :as str]
+            [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.keychain :as keychain]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.store :as store :refer [fail! shell-quote]]))
@@ -136,7 +138,8 @@
    :secrets-age-identity "SECRETS_AGE_IDENTITY"
    :secrets-age-identity-b64 "SECRETS_AGE_IDENTITY_B64"
    :configured-key-file "key file"
-   :default-key-file "key file"})
+   :key-command ":key-command"
+   :keychain "macOS Keychain"})
 
 ;;;; Utilities
 
@@ -343,17 +346,26 @@
             "generating a new manifest key, so every value hash changes once."))
     manifest-key))
 
+(defn- keychain-read-command
+  "The shell command that prints `app`'s key from the macOS Keychain."
+  [app]
+  (str "security find-generic-password -s " keychain/service " -a " (shell-quote app) " -w"))
+
 (defn- keygen-lines
-  "The report after a key is written: where, the public key, and how to back
+  "The report after a key is stored: where, the public key, and how to back
   it up and deploy it."
-  [environment-name key-file recipients-file pub]
-  (cond-> [[:ok "Key written:" key-file]
+  [{:keys [app key-file recipients-file] environment-name :name :as env} pub]
+  (cond-> [[:ok "Key written:" (store/key-location env)]
            [:line]
            [:line [:bold "  Public key:"] pub]
            [:line]
            [:warn "Back this key up (e.g. a password manager). It is NOT in git and"]
            [:line (str "    cannot be recovered. A deployment takes its contents in"
                        " SECRETS_AGE_IDENTITY.")]]
+    (not key-file)
+    (into [[:line "    This prints it, for a backup or a deployment secret:"]
+           [:line [:dim (str "      " (keychain-read-command app))]]])
+
     recipients-file
     (into [[:line]
            [:info "This project encrypts to a shared recipients file. Add your public"]
@@ -362,26 +374,49 @@
                              (shell-quote (name environment-name)))]]])))
 
 (defn keygen!
-  "Generate an age identity at an environment's key-file and print where it
-  is and its public key. Returns the key-file path, or :aborted when an
-  existing key is kept. An existing key requires confirmation before it is
-  replaced."
+  "Generate an age identity where an environment keeps its key, its :key-file
+  or, on macOS, the Keychain item for the app, and print where it is and its
+  public key. Returns that location, or :aborted when an existing key is
+  kept. An existing key requires confirmation before it is replaced. An
+  environment whose key comes from :key-command fails: the command only
+  reads the key, so the key is stored with the password manager's own tools."
   [config env-arg]
-  (age/ensure-installed!)
-  (let [{:keys [key-file recipients-file] environment-name :name}
+  (let [{:keys [app key-file key-command] environment-name :name :as env}
         (store/resolve-env config env-arg)
-        proceed? (or (not (.exists (io/file key-file)))
-                     (do
-                       (warn "Key already exists:" key-file)
-                       (confirm!
-                        "Overwrite? Existing secrets encrypted to it become UNREADABLE.")))]
-    (if-not proceed?
-      (do (info "Aborted.") :aborted)
-      (do
-        (info "Generating age key for" (name environment-name) "…")
-        (say! (keygen-lines environment-name key-file recipients-file
-                            (age/keygen! key-file)))
-        key-file))))
+        label (name environment-name)]
+    (cond
+      key-command
+      (fail! :usage
+             (str "Environment " label " reads its key with :key-command " (first key-command)
+                  ", which\n    keygen cannot write to. Generate a key with `age-keygen`"
+                  " and store it\n    with that password manager's own tools.")
+             {:environment environment-name})
+
+      (not (or key-file (keychain/available?)))
+      (fail! :usage
+             (str "Environment " label " has nowhere to keep a key. Without the macOS"
+                  " Keychain,\n    set :key-command (a password manager that prints the"
+                  " key) or :key-file.")
+             {:environment environment-name}))
+    (age/ensure-installed!)
+    (let [location (store/key-location env)
+          proceed? (or (not (if key-file
+                              (.exists (io/file key-file))
+                              (keychain/has-key? app)))
+                       (do
+                         (warn "Key already exists:" location)
+                         (confirm!
+                          "Overwrite? Existing secrets encrypted to it become UNREADABLE.")))]
+      (if-not proceed?
+        (do (info "Aborted.") :aborted)
+        (do
+          (info "Generating age key for" label "…")
+          (say! (keygen-lines env (if key-file
+                                    (age/keygen! key-file)
+                                    (let [{:keys [identity-contents public-key]} (age/generate)]
+                                      (keychain/store-key! app identity-contents)
+                                      public-key))))
+          location)))))
 
 (defn- require-secrets-file!
   "Fail with `:no-file` unless the environment's secrets file exists, naming
@@ -584,30 +619,29 @@
                   secrets-file)))))))))
 
 (defn- show-key-line
-  "One line per environment: its public key, or a warning that the key file
-  is absent."
-  [environment-name key-file pub]
+  "One line per environment: its public key, or a warning that its key is
+  absent."
+  [environment-name location pub]
   (if pub
     [:line (format "  %-6s %s" (str (name environment-name) ":") pub)]
-    [:warn (format "%s: no key at %s" (name environment-name) key-file)]))
+    [:warn (format "%s: no key in %s" (name environment-name) location)]))
 
 (defn show-key!
   "Print the public key(s). Share these so teammates can encrypt to you.
-  Reads the configured :key-file (not the env-var identity), and runs
-  `age-keygen` only for a key file that lacks its `# public key:` comment.
-  Returns a map of env name → public key (nil when the key is missing);
-  environments sharing a :key-file are reported once, under whichever env is
-  seen first."
+  Reads the key each environment keeps (its :key-command, :key-file, or
+  Keychain item), not an identity variable. Returns a map of env name →
+  public key (nil when the key is missing); environments sharing a key are
+  reported once, under whichever env is seen first."
   [config env-arg]
   (let [envs (if env-arg
                [(store/resolve-env config env-arg)]
                (vals (:environments config)))]
     (into {}
-          (map (fn [{:keys [key-file] environment-name :name}]
-                 (let [pub (age/public-key key-file)]
-                   (say! [(show-key-line environment-name key-file pub)])
+          (map (fn [{environment-name :name :as env}]
+                 (let [pub (store/own-public-key env)]
+                   (say! [(show-key-line environment-name (store/key-location env) pub)])
                    [environment-name pub])))
-          (distinct-by :key-file envs))))
+          (distinct-by store/key-location envs))))
 
 (defn reencrypt!
   "Decrypt and immediately re-encrypt to the environment's current recipients.
@@ -661,10 +695,10 @@
 
 (defn add-recipient!
   "Add an age public key to an environment's recipients file. With no key given,
-  adds the environment's own public key (from its key-file). Returns the
+  adds the environment's own public key (from where it keeps its key). Returns the
   recipient added (or already present)."
   [config env-arg pubkey]
-  (let [{:keys [recipients-file key-file secrets-file]
+  (let [{:keys [recipients-file secrets-file]
          environment-name :name :as env}
         (store/resolve-env config env-arg)
         environment-label (clojure.core/name environment-name)]
@@ -674,14 +708,13 @@
                   " has no :recipients-file configured (single-key mode).\n"
                   "    Add :recipients-file to its config to encrypt to multiple people.")
              {:environment environment-name}))
-    (let [pub (or pubkey (age/public-key key-file))]
+    (let [pub (or pubkey (store/own-public-key env))]
       (when-not pub
         (fail! :no-identity
-               (str "No public key given and no key at " key-file "\n"
+               (str "No public key given and no key in " (store/key-location env) "\n"
                     "    Generate one with:  bb secrets keygen "
                     (shell-quote environment-label))
-               {:key-file key-file
-                :environment environment-name}))
+               {:environment environment-name}))
       (let [pub (str/trim pub)]
         (when-not (age/valid-recipient? pub)
           (fail! :invalid-recipient "Not a valid age public key."))
@@ -884,9 +917,9 @@
 
 (def ^:private identity-failure-reasons
   "The reasons a failed identity resolution carries: a blank or undecodable
-  variable, a path that is not a local path, and a designated file that does
-  not exist."
-  #{:invalid-identity :disallowed-identity :no-identity})
+  variable, a path that is not a local path, a designated file that does not
+  exist, and a key command or Keychain read that failed."
+  #{:invalid-identity :disallowed-identity :no-identity :key-command-failed :keychain-failed})
 
 (defn- doctor-report
   "Diagnose normalized environment `env`. `identity-problem` is the message of
@@ -903,7 +936,7 @@
         version (age/version)
         recipients (when (exists? recipients-file) (store/read-recipients env))
         invalid (count (remove age/valid-recipient? recipients))
-        injected? (#{:secrets-age-identity :secrets-age-identity-b64} identity-source)
+        has-identity? (secrets/identity-available? env)
         warnings
         (cond-> []
           (nil? version)
@@ -914,9 +947,11 @@
           (conj (str "No manifest. Write it with:  bb secrets reencrypt " label))
           (and recipients-file (not (exists? recipients-file)))
           (conj (str "No recipients file yet. Start it with:  bb secrets add-recipient " label))
-          (not (or identity-problem (exists? identity-file)))
+          (not (or identity-problem has-identity?))
           (conj (str "No identity, so only keyless verification works here."
-                     " Create a key with:  bb secrets keygen " label)))
+                     (if (or (:key-file env) (keychain/available?))
+                       (str " Create a key with:  bb secrets keygen " label)
+                       " Set :key-command or :key-file for this environment."))))
         problems
         (cond-> []
           identity-problem (conj identity-problem)
@@ -932,8 +967,8 @@
              :manifest (when (string? manifest)
                          {:path manifest :exists? (exists? manifest)})
              :identity {:source identity-source
-                        :path (when-not injected? identity-file)
-                        :exists? (exists? identity-file)}
+                        :path identity-file
+                        :exists? has-identity?}
              :warnings warnings
              :problems problems
              :exit (cond (seq problems) 2 (seq warnings) 1 :else 0)}
@@ -978,8 +1013,8 @@
   The map holds `:environment`, `:age` (the installed version, or nil),
   `:secrets-file` and `:manifest` (each `{:path :exists?}`, and `:manifest`
   nil when disabled), `:recipients-file` in team mode (`{:path :exists?
-  :count}`), `:identity` (`{:source :path :exists?}`, with no path for an
-  identity injected as contents), `:warnings` and `:problems` (vectors of
+  :count}`), `:identity` (`{:source :path :exists?}`, with a path only for a
+  key file), `:warnings` and `:problems` (vectors of
   messages), and `:exit`.
 
   `:exit` is 0 when healthy. It is 1 on a warning: `age` is not installed, or
@@ -1003,8 +1038,6 @@
                                         (ex-message e))
                          (throw e)))))
                  (catch clojure.lang.ExceptionInfo e
-                   (when (= :private-file-remains (:reason (ex-data e)))
-                     (throw e))
                    {:problems [(ex-message e)] :exit 2}))]
     (say! (doctor-lines result))
     result))

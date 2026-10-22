@@ -27,7 +27,7 @@
         (finally
           (doseq [p (reverse (file-seq (io/file dir)))] (.delete p)))))))
 
-(use-fixtures :each with-tmp-key)
+(use-fixtures :each with-tmp-key test-env/with-fake-keychain)
 
 ;;;; Helpers
 
@@ -86,7 +86,7 @@
         cfg (spit-config! "{:port #long \"8080\" :host \"localhost\"}")
         calls (atom 0)]
     (with-redefs [age/decrypt (counting calls age/decrypt)
-                  secrets/with-identity (counting calls secrets/with-identity)
+                  secrets/resolve-identity (counting calls secrets/resolve-identity)
                   secrets/load-secrets (counting calls secrets/load-secrets)]
       (is (= {:port 8080 :host "localhost"}
              (secrets-aero/read-config cfg {:secrets store})))

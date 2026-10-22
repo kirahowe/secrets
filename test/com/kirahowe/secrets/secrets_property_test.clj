@@ -110,9 +110,9 @@
 
 (def ^:private resolution
   "Generator of which identity sources are present, with the values they hold,
-  as `{:arg :env :expected}`: the argument for `with-identity`, the
-  environment, and what the documented order hands the callback, as a path and
-  source or as a source and file contents."
+  as `{:arg :env :expected}`: the argument for `resolve-identity`, the
+  environment, and what the documented order resolves to, as a path and
+  source or as a source and key contents. The Keychain is empty."
   (gen/let [[explicit? file? raw? b64? key-file? app?] (gen/vector gen/boolean 6)
             bare? gen/boolean
             explicit path-text
@@ -128,7 +128,7 @@
                       [(and key-file? (not bare-explicit?))
                        {:path key-file :source :configured-key-file}]
                       [(and app? (not bare-explicit?))
-                       {:path (fs/default-key-file app) :source :default-key-file}]]]
+                       {:path nil :source :keychain}]]]
       {:arg (if bare-explicit?
               explicit
               (cond-> {}
@@ -144,15 +144,14 @@
 
 (defspec identity-sources-resolve-in-documented-order 300
   (prop/for-all [{:keys [arg env expected]} resolution]
-    (let [_ (when (and (:path expected) (not= :default-key-file (:source expected)))
+    (let [_ (when (:path expected)
               (touch! (:path expected)))
           seen (with-env env
-                 #(secrets/with-identity
-                    arg
-                    (fn [{:keys [identity-file identity-source]}]
-                      (cond-> {:source identity-source}
-                        (:contents expected) (assoc :contents (slurp identity-file))
-                        (not (:contents expected)) (assoc :path identity-file)))))]
+                 #(let [{:keys [identity-file identity-contents identity-source]}
+                        (secrets/resolve-identity arg)]
+                    (cond-> {:source identity-source}
+                      (:contents expected) (assoc :contents identity-contents)
+                      (not (:contents expected)) (assoc :path identity-file))))]
       (and (= (:source expected) (:source seen))
            (= (:path expected) (:path seen))
            (= (:contents expected) (:contents seen))))))
@@ -180,8 +179,9 @@
                               [v (later-values v)]))
           called? (atom false)
           e (thrown #(with-env environment
-                       (fn [] (secrets/with-identity {:key-file key-file :app app}
-                                (fn [_] (reset! called? true))))))]
+                       (fn []
+                         (secrets/resolve-identity {:key-file key-file :app app})
+                         (reset! called? true))))]
       (and (instance? clojure.lang.ExceptionInfo e)
            (= blank-var (:env (ex-data e)))
            (str/includes? (ex-message e) blank-var)
@@ -195,7 +195,7 @@
                  form (gen/elements [:string :opts])]
     (let [arg (if (= :string form) (touch! explicit) {:identity-file (touch! explicit)})
           seen (with-env {(nth identity-vars index) blank}
-                 #(secrets/with-identity arg identity))]
+                 #(secrets/resolve-identity arg))]
       (and (= explicit (:identity-file seen))
            (= :identity-file (:identity-source seen))))))
 
@@ -232,8 +232,9 @@
                  key-file path-text]
     (let [called? (atom false)
           e (thrown #(with-env {"SECRETS_AGE_IDENTITY_B64" input}
-                       (fn [] (secrets/with-identity {:key-file key-file}
-                                (fn [_] (reset! called? true))))))
+                       (fn []
+                         (secrets/resolve-identity {:key-file key-file})
+                         (reset! called? true))))
           shown (rendered e)]
       (and (instance? clojure.lang.ExceptionInfo e)
            (= "SECRETS_AGE_IDENTITY_B64" (:env (ex-data e)))
@@ -244,70 +245,16 @@
 
 ;;;; Injected identities
 
-(defn- observe
-  "What a callback sees of the identity file it is handed."
-  [{:keys [identity-file identity-source]}]
-  {:path identity-file
-   :source identity-source
-   :exists? (.exists (io/file identity-file))
-   :permissions (test-env/permission-names identity-file)
-   :contents (slurp identity-file)})
-
-(defspec an-injected-identity-is-private-exact-and-gone-after-the-call 60
+(defspec an-injected-identity-is-held-in-memory-exactly 60
   (prop/for-all [[text wrapped] identity-and-wrapped
-                 kind (gen/elements [:raw :b64])
-                 outcome (gen/elements [:return :throw])]
+                 kind (gen/elements [:raw :b64])]
     (let [environment (if (= :raw kind)
                         {"SECRETS_AGE_IDENTITY" text}
                         {"SECRETS_AGE_IDENTITY_B64" wrapped})
-          seen (atom nil)
-          failure (ex-info "callback failed" {:reason :callback-failed})
-          result (atom nil)
-          error (thrown #(with-env environment
-                           (fn []
-                             (reset! result
-                                     (secrets/with-identity
-                                       nil
-                                       (fn [identity]
-                                         (reset! seen (observe identity))
-                                         (if (= :throw outcome)
-                                           (throw failure)
-                                           [:returned text])))))))
-          {:keys [path source exists? permissions contents]} @seen]
-      (and (= (if (= :raw kind) :secrets-age-identity :secrets-age-identity-b64) source)
-           exists?
-           (= test-env/owner-only-names permissions)
-           (= text contents)
-           (not (.exists (io/file path)))
-           (if (= :throw outcome)
-             (identical? failure error)
-             (and (nil? error) (= [:returned text] @result)))))))
-
-(defspec a-caller-owned-identity-path-is-never-deleted 40
-  (prop/for-all [text identity-text
-                 via (gen/elements [:string :opts :env :key-file])
-                 outcome (gen/elements [:return :throw])]
-    (let [file (fs/owner-only-temp-file! "kira-identity-" ".txt")
-          path (.getAbsolutePath file)]
-      (try
-        (spit file text)
-        (let [seen (atom nil)
-              f (fn [identity]
-                  (reset! seen identity)
-                  (when (= :throw outcome) (throw (Exception.))))
-              arg (case via
-                    :string path
-                    :opts {:identity-file path}
-                    :env nil
-                    :key-file {:key-file path})
-              environment (when (= :env via) {"SECRETS_AGE_IDENTITY_FILE" path})
-              error (thrown #(with-env environment (fn [] (secrets/with-identity arg f))))]
-          (and (= path (:identity-file @seen))
-               (= (some? error) (= :throw outcome))
-               (.exists file)
-               (= text (slurp file))))
-        (finally
-          (.delete file))))))
+          seen (with-env environment #(secrets/resolve-identity nil))]
+      (= {:identity-contents text
+          :identity-source (if (= :raw kind) :secrets-age-identity :secrets-age-identity-b64)}
+         seen))))
 
 (def ^:private refused-path
   "Generator of `[value secret]`: a path setting that holds key contents or a
@@ -334,7 +281,9 @@
                 :key-file {:key-file value})
           environment (when (= :env via) {"SECRETS_AGE_IDENTITY_FILE" value})
           e (thrown #(with-env environment
-                       (fn [] (secrets/with-identity arg (fn [_] (reset! called? true))))))]
+                       (fn []
+                         (secrets/resolve-identity arg)
+                         (reset! called? true))))]
       (and (instance? clojure.lang.ExceptionInfo e)
            (= :disallowed-identity (:reason (ex-data e)))
            (not @called?)
@@ -344,10 +293,10 @@
   (prop/for-all [name scheme-word
                  rest-of-name word]
     (let [bare (str name ":" rest-of-name)
-          refused (thrown #(secrets/with-identity bare identity))
+          refused (thrown #(secrets/resolve-identity bare))
           ;; Only the dot-slash form gets past the locator check, to the
           ;; existence check that the missing file then fails.
-          kept (thrown #(secrets/with-identity (str "./" bare) identity))]
+          kept (thrown #(secrets/resolve-identity (str "./" bare)))]
       (and (= :disallowed-identity (:reason (ex-data refused)))
            (= :no-identity (:reason (ex-data kept)))
            (= (str "./" bare) (:identity-file (ex-data kept)))))))
@@ -373,7 +322,9 @@
                 :env nil)
           environment (when (= :env via) {"SECRETS_AGE_IDENTITY_FILE" value})
           e (thrown #(with-env environment
-                       (fn [] (secrets/with-identity arg (fn [_] (reset! called? true))))))]
+                       (fn []
+                         (secrets/resolve-identity arg)
+                         (reset! called? true))))]
       (and (instance? clojure.lang.ExceptionInfo e)
            (= :no-identity (:reason (ex-data e)))
            (= expanded (:identity-file (ex-data e)))
@@ -384,10 +335,9 @@
 (defspec a-default-key-location-need-not-exist 50
   (prop/for-all [app word
                  path missing-path-text]
-    (let [seen (with-env {} #(secrets/with-identity {:app (str "kira-missing-" app)} identity))
-          configured (with-env {} #(secrets/with-identity {:key-file path :app app} identity))]
-      (and (= :default-key-file (:identity-source seen))
-           (= (fs/default-key-file (str "kira-missing-" app)) (:identity-file seen))
+    (let [seen (with-env {} #(secrets/resolve-identity {:app (str "kira-missing-" app)}))
+          configured (with-env {} #(secrets/resolve-identity {:key-file path :app app}))]
+      (and (= {:identity-file nil :identity-source :keychain} seen)
            (= {:identity-file path :identity-source :configured-key-file} configured)))))
 
 ;;;; get-secret
@@ -505,7 +455,7 @@
                (contains? edn-reasons (:reason (ex-data e)))
                (not (str/includes? (rendered e) marker))))))))
 
-(defspec an-identity-age-rejects-is-not-repeated-and-its-file-is-deleted 15
+(defspec an-identity-age-rejects-is-not-repeated 15
   (prop/for-all [[text wrapped] identity-and-wrapped
                  kind (gen/elements [:raw :b64])]
     (with-ciphertext (pr-str {:k 1})
@@ -513,11 +463,9 @@
         (let [environment (if (= :raw kind)
                             {"SECRETS_AGE_IDENTITY" text}
                             {"SECRETS_AGE_IDENTITY_B64" wrapped})
-              e (thrown #(with-env environment (fn [] (secrets/load-secrets encrypted))))
-              path (:identity-file (ex-data e))]
+              e (thrown #(with-env environment (fn [] (secrets/load-secrets encrypted))))]
           (and (instance? clojure.lang.ExceptionInfo e)
-               (string? path)
-               (not (.exists (io/file path)))
+               (not (contains? (ex-data e) :identity-file))
                (not (str/includes? (rendered e) (key-line text)))))))))
 
 (defspec a-generated-secrets-file-loads-back-as-it-was-encrypted 12

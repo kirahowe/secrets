@@ -16,6 +16,7 @@
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.keychain :as keychain]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]
@@ -50,7 +51,7 @@
                    (ns-resolve 'com.kirahowe.secrets.store 'exit!) (fn [_])}
     f))
 
-(use-fixtures :each with-no-terminal with-tmp-key)
+(use-fixtures :each with-no-terminal with-tmp-key test-env/with-fake-keychain)
 
 (defn- age-env-set?
   "Whether an SECRETS_AGE_IDENTITY* variable overrides the fixture key."
@@ -62,14 +63,18 @@
           "SECRETS_AGE_IDENTITY_B64"])))
 
 (defn- test-config
-  "A single-env config rooted in the fixture's temp dir, key pinned to *key*."
+  "A single-env config rooted in the fixture's temp dir, key pinned to *key*.
+  An override whose value is `::absent` removes that setting, so
+  `{:key-file ::absent}` leaves the key to the Keychain or a `:key-command`."
   ([] (test-config {}))
   ([env-overrides]
    {:app "cli-test"
     :default-environment :dev
-    :environments {:dev (merge {:secrets-file (str *dir* "/secrets.edn.age")
-                                :key-file *key*}
-                               env-overrides)}}))
+    :environments {:dev (into {}
+                              (remove (comp #{::absent} val))
+                              (merge {:secrets-file (str *dir* "/secrets.edn.age")
+                                      :key-file *key*}
+                                     env-overrides))}}))
 
 (defn- encrypt-text!
   "Encrypt exactly `text` to the config's secrets file out-of-band (no
@@ -123,9 +128,10 @@
   (edn/read-string (slurp path)))
 
 (defn- store-text
-  "The decrypted plaintext of the store at `path`, library metadata included."
+  "The decrypted plaintext of the store at `path`, library metadata included,
+  read with the identity file at `identity`."
   [path identity]
-  (age/decrypt identity path))
+  (age/decrypt {:identity-file identity} path))
 
 (defn- store-manifest-key
   "The manifest key the store at `path` holds, read as a recipient who
@@ -201,37 +207,26 @@
   [environment f]
   (with-redefs-fn (test-env/getenv-redefs environment) f))
 
-(defn- observe-injected-identities
-  "Run `f`, recording only temp files allocated for raw/base64 age identities.
-  The wrapper delegates the actual owner-only creation to `fs`; it observes no
-  plaintext and ignores the CLI's unrelated plaintext scratch files."
-  ([f] (observe-injected-identities (atom []) f))
-  ([created f]
-   (let [real-owner-only-temp-file! fs/owner-only-temp-file!]
-     (with-redefs [fs/owner-only-temp-file!
-                   (fn [& args]
-                     (let [file (apply real-owner-only-temp-file! args)]
-                       (when (= "age-identity-" (first args))
-                         (swap! created conj (.getAbsolutePath file)))
-                       file))]
-       {:result (f) :paths @created}))))
-
-(defn- capture-injected-identity-outcome
-  "Like `observe-injected-identities`, but retain an operation failure so a
-  cleanup failure can be examined without losing the temp path it left behind."
+(defn- observe-temp-file-prefixes
+  "Run `f` and return `{:result … :prefixes […]}`, where `:prefixes` holds the
+  name prefix of every private temp file created while it ran. The wrapper
+  delegates the actual creation to `fs`, so the files behave as they would."
   [f]
-  (let [created (atom [])
+  (let [prefixes (atom [])
         real-owner-only-temp-file! fs/owner-only-temp-file!]
     (with-redefs [fs/owner-only-temp-file!
                   (fn [& args]
-                    (let [file (apply real-owner-only-temp-file! args)]
-                      (when (= "age-identity-" (first args))
-                        (swap! created conj (.getAbsolutePath file)))
-                      file))]
-      (let [outcome (try
-                      {:value (f)}
-                      (catch Throwable e {:failure e}))]
-        (assoc outcome :paths @created)))))
+                    (swap! prefixes conj (if (= 3 (count args)) (second args) (first args)))
+                    (apply real-owner-only-temp-file! args))]
+      (let [result (f)]
+        {:result result :prefixes @prefixes}))))
+
+(defn- assert-no-identity-file!
+  "An identity held in memory goes to age on its standard input, so no
+  operation writes it to a temp file."
+  [prefixes]
+  (is (not-any? #(str/starts-with? (str %) "age-identity-") prefixes)
+      "no temporary identity file is created"))
 
 (defn- identity-environment
   "The one identity environment variable represented by `source`, carrying the
@@ -244,15 +239,6 @@
             (.encodeToString (java.util.Base64/getEncoder)
                              (.getBytes identity "UTF-8"))})))
 
-(defn- assert-cleaned-identity! [paths]
-  (is (= 1 (count paths)) "each operation gets one temporary identity")
-  (is (every? #(not (.exists (io/file %))) paths)
-      "the operation removes its temporary identity before returning"))
-
-(defn- under-default-key-file
-  [path f]
-  (with-redefs-fn {#'fs/default-key-file (constantly path)} f))
-
 (defn- capture-doctor
   [config env-arg]
   (let [result (atom nil)
@@ -263,15 +249,18 @@
     {:result @result :out (str out) :err (str err)}))
 
 (defn- doctor-under
-  "Run doctor with process boundaries replaced, including the app default key
-  path so tests do not depend on the developer's home or environment."
-  [config env-arg {:keys [environment version] :as opts}]
-  (with-redefs-fn {#'fs/default-key-file (fn [_] *key*)
-                   #'age/version (fn [] (if (contains? opts :version)
+  "Run doctor with process boundaries replaced (the identity variables, the
+  Keychain, and the age version) so tests do not depend on the developer's
+  home or environment. `:keychain` is the fake Keychain's items, app name to
+  key, and empty when absent."
+  [config env-arg {:keys [environment version keychain] :as opts}]
+  (with-redefs-fn {#'age/version (fn [] (if (contains? opts :version)
                                           version
                                           "age test-version"))}
     #(with-identity-environment (or environment {})
-       (fn [] (capture-doctor config env-arg)))))
+       (fn []
+         (with-redefs-fn (test-env/keychain-redefs (atom (or keychain {})))
+           (fn [] (capture-doctor config env-arg)))))))
 
 (defn- complete-doctor-config
   ([] (complete-doctor-config {}))
@@ -302,8 +291,9 @@
         env (get-in cfg [:environments :prod])]
     (is (= "env/secrets.edn.example" (:template env)))
     (is (= "env/secrets.edn.manifest" (:manifest env)))
-    (is (= (str (System/getProperty "user.home") "/.config/myapp/key.txt")
-           (:key-file env)))
+    (is (not (contains? env :key-file))
+        "there is no default key file: the key lives in the Keychain or a command")
+    (is (not (contains? env :key-command)))
     (is (= :prod (:name env)))
     (is (= "myapp" (:app env)))
     (is (nil? (:identity-file env))
@@ -322,13 +312,15 @@
 (deftest normalize-config-does-not-materialize-or-resolve-injected-identities-test
   (doseq [source [:raw :b64]]
     (testing (name source)
-      (let [{:keys [result paths]}
-            (observe-injected-identities
+      (let [{:keys [result prefixes]}
+            (observe-temp-file-prefixes
              #(with-identity-environment (identity-environment source)
-                (fn [] (cli/normalize-config (test-config)))))]
-        (is (nil? (get-in result [:environments :dev :identity-file])))
-        (is (empty? paths)
-            "resolving config neither reads injected contents nor writes a temp file")))))
+                (fn [] (cli/normalize-config (test-config)))))
+            env (get-in result [:environments :dev])]
+        (is (nil? (:identity-file env)))
+        (is (nil? (:identity-contents env))
+            "resolving config does not read injected contents")
+        (is (empty? prefixes) "resolving config writes no temp file")))))
 
 (deftest identity-file-is-not-a-config-key-test
   (testing "a config that sets :identity-file is rejected by name"
@@ -339,14 +331,14 @@
     (let [config (cli/normalize-config (test-config {:key-file (str *dir* "/not-a-key")}))]
       (doseq [environment [{"SECRETS_AGE_IDENTITY" "not the fixture identity"}
                            {"SECRETS_AGE_IDENTITY_B64" "bm90IHRoZSBmaXh0dXJlIGlkZW50aXR5"}]]
-        (let [{:keys [paths]}
-              (observe-injected-identities
+        (let [{:keys [prefixes]}
+              (observe-temp-file-prefixes
                #(with-identity-environment (assoc environment "SECRETS_AGE_IDENTITY_FILE" *key*)
                   (fn []
                     (with-out-str
                       (with-in-str "chosen-by-path"
                         (cli/set-secret! config "dev" ":identity/precedence"))))))]
-          (is (empty? paths) "a path is caller-owned and needs no temp file")
+          (assert-no-identity-file! prefixes)
           (is (= {:identity/precedence "chosen-by-path"}
                  (secrets/load-secrets (str *dir* "/secrets.edn.age") *key*))))))))
 
@@ -449,17 +441,26 @@
         (let [[exit text] (warned config {})]
           (is (= 1 exit))
           (is (str/includes? text "bb secrets reencrypt 'dev'")))))
-    (testing "no key at the default location, which is not a designation"
-      (let [missing (str *dir* "/missing-default-key.txt")
-            config (update-in (complete-doctor-config) [:environments :dev] dissoc :key-file)
-            {:keys [result out]}
-            (with-redefs-fn {#'fs/default-key-file (constantly missing)
-                             #'age/version (constantly "age test-version")}
-              #(with-identity-environment {} (fn [] (capture-doctor config nil))))]
+    (testing "no key in the Keychain, which is not a designation"
+      (let [config (update-in (complete-doctor-config) [:environments :dev] dissoc :key-file)
+            {:keys [result out]} (doctor-under config nil {})]
         (is (= 1 (:exit result)))
-        (is (= {:source :configured-key-file :path missing :exists? false} (:identity result)))
-        (is (str/includes? out (str "Identity: key file " missing " (missing)\n")))
-        (is (str/includes? out "bb secrets keygen 'dev'")))))
+        (is (= {:source :keychain :path nil :exists? false} (:identity result)))
+        (is (str/includes? out "Identity: macOS Keychain (missing)\n"))
+        (is (str/includes? out "bb secrets keygen 'dev'"))))
+    (testing "no key file and no Keychain points at :key-command, not keygen"
+      (let [config (update-in (complete-doctor-config) [:environments :dev] dissoc :key-file)
+            {:keys [result out]}
+            (with-redefs-fn {#'age/version (constantly "age test-version")}
+              #(with-identity-environment {}
+                 (fn []
+                   (with-redefs [keychain/available? (constantly false)]
+                     (capture-doctor config nil)))))]
+        (is (= 1 (:exit result)))
+        (is (= {:source nil :path nil :exists? false} (:identity result)))
+        (is (str/includes? out "Identity: not resolved\n"))
+        (is (str/includes? out "Set :key-command or :key-file for this environment."))
+        (is (not (str/includes? out "keygen"))))))
   (testing "a missing template and a disabled manifest are not warnings"
     (let [config (complete-doctor-config {:manifest false})]
       (.delete (io/file (str *dir* "/secrets.edn.example")))
@@ -514,7 +515,14 @@
              {:source :configured-key-file
               :label "key file"
               :config (complete-doctor-config {:key-file other})
-              :path other}]]
+              :path other}
+             {:source :key-command
+              :label ":key-command"
+              :config (complete-doctor-config {:key-file ::absent :key-command ["cat" other]})}
+             {:source :keychain
+              :label "macOS Keychain"
+              :config (complete-doctor-config {:key-file ::absent})
+              :keychain {"cli-test" raw-value}}]]
       (testing (name source)
         (let [{:keys [result out err]} (doctor-under (or config (complete-doctor-config)) nil spec)
               disclosed (str (pr-str result) out err)]
@@ -818,10 +826,10 @@
 
 ;;;; Re-encrypt and verify
 
-(deftest injected-cli-identities-live-for-one-real-command-test
+(deftest injected-cli-identities-never-touch-disk-test
   (doseq [source [:raw :b64]]
     (testing (name source)
-      (let [config (cli/normalize-config (test-config))
+      (let [config (cli/normalize-config (test-config {:key-file (str *dir* "/not-a-key")}))
             env (identity-environment source)
             ciphertext (str *dir* "/secrets.edn.age")]
         (encrypt-edn! {:value "before"})
@@ -835,14 +843,17 @@
                      (fn [] (cli/edit! config "dev")))]
                  ["reencrypt" #(cli/reencrypt! config "dev")]
                  ["verify" #(verify config "dev")]]]
-          (let [{:keys [result paths]}
-                (observe-injected-identities
+          (let [{:keys [result prefixes]}
+                (observe-temp-file-prefixes
                  #(with-identity-environment env
                     (fn [] (with-out-str (invoke)))))]
             (is (some? result) (str label " completes with an injected identity"))
-            (assert-cleaned-identity! paths)))
+            (assert-no-identity-file! prefixes)))
         (is (= {:value "after-edit"}
-               (secrets/load-secrets ciphertext *key*)))))))
+               (secrets/load-secrets ciphertext *key*)))
+        (is (= {:results {:dev :ok} :exit 0}
+               (with-identity-environment env #(verify config "dev")))
+            "the injected key, not the absent key file, did the work")))))
 
 (deftest caller-owned-cli-identity-files-survive-operations-test
   (let [ciphertext (str *dir* "/secrets.edn.age")
@@ -851,25 +862,25 @@
     (doseq [[label config environment]
             [["SECRETS_AGE_IDENTITY_FILE" from-environment
               {"SECRETS_AGE_IDENTITY_FILE" *key*}]]]
-      (let [{:keys [paths]}
-            (observe-injected-identities
+      (let [{:keys [prefixes]}
+            (observe-temp-file-prefixes
              #(with-identity-environment environment
                 (fn [] (with-out-str (cli/reencrypt! config "dev")))))]
         (is (.exists (io/file *key*)) (str label " leaves the caller's key file alone"))
-        (is (empty? paths) (str label " does not materialize a copy"))))
+        (assert-no-identity-file! prefixes)))
     (is (= {:caller-owned true}
            (secrets/load-secrets ciphertext *key*)))))
 
-(deftest failed-cli-operation-cleans-its-injected-identity-test
+(deftest failed-cli-operation-with-an-injected-identity-writes-no-identity-test
   (doseq [source [:raw :b64]]
-    (let [config (cli/normalize-config (test-config))
-          {:keys [failure paths]}
-          (capture-injected-identity-outcome
-           #(with-identity-environment (identity-environment source)
-              (fn [] (with-out-str (cli/reencrypt! config "dev")))))]
-      (is (instance? clojure.lang.ExceptionInfo failure))
-      (is (str/includes? (ex-message failure) "No secrets file"))
-      (assert-cleaned-identity! paths))))
+    (testing (name source)
+      (let [config (cli/normalize-config (test-config))
+            {:keys [result prefixes]}
+            (observe-temp-file-prefixes
+             #(with-identity-environment (identity-environment source)
+                (fn [] (capture-failure (fn [] (cli/reencrypt! config "dev"))))))]
+        (is (str/includes? (get-in result [:failure :message]) "No secrets file"))
+        (assert-no-identity-file! prefixes)))))
 
 (defn- failing-delete-of
   "A `with-redefs-fn` map under which deleting a private temp file whose name
@@ -880,45 +891,6 @@
                         (if (str/starts-with? (.getName file) prefix)
                           false
                           (real file)))}))
-
-(deftest cleanup-failure-is-actionable-after-cli-success-or-failure-test
-  (let [config (cli/normalize-config (test-config))
-        failure-config (cli/normalize-config
-                        (test-config {:secrets-file (str *dir* "/missing.age")}))
-        environment (identity-environment :raw)
-        success
-        (capture-injected-identity-outcome
-         #(with-identity-environment environment
-            (fn []
-              (with-redefs-fn (failing-delete-of "age-identity-")
-                (fn []
-                  (with-out-str
-                    (with-in-str "written-before-cleanup-failure"
-                      (cli/set-secret! config "dev" ":cleanup/test"))))))))
-        success-error (:failure success)
-        remaining (first (:paths success))
-        rendered (str/join " " (mapcat rest ((cli-private 'error-lines) success-error)))
-        failure
-        (capture-injected-identity-outcome
-         #(with-identity-environment environment
-            (fn []
-              (with-redefs-fn (failing-delete-of "age-identity-")
-                (fn [] (with-out-str (cli/reencrypt! failure-config "dev")))))))]
-    (is (= :private-file-remains (:reason (ex-data success-error))))
-    (is (.exists (io/file (str *dir* "/secrets.edn.age")))
-        "the command committed its ciphertext before cleanup reported failure")
-    (is (and remaining (.exists (io/file remaining)))
-        "a failed cleanup leaves a concrete file for the operator to remove")
-    (is (str/includes? rendered remaining))
-    (is (not (str/includes? rendered (slurp *key*)))
-        "the remediation reports only the temp path, never identity contents")
-    (is (= (first (:paths failure)) (:remaining-file (ex-data (:failure failure)))))
-    (is (str/includes? (ex-message (:failure failure)) "No secrets file"))
-    (is (str/includes? (ex-message (:failure failure)) (first (:paths failure)))
-        "the operation's own failure also names the remaining file")
-    (doseq [path (:paths failure)]
-      (when (.exists (io/file path)) (.delete (io/file path))))
-    (when (.exists (io/file remaining)) (.delete (io/file remaining)))))
 
 (deftest plaintext-temp-file-is-deleted-plainly-and-a-failure-is-reported-test
   (if (age-env-set?)
@@ -1047,16 +1019,10 @@
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [config (cli/normalize-config (test-config))
           missing (str *dir* "/no-such-key.txt")
-          keyless-verify (fn []
-                           (under-default-key-file
-                            missing
-                            #(verify (cli/normalize-config
-                                      (update-in (test-config) [:environments :dev]
-                                                 dissoc :key-file))
-                                     "dev")))]
+          keyless-verify #(verify (cli/normalize-config (test-config {:key-file ::absent})) "dev")]
       (encrypt-edn! {:a 1})
       (with-out-str (cli/reencrypt! config "dev"))
-      (testing "fresh manifest → freshness verified without any key"
+      (testing "fresh manifest and an empty Keychain → freshness verified without any key"
         (let [{:keys [results exit]} (keyless-verify)]
           (is (= 0 exit))
           (is (= :ok-keyless (:dev results)))))
@@ -1067,7 +1033,7 @@
                      (fn [] (verify config "dev")))]]]
           (testing label
             (is (= {:results {:dev :error} :exit 2} (run-verify))))))
-      (testing "a configured :key-file that does not exist is keyless, like the app default"
+      (testing "a configured :key-file that does not exist is keyless, like an empty Keychain"
         (let [{:keys [result out]}
               (capture-verify (cli/normalize-config (test-config {:key-file missing})) "dev")]
           (is (= {:results {:dev :ok-keyless} :exit 0} result))
@@ -1079,8 +1045,8 @@
           (is (= :drift (:dev results))))))))
 
 (deftest a-configured-key-file-that-does-not-exist-is-not-a-designation-test
-  ;; :key-file says where the project keeps its key by default, the same role
-  ;; as ~/.config/<app>/key.txt. Its absence means no identity is available.
+  ;; :key-file says where the project keeps its key, the same role as the
+  ;; app's Keychain item. Its absence means no identity is available.
   (if (age-env-set?)
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [missing (str *dir* "/no-such-key.txt")
@@ -1100,22 +1066,17 @@
           (is (str/includes? (ex-message e) "bb secrets keygen 'dev'")))))))
 
 (defn- keyless-config
-  "A config with no designated identity, for use under `under-default-key-file`
-  with an absent default, so `verify` takes the keyless path."
-  [absent]
-  (under-default-key-file
-   absent
-   #(cli/normalize-config (update-in (test-config) [:environments :dev] dissoc :key-file))))
+  "A config with no key file, so under an empty Keychain `verify` takes the
+  keyless path."
+  []
+  (cli/normalize-config (test-config {:key-file ::absent})))
 
 (defn- capture-keyed-and-keyless
   "Run `verify` on dev with the fixture identity and again with none. Returns
   `[[label captured] …]`."
   [config]
-  (let [absent (str *dir* "/absent-key.txt")
-        keyless (keyless-config absent)]
-    [["keyed" (with-identity-environment {} #(capture-verify config "dev"))]
-     ["keyless" (with-identity-environment
-                  {} (fn [] (under-default-key-file absent #(capture-verify keyless "dev"))))]]))
+  [["keyed" (with-identity-environment {} #(capture-verify config "dev"))]
+   ["keyless" (with-identity-environment {} #(capture-verify (keyless-config) "dev"))]])
 
 (deftest verify-version-gate-test
   (let [config (cli/normalize-config (test-config))
@@ -1214,7 +1175,7 @@
               ciphertext (str *dir* "/secrets.edn.age")
               manifest-path (str *dir* "/secrets.edn.manifest")
               sha256 (cli-private 'sha256)
-              recipient (age/public-key *key*)
+              recipient (age/public-key {:identity-file *key*})
               forge! (fn [committed value]
                        (let [forged (str *dir* "/forged.edn")]
                          (spit forged (pr-str value))
@@ -1856,7 +1817,8 @@
           encrypted (str *dir* "/secrets.edn.age")]
       (with-out-str (with-in-str "v" (cli/set-secret! config "dev" "[:a :b]")))
       (with-out-str (with-in-str "w" (cli/set-secret! config "dev" ":c")))
-      (let [plaintext ((cli-private 'user-plaintext) (age/decrypt *key* encrypted))]
+      (let [plaintext ((cli-private 'user-plaintext)
+                       (age/decrypt {:identity-file *key*} encrypted))]
         (is (= {:a {:b "v"} :c "w"} (edn/read-string plaintext)))
         (is (= "{:a {:b \"v\"}, :c \"w\"}\n" plaintext)
             "what `edit` shows next is the pretty-printed map, without library metadata")
@@ -1967,7 +1929,7 @@
       (is (some? pub1))
       (is (some? pub2))
       (is (not= pub1 pub2) "the second call really did replace the key")
-      (is (= pub2 (age/public-key path)) "and the file on disk is the new one")
+      (is (= pub2 (age/public-key {:identity-file path})) "and the file on disk is the new one")
       (is (= ["regen.txt"]
              (filter #(str/includes? % "regen.txt") (.list (io/file *dir*))))
           "no staging leftovers beside the key"))))
@@ -1984,7 +1946,7 @@
         out (with-out-str (reset! result (cli/keygen! config "dev")))]
     (is (= dev-key @result))
     (is (str/includes? out (str "Key written: " dev-key "\n")))
-    (is (str/includes? out (str "Public key: " (age/public-key dev-key) "\n")))
+    (is (str/includes? out (str "Public key: " (age/public-key {:identity-file dev-key}) "\n")))
     (is (not (re-find #"Used by|prod" out))
         "it reports the key it wrote, and infers nothing about other environments")
     (testing "without an environment or a default there is nothing to name"
@@ -1999,7 +1961,7 @@
           bob-key (str *dir* "/bob-key.txt")
           secret-value "team-bootstrap-value-that-must-not-be-printed"
           config (cli/normalize-config (test-config {:recipients-file recipients}))
-          alice-public (age/public-key *key*)
+          alice-public (age/public-key {:identity-file *key*})
           added (atom nil)
           initial-out (with-out-str
                         (reset! added (cli/add-recipient! config "dev" nil)))]
@@ -2200,7 +2162,7 @@
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [recipients (str *dir* "/recipients.txt")
           ciphertext (str *dir* "/secrets.edn.age")
-          alice-public (age/public-key *key*)
+          alice-public (age/public-key {:identity-file *key*})
           bob-key (str *dir* "/bob-key.txt")
           bob-public (age/keygen! bob-key)
           config (cli/normalize-config (test-config {:recipients-file recipients}))
@@ -2219,7 +2181,7 @@
               "the swap really happened, so the assertions below are not vacuous")
           (is (map? (secrets/load-secrets ciphertext *key*))
               "the snapshotted recipient still decrypts")
-          (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))
+          (is (thrown? clojure.lang.ExceptionInfo (age/decrypt {:identity-file bob-key} ciphertext))
               "the recipient substituted during the editor interval cannot"))))))
 
 (defn- with-bound
@@ -2234,7 +2196,7 @@
           ciphertext (str *dir* "/secrets.edn.age")
           bob-key (str *dir* "/bob-key.txt")
           bob-public (age/keygen! bob-key)
-          alice-public (age/public-key *key*)
+          alice-public (age/public-key {:identity-file *key*})
           config (cli/normalize-config (test-config {:recipients-file recipients}))]
       (testing "the bound is 256 KiB"
         (is (= 262144 @(cli-private 'max-recipients-bytes))))
@@ -2489,7 +2451,7 @@
     (let [team-list (str *dir* "/team-list.txt")
           bob-key (str *dir* "/bob-key.txt")
           bob-public (age/keygen! bob-key)
-          alice-public (age/public-key *key*)
+          alice-public (age/public-key {:identity-file *key*})
           config (cli/normalize-config (test-config {:recipients-file team-list}))]
       (spit team-list (str "# team\n" alice-public "\n" bob-public "\n"))
       (let [argvs (recorded-sh-argvs #(store-through-stdin! config))
@@ -2563,13 +2525,18 @@
 
 (deftest compatible-artifact-sharing-is-allowed-test
   (do
-    (testing "the app-wide default key file shared by two environments"
-      (is (some? (under-default-key-file
-                  (str *dir* "/home/.config/x/key.txt")
-                  #(normalize-without-env-identity
-                    {:app "x"
-                     :environments {:dev {:secrets-file (str *dir* "/dev/s.age")}
-                                    :prod {:secrets-file (str *dir* "/prod/s.age")}}})))))
+    (testing "one key file shared by two environments"
+      (is (nil? (normalize-failure
+                 {:app "x"
+                  :environments {:dev {:secrets-file (str *dir* "/dev/s.age")
+                                       :key-file (str *dir* "/key.txt")}
+                                 :prod {:secrets-file (str *dir* "/prod/s.age")
+                                        :key-file (str *dir* "/key.txt")}}}))))
+    (testing "two environments with no key setting share the app's Keychain item"
+      (is (nil? (normalize-failure
+                 {:app "x"
+                  :environments {:dev {:secrets-file (str *dir* "/dev/s.age")}
+                                 :prod {:secrets-file (str *dir* "/prod/s.age")}}}))))
     (testing "one recipients file shared by two environments"
       (is (nil? (normalize-failure
                  {:app "x"
@@ -2671,19 +2638,6 @@
                                (cli/set-secret! config "dev" ":test")))))
     (is (= identity (slurp other)))
     (is (not (.exists (io/file (str *dir* "/secrets.edn.age")))))))
-
-(deftest doctor-does-not-hide-identity-cleanup-failure-test
-  (let [{:keys [failure paths]}
-        (capture-injected-identity-outcome
-         #(with-identity-environment (identity-environment :raw)
-            (fn []
-              (with-redefs-fn (failing-delete-of "age-identity-")
-                (fn [] (with-out-str (cli/doctor! (complete-doctor-config) "dev")))))))]
-    (try
-      (is (= :private-file-remains (:reason (ex-data failure))))
-      (is (= (first paths) (:remaining-file (ex-data failure))))
-      (finally
-        (doseq [path paths] (.delete (io/file path)))))))
 
 ;;;; Release-hardening checks: cleanup, disclosure, and error paths
 
@@ -2849,7 +2803,7 @@
   (let [recipients (str *dir* "/recipients.txt")
         bob-key (str *dir* "/bob-key.txt")
         bob-public (age/keygen! bob-key)
-        alice-public (age/public-key *key*)]
+        alice-public (age/public-key {:identity-file *key*})]
     (spit recipients (str alice-public "\n" bob-public "\n"))
     {:recipients recipients
      :ciphertext (str *dir* "/secrets.edn.age")
@@ -2885,7 +2839,7 @@
           text "{:db {:url \"postgres://x\" :port 5432}\n :admins #{\"a@b.c\"}\n :empty {}}"
           manifest-for #(manifest-of (str *dir* "/" % ".edn.manifest"))
           key-for #(store-manifest-key (str *dir* "/" % ".edn.age") *key*)]
-      (spit recipients (str (age/public-key *key*) "\n"))
+      (spit recipients (str (age/public-key {:identity-file *key*}) "\n"))
       ;; The template is a decrypted store someone saved, manifest key and all.
       (new-store! config "solo" text)
       (spit template (store-text (str *dir* "/solo.edn.age") *key*))
@@ -3002,7 +2956,8 @@
             (spit recipients (str alice-public "\n"))
             (after-removal! alice)
             (is (= "4821" (:pin (secrets/load-secrets ciphertext *key*))))
-            (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))
+            (is (thrown? clojure.lang.ExceptionInfo
+                         (age/decrypt {:identity-file bob-key} ciphertext))
                 "Bob's identity no longer decrypts")
             (let [now (published)]
               (is (not-any? #(contains? now (vhash-of retained %)) candidates)
@@ -3533,18 +3488,20 @@
           (is (= {:results {:dev :drift} :exit 1} result))
           (is (str/includes? err "recipients changed since the last encryption; run reencrypt"))
           (is (str/includes? (str out err) "bb secrets reencrypt 'dev'")))
-        (is (some? (age/decrypt bob-key ciphertext)) "the removed key does still decrypt")
+        (is (some? (age/decrypt {:identity-file bob-key} ciphertext))
+            "the removed key does still decrypt")
         (is (= {:results {:dev :drift} :exit 1} (verify alice nil))))
       (testing "reencrypt clears it"
         (with-out-str (cli/reencrypt! alice "dev"))
         (is (= {:results {:dev :ok} :exit 0} (verify alice "dev")))
-        (is (thrown? clojure.lang.ExceptionInfo (age/decrypt bob-key ciphertext))))
+        (is (thrown? clojure.lang.ExceptionInfo (age/decrypt {:identity-file bob-key} ciphertext))))
       (testing "a recipient added to the file"
         (spit recipients (str alice-public "\n" (age/keygen! third) "\n"))
         (is (= {:results {:dev :drift} :exit 1} (verify alice "dev")))
         (with-out-str (cli/reencrypt! alice "dev")))
       (testing "the same set in another order, with a comment, is not a change"
-        (spit recipients (str "# the team\n" (age/public-key third) "\n\n" alice-public "\n"))
+        (spit recipients (str "# the team\n" (age/public-key {:identity-file third})
+                              "\n\n" alice-public "\n"))
         (is (= {:results {:dev :ok} :exit 0} (verify alice "dev"))))
       (testing "a store moved from a recipients file to its own key"
         (spit recipients both)
@@ -3592,7 +3549,8 @@
       (doseq [k [:name :app]]
         (let [e (failure {k "other"})]
           (is (= :unknown-config-key (:reason (ex-data e))))
-          (is (= "Known keys: :key-file, :manifest, :recipients-file, :secrets-file, :template."
+          (is (= (str "Known keys: :key-command, :key-file, :manifest, :recipients-file,"
+                      " :secrets-file, :template.")
                  (str/trim (last (str/split-lines (ex-message e)))))))))
     (testing "a default environment that is not configured"
       (doseq [default [:prod "dev" 5]]
@@ -3758,7 +3716,7 @@
     (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
     (let [recipients (str *dir* "/recipients.txt")
           config (cli/normalize-config (test-config {:recipients-file recipients}))]
-      (spit recipients (str (age/public-key *key*) "\n"))
+      (spit recipients (str (age/public-key {:identity-file *key*}) "\n"))
       (store-through-stdin! config)
       (is (= {:results {:dev :ok} :exit 0} (verify config "dev")))
       (let [{:keys [result err]} (with-bound (cli-private 'max-recipients-bytes) 8
@@ -3773,7 +3731,7 @@
 
 (deftest a-key-file-without-its-comment-lines-has-a-public-key-test
   (let [bare (str *dir* "/bare-key.txt")
-        public (age/public-key *key*)
+        public (age/public-key {:identity-file *key*})
         recipients (str *dir* "/recipients.txt")
         config (cli/normalize-config (test-config {:key-file bare :recipients-file recipients}))]
     (spit bare (str (first (filter #(str/starts-with? % "AGE-SECRET-KEY-")
@@ -3791,10 +3749,10 @@
                       @result)))
       (is (= (str public "\n") (slurp recipients))))
     (testing "a key file with its comment is read without running a program"
-      (is (= [] (recorded-sh-argvs #(age/public-key *key*)))))
+      (is (= [] (recorded-sh-argvs #(age/public-key {:identity-file *key*})))))
     (testing "a file that holds no key has none"
       (spit bare "not a key\n")
-      (is (nil? (age/public-key bare))))))
+      (is (nil? (age/public-key {:identity-file bare}))))))
 
 ;;;; Print limits
 
@@ -3856,7 +3814,7 @@
       (is (= (str other "\n") (slurp recipients))))
     (testing "anything else is the environment, whose own key is added"
       (with-out-str (cli/run! config ["add-recipient" "dev"]))
-      (is (= (str other "\n" (age/public-key *key*) "\n") (slurp recipients))))
+      (is (= (str other "\n" (age/public-key {:identity-file *key*}) "\n") (slurp recipients))))
     (testing "an argument that is neither is an unknown environment"
       (let [captured (capture-failure
                       #((cli-private 'dispatch!) config ["add-recipient" "age1nope"]))]
@@ -4070,3 +4028,205 @@
         (is (= {:results {:dev :drift} :exit 1} result))
         (is (re-find #"manifest is not valid EDN: malformed EDN syntax at line 2, column \d+" err))
         (is (str/includes? out "Regenerate it with:  bb secrets reencrypt 'dev'"))))))
+
+;;;; Keys in the macOS Keychain and from :key-command
+
+(defn- with-keychain
+  "Run `f` with no identity variables and a fake Keychain whose items are the
+  atom `items`, app name to key, so a test can see what a command stored.
+  Nothing here reaches the real login Keychain."
+  [items f]
+  (with-identity-environment {}
+    #(with-redefs-fn (test-env/keychain-redefs items) f)))
+
+(defn- key-line
+  "The `AGE-SECRET-KEY-1…` line of the identity file at `path`, which is what
+  the Keychain or a password manager holds."
+  [path]
+  (first (filter #(str/starts-with? % "AGE-SECRET-KEY-") (str/split-lines (slurp path)))))
+
+(defn- with-out-str-result
+  "Call `f` with its output discarded and return what it returned."
+  [f]
+  (let [result (atom nil)]
+    (binding [*err* (java.io.StringWriter.)]
+      (with-out-str (reset! result (f))))
+    @result))
+
+(def ^:private keychain-location
+  "Where `keygen` and `show-key` say the fixture app's Keychain key lives."
+  "the macOS Keychain (com.kirahowe.secrets, account cli-test)")
+
+(deftest keygen-stores-a-new-key-in-the-keychain-test
+  (let [items (atom {})
+        config (cli/normalize-config (test-config {:key-file ::absent}))
+        keygen (fn [answer]
+                 (let [result (atom nil)
+                       out (with-out-str
+                             (with-in-str answer (reset! result (cli/keygen! config "dev"))))]
+                   [@result out]))]
+    (with-keychain items
+      (fn []
+        (testing "an empty Keychain gets a new key without a question"
+          (let [[result out] (keygen "")
+                stored (get @items "cli-test")
+                public (age/public-key {:identity-contents stored})]
+            (is (= keychain-location result))
+            (is (str/starts-with? (str stored) "AGE-SECRET-KEY-1"))
+            (is (str/includes? out (str "Key written: " keychain-location "\n")))
+            (is (str/includes? out (str "Public key: " public "\n")))
+            (is (str/includes? out (str "security find-generic-password"
+                                        " -s com.kirahowe.secrets -a 'cli-test' -w"))
+                "it says how to read the key back for a backup")
+            (is (not (str/includes? out "[y/N]")))
+            (is (not (str/includes? out stored)) "the secret key is never printed")
+            (is (= ["key.txt"] (vec (.list (io/file *dir*))))
+                "no key file is written beside the fixture key")
+            (is (= {:dev public} (with-out-str-result #(cli/show-key! config "dev"))))))
+        (testing "an existing item needs confirmation before it is replaced"
+          (doseq [answer ["n\n" "\n" ""]]
+            (let [before @items
+                  [result out] (keygen answer)]
+              (is (= :aborted result) (pr-str answer))
+              (is (str/includes? out (str "Key already exists: " keychain-location)))
+              (is (str/includes? out "Aborted."))
+              (is (= before @items) "a declined replacement leaves the item alone")))
+          (let [before (get @items "cli-test")
+                [result out] (keygen "y\n")
+                after (get @items "cli-test")]
+            (is (= keychain-location result))
+            (is (str/includes? out "[y/N]"))
+            (is (str/starts-with? (str after) "AGE-SECRET-KEY-1"))
+            (is (not= before after) "a confirmed replacement stores a new key")))))))
+
+(deftest keygen-refuses-where-it-cannot-store-a-key-test
+  (testing "a :key-command environment: the command only reads the key"
+    (let [items (atom {})
+          config (cli/normalize-config
+                  (test-config {:key-file ::absent :key-command ["cat" *key*]}))
+          captured (atom nil)
+          argvs (with-keychain items
+                  #(recorded-sh-argvs
+                    (fn [] (reset! captured (capture-failure (fn [] (cli/keygen! config "dev")))))))
+          {:keys [failure]} @captured]
+      (is (= {:reason :usage :environment :dev} (:data failure)))
+      (is (str/includes? (:message failure) "reads its key with :key-command cat"))
+      (is (empty? argvs) "no age-keygen and no key command ran")
+      (is (empty? @items) "nothing reached the Keychain")))
+  (testing "no :key-file and no Keychain: there is nowhere to keep a key"
+    (let [config (cli/normalize-config (test-config {:key-file ::absent}))
+          {:keys [failure]}
+          (with-keychain (atom {})
+            (fn []
+              (with-redefs [keychain/available? (constantly false)
+                            keychain/store-key! (fn [& _] (throw (AssertionError. "stored")))]
+                (capture-failure #(cli/keygen! config "dev")))))]
+      (is (= {:reason :usage :environment :dev} (:data failure)))
+      (is (str/includes? (:message failure) "has nowhere to keep a key"))
+      (is (str/includes? (:message failure) ":key-command")))))
+
+(deftest key-command-must-be-a-vector-of-non-blank-strings-test
+  (let [failure (fn [overrides]
+                  (test-env/thrown
+                   #(cli/normalize-config (test-config (merge {:key-file ::absent} overrides)))))]
+    (doseq [[label command] [["a string" "cat key.txt"]
+                             ["an empty vector" []]
+                             ["a list" '("cat" "key.txt")]
+                             ["a blank argument" ["cat" " "]]
+                             ["an empty program" [""]]
+                             ["a non-string argument" ["cat" :key]]]]
+      (testing label
+        (let [e (failure {:key-command command})]
+          (is (= {:reason :invalid-config :environment :dev :field :key-command} (ex-data e)))
+          (is (str/includes? (ex-message e)
+                             (str "Environment dev :key-command must be a vector"
+                                  " of non-blank strings"))))))
+    (testing "a key lives in one place, so :key-file and :key-command together are refused"
+      (let [e (failure {:key-file *key* :key-command ["cat" *key*]})]
+        (is (= {:reason :invalid-config :environment :dev} (ex-data e)))
+        (is (str/includes? (ex-message e) "has both :key-file and :key-command"))))
+    (testing "a well-formed command is kept as written and adds no key file"
+      (let [env (get-in (cli/normalize-config
+                         (test-config {:key-file ::absent :key-command ["cat" *key*]}))
+                        [:environments :dev])]
+        (is (= ["cat" *key*] (:key-command env)))
+        (is (not (contains? env :key-file)))))))
+
+(deftest a-key-command-drives-every-command-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [items (atom {})
+          ciphertext (str *dir* "/secrets.edn.age")
+          config (cli/normalize-config
+                  (test-config {:key-file ::absent :key-command ["cat" *key*]}))]
+      (with-keychain items
+        (fn []
+          (let [{:keys [prefixes]}
+                (observe-temp-file-prefixes
+                 (fn []
+                   (new-store! config "dev" "{:a 1}")
+                   (with-out-str (with-in-str "2" (cli/set-secret! config "dev" ":b")))
+                   (edit-store! config "dev" #(str/replace % "1" "3"))
+                   (with-out-str (cli/reencrypt! config "dev"))))]
+            (assert-no-identity-file! prefixes))
+          (testing "the store is encrypted to the key the command printed"
+            (is (= {:a 3 :b "2"} (secrets/load-secrets ciphertext *key*))))
+          (testing "verify decrypts with it rather than falling back to keyless"
+            (is (= {:results {:dev :ok} :exit 0} (verify config "dev"))))
+          (testing "show-key reports its public key and names the command"
+            (is (= {:dev (age/public-key {:identity-file *key*})}
+                   (with-out-str-result #(cli/show-key! config "dev")))))
+          (testing "the Keychain is never consulted"
+            (is (empty? @items))))))))
+
+(deftest a-failing-key-command-is-a-problem-test
+  (let [config (complete-doctor-config {:key-file ::absent :key-command ["false"]})]
+    (testing "a command that needs the key fails with the command's reason"
+      (encrypt-edn! {:a 1})
+      (let [{:keys [failure]} (with-keychain (atom {})
+                                #(capture-failure (fn [] (cli/reencrypt! config "dev"))))]
+        (is (= :key-command-failed (get-in failure [:data :reason])))
+        (is (str/includes? (:message failure) "The :key-command false"))))
+    (testing "doctor reports it as a problem"
+      (let [{:keys [result]} (doctor-under config nil {})]
+        (is (= 2 (:exit result)))
+        (is (= 1 (count (:problems result))))
+        (is (str/includes? (first (:problems result)) ":key-command false"))))))
+
+(deftest the-keychain-key-drives-every-command-test
+  (if (age-env-set?)
+    (is true "skipped: an SECRETS_AGE_IDENTITY* env var is set")
+    (let [ciphertext (str *dir* "/secrets.edn.age")
+          config (cli/normalize-config (test-config {:key-file ::absent}))
+          public (age/public-key {:identity-file *key*})]
+      (testing "with the fixture key in the app's Keychain item"
+        (with-keychain (atom {"cli-test" (key-line *key*)})
+          (fn []
+            (let [{:keys [prefixes]}
+                  (observe-temp-file-prefixes
+                   (fn []
+                     (new-store! config "dev" "{:a 1}")
+                     (with-out-str (with-in-str "2" (cli/set-secret! config "dev" ":b")))))]
+              (assert-no-identity-file! prefixes))
+            (is (= {:a 1 :b "2"} (secrets/load-secrets ciphertext *key*)))
+            (is (= {:a 1 :b "2"} (secrets/load-secrets ciphertext {:app "cli-test"}))
+                "the runtime reads the same item")
+            (is (= {:results {:dev :ok} :exit 0} (verify config "dev")))
+            (let [result (atom nil)
+                  out (with-out-str (reset! result (cli/show-key! config "dev")))]
+              (is (= {:dev public} @result))
+              (is (str/includes? out public))))))
+      (testing "with no item, show-key says where it looked"
+        (with-keychain (atom {})
+          (fn []
+            (let [result (atom nil)
+                  out (with-out-str (reset! result (cli/show-key! config "dev")))]
+              (is (= {:dev nil} @result))
+              (is (str/includes? out (str "dev: no key in " keychain-location))))
+            (testing "and a command that needs the key names the Keychain and keygen"
+              (let [{:keys [failure]} (capture-failure #(cli/reencrypt! config "dev"))]
+                (is (= :no-identity (get-in failure [:data :reason])))
+                (is (str/includes? (:message failure) (str "in " keychain-location)))
+                (is (str/includes? (:message failure) "bb secrets keygen 'dev'"))))
+            (testing "and verify is keyless"
+              (is (= {:results {:dev :ok-keyless} :exit 0} (verify config "dev"))))))))))

@@ -26,16 +26,16 @@
 
   An explicit identity path takes precedence. Otherwise resolution uses:
     1. $SECRETS_AGE_IDENTITY_FILE, a path to the key file.
-    2. $SECRETS_AGE_IDENTITY, the raw key file *contents*, used verbatim and
-       materialized to a 0600 temp file. Lets a deploy inject the key as one
-       secret/env var.
+    2. $SECRETS_AGE_IDENTITY, the raw key file *contents*, used verbatim. Lets
+       a deploy inject the key as one secret/env var.
     3. $SECRETS_AGE_IDENTITY_B64, canonical base64-encoded key file contents.
        ASCII space, horizontal tab, carriage return, and line feed are permitted
        for wrapping; every other nonalphabet character or malformed encoding throws.
-    4. the project's default key location: a `:key-file` option, or
-       ~/.config/<app>/key.txt when an app name is known (an `:app` option).
-  When none of these yields an identity, resolution returns nil and loading
-  throws with the options above rather than guessing a path.
+    4. where the project keeps its key: the output of a `:key-command`, such as
+       a password manager's read command, else a `:key-file`, else on macOS the
+       login Keychain item for the `:app` option.
+  When none of these yields an identity, loading throws with the options above
+  rather than guessing a path. There is no default key file.
 
   An identity path is a local filesystem path, with a leading `~` expanded. A
   URI-shaped value, which includes a bare relative name with a colon such as
@@ -45,16 +45,17 @@
 
   A path you designate has to exist. An explicit path, `:identity-file`, or
   $SECRETS_AGE_IDENTITY_FILE that names a missing file fails with
-  `:no-identity`, naming the source and the path. Only the default location
-  in 4 may be absent, and then no identity is available.
+  `:no-identity`, naming the source and the path. A `:key-file` may be
+  absent, and so may the Keychain item, and then no identity is available.
 
-  Sources 2 and 3 are written to a private temporary file only while an
-  operation needs them, then deleted before that operation returns. If the
-  delete fails, the error names the remaining path."
+  A key that is not in a file (sources 2 and 3, a `:key-command`, the
+  Keychain) is held in memory and handed to `age` on its standard input. The
+  library never writes it to disk."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.keychain :as keychain]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]))
@@ -128,16 +129,67 @@
   "How an error names the place an identity path came from."
   {:identity-file "The explicit identity path"
    :secrets-age-identity-file "SECRETS_AGE_IDENTITY_FILE"
-   :configured-key-file "The configured :key-file"
-   :default-key-file "The default key path"})
+   :configured-key-file "The configured :key-file"})
+
+(defn- run-key-command!
+  "Run `argv`, a `:key-command`, and return what it prints: the age identity.
+  It gets no standard input, so it cannot consume a value piped to the CLI.
+  A command that is not a vector of strings, cannot start, fails, or prints
+  nothing throws, naming the program and never its output."
+  [argv]
+  (when-not (and (vector? argv) (seq argv) (every? #(and (string? %) (not (str/blank? %))) argv))
+    (throw (ex-info (str ":key-command must be a vector of non-blank strings, a program and"
+                         " its arguments, such as [\"op\" \"read\" \"op://vault/myapp/key\"].")
+                    {:reason :invalid-identity :identity-source :key-command})))
+  (let [program (first argv)
+        fail (fn [why] (ex-info (str "The :key-command " program " " why)
+                                {:reason :key-command-failed
+                                 :identity-source :key-command
+                                 :program program}))
+        {:keys [exit out err]} (try
+                                 (fs/sh argv)
+                                 (catch java.io.IOException _
+                                   (throw (fail "could not be started. Is it installed?"))))]
+    (cond
+      (not (zero? exit))
+      (throw (fail (str "exited " exit (when-not (str/blank? err) (str ": " (str/trim err))))))
+
+      (str/blank? out)
+      (throw (ex-info (str "The :key-command " program " printed no age identity.")
+                      {:reason :invalid-identity
+                       :identity-source :key-command
+                       :program program}))
+
+      :else out)))
+
+(defn key-identity
+  "Return the identity a project keeps for itself, ignoring the
+  SECRETS_AGE_IDENTITY* variables: the output of `:key-command`, else the
+  `:key-file`, else on macOS the Keychain item for `:app`. A command or the
+  Keychain is read now, and its key is held in memory as
+  `:identity-contents`. A key file is named by `:identity-file` whether or
+  not it exists. When the Keychain has no item for the app, or nothing names
+  a key, the result has no `:identity-contents` and a nil `:identity-file`."
+  [{:keys [key-command key-file app]}]
+  (cond
+    key-command
+    {:identity-contents (run-key-command! key-command) :identity-source :key-command}
+
+    key-file
+    {:identity-file (fs/expand-home key-file) :identity-source :configured-key-file}
+
+    (and app (keychain/available?))
+    (if-let [contents (keychain/read-key app)]
+      {:identity-contents contents :identity-source :keychain}
+      {:identity-file nil :identity-source :keychain})
+
+    :else
+    {:identity-file nil :identity-source nil}))
 
 (defn- identity-candidate
-  "Choose an identity without materializing injected contents.
-
-  Every path has `~` expanded here, so one rule covers each source. An
-  explicit path and SECRETS_AGE_IDENTITY_FILE are `:designated?`: the file has
-  to exist. `:key-file` and the app default are where a key is expected by
-  default, so their absence means only that no identity is available."
+  "Choose an identity. An explicit path and SECRETS_AGE_IDENTITY_FILE are
+  `:designated?`: the file has to exist. Everything else comes from
+  [[key-identity]]."
   [identity-or-opts]
   (let [opts (if (map? identity-or-opts) identity-or-opts {})
         explicit (if (map? identity-or-opts) (:identity-file opts) identity-or-opts)
@@ -150,17 +202,11 @@
         (when-let [path (identity-env "SECRETS_AGE_IDENTITY_FILE")]
           (designated path :secrets-age-identity-file))
         (when-let [contents (identity-env "SECRETS_AGE_IDENTITY")]
-          {:contents contents :identity-source :secrets-age-identity})
+          {:identity-contents contents :identity-source :secrets-age-identity})
         (when-let [contents (identity-env "SECRETS_AGE_IDENTITY_B64")]
-          {:contents (decode-b64-identity contents)
+          {:identity-contents (decode-b64-identity contents)
            :identity-source :secrets-age-identity-b64})
-        (when-let [path (:key-file opts)]
-          {:identity-file (fs/expand-home path)
-           :identity-source :configured-key-file})
-        (when-let [app (:app opts)]
-          {:identity-file (fs/default-key-file app)
-           :identity-source :default-key-file})
-        {:identity-file nil :identity-source nil})))
+        (key-identity opts))))
 
 (defn- validate-identity-path!
   "Throw `:disallowed-identity` when `path` cannot name a local identity file:
@@ -175,80 +221,63 @@
                              :identity-source identity-source}
                       (:scheme problem) (assoc :scheme (:scheme problem)))))))
 
-(defn- identity-file-exists?
-  "True when `path` names an identity file that exists."
-  [path]
-  (boolean (and path (.exists (io/file (str path))))))
+(defn identity-available?
+  "True when `identity`, a resolved identity, holds a key in memory or names
+  an identity file that exists."
+  [{:keys [identity-file identity-contents]}]
+  (boolean (or identity-contents
+               (and identity-file (.exists (io/file (str identity-file)))))))
 
-(defn- require-designated-identity!
-  "Throw `:no-identity` when the designated identity file at `path` does not
-  exist, naming where the path came from and the path."
-  [path identity-source]
-  (when-not (identity-file-exists? path)
-    (throw (ex-info (str (identity-source-subject identity-source)
-                         " names an age identity file that does not exist: " path)
-                    {:reason :no-identity
-                     :identity-file path
-                     :identity-source identity-source}))))
+(defn resolve-identity
+  "Resolve `identity-or-opts`, an explicit path or an options map, to the
+  identity an operation decrypts with, and return it.
 
-(defn with-identity
-  "Call `f` with an operation-owned identity descriptor.
+  The result is `{:identity-file path :identity-source source}` for a key
+  file, or `{:identity-contents key :identity-source source}` for a key held
+  in memory, which is handed to `age` on its standard input and never written
+  to disk. Resolution is an explicit path (`:identity-file`), then
+  SECRETS_AGE_IDENTITY_FILE, SECRETS_AGE_IDENTITY, SECRETS_AGE_IDENTITY_B64,
+  then `:key-command`, `:key-file`, and on macOS the Keychain item for `:app`.
+  Every path has a leading `~` expanded.
 
-  `identity-or-opts` accepts an explicit path or an options map. `f` receives
-  `{:identity-file path-or-nil :identity-source source}`. Resolution is an
-  explicit path, then SECRETS_AGE_IDENTITY_FILE/raw/base64, then `:key-file`,
-  then an `:app` default. Every path has a leading `~` expanded.
-
-  Before `f` runs, a path that is URI-shaped or holds key contents throws
+  A path that is URI-shaped or holds key contents throws
   `:disallowed-identity`. An explicit path and SECRETS_AGE_IDENTITY_FILE each
   designate a file, and one that does not exist throws `:no-identity` naming
-  its source and the path. `:key-file` and the `:app` default are default
-  locations, not designations: `f` receives the path whether or not the file
-  exists, and a nil path when there is neither, so keyless operations stay
-  possible.
-
-  A raw or base64 identity is written to a private temporary file for this
-  call only, through [[com.kirahowe.secrets.fs/with-private-temp-file]], which
-  deletes it when `f` returns or throws and names the path under
-  `:remaining-file` if the delete fails. A failed write throws
-  `:identity-not-materialized` without the cause or its message."
-  [identity-or-opts f]
-  (let [{:keys [contents identity-source] :as candidate}
+  its source and the path. A `:key-file` that does not exist, or a Keychain
+  with no item for the app, means only that no identity is available
+  ([[identity-available?]] is false), so keyless operations stay possible."
+  [identity-or-opts]
+  (let [{:keys [identity-file identity-source designated?] :as candidate}
         (identity-candidate identity-or-opts)]
-    (if (contains? candidate :contents)
-      (fs/with-private-temp-file "age-identity-" ".txt"
-        (fn [file]
-          (try
-            (spit file contents)
-            (catch Exception e
-              (throw (ex-info (str "Could not write the injected age identity to a temp file ("
-                                   (.getName (class e)) "). Check the temp directory is writable.")
-                              {:reason :identity-not-materialized
-                               :identity-source identity-source}))))
-          (f {:identity-file (.getAbsolutePath ^java.io.File file)
-              :identity-source identity-source})))
-      (let [{:keys [identity-file designated?]} candidate]
-        (validate-identity-path! identity-file identity-source)
-        (when designated?
-          (require-designated-identity! identity-file identity-source))
-        (f {:identity-file identity-file :identity-source identity-source})))))
+    (when identity-file
+      (validate-identity-path! identity-file identity-source))
+    (when (and designated? (not (identity-available? candidate)))
+      (throw (ex-info (str (identity-source-subject identity-source)
+                           " names an age identity file that does not exist: " identity-file)
+                      {:reason :no-identity
+                       :identity-file identity-file
+                       :identity-source identity-source})))
+    (dissoc candidate :designated?)))
 
 (def ^:private identity-options
   "One-line remediation appended to \"no identity\" errors."
-  (str "Set SECRETS_AGE_IDENTITY_FILE (key path), SECRETS_AGE_IDENTITY (raw key contents), or "
-       "SECRETS_AGE_IDENTITY_B64 (base64 contents); pass {:identity-file …} or "
-       "{:app \"myapp\"} (→ ~/.config/myapp/key.txt); or create the key with "
-       "`bb secrets keygen`."))
+  (str "Store a key with `bb secrets keygen` (the macOS Keychain, or the configured "
+       ":key-file), or pass {:key-command [...]} or {:key-file ...}; or set "
+       "SECRETS_AGE_IDENTITY_FILE (key path), SECRETS_AGE_IDENTITY (raw key contents), or "
+       "SECRETS_AGE_IDENTITY_B64 (base64 contents)."))
 
 ;;;; Loading
 
 (defn- validate-load-identity!
-  "Throw unless `identity` names an existing file."
-  [descriptor identity]
-  (let [nameable (some-> identity str)]
-    (when-not (identity-file-exists? identity)
+  "Throw unless `identity` is available, naming the key file it looked for."
+  [descriptor {:keys [identity-file identity-source] :as identity}]
+  (when-not (identity-available? identity)
+    (let [nameable (some-> identity-file str)]
       (throw (ex-info (str "No age identity found"
-                           (when nameable (str " (" nameable " does not exist)"))
+                           (cond
+                             nameable (str " (" nameable " does not exist)")
+                             (= :keychain identity-source)
+                             " (the macOS Keychain has no key for this app)")
                            ". " identity-options)
                       (cond-> {:reason :no-identity}
                         descriptor (assoc :source descriptor)
@@ -289,18 +318,12 @@
       (cleanup!))))
 
 (defn- load-with-identity
-  "Load `source` while an identity descriptor is owned by the calling scope."
-  [source {:keys [identity-file]}]
+  "Load `source` with the resolved `identity`."
+  [source identity]
   (let [descriptor (source/descriptor source)]
-    (validate-load-identity! descriptor identity-file)
+    (validate-load-identity! descriptor identity)
     (let [[file cleanup!] (source/acquire! source descriptor)]
-      (decrypt-and-read! identity-file file descriptor cleanup!))))
-
-(defn- load-from
-  "Load `source` in an operation-owned identity scope."
-  [source identity-or-opts]
-  (with-identity identity-or-opts
-    #(load-with-identity source %)))
+      (decrypt-and-read! identity file descriptor cleanup!))))
 
 (defn load-secrets
   "Decrypt an age-encrypted EDN source and return its value. The reserved
@@ -313,16 +336,22 @@
   Anything else is rejected with `:disallowed-source` before it is opened.
   `identity-or-opts` is an identity path or an options map:
     :identity-file  explicit identity path (wins over the env vars)
+    :key-command    a program and its arguments, as a vector of strings, that
+                    prints the key, used when no env var is set
     :key-file       the project's key path, used when no env var is set
-    :app            app name for the default ~/.config/<app>/key.txt
+    :app            app name; on macOS, its login Keychain item holds the key
+                    when neither of the two above is given
   Without one of these, only the SECRETS_AGE_IDENTITY* environment variables
   are used.
 
   Missing or invalid inputs throw ex-info with a :reason:
-    :no-identity        no identity resolves, the app default key file is
-                        absent, or a designated identity file does not exist.
-    :invalid-identity   an identity variable is set but blank, or
-                        SECRETS_AGE_IDENTITY_B64 is not valid base64.
+    :no-identity        no identity resolves, or a designated identity file
+                        does not exist.
+    :invalid-identity   an identity variable is set but blank,
+                        SECRETS_AGE_IDENTITY_B64 is not valid base64, or a
+                        :key-command is malformed or prints nothing.
+    :key-command-failed the :key-command could not start or exited nonzero.
+    :keychain-failed    the macOS Keychain could not be read.
     :disallowed-identity  the identity path is URI-shaped or holds key
                         contents, so it is not a local path.
     :decrypt-failed     age could not decrypt the source with the identity.
@@ -340,11 +369,11 @@
   which source failed (a file's path, a resource URL's scheme and path, a
   refused URL's or string's scheme alone, or a rejected object's class) and
   never the source value, whose userinfo, query, or `toString` can be a
-  credential. Injected identities are kept in a
-  private temporary file only for the duration of this operation."
+  credential. A key that is not in a file reaches `age` on its standard
+  input and is never written to disk."
   ([source] (load-secrets source nil))
   ([source identity-or-opts]
-   (load-from source identity-or-opts)))
+   (load-with-identity source (resolve-identity identity-or-opts))))
 
 (defn get-secret
   "Read a secret from a loaded store. `key-path` is a vector path
@@ -381,11 +410,10 @@
       {:present? false :reason :no-file}
 
       :else
-      (with-identity opts
-        (fn [{:keys [identity-file] :as identity}]
-          (if-not (identity-file-exists? identity-file)
-            {:present? false :reason :no-identity}
-            {:present? true :secrets (load-with-identity source identity)}))))))
+      (let [identity (resolve-identity opts)]
+        (if-not (identity-available? identity)
+          {:present? false :reason :no-identity}
+          {:present? true :secrets (load-with-identity source identity)})))))
 
 (defn- validate-reader-source!
   "Throw `:disallowed-source` when the readers' `:file` or `:resource` is
@@ -447,7 +475,8 @@
                    A URI-shaped :file or :resource throws `:disallowed-source`
                    here, with the same credential-free `:source` descriptor a
                    load failure carries.
-    :app           app name for the default key path ~/.config/<app>/key.txt.
+    :app           app name; on macOS its Keychain item holds the key.
+    :key-command   a program and its arguments that print the key.
     :key-file      the project's key path, used when no env var is set.
     :identity-file explicit identity path (overrides resolution).
 
@@ -461,8 +490,8 @@
                     identity (key) is available, or when the key is missing
                     from the decrypted map.
     #secret/opt k → optional: nil in all three of those cases.
-  \"No identity is available\" means none was designated and the default key
-  file is absent. A designated identity file that does not exist makes both
+  \"No identity is available\" means none was designated and the project's
+  key file or Keychain item is absent. A designated identity file that does not exist makes both
   tags throw `:no-identity`, and a decryption that fails makes both throw
   `:decrypt-failed`."
   [opts]

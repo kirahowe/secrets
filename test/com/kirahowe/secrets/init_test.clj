@@ -5,40 +5,52 @@
             [clojure.test :refer [are deftest is testing use-fixtures]]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.cli :as cli]
-            [com.kirahowe.secrets.fs :as fs]
             [com.kirahowe.secrets.init :as init]
-            [com.kirahowe.secrets.store :as store])
+            [com.kirahowe.secrets.keychain :as keychain]
+            [com.kirahowe.secrets.store :as store]
+            [com.kirahowe.secrets.test-env :as test-env])
   (:import [java.nio.file Files LinkOption]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 ;;;; Fixtures
 
 (def ^:dynamic ^:private *dir* nil)
-(def ^:dynamic ^:private *key-file* nil)
+(def ^:dynamic ^:private *keychain* nil)
 
 (defn- with-temp-dirs
-  "Give each test an empty project directory and, outside it, the path the
-  app's default identity resolves to."
+  "Give each test an empty project directory."
   [test-fn]
-  (let [temp #(str (Files/createTempDirectory "secrets-init-test" (make-array FileAttribute 0)))
-        dir (temp)
-        home (temp)]
-    (binding [*dir* dir
-              *key-file* (str home "/.config/reader/key.txt")]
+  (let [dir (str (Files/createTempDirectory "secrets-init-test" (make-array FileAttribute 0)))]
+    (binding [*dir* dir]
       (try
-        (with-redefs [fs/default-key-file (fn [app] (str home "/.config/" app "/key.txt"))]
-          (test-fn))
+        (test-fn)
         (finally
-          (doseq [root [dir home]]
-            (run! #(.delete ^java.io.File %) (reverse (file-seq (io/file root))))))))))
+          (run! #(.delete ^java.io.File %) (reverse (file-seq (io/file dir)))))))))
 
-(use-fixtures :each with-temp-dirs)
+(defn- with-fake-keychain
+  "Give each test an empty fake Keychain, kept in `*keychain*` (an atom of app
+  name to key) so a test can see what the initializer stored. Nothing reaches
+  the real login Keychain. A key written to a file instead would be a
+  regression, so `age/keygen!`, which writes one, fails the test."
+  [test-fn]
+  (let [items (atom {})]
+    (binding [*keychain* items]
+      (with-redefs-fn (merge (test-env/keychain-redefs items)
+                             {#'age/keygen! (fn [path]
+                                              (throw (AssertionError.
+                                                      (str "a key file was written: " path))))})
+        test-fn))))
+
+(use-fixtures :each with-temp-dirs with-fake-keychain)
 
 (def ^:private default-dependency @@#'init/default-dependency)
 (def ^:private coordinates
   (edn/read-string (slurp (io/resource "com/kirahowe/secrets/coordinate.edn"))))
 
 (def ^:private template "secrets/secrets.edn.example")
+(def ^:private key-item
+  "How the initializer names the reader app's Keychain item in its plan."
+  "macOS Keychain item com.kirahowe.secrets, account reader")
 (def ^:private reader-task (#'init/task-spec (#'init/proposed-config {:app "reader"})))
 
 (defn- file [path] (io/file *dir* path))
@@ -96,7 +108,7 @@
         (is (str/includes? out "Usage: -m com.kirahowe.secrets.init --app NAME [options]"))
         (doseq [line ["  --app NAME    Application name (required)"
                       "  --env NAME    Environment name (default: dev)"
-                      "  --keygen      Also generate an age identity"
+                      "  --keygen      Also generate an age identity in the macOS Keychain"
                       "  --apply       Create the files instead of previewing"
                       "  -h, --help    Show this help"]]
           (is (str/includes? out (str line "\n"))))
@@ -125,7 +137,7 @@
 ;;;; The proposed configuration
 
 (deftest the-cli-derives-the-paths-the-initializer-uses-test
-  (let [{:keys [config key-file]} (#'init/plan {:root *dir* :app "reader" :keygen? true})
+  (let [{:keys [config files] :as proposal} (#'init/plan {:root *dir* :app "reader" :keygen? true})
         environment (get-in (cli/normalize-config config) [:environments :dev])]
     (is (= {:app "reader"
             :default-environment :dev
@@ -134,7 +146,11 @@
     (is (= template (:template environment))
         "the template the initializer creates is the one the CLI reads")
     (is (= "secrets/secrets.edn.manifest" (:manifest environment)))
-    (is (= *key-file* key-file (:key-file environment))
+    (is (not (contains? proposal :key-file)) "there is no key file to plan")
+    (is (= {:path key-item :action :create :keychain-app "reader"} (last files)))
+    (is (not (contains? environment :key-file)))
+    (is (= "the macOS Keychain (com.kirahowe.secrets, account reader)"
+           (store/key-location environment))
         "the identity the initializer generates is the one the CLI reads")))
 
 ;;;; Preview
@@ -143,17 +159,35 @@
   (let [{:keys [result out]} (run!! {:keygen? true})]
     (is (= {:status :preview} result))
     (is (empty? (files)))
-    (is (not (.exists (io/file *key-file*))))
+    (is (empty? @*keychain*) "a preview stores no key")
     (is (str/includes? out "Nothing is written without --apply."))
     (is (str/includes? out "Would create:"))
-    (doseq [path ["bb.edn" template *key-file*]]
+    (doseq [path ["bb.edn" template key-item]]
       (is (str/includes? out (str "\n  " path "\n")) path))
+    (is (str/includes? out (str key-item "\n      a new age identity, never written to disk\n")))
     (is (str/includes? out "Rerun with --apply"))))
 
 (deftest preview-says-when-no-identity-is-generated-test
   (is (str/includes? (:out (run!! {}))
-                     (str "Pass --keygen to generate one at " *key-file* ".")))
-  (is (not (str/includes? (:out (run!! {:keygen? true})) "Pass --keygen"))))
+                     "Pass --keygen to store one in the macOS Keychain."))
+  (is (not (str/includes? (:out (run!! {:keygen? true})) "Pass --keygen")))
+  (testing "without the Keychain it points at :key-command and :key-file instead"
+    (with-redefs [keychain/available? (constantly false)]
+      (let [{:keys [out]} (run!! {})]
+        (is (str/includes? out (str "No age identity is generated. Without the macOS Keychain,"
+                                    " add :key-command")))
+        (is (not (str/includes? out "--keygen")))))))
+
+(deftest keygen-without-the-keychain-is-refused-test
+  (with-redefs [keychain/available? (constantly false)]
+    (doseq [apply? [false true]]
+      (testing (if apply? "apply" "preview")
+        (let [e (test-env/thrown #(run!! {:keygen? true :apply? apply?}))]
+          (is (= {:reason :usage} (ex-data e)))
+          (is (str/includes? (ex-message e) "--keygen stores the key in the macOS Keychain"))
+          (is (str/includes? (ex-message e) ":key-command"))
+          (is (empty? (files)) "nothing is written, the project files included")
+          (is (empty? @*keychain*)))))))
 
 ;;;; The printed coordinate
 
@@ -180,21 +214,27 @@
 
 (deftest apply-creates-exactly-the-planned-files-test
   (let [{:keys [result out]} (run!! {:keygen? true :apply? true})]
-    (is (= {:status :applied :created ["bb.edn" template *key-file*]} result))
-    (is (= ["bb.edn" template] (files)))
+    (is (= {:status :applied :created ["bb.edn" template key-item]} result))
+    (is (= ["bb.edn" template] (files)) "the identity is not a file in the project")
     (testing "contents"
       (is (= {:deps default-dependency :tasks {'secrets reader-task}}
              (edn/read-string (slurp (file "bb.edn")))))
       (is (= "{:example/api-key \"replace-me\"}\n" (slurp (file template))))
-      (is (str/includes? (slurp *key-file*) "AGE-SECRET-KEY-1")))
+      (is (= ["reader"] (keys @*keychain*)))
+      (is (str/starts-with? (str (get @*keychain* "reader")) "AGE-SECRET-KEY-1")))
     (testing "permissions"
-      (is (= "rw-------" (permissions *key-file*)))
       (spit (file "ordinary") "")
       (doseq [path ["bb.edn" template]]
         (is (= (permissions (file "ordinary")) (permissions (file path))) path)))
     (testing "output"
       (is (str/includes? out "Created:"))
-      (is (re-find #"Public key: age1\S+" out))
+      (is (str/includes? out (str "Public key: "
+                                  (age/public-key {:identity-contents (get @*keychain* "reader")})
+                                  "\n"))
+          "the public key printed is the stored key's")
+      (is (str/includes? out (str "security find-generic-password"
+                                  " -s com.kirahowe.secrets -a 'reader' -w"))
+          "it says how to read the key back for a backup")
       (is (not (str/includes? out "AGE-SECRET-KEY"))))))
 
 (deftest a-second-run-finds-nothing-to-do-test
@@ -283,11 +323,11 @@
       (is (not (.exists outside)))))
   (testing "an identity"
     (let [proposal (#'init/plan {:root *dir* :app "reader" :keygen? true})]
-      (io/make-parents (io/file *key-file*))
-      (spit *key-file* "my key")
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"key.txt already exists"
+      (swap! *keychain* assoc "reader" "my key")
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"Keychain item com\.kirahowe\.secrets, account reader already exists"
                             (#'init/apply-plan! proposal)))
-      (is (= "my key" (slurp *key-file*))))))
+      (is (= {"reader" "my key"} @*keychain*)))))
 
 ;;;; Failures name a path and what was created
 
@@ -310,21 +350,21 @@
           (Files/setPosixFilePermissions (.toPath (io/file *dir*)) writable)))))
   (testing "a key that cannot be generated after the project files were written"
     (let [proposal (#'init/plan {:root *dir* :app "reader" :keygen? true})
-          e (with-redefs [age/keygen! (fn [_]
-                                        (throw (ex-info "age-keygen failed"
-                                                        {:reason :keygen-failed})))]
+          e (with-redefs [age/generate (fn []
+                                         (throw (ex-info "age-keygen failed"
+                                                         {:reason :keygen-failed})))]
               (try (#'init/apply-plan! proposal) nil (catch Exception e e)))]
       (is (= (str "age-keygen failed\nCreated before stopping: bb.edn, " template ".")
              (ex-message e)))
-      (is (= {:reason :keygen-failed :path *key-file* :created ["bb.edn" template]}
+      (is (= {:reason :keygen-failed :path key-item :created ["bb.edn" template]}
              (ex-data e)))
-      (is (= ["bb.edn" template] (files)) "what it names is what is there"))))
+      (is (= ["bb.edn" template] (files)) "what it names is what is there")
+      (is (empty? @*keychain*)))))
 
 (deftest an-existing-identity-is-kept-test
-  (io/make-parents (io/file *key-file*))
-  (spit *key-file* "my key")
+  (swap! *keychain* assoc "reader" "my key")
   (let [{:keys [out]} (run!! {:keygen? true :apply? true})]
-    (is (= "my key" (slurp *key-file*)))
-    (is (str/includes? out (str "\n  " *key-file* "\n")))
+    (is (= {"reader" "my key"} @*keychain*))
+    (is (str/includes? out (str "\n  " key-item "\n")))
     (is (str/includes? out "Already there, left as they are:"))
     (is (not (str/includes? out "Public key:")))))

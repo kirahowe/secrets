@@ -17,18 +17,13 @@
       (str (user-home) (subs s 1))
       s)))
 
-(defn default-key-file
-  "Return the default identity path for `app`: `~/.config/<app>/key.txt` with
-  the home directory expanded."
-  [app]
-  (expand-home (str "~/.config/" app "/key.txt")))
-
 (defn sh
-  "Run the program `argv` with no input, in directory `dir` when one is given,
-  and return `{:exit code :out stdout :err stderr}`. Standard error is read on
-  a daemon thread, so no thread outlives the call and keeps a JVM from
-  exiting. A program that cannot be started throws `java.io.IOException`."
-  [argv & [dir]]
+  "Run the program `argv` and return `{:exit code :out stdout :err stderr}`.
+  It runs in directory `:dir` when one is given, and reads the string `:in` as
+  its standard input, or no input at all. Standard error is read on a daemon
+  thread, so no thread outlives the call and keeps a JVM from exiting. A
+  program that cannot be started throws `java.io.IOException`."
+  [argv & [{:keys [dir in]}]]
   (let [process (-> (ProcessBuilder. ^java.util.List (mapv str argv))
                     (cond-> dir (.directory (java.io.File. (str dir))))
                     .start)
@@ -36,7 +31,9 @@
     (doto (Thread. (fn [] (deliver err (slurp (.getErrorStream process) :encoding "UTF-8"))))
       (.setDaemon true)
       .start)
-    (.close (.getOutputStream process))
+    (with-open [stdin (.getOutputStream process)]
+      (when in
+        (.write stdin (.getBytes ^String in "UTF-8"))))
     (let [out (slurp (.getInputStream process) :encoding "UTF-8")]
       {:exit (.waitFor process) :out out :err @err})))
 

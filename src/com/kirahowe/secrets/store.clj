@@ -11,6 +11,7 @@
             [com.kirahowe.secrets :as secrets]
             [com.kirahowe.secrets.age :as age]
             [com.kirahowe.secrets.fs :as fs]
+            [com.kirahowe.secrets.keychain :as keychain]
             [com.kirahowe.secrets.manifest :as manifest]
             [com.kirahowe.secrets.safe-edn :as safe-edn]
             [com.kirahowe.secrets.source :as source]))
@@ -157,8 +158,9 @@
   #{:app :default-environment :environments})
 
 (def ^:private environment-keys
-  "Every key an environment's config may hold. Each names a path."
-  #{:secrets-file :key-file :template :manifest :recipients-file})
+  "Every key an environment's config may hold. Each names a path, except
+  `:key-command`, a program and its arguments."
+  #{:secrets-file :key-file :key-command :template :manifest :recipients-file})
 
 (defn- reject-unknown-keys!
   "Fail when map `m` holds a key outside `known`, naming the key and the known
@@ -175,7 +177,19 @@
   [app environment-name env-config]
   (let [label (name environment-name)]
     (reject-unknown-keys! (str "Environment " label) environment-keys env-config)
-    (doseq [[k v] env-config]
+    (when-let [command (:key-command env-config)]
+      (when-not (and (vector? command) (seq command)
+                     (every? #(and (string? %) (not (str/blank? %))) command))
+        (fail! :invalid-config
+               (str "Environment " label " :key-command must be a vector of non-blank strings,"
+                    " a program and its arguments.")
+               {:environment environment-name :field :key-command}))
+      (when (contains? env-config :key-file)
+        (fail! :invalid-config
+               (str "Environment " label " has both :key-file and :key-command. Its key"
+                    " lives in one place: keep one of them.")
+               {:environment environment-name})))
+    (doseq [[k v] (dissoc env-config :key-command)]
       (when-not (or (string? v) (and (= :manifest k) (false? v)))
         (fail! :invalid-config
                (str "Environment " label " " k " must be a path string"
@@ -192,8 +206,7 @@
           derived #(str/replace secrets-file #"\.age$" %)
           ;; An explicit :manifest false is kept. Absent values are derived
           ;; from the secrets file.
-          env (merge {:key-file (fs/default-key-file app)
-                      :template (derived ".example")
+          env (merge {:template (derived ".example")
                       :manifest (derived ".manifest")
                       :recipients-file nil}
                      paths
@@ -211,19 +224,22 @@
                     "    explicitly.")
                {:environment environment-name
                 :secrets-file secrets-file}))
-      (doseq [kind [:key-file :template :manifest :recipients-file]]
+      (doseq [kind [:key-file :template :manifest :recipients-file]
+              :when (contains? env kind)]
         (require-path! environment-name kind (get env kind)))
       env)))
 
 (defn normalize-config
   "Validate a secrets config as it is written in `bb.edn` and return it with
-  per-environment defaults (:key-file, :template, :manifest) applied. The
+  per-environment defaults (:template, :manifest) applied. The
   command functions take the result. A config this function returned comes
   back unchanged.
 
   Requires a non-blank :app and at least one environment, each a map with a
-  :secrets-file. Every environment setting is a path string with a leading
-  `~` expanded, and :manifest may also be false. A secrets path not ending in
+  :secrets-file. Every environment setting except :key-command is a path
+  string with a leading `~` expanded, and :manifest may also be false.
+  :key-command is a vector of strings, and an environment names at most one
+  of :key-file and :key-command. A secrets path not ending in
   `.age` requires explicit :template and :manifest values. No file may serve two purposes across the
   environments (see `reject-shared-paths!`). A key the config or an environment
   does not define is rejected by name, so a misspelled key cannot be silently
@@ -249,11 +265,8 @@
       (when-not (and (string? app) (not (str/blank? app)))
         (fail! :invalid-config
                (str "secrets config has no :app (a name string is required). It names the\n"
-                    "    default key path ~/.config/<app>/key.txt and is recorded in the "
-                    "manifest,\n"
-                    "    so there is deliberately no default: projects must not share a key "
-                    "path\n"
-                    "    by accident.")))
+                    "    app's macOS Keychain item and is recorded in the manifest, so there\n"
+                    "    is deliberately no default: projects must not share a key by accident.")))
       (when (and (contains? config :default-environment)
                  (not (contains? environments (:default-environment config))))
         (fail! :invalid-config
@@ -280,16 +293,41 @@
                     " One of: " (str/join ", " (map name (keys environments))))))))
 
 (defn with-environment-identity
-  "Hold one resolved identity through the command's decryption and hashing.
-  An identity path that came from SECRETS_AGE_IDENTITY_FILE was not in the
-  config when its paths were checked, so it is checked against them here."
+  "Resolve the environment's identity once and call `f` with the environment
+  and that identity merged, so one key serves the command's decryption and
+  hashing. An identity path that came from SECRETS_AGE_IDENTITY_FILE was not
+  in the config when its paths were checked, so it is checked against them
+  here."
   [config env f]
-  (secrets/with-identity env
-    (fn [identity]
-      (let [resolved (merge env identity)]
-        (when (= :secrets-age-identity-file (:identity-source identity))
-          (reject-shared-paths! (assoc (:environments config) (:name env) resolved)))
-        (f resolved)))))
+  (let [identity (secrets/resolve-identity env)
+        resolved (merge env identity)]
+    (when (= :secrets-age-identity-file (:identity-source identity))
+      (reject-shared-paths! (assoc (:environments config) (:name env) resolved)))
+    (f resolved)))
+
+(defn identity-of
+  "The identity in a resolved environment, as `age` takes it."
+  [env]
+  (select-keys env [:identity-file :identity-contents]))
+
+(defn own-public-key
+  "The public key of the key the environment keeps for itself (see
+  [[com.kirahowe.secrets/key-identity]]), ignoring the SECRETS_AGE_IDENTITY*
+  variables, or nil when there is no such key."
+  [env]
+  (let [identity (secrets/key-identity env)]
+    (when (secrets/identity-available? identity)
+      (age/public-key identity))))
+
+(defn key-location
+  "Describe where the environment's own key lives, for messages: its
+  `:key-file`, its `:key-command`, or the macOS Keychain item for its app."
+  [{:keys [app key-file key-command]}]
+  (cond
+    key-file key-file
+    key-command (str ":key-command " (first key-command))
+    (keychain/available?) (str "the macOS Keychain (" keychain/service ", account " app ")")
+    :else "nowhere: set :key-file or :key-command"))
 
 ;;;; Bounded reads
 
@@ -335,18 +373,21 @@
     (apply str (map #(format "%02x" %) (.digest md)))))
 
 (defn require-identity!
-  "Require the resolved identity file, naming its path when it is missing."
-  [{environment-name :name :keys [identity-file]}]
-  (when-not (and identity-file (.exists (io/file identity-file)))
+  "Require the resolved identity, naming where it looked when there is none."
+  [{environment-name :name :keys [identity-file] :as env}]
+  (when-not (secrets/identity-available? env)
     (fail! :no-identity
            (str "No age identity for " (name environment-name)
-                " at " identity-file "\n"
-                "    Create one with:  bb secrets keygen "
-                (shell-quote (name environment-name)) "\n"
+                (if identity-file (str " at " identity-file) (str " in " (key-location env)))
+                "\n"
+                (when (or identity-file (keychain/available?))
+                  (str "    Create one with:  bb secrets keygen "
+                       (shell-quote (name environment-name)) "\n"))
                 "    Or point at an existing key via SECRETS_AGE_IDENTITY_FILE (a path),\n"
                 "    SECRETS_AGE_IDENTITY (raw key contents), or "
                 "SECRETS_AGE_IDENTITY_B64 (base64 contents).")
-           {:environment environment-name :identity-file identity-file})))
+           (cond-> {:environment environment-name}
+             identity-file (assoc :identity-file identity-file)))))
 
 ;;;; Recipients (multi-recipient mode)
 
@@ -433,13 +474,13 @@
 
   Multi-recipient mode returns the validated `{:recipients [\"age1…\" …]}`
   snapshot, so age receives repeated `-r` values and no pathname to re-read.
-  Single-key mode returns the environment's resolved `{:identity-file …}` (so
+  Single-key mode returns the environment's resolved identity (so
   SECRETS_AGE_IDENTITY* works in CI too)."
-  [{:keys [recipients-file identity-file] :as env}]
+  [{:keys [recipients-file] :as env}]
   (if recipients-file
     {:recipients (recipient-snapshot env)}
     (do (require-identity! env)
-        {:identity-file identity-file})))
+        (identity-of env))))
 
 ;;;; Store metadata
 
@@ -517,14 +558,14 @@
   ciphertext past `source/max-source-bytes` is refused with `:source-too-large`
   before it is decrypted, as `load-secrets` refuses it, which bounds the
   plaintext too: age does not compress."
-  [{:keys [secrets-file identity-file]}]
+  [{:keys [secrets-file] :as env}]
   (let [size (.length (io/file (str secrets-file)))
         limit source/max-source-bytes]
     (when (> size limit)
       (fail! :source-too-large
              (str "The secrets file " secrets-file " is larger than the " limit " byte limit.")
              {:secrets-file (str secrets-file) :limit limit :observed size})))
-  (age/decrypt identity-file secrets-file))
+  (age/decrypt (identity-of env) secrets-file))
 
 ;;;; Plaintext and writing
 
@@ -744,8 +785,8 @@
 
 (defn verify-one!
   "Verify one environment's committed manifest against its encrypted secrets,
-  returning its finding. When the environment's identity file does not exist,
-  which can only be an absent key file, it compares the manifest's recorded
+  returning its finding. When the environment has no identity, which can
+  only be an absent key file or Keychain item, it compares the manifest's recorded
   :ciphertext-sha against the actual ciphertext (freshness only). With an
   identity it decrypts the store and compares its entries, hashed under the
   store's manifest key. A store without usable metadata is drift, reported
@@ -753,7 +794,7 @@
 
   This establishes *agreement* between the two committed artifacts, which is drift
   detection, and never who authored either of them; see [[verify!]]."
-  [{:keys [app secrets-file manifest identity-file] :as env}]
+  [{:keys [app secrets-file manifest] :as env}]
   (cond
     (not (string? manifest))
     {:status :ok :reason :manifest-disabled}
@@ -771,7 +812,7 @@
           problem
           (assoc problem :status :drift)
 
-          (not (.exists (io/file identity-file)))
+          (not (secrets/identity-available? env))
           (keyless-finding committed (sha256 secrets-file))
 
           :else
