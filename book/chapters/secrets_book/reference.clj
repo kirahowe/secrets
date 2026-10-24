@@ -18,13 +18,11 @@
 ;; `com.kirahowe.secrets.init`. They are listed below.
 ;;
 ;; `com.kirahowe.secrets.age`, `com.kirahowe.secrets.identity`,
-;; `com.kirahowe.secrets.keychain`,
-;; `com.kirahowe.secrets.manifest`,
+;; `com.kirahowe.secrets.keychain`, `com.kirahowe.secrets.manifest`,
 ;; `com.kirahowe.secrets.store`, `com.kirahowe.secrets.fs`,
 ;; `com.kirahowe.secrets.safe-edn`, and `com.kirahowe.secrets.source` are
-;; implementation namespaces. Their vars are
-;; public so the other namespaces can use them. They are not listed here and
-;; can change without notice.
+;; implementation namespaces. Their vars are public so the other namespaces
+;; can use them. They are not listed here and can change without notice.
 ;;
 ;; The library is in alpha, so the public API can still change between
 ;; releases too.

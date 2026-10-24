@@ -725,8 +725,8 @@ the one place that exits.
 
 Those four namespaces are the public API. `com.kirahowe.secrets.age`,
 `.identity`, `.keychain`, `.manifest`, `.store`, `.fs`, `.safe-edn`, and
-`.source` are implementation namespaces and can change without notice. The book's reference chapter lists
-every public API var with its docstring.
+`.source` are implementation namespaces and can change without notice. The
+book's reference chapter lists every public API var with its docstring.
 
 ### Failure reasons
 
