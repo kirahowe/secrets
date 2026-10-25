@@ -612,6 +612,26 @@
 
 ;;;; Validated, transactional saves
 
+(deftest a-refused-write-announces-no-encryption-test
+  (let [config (cli/normalize-config (test-config))]
+    (with-out-str
+      (with-redefs-fn {(cli-private 'run-editor!) #(spit % "{:a 1}")}
+        #(cli/new! config "dev")))
+    (doseq [[label invalid] [["malformed" "{:unfinished"]
+                             ["not a map" "[1 2]"]]]
+      (testing label
+        (let [out (java.io.StringWriter.)
+              e (binding [*out* out *err* out]
+                  (try
+                    (with-redefs-fn {(cli-private 'run-editor!) #(spit % invalid)}
+                      #(cli/edit! config "dev"))
+                    nil
+                    (catch clojure.lang.ExceptionInfo e e)))]
+          (is (some? e))
+          (is (str/includes? (str out) "Decrypting"))
+          (is (not (str/includes? (str out) "ncrypting…"))
+              "no Encrypting or Re-encrypting line precedes the refusal"))))))
+
 (deftest new-rejects-invalid-edn-before-writing-test
   (let [config (cli/normalize-config (test-config))
         encrypted (str *dir* "/secrets.edn.age")

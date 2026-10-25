@@ -672,35 +672,43 @@
   replaced. The pair is not one transaction: the ciphertext is authoritative
   and the manifest derived from it, so if the manifest cannot be replaced after
   the ciphertext, the failure has `:reason :manifest-stale` and says how to
-  regenerate it."
-  [{:keys [manifest app secrets-file] environment-name :name} target tmp user-text manifest-key]
-  (let [[value plaintext] (store-plaintext! secrets-file target user-text manifest-key)
-        staging (fs/staging-file secrets-file)]
-    (try
-      (spit tmp plaintext :encoding "UTF-8")
-      (age/encrypt-file! target tmp staging)
-      (let [manifest-text (when (string? manifest)
-                            (manifest/render {:app app :ciphertext-sha (sha256 staging)}
-                                             (manifest/entries value manifest-key)))]
-        (fs/atomic-move! staging secrets-file)
-        (when manifest-text
-          (try
-            (replace-file! manifest manifest-text)
-            (catch Exception e
-              (throw (ex-info
-                      (str "The ciphertext " secrets-file " was updated, but its manifest "
-                           manifest " could not be replaced (" (.getName (class e))
-                           "), so the manifest is stale.\n"
-                           "    `bb secrets verify` will report it. Regenerate it with:"
-                           "  bb secrets reencrypt "
-                           (shell-quote (name environment-name)))
-                      {:reason :manifest-stale
-                       :secrets-file (str secrets-file)
-                       :manifest manifest
-                       :environment environment-name}
-                      e))))))
-      (finally
-        (.delete staging)))))
+  regenerate it.
+
+  `before-encrypt`, when given, is called once the plaintext has passed
+  validation and before encryption starts, so a progress message never
+  precedes a refusal."
+  ([env target tmp user-text manifest-key]
+   (write-secrets! env target tmp user-text manifest-key nil))
+  ([{:keys [manifest app secrets-file] environment-name :name}
+    target tmp user-text manifest-key before-encrypt]
+   (let [[value plaintext] (store-plaintext! secrets-file target user-text manifest-key)
+         staging (fs/staging-file secrets-file)]
+     (when before-encrypt (before-encrypt))
+     (try
+       (spit tmp plaintext :encoding "UTF-8")
+       (age/encrypt-file! target tmp staging)
+       (let [manifest-text (when (string? manifest)
+                             (manifest/render {:app app :ciphertext-sha (sha256 staging)}
+                                              (manifest/entries value manifest-key)))]
+         (fs/atomic-move! staging secrets-file)
+         (when manifest-text
+           (try
+             (replace-file! manifest manifest-text)
+             (catch Exception e
+               (throw (ex-info
+                       (str "The ciphertext " secrets-file " was updated, but its manifest "
+                            manifest " could not be replaced (" (.getName (class e))
+                            "), so the manifest is stale.\n"
+                            "    `bb secrets verify` will report it. Regenerate it with:"
+                            "  bb secrets reencrypt "
+                            (shell-quote (name environment-name)))
+                       {:reason :manifest-stale
+                        :secrets-file (str secrets-file)
+                        :manifest manifest
+                        :environment environment-name}
+                       e))))))
+       (finally
+         (.delete staging))))))
 
 ;;;; Verifying
 

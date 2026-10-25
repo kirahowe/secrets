@@ -434,9 +434,9 @@
               (spit tmp (store/user-plaintext (template-content env)))
               (info "Opening" (editor) "…")
               (run-editor! tmp)
-              (info "Encrypting…")
               (store/write-secrets! env target tmp (read-edited! env tmp)
-                                    (manifest-key-for :create env nil target))
+                                    (manifest-key-for :create env nil target)
+                                    #(info "Encrypting…"))
               (report-written! env "Encrypted secrets written:" secrets-file)
               secrets-file)))))))
 
@@ -467,9 +467,9 @@
                   (if (= before after)
                     (warn "No changes: leaving" secrets-file "untouched.")
                     (do
-                      (info "Re-encrypting…")
                       (store/write-secrets! env target tmp after
-                                            (manifest-key-for :update env store target))
+                                            (manifest-key-for :update env store target)
+                                            #(info "Re-encrypting…"))
                       (report-written! env "Secrets updated:" secrets-file)))))
               secrets-file)))))))
 
@@ -547,10 +547,10 @@
                                                    env store target)
                     current (or (manifest/user-data store) {})]
                 (require-map-parents! current path)
-                (info (if exists? "Re-encrypting…" "Encrypting…"))
                 (store/write-secrets! env target tmp
                                       (render-secrets (assoc-in current path value))
-                                      manifest-key)
+                                      manifest-key
+                                      #(info (if exists? "Re-encrypting…" "Encrypting…")))
                 (report-written! env "Set" (pr-str path) "in" secrets-file)
                 secrets-file))))))))
 
@@ -587,8 +587,8 @@
                             (dissoc current k))]
               (with-plaintext-temp
                 (fn [tmp]
-                  (info "Re-encrypting…")
-                  (store/write-secrets! env target tmp (render-secrets updated) manifest-key)
+                  (store/write-secrets! env target tmp (render-secrets updated) manifest-key
+                                        #(info "Re-encrypting…"))
                   (report-written! env "Removed" (pr-str path) "from" secrets-file)
                   secrets-file)))))))))
 
@@ -644,9 +644,9 @@
                     user-text (if (and (map? value) (contains? value manifest/store-key))
                                 (render-secrets (manifest/user-data value))
                                 text)]
-                (info "Re-encrypting to current recipients…")
                 (store/write-secrets! env target tmp user-text
-                                      (manifest-key-for :reencrypt env nil target)))
+                                      (manifest-key-for :reencrypt env nil target)
+                                      #(info "Re-encrypting to current recipients…")))
               (report-written! env "Re-encrypted:" secrets-file)
               secrets-file)))))))
 
