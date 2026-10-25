@@ -936,7 +936,8 @@
       recipients-file
       (assoc :recipients-file {:path recipients-file
                                :exists? (exists? recipients-file)
-                               :count (count recipients)}))))
+                               :count (count (distinct (filter age/valid-recipient?
+                                                               recipients)))}))))
 
 (defn- doctor-lines
   "The `doctor` report: paths and counts, never file contents, recipient
@@ -973,7 +974,8 @@
 
   The map holds `:environment`, `:age` (the installed version, or nil),
   `:secrets-file` and `:manifest` (each `{:path :exists?}`; `:manifest` is nil
-  when disabled), `:recipients-file` in team mode (`{:path :exists? :count}`),
+  when disabled), `:recipients-file` in team mode (`{:path :exists? :count}`,
+  where `:count` is the distinct valid recipients encryption would use),
   `:identity` (`{:source :path :exists?}`, a path only for a key file),
   `:warnings` and `:problems` (vectors of messages), and `:exit`.
 

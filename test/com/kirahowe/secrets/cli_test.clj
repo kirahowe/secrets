@@ -582,11 +582,12 @@
       (let [{:keys [result out]} (run)]
         (is (= 2 (:exit result)))
         (is (str/includes? out "Problem: The recipients file lists nobody."))))
-    (testing "so is a line age would refuse, which is counted and never printed"
+    (testing "so is a line age would refuse, which is never printed or counted"
       (spit recipients (str valid-a "\nnot-an-age-recipient-SENTINEL\n"))
       (let [{:keys [result out]} (run)]
         (is (= 2 (:exit result)))
-        (is (= 2 (get-in result [:recipients-file :count])))
+        (is (= 1 (get-in result [:recipients-file :count]))
+            "the count is the recipients encryption would use")
         (is (str/includes? out "Problem: 1 recipients file line(s) are not age recipients."))
         (is (not (str/includes? (str out (pr-str result)) "SENTINEL")))))
     (testing "valid recipients are counted, and their lines stay out of the report"
@@ -597,6 +598,9 @@
         (is (str/includes? out (str "Recipients file: " recipients " (present)\nRecipients: 2\n")))
         (is (not (str/includes? (str (pr-str result) out) valid-a)))
         (is (not (str/includes? (str (pr-str result) out) valid-b)))))
+    (testing "a recipient listed twice is counted once, as encryption uses it once"
+      (spit recipients (str valid-a "\n" valid-a "\n" valid-b "\n"))
+      (is (= 2 (get-in (:result (run)) [:recipients-file :count]))))
     (testing "a solo store reports no recipients file"
       (let [{:keys [result out]} (doctor-under (complete-doctor-config) nil {})]
         (is (not (contains? result :recipients-file)))
