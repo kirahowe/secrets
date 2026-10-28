@@ -1,8 +1,9 @@
 # com.kirahowe/secrets
 
-Keep an application's secrets in one age-encrypted EDN file per environment,
-committed next to the code that uses them. The only secret you manage outside
-the repository is an [age](https://age-encryption.org) private key.
+**secrets** is a library for keeping an application's secrets in one
+age-encrypted EDN file per environment, committed next to the code that uses
+them. The only secret you manage outside the repository is an
+[age](https://age-encryption.org) private key.
 
 - The secrets are EDN: strings, numbers, sets, vectors, and nested maps.
 - An application loads the whole map, or references single values from its EDN
